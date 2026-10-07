@@ -1,6 +1,6 @@
-# StitchOS 架构说明（Architecture）
+# SutureOS 架构说明（Architecture）
 
-> 每一层标注代码来源：**[来源系统]** 或 **[原创]**（原创 = StitchOS 胶水，GPL-3.0）。
+> 每一层标注代码来源：**[来源系统]** 或 **[原创]**（原创 = SutureOS 胶水，GPL-3.0）。
 
 ## 1. 总体分层
 
