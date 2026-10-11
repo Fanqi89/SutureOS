@@ -6,22 +6,26 @@
  */
 #include "ioapic.h"
 #include <stitch/io.h>
+#include <stitch/console.h>
+#include <stitch/types.h>
 
 static volatile uint32_t *ioapic_base = NULL;
 static uint8_t rte_count = 0;
 
 static void ioapic_write(uint32_t reg, uint32_t val) {
+    if (!ioapic_base) return;
     ioapic_base[0] = reg;
     ioapic_base[4] = val;
 }
 
 static uint32_t ioapic_read(uint32_t reg) {
+    if (!ioapic_base) return 0;
     ioapic_base[0] = reg;
     return ioapic_base[4];
 }
 
 void naos_ioapic_init(uint32_t addr) {
-    ioapic_base = (volatile uint32_t *)(uintptr_t)addr;
+    ioapic_base = (volatile uint32_t *)addr;
     uint32_t ver = ioapic_read(NAOS_IOAPIC_REG_VER);
     rte_count = (uint8_t)((ver >> 16) & 0xFF) + 1;
 }
@@ -48,3 +52,31 @@ void naos_ioapic_unmask_irq(uint8_t irq) {
 }
 
 uint8_t naos_ioapic_get_rte_count(void) { return rte_count; }
+
+/* Wrapper functions with hanos_ prefix for consistency */
+bool hanos_ioapic_init(void) {
+    console_puts("[ioapic] Initializing IOAPIC...\n");
+    uint32_t addr = 0xFEC00000;  /* Default IOAPIC address */
+    
+    /* Check if IOAPIC address is within identity-mapped range (1 GiB) */
+    if (addr >= 0x40000000) {
+        console_printf("[ioapic] WARNING: IOAPIC at 0x%lx outside 1GiB identity map, deferring to Phase-3\n", addr);
+        return false;
+    }
+    
+    naos_ioapic_init(addr);
+    console_printf("[ioapic] IOAPIC initialized at 0x%lx, RTE count: %u\n", addr, rte_count);
+    return true;
+}
+
+void hanos_ioapic_set_irq(uint8_t irq, uint8_t vector, uint8_t delivery_mode) {
+    naos_ioapic_set_irq(irq, vector, delivery_mode);
+}
+
+void hanos_ioapic_mask_irq(uint8_t irq) {
+    naos_ioapic_mask_irq(irq);
+}
+
+void hanos_ioapic_unmask_irq(uint8_t irq) {
+    naos_ioapic_unmask_irq(irq);
+}

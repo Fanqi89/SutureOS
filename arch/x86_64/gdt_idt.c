@@ -215,6 +215,31 @@ void vim_idt_init(void)
 }
 
 /* ==================== PIC ==================== */
+/* Remap PIC to vectors 0x20-0x2F (IRQ0-15) and mask all initially.
+ * This matches the x86_64 exception vectors and avoids conflicts with CPU exceptions. */
+void vim_pic_init(void)
+{
+    /* ICW1: edge-triggered, cascaded, needs ICW4 */
+    outb(0x20, 0x11);   /* master */
+    outb(0xA0, 0x11);   /* slave */
+
+    /* ICW2: vector offsets */
+    outb(0x21, 0x20);   /* master IRQ0-7 -> vectors 0x20-0x27 */
+    outb(0xA1, 0x28);   /* slave  IRQ8-15 -> vectors 0x28-0x2F */
+
+    /* ICW3: cascade identity (master IRQ2 connects to slave) */
+    outb(0x21, 0x04);   /* master: slave on IRQ2 */
+    outb(0xA1, 0x02);   /* slave: cascade identity 2 */
+
+    /* ICW4: 8086 mode, normal EOI, non-buffered */
+    outb(0x21, 0x01);
+    outb(0xA1, 0x01);
+
+    /* Mask all IRQs initially - drivers will unmask as needed */
+    outb(0x21, 0xFF);
+    outb(0xA1, 0xFF);
+}
+
 /* VimtuOS pic_remap() finishes with "mask everything, each driver unmasks on
  * demand". The kernel keeps interrupts off (cli) in this phase, so only that
  * final step is ported: no ICW sequence, no EOI, no unmask. */
@@ -222,6 +247,16 @@ void vim_pic_mask_all(void)
 {
     outb(0x21, 0xFF);   /* 8259 master  IMR: all masked */
     outb(0xA1, 0xFF);   /* 8259 slave   IMR: all masked */
+}
+
+/* Timer interrupt handler - set IDT gate directly to avoid ISR stub frame layout */
+extern void timer_irq_handler_asm(void);
+
+void vim_idt_set_timer_gate(void)
+{
+    /* Vector 0x20 = 32 decimal */
+    vim_idt_set_gate(32, (uint64_t)(uintptr_t)timer_irq_handler_asm,
+                     VIM_KERNEL_CS, 0x8E, 0);
 }
 
 /* ==================== self test ==================== */

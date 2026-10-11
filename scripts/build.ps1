@@ -1,18 +1,17 @@
-# StitchOS (缝合怪系统) build script
-# Toolchain: clang (freestanding, x86_64-unknown-none-elf) + x86_64-elf-ld (self-built binutils)
+# StitchOS (缝合怪系统) build script - working version
 param(
     [switch]$Clean
 )
 
 $ErrorActionPreference = 'Stop'
-$root = 'C:\Users\fanqi\Desktop\缝合怪系统'
-$cc   = 'C:\msys64\mingw64\bin\clang.exe'
+$root = 'C:/Users/fanqi/Desktop/缝合怪系统'
+$cc   = 'C:/msys64/mingw64/bin/clang.exe'
 if (-not (Test-Path $cc)) { throw "clang not found: $cc" }
 
-# ELF linker: prefer the project-local cross binutils, fall back to temp build
+# ELF linker: prefer the project-local cross binutils
 $ldCandidates = @(
-    (Join-Path $root 'tools\cross\bin\x86_64-elf-ld.exe'),
-    'C:\Users\fanqi\AppData\Local\Temp\xb64\install\bin\x86_64-elf-ld.exe'
+    (Join-Path $root 'tools/cross/bin/x86_64-elf-ld.exe'),
+    'C:/Users/fanqi/AppData/Local/Temp/xb64/install/bin/x86_64-elf-ld.exe'
 )
 $ld = $ldCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $ld) { throw "x86_64-elf-ld not found. Run scripts/fetch-toolchain first." }
@@ -28,23 +27,29 @@ $cflags = @(
     '-ffreestanding', '-fno-builtin',
     '-mno-red-zone', '-mno-sse', '-mno-mmx', '-mno-80387',
     '-fno-pic', '-fno-pie', '-fno-stack-protector', '-fno-asynchronous-unwind-tables',
-    '-nostdinc', '-isystem', "$resourceDir\include",
+    '-nostdinc', '-isystem', "$resourceDir/include",
     "-I$(Join-Path $root 'include')",
-    "-I$(Join-Path $root 'arch\x86_64')",
-    "-I$(Join-Path $root 'kernel\interrupts')",
+    "-I$(Join-Path $root 'arch/x86_64')",
+    "-I$(Join-Path $root 'kernel/interrupts')",
+    "-I$(Join-Path $root 'kernel/mm')",
+    "-I$(Join-Path $root 'kernel/drivers')",
+    "-I$(Join-Path $root 'kernel/syscall')",
     '-O2', '-g', '-Wall', '-Wextra'
 )
 
 # ---- collect sources ----
 $sources = @()
 $sources += Get-ChildItem -Path (Join-Path $root 'boot') -Filter '*.S' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
-$sources += Get-ChildItem -Path (Join-Path $root 'arch\x86_64') -Filter '*.c' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
-$sources += Get-ChildItem -Path (Join-Path $root 'arch\x86_64') -Filter '*.S' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+$sources += Get-ChildItem -Path (Join-Path $root 'arch/x86_64') -Filter '*.c' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+$sources += Get-ChildItem -Path (Join-Path $root 'arch/x86_64') -Filter '*.S' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
 $sources += Get-ChildItem -Path (Join-Path $root 'kernel') -Filter '*.c' -Recurse -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
 $sources += Get-ChildItem -Path (Join-Path $root 'kernel') -Filter '*.S' -Recurse -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
 $sources += Get-ChildItem -Path (Join-Path $root 'lib') -Filter '*.c' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
 $sources = $sources | Sort-Object -Unique
+
 if ($sources.Count -eq 0) { throw 'no sources found' }
+
+Write-Host "Found $($sources.Count) source files" -ForegroundColor Cyan
 
 # ---- compile ----
 $objs = @()
@@ -54,10 +59,9 @@ foreach ($s in $sources) {
     $flat = ($rel -replace '[\\/]', '__')
     $o = Join-Path $obj ($flat + '.o')
     $ext = [IO.Path]::GetExtension($s).ToLower()
-    $args = @()
-    if ($ext -eq '.s' -or $ext -eq '.asm') { $args += @( '-c' ) } else { $args += @( '-c' ) }
+    $args = @('-c')
     $args += $cflags
-    $args += @('-o', $o, $s)
+    $args += '-o', $o, $s
     & $cc @args
     if ($LASTEXITCODE -ne 0) {
         Write-Host "COMPILE FAIL: $rel" -ForegroundColor Red
@@ -68,9 +72,11 @@ foreach ($s in $sources) {
 }
 if ($fail -gt 0) { throw "$fail file(s) failed to compile" }
 
+Write-Host "Compiled $($objs.Count) object files" -ForegroundColor Green
+
 # ---- link ----
 $elf = Join-Path $build 'kernel.elf'
-$ldArgs = @('-T', (Join-Path $root 'boot\linker.ld'), '-o', $elf) + $objs
+$ldArgs = @('-T', (Join-Path $root 'boot/linker.ld'), '-o', $elf) + $objs
 & $ld @ldArgs
 if ($LASTEXITCODE -ne 0) { throw "link failed ($LASTEXITCODE)" }
 

@@ -18,7 +18,9 @@ GPL-3.0 **聚合兼容**（aggregate compatible），即本项目整体可按 GP
 ## 1. CoolPotOS — MIT
 - 上游: https://github.com/plos-clan/CoolPotOS
 - 版权: Copyright (c) 2024-2025 plos-clan
-- 引入文件: `lib/rbtree.c`, `include/stitch/rbtree.h`（取自 `src/util/rbtree.c`, `src/include/rbtree.c`）
+- 引入文件: 
+  - `lib/rbtree.c`, `include/stitch/rbtree.h`（取自 `src/util/rbtree.c`, `src/include/rbtree.c`）——红黑树
+  - `kernel/sched/eevdf.c`, `kernel/sched/eevdf.h`（取自 `src/task/eevdf.c`, `src/include/task/eevdf.h`）——EEVDF 调度器
 - 原始协议文本要求: 保留版权声明与许可文本 → 已在各移植文件头部保留。
 
 ## 2. SpiritFoxOS — GPL-3.0

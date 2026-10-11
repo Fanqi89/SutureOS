@@ -21,4 +21,8 @@ uintptr_t lemis_heap_free_space(void);
 
 void st_lemis_heap_test(void);
 
+/* malloc/free 兼容层 */
+#define malloc(size) lemis_heap_alloc(size)
+#define free(ptr) lemis_heap_free(ptr)
+
 #endif /* STITCH_HEAP_H */

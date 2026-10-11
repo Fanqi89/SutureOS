@@ -25,6 +25,7 @@
 pml4:       .skip 4096
 pdpt:       .skip 4096
 pd0:        .skip 4096
+pd_high:    .skip 4096          /* PD for high memory (LAPIC/IOAPIC) */
 .align 16
 stack_bottom:
             .skip 16384                 /* 16 KiB kernel stack */
@@ -64,10 +65,16 @@ _start:
     movl $pdpt, %eax
     orl  $0b11, %eax                    /* present | writable */
     movl %eax, pml4
-    /* PDPT[0] -> PD */
+    /* PDPT[0] -> PD for low 1 GiB */
     movl $pd0, %eax
     orl  $0b11, %eax
     movl %eax, pdpt
+
+    /* PDPT[511] -> PD for high memory (4GB-2MB to 4GB) */
+    movl $pd_high, %eax
+    orl  $0b11, %eax
+    movl %eax, pdpt+4088        /* PDPT[511] at offset 511*8=4088 */
+
     /* PD[0..511] -> 2 MiB pages, identity map first 1 GiB */
     xorl %ecx, %ecx
 1:
@@ -78,6 +85,14 @@ _start:
     incl %ecx
     cmpl $512, %ecx
     jne 1b
+
+    /* Map LAPIC (0xFEE00000) and IOAPIC (0xFEC00000) in pd_high */
+    /* 0xFEE00000 = 4094 * 2MB, 0xFEC00000 = 4093 * 2MB */
+    /* PD index 4094 = LAPIC, 4093 = IOAPIC */
+    movl $0x10000011, %eax             /* present | writable | page-size(2MB) | address=0xFEE00000 */
+    movl %eax, pd_high+32752          /* pd_high[4094] at offset 4094*8=32752 */
+    movl $0x10000011, %eax             /* address=0xFEC00000 */
+    movl %eax, pd_high+32744          /* pd_high[4093] at offset 4093*8=32744 */
 
     /* enable PAE */
     movl %cr4, %eax

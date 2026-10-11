@@ -153,3 +153,12 @@ void st_xj_vfs_test(void) {
 
     st_run("xj_vfs", pass);
 }
+
+/* 供 loader 使用：读取内嵌文件 */
+void *vfs_read_file(const char *path, size_t *len) {
+    if (strcmp(path, "/init") == 0) {
+        extern void *test_program_binary(size_t *len);
+        return test_program_binary(len);
+    }
+    return NULL;
+}

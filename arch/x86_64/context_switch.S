@@ -1,9 +1,11 @@
 /* SutureOS module: context switch assembly (cinux_ prefix)
  * Ported from: Cinux (C:\Users\fanqi\Desktop\自研操作系统\Cinux\kernel\arch\x86_64\context_switch.S)
  * Original license: GPL-3.0
- * Changes: symbol prefix cinux_; no FPU/SSE state save; segment bases
+ * Changes: symbol prefix cinux_; added gs_base for user GS (TLS); segment bases
  *          saved/restored via MSR_GS_BASE/MSR_FS_BASE; trampoline is a
  *          C function called as initial rip for new tasks.
+ * Struct offsets: r15=0x00 r14=0x08 r13=0x10 r12=0x18 rbp=0x20 rbx=0x28
+ *                 rsp=0x30 rip=0x38 rflags=0x40 kgs_base=0x48 fs_base=0x50 gs_base=0x58
  */
     .text
     .globl cinux_context_switch
@@ -11,7 +13,7 @@
 /* void cinux_context_switch(cinux_cpu_context_t *from, cinux_cpu_context_t *to)
  * rdi = from, rsi = to
  * Struct offsets: r15=0x00 r14=0x08 r13=0x10 r12=0x18 rbp=0x20 rbx=0x28
- *                 rsp=0x30 rip=0x38 rflags=0x40 kgs_base=0x48 fs_base=0x50
+ *                 rsp=0x30 rip=0x38 rflags=0x40 kgs_base=0x48 fs_base=0x50 gs_base=0x58
  */
 cinux_context_switch:
     /* Save current context to *from */
@@ -37,6 +39,11 @@ cinux_context_switch:
     shlq $32, %rdx
     orq  %rax, %rdx
     movq %rdx, 0x50(%rdi)      /* fs_base */
+    movq $0xC0000102, %rcx     /* MSR_KERNEL_GS_BASE (actually we use it for user GS) */
+    rdmsr
+    shlq $32, %rdx
+    orq  %rax, %rdx
+    movq %rdx, 0x58(%rdi)      /* gs_base */
 
     /* Load new context from *to */
     movq 0x00(%rsi), %r15
@@ -58,6 +65,11 @@ cinux_context_switch:
     movq %rdx, %rax
     shrq $32, %rdx
     movq $0xC0000100, %rcx     /* MSR_FS_BASE */
+    wrmsr
+    movq 0x58(%rsi), %rdx      /* gs_base */
+    movq %rdx, %rax
+    shrq $32, %rdx
+    movq $0xC0000102, %rcx     /* MSR_KERNEL_GS_BASE */
     wrmsr
     movq 0x38(%rsi), %rax      /* target rip */
     jmp *%rax

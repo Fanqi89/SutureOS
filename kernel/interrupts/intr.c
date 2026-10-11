@@ -1,26 +1,31 @@
-/* StitchOS module: interrupt dispatcher + IRQ handler registry (moos_ prefix)
- * Ported from: MOOS (C:\Users\fanqi\Desktop\自研操作系统\MOOS\Kernel\Misc\IDT.cs
- *              intr_handler split/dispatch logic,
- *              C:\Users\fanqi\Desktop\自研操作系统\MOOS\Kernel\Misc\Interrupts.cs
- *              IRQ handler registry)
+/* StitchOS module: interrupt stub frames + dispatcher (moos_ prefix)
+ * Ported from: MOOS (C:\Users\fanqi\Desktop\自研操作系统\MOOS\NativeLib\interrupts_asm.asm,
+ *              C:\Users\fanqi\Desktop\自研操作系统\MOOS\NativeLib\interrupts.cpp,
+ *              C:\Users\fanqi\Desktop\自研操作系统\MOOS\Kernel\Misc\IDT.cs,
+ *              C:\Users\fanqi\Desktop\自研操作系统\MOOS\Kernel\Misc\Interrupts.cs)
  * Original license: Unlicense (MOOS LICENSE = public-domain dedication; MIT also cited)
- * Changes: C# Panic/Console/framebuffer paths replaced by bookkeeping that is
- *          safe while interrupts are permanently masked: last-vector + per-
- *          vector counters, a warning (never a panic) for unexpected CPU
- *          exceptions, and a 256-slot handler table instead of MOOS's
- *          List-of-delegates. int 0x80 named-syscall lookup dropped (phase-2).
+ * Changes: MASM pushaq/popaq rewritten as GAS macros in isr_stubs.S; the
+ *          Windows x64 argument registers (rcx/rdx, kept for provenance) are
+ *          mirrored into the SysV AMD64 argument registers (rdi/rsi) that
+ *          clang actually reads; the MOOS "struct of delegate list" registry
+ *          became a fixed 256-slot table with explicit overwrite semantics;
+ *          the int 0x80 named-syscall lookup (IDT.cs) is dropped for phase-1.
+ *          Fixed: interrupt frame layout for proper iretq in 64-bit mode.
  */
 #include "intr.h"
 
 #include <stitch/console.h>
 #include <stitch/selftest.h>
 #include <stitch/string.h>
+#include "mmu.h"
+#include "task.h"
+#include "signal.h"
 
 /* ---- statistics ---- */
 static uint32_t g_counts[256];
 static uint64_t g_last_vector;
 
-/* ---- handler registry (MOOS Interrupts.cs delegate table -> array) ---- */
+/* ---- handler registry (MOOS Interrupts.cs delegate list -> array) ---- */
 static moos_irq_fn g_table[256];
 
 /* Vectors tolerated without a warning during bring-up: #DB (1) and #BP (3)
@@ -37,9 +42,44 @@ static bool vector_expected(uint64_t vec)
     return false;
 }
 
-/* Called from every isr_stubs.S stub (SysV: rcx-less, arg1 in rdi). */
-void moos_intr_handler(uint64_t vec, struct moos_regs *frame)
+#include "mmu.h"
+
+/* Called from every isr_stubs.S stub (SysV: rdi=frame, rsi=vector). */
+void moos_intr_handler(struct moos_regs *frame, uint64_t vec)
 {
+    if (vec < 256u)
+        g_counts[vec]++;
+    g_last_vector = vec;
+
+    /* 处理缺页异常 (vector 14) - COW 支持 */
+    if (vec == 14) {  /* #PF - Page Fault */
+        uint64_t fault_addr = 0;
+        __asm__ volatile("mov %%cr2, %0" : "=r"(fault_addr));
+        
+        uint64_t error_code = frame->error_code;
+        bool write = error_code & 0x2;
+        bool user = error_code & 0x4;
+        bool present = error_code & 0x1;
+        
+        // 获取当前进程的页表
+        uint64_t current_pml4 = read_cr3();
+        
+        // 查找故障地址对应的 PTE
+        uint64_t *pte = mmu_walk((uint64_t *)current_pml4, 0, fault_addr, 0);
+        
+        if (pte && (*pte & PTE_P) && mmu_is_cow(*pte)) {
+            // COW 处理
+            if (mmu_handle_cow((uint64_t *)((uint64_t)current_pml4), fault_addr) == 0) {
+                return;  // COW 处理成功，返回继续执行
+            }
+        }
+        
+        // 非 COW 错误或处理失败，发送 SIGSEGV
+        extern sched_cpu_t sched_cpu;
+        sig_send(sched_cpu.current, SIGSEGV);
+        return;
+    }
+
     if (vec < 256u)
         g_counts[vec]++;
     g_last_vector = vec;
@@ -56,9 +96,8 @@ void moos_intr_handler(uint64_t vec, struct moos_regs *frame)
         g_table[vec](frame);        /* MOOS Interrupts.HandleInterrupt equivalent */
 }
 
-/* Registry: one slot per vector; registering again overwrites (documented
- * behaviour - MOOS appended to a List and fired every match; the fixed table
- * makes "replace the handler" explicit). vec out of range is ignored. */
+/* Registry (cf. MOOS Interrupts.cs delegate list): fixed 256-slot table,
+ * register overwrites the previous entry, fn = NULL clears it. */
 void moos_irq_register(int vec, moos_irq_fn fn)
 {
     if (vec < 0 || vec > 255)
@@ -99,7 +138,7 @@ void moos_intr_reset_stats(void)
     g_last_vector = 0;
 }
 
-/* ==================== self test ==================== */
+/* ---- self test ==================== */
 /* Synthetic frames only - never waits for a real interrupt (kernel is cli). */
 static int g_h1_calls;
 static int g_h2_calls;
@@ -173,10 +212,10 @@ void st_moos_intr_test(void)
      *    also fires, which is the MOOS HandleInterrupt behaviour. */
     before = moos_intr_count(200);
     frame.vector = 200;
-    moos_intr_handler(200, &frame);
+    moos_intr_handler(&frame, 200);
     ok = ok && (moos_intr_count(200) == before + 1u);
     ok = ok && (moos_intr_last_vector() == 200);
-    moos_intr_handler(200, &frame);
+    moos_intr_handler(&frame, 200);
     ok = ok && (moos_intr_count(200) == before + 2u);
 
     /*    unexpected CPU exception (vec 13): warning only, count still taken,
@@ -184,7 +223,7 @@ void st_moos_intr_test(void)
     before = moos_intr_count(13);
     frame.vector = 13;
     frame.error_code = 0xBADull;
-    moos_intr_handler(13, &frame);
+    moos_intr_handler(&frame, 13);
     ok = ok && (moos_intr_count(13) == before + 1u);
     ok = ok && (moos_intr_last_vector() == 13);
 
@@ -193,7 +232,7 @@ void st_moos_intr_test(void)
     moos_irq_register(41, test_handler_a);
     g_h1_calls = 0;
     g_h1_vec = 0;
-    moos_intr_handler(41, &frame);
+    moos_intr_handler(&frame, 41);
     ok = ok && (g_h1_calls == 1);
     ok = ok && (g_h1_vec == 41);
     moos_irq_register(41, NULL);

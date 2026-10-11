@@ -74,8 +74,9 @@ typedef void (*moos_irq_fn)(struct moos_regs *frame);
 
 /* Entry from every stub: record vector, count it, warn on unexpected CPU
  * exceptions (no panic - interrupts stay masked during bring-up), then run
- * any handler registered for this vector (cf. MOOS Interrupts.HandleInterrupt). */
-void moos_intr_handler(uint64_t vec, struct moos_regs *frame);
+ * any handler registered for this vector (cf. MOOS Interrupts.HandleInterrupt).
+ * New calling convention: rdi=frame, rsi=vector (SysV AMD64 ABI). */
+void moos_intr_handler(struct moos_regs *frame, uint64_t vec);
 
 /* Registry (cf. MOOS Interrupts.cs delegate list): fixed 256-slot table,
  * register overwrites the previous entry, fn = NULL clears it. */

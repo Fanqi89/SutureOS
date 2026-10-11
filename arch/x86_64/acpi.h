@@ -3,6 +3,7 @@
  * Original license: GPL-3.0
  * Changes: symbol prefix hanos_; RSDP/RSDT/XSDT parsing; checksum validation;
  *          table iteration; no ACPI 2.0+ XSDT fallback (RSDT only for now).
+ *          Added MADT parsing for LAPIC ID extraction.
  */
 #ifndef STITCH_ACPI_H
 #define STITCH_ACPI_H
@@ -38,8 +39,43 @@ typedef struct acpi_rsdt {
     uint32_t entries[];
 } acpi_rsdt_t;
 
+/* MADT (Multiple APIC Description Table) parsing */
+typedef struct acpi_madt {
+    acpi_sdt_header_t header;
+    uint32_t local_apic_addr;
+    uint32_t flags;
+    uint8_t entries[];
+} __attribute__((packed)) acpi_madt_t;
+
+typedef struct acpi_madt_header {
+    uint8_t type;
+    uint8_t length;
+} __attribute__((packed)) acpi_madt_header_t;
+
+typedef struct acpi_madt_lapic {
+    acpi_madt_header_t header;
+    uint8_t acpi_processor_id;
+    uint8_t apic_id;
+    uint32_t flags;
+} __attribute__((packed)) acpi_madt_lapic_t;
+
 acpi_rsdp_t *hanos_acpi_find_rsdp(void);
 acpi_sdt_header_t *hanos_acpi_find_table(acpi_rsdp_t *rsdp, const char *signature);
 bool hanos_acpi_checksum_valid(void *ptr, uint32_t length);
+
+/* MADT parsing - returns count of enabled LAPICs, fills out_ids if provided */
+int hanos_acpi_madt_parse_lapic_ids(uint8_t **out_ids, int max_ids);
+
+/* MADT types and structures for ioapic access */
+#define MADT_TYPE_LAPIC  0
+#define MADT_TYPE_IOAPIC 1
+
+typedef struct madt_ioapic {
+    acpi_madt_header_t header;
+    uint8_t  ioapic_id;
+    uint8_t  reserved;
+    uint32_t ioapic_addr;
+    uint32_t gsi_base;
+} __attribute__((packed)) madt_ioapic_t;
 
 #endif /* STITCH_ACPI_H */

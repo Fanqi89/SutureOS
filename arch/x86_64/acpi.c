@@ -3,9 +3,12 @@
  * Original license: GPL-3.0
  * Changes: symbol prefix hanos_; RSDP/RSDT/XSDT parsing; checksum validation;
  *          table iteration; no ACPI 2.0+ XSDT fallback (RSDT only for now).
+ *          Added MADT parsing for LAPIC ID extraction.
  */
 #include "acpi.h"
 #include <stitch/string.h>
+#include <stitch/console.h>
+#include "heap.h"
 
 /* Scan EBDA and BIOS ROM for RSDP signature "RSD PTR ". */
 acpi_rsdp_t *hanos_acpi_find_rsdp(void) {
@@ -42,4 +45,66 @@ acpi_sdt_header_t *hanos_acpi_find_table(acpi_rsdp_t *rsdp, const char *signatur
         if (memcmp(hdr->signature, signature, 4) == 0) return hdr;
     }
     return NULL;
+}
+
+/* Parse MADT table to extract LAPIC IDs */
+int hanos_acpi_madt_parse_lapic_ids(uint8_t **out_ids, int max_ids) {
+    acpi_rsdp_t *rsdp = hanos_acpi_find_rsdp();
+    if (!rsdp) {
+        console_puts("[ACPI] RSDP not found\n");
+        return 0;
+    }
+
+    acpi_sdt_header_t *madt_hdr = hanos_acpi_find_table(rsdp, "APIC");
+    if (!madt_hdr) {
+        console_puts("[ACPI] MADT not found\n");
+        return 0;
+    }
+
+    acpi_madt_t *madt = (acpi_madt_t *)madt_hdr;
+    uint8_t *entries = madt->entries;
+    uintptr_t entries_end = (uintptr_t)madt + madt->header.length;
+
+    /* First pass: count enabled LAPICs */
+    int count = 0;
+    uintptr_t ptr = (uintptr_t)entries;
+    while (ptr < entries_end) {
+        acpi_madt_header_t *hdr = (acpi_madt_header_t *)ptr;
+        
+        if (hdr->type == 0 && hdr->length >= sizeof(acpi_madt_lapic_t)) {
+            acpi_madt_lapic_t *lapic = (acpi_madt_lapic_t *)hdr;
+            if (lapic->flags & 1) {  /* processor enabled */
+                count++;
+            }
+        }
+        ptr += hdr->length;
+    }
+
+    if (count == 0) return 0;
+    if (count > max_ids) count = max_ids;
+
+    if (out_ids && count > 0) {
+        uint8_t *ids = (uint8_t*)malloc(count);
+        if (!ids) {
+            console_puts("[ACPI] malloc failed for LAPIC IDs\n");
+            return 0;
+        }
+        *out_ids = ids;
+
+        int idx = 0;
+        uintptr_t ptr = (uintptr_t)entries;
+        while (ptr < entries_end && idx < count) {
+            acpi_madt_header_t *hdr = (acpi_madt_header_t *)ptr;
+            if (hdr->type == 0 && hdr->length >= sizeof(acpi_madt_lapic_t)) {
+                acpi_madt_lapic_t *lapic = (acpi_madt_lapic_t *)hdr;
+                if (lapic->flags & 1) {
+                    ids[idx++] = lapic->apic_id;
+                }
+            }
+            ptr += hdr->length;
+        }
+    }
+
+    console_printf("[ACPI] Found %d enabled LAPIC(s) in MADT\n", count);
+    return count;
 }

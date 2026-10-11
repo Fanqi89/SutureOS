@@ -5,6 +5,11 @@
 #include <stitch/selftest.h>
 #include <stitch/init.h>
 #include <stitch/io.h>
+#include "intr.h"
+#include "task.h"
+#include "gdt_idt.h"
+#include "fbcon.h"
+#include "syscall.h"
 
 /* Module self-test declarations */
 void st_vim_gdt_idt_test(void);
@@ -18,11 +23,18 @@ void st_phobos_queue_test(void);
 void st_cp_rbtree_test(void);
 void st_helos_fifo32_test(void);
 void st_sched_test(void);
+void st_eevdf_test(void);
 void st_xj_vfs_test(void);
 
 /* External symbols from boot.S */
 extern uint32_t _bss_start[];
 extern uint32_t _bss_end[];
+
+/* Timer interrupt handler for vector 0x20 - assembly wrapper */
+void timer_irq_handler_asm(void);
+
+/* Timer tick function (C version for assembly handler) */
+void kernel_timer_tick_c(void);
 
 void kernel_main(uint32_t magic, uint32_t mbi) {
     /* NOTE: BSS is already cleared by boot.S *before* the page tables (which
@@ -31,10 +43,29 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
     (void)_bss_start;
     (void)_bss_end;
 
+    /* Disable interrupts immediately - multiboot doesn't guarantee they're off */
+    __asm__ volatile("cli");
+
     console_init();
 
-    /* Phase-2: Hardware initialization (legacy PIC mode) */
+    /* Initialize syscall subsystem */
+    syscall_init();
+
+    /* Phase-2: Hardware initialization */
     kernel_arch_init();
+
+    /* Parse Limine framebuffer tag and initialize fbcon */
+    limine_parse_fb(mbi);
+    console_printf("[init] limine fb: addr=%p w=%u h=%u pitch=%u bpp=%u\n",
+                   (void*)limine_fb_addr, limine_fb_width, limine_fb_height,
+                   limine_fb_pitch, limine_fb_bpp);
+    if (limine_fb_addr) {
+        fbcon_init(limine_fb_addr, limine_fb_width, limine_fb_height,
+                   limine_fb_pitch, limine_fb_bpp);
+        console_puts("[init] fbcon initialized\n");
+    } else {
+        console_puts("[init] No framebuffer (BIOS mode?), using serial only\n");
+    }
 
     /* Banner */
     console_puts("\n");
@@ -58,6 +89,10 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
     /* Memory info */
     console_printf("[boot] mbi=0x%p\n", mbi);
 
+    /* Set timer interrupt handler (vector 0x20) directly in IDT */
+    vim_idt_set_timer_gate();
+    console_puts("[init] Timer IRQ handler registered at vector 0x20 (direct IDT gate)\n");
+
     /* Run all module self-tests */
     console_puts("\n[selftest] running module self-tests...\n");
 
@@ -72,6 +107,7 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
     st_cp_rbtree_test();
     st_helos_fifo32_test();
     st_sched_test();
+    st_eevdf_test();
     st_xj_vfs_test();
 
     /* Summary */
@@ -84,9 +120,33 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
         console_puts("[stitch] all self-tests PASSED\n");
     }
 
-    console_puts("\n[stitch] All self-tests passed. Halting...\n");
+    /* Set timer interrupt handler (vector 0x20) AFTER self-tests (which reinitialize IDT) */
+    vim_idt_set_timer_gate();
+    console_puts("[init] Timer IRQ handler registered at vector 0x20 (direct IDT gate)\n");
 
-    /* Halt without enabling interrupts */
+    console_puts("\n[stitch] Phase-1 self-tests complete. Initializing scheduler...\n");
+
+    /* Initialize EEVDF scheduler and create idle task BEFORE enabling interrupts */
+    sched_eevdf_init();
+    int idle_tid = sched_create_idle();
+    if (idle_tid < 0) {
+        console_puts("[init] ERROR: failed to create idle task\n");
+        return;
+    }
+    console_puts("[init] Idle task created\n");
+    
+    /* Initialize idle task in EEVDF */
+    struct sched_task *idle_task = &sched_cpu.tasks[idle_tid];
+    eevdf_init_cpu_idle(idle_task);
+
+    console_puts("\n[stitch] Phase-1 self-tests complete. Starting EEVDF scheduler...\n");
+
+    /* Start EEVDF scheduler - this will run tasks and only return on shutdown */
+    sched_eevdf_start();
+
+    console_puts("\n[stitch] Scheduler shutdown. Halting...\n");
+
+    /* Halt */
     for (;;) {
         __asm__ volatile("hlt");
     }

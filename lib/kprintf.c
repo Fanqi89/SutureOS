@@ -1,8 +1,9 @@
-/* StitchOS (缝合怪系统) - minimal kernel printf
+/* SutureOS (缝合怪系统) - minimal kernel printf
  * Uses compiler builtins only (no libc, no headers).
  * Formatting approach kept deliberately small: %s %c %d %u %x %p %%.
  */
 #include <stitch/console.h>
+#include "../../kernel/drivers/fbcon.h"
 
 typedef __builtin_va_list va_list;
 #define va_start(v, l) __builtin_va_start(v, l)
@@ -21,7 +22,7 @@ static void print_unsigned(uint64_t v, unsigned base, int width, char pad)
     while (i < width && i < (int)sizeof(buf))
         buf[i++] = pad;
     while (i--)
-        console_putc(buf[i]);
+        fbcon_putc(buf[i]);
 }
 
 void console_printf(const char *fmt, ...)
@@ -31,7 +32,7 @@ void console_printf(const char *fmt, ...)
 
     for (; *fmt; fmt++) {
         if (*fmt != '%') {
-            console_putc(*fmt);
+            fbcon_putc(*fmt);
             continue;
         }
         fmt++;
@@ -49,15 +50,15 @@ void console_printf(const char *fmt, ...)
         case 's': {
             const char *s = va_arg(ap, const char *);
             if (!s) s = "(null)";
-            while (*s) console_putc(*s++);
+            while (*s) fbcon_putc(*s++);
             break;
         }
         case 'c':
-            console_putc((char)va_arg(ap, int));
+            fbcon_putc((char)va_arg(ap, int));
             break;
         case 'd': {
             int64_t v = va_arg(ap, int64_t);   /* callers must pass int64_t/uint64_t */
-            if (v < 0) { console_putc('-'); v = -v; }
+            if (v < 0) { fbcon_putc('-'); v = -v; }
             print_unsigned((uint64_t)v, 10, width, pad);
             break;
         }
@@ -68,15 +69,15 @@ void console_printf(const char *fmt, ...)
             print_unsigned((uint64_t)va_arg(ap, uint64_t), 16, width, pad);
             break;
         case 'p':
-            console_puts("0x");
+            fbcon_puts("0x");
             print_unsigned((uint64_t)va_arg(ap, uint64_t), 16, 16, '0');
             break;
         case '%':
-            console_putc('%');
+            fbcon_putc('%');
             break;
         default:
-            console_putc('%');
-            console_putc(*fmt);
+            fbcon_putc('%');
+            fbcon_putc(*fmt);
             break;
         }
     }

@@ -31,6 +31,7 @@ $cflags = @(
     "-I$(Join-Path $root 'include')",
     "-I$(Join-Path $root 'arch\x86_64')",
     "-I$(Join-Path $root 'kernel\interrupts')",
+    "-I$(Join-Path $root 'kernel\mm')",
     '-O2', '-g', '-Wall', '-Wextra'
 )
 

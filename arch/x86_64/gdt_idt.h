@@ -23,7 +23,11 @@
 
 void vim_gdt_init(void);      /* build + lgdt + ltr (idempotent)   */
 void vim_idt_init(void);      /* build 256x16B gates + lidt         */
+void vim_pic_init(void);      /* remap 8259 PIC to 0x20-0x2F + mask all */
 void vim_pic_mask_all(void);  /* 8259 master/slave: mask every line */
+
+/* Timer interrupt handler - set IDT gate directly to timer ISR */
+void vim_idt_set_timer_gate(void);
 
 /* boot-time self test (selftest.h st_run("vimtuos_gdtidt", ...)) */
 void st_vim_gdt_idt_test(void);

@@ -10,6 +10,7 @@
 
 #include <stitch/types.h>
 #include <stitch/cpu_context.h>
+#include <stitch/user_context.h>
 
 #define SCHED_MAX_TASKS 16
 
@@ -32,15 +33,34 @@ typedef struct sched_cpu {
     sched_task_t tasks[SCHED_MAX_TASKS];
     int current;
     bool shutdown;
+    int idle_task_id;
 } sched_cpu_t;
+
+extern volatile bool g_need_resched;
+extern sched_cpu_t sched_cpu;
 
 void sched_init(void);
 int  sched_create(void (*func)(void *), void *arg);
+int  sched_create_idle(void);
 void sched_yield(void);
 void sched_shutdown(void);
 void sched_start(void);
 void sched_tick(void);
 
 void st_sched_test(void);
+void st_eevdf_test(void);
+
+/* EEVDF 调度器接口 */
+void sched_eevdf_init(void);
+int sched_eevdf_create(void (*func)(void *), void *arg, int nice);
+void sched_eevdf_yield(void);
+void sched_eevdf_tick(void);
+void sched_eevdf_start(void);
+void eevdf_init_cpu_idle(struct sched_task *idle_task);
+
+/* 用户任务上下文初始化 */
+void user_context_init(user_context_t *ctx,
+                       uint64_t entry, uint64_t stack_top,
+                       uint64_t arg);
 
 #endif /* STITCH_SCHED_H */

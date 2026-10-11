@@ -6,11 +6,13 @@
 #include <stitch/console.h>
 #include <stitch/types.h>
 #include <stitch/io.h>
+#include "gdt_idt.h"
 
 #include "hpet.h"
 #include "task.h"
 
 volatile uint64_t g_tick_count = 0;
+extern volatile bool g_need_resched;
 
 void kernel_arch_init(void)
 {
@@ -24,7 +26,8 @@ void kernel_arch_init(void)
         console_puts("[init] WARNING: HPET init failed, will fall back to PIT\n");
     }
 
-    /* Use legacy PIC for timer interrupt (vector 0x20) */
+    /* Initialize legacy PIC (remap to vectors 0x20-0x2F, mask all) */
+    vim_pic_init();
     console_puts("[init] Using legacy PIC for timer (IOAPIC/LAPIC deferred)\n");
 
     /* Unmask IRQ 0 (timer) on PIC master */
@@ -33,10 +36,12 @@ void kernel_arch_init(void)
     console_puts("[init] Hardware init complete (legacy PIC mode)\n");
 }
 
-/* Called by timer ISR (vector 0x20) - just tick counter, no context switch */
+/* Called by timer ISR (vector 0x20) - just set reschedule flag, send EOI */
 void kernel_timer_tick_c(void)
 {
+    g_tick_count++;
+    g_need_resched = true;
+    
     /* Send EOI to PIC master */
-    movb $0x20, %al
-    outb %al, $0x20
-    ret
+    __asm__ volatile("outb %%al, %w0" : : "Nd"(0x20) : "al");
+}

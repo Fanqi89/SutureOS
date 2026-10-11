@@ -1,8 +1,7 @@
 /* SutureOS module: CPU context structure (cinux_ prefix)
  * Ported from: Cinux (C:\Users\fanqi\Desktop\自研操作系统\Cinux\kernel\arch\x86_64\include\context.h)
  * Original license: GPL-3.0
- * Changes: layout locked by _Static_assert; no rdi field (asm trampoline
- *          reads tasks[current].arg to set rdi); 11 fields, 96 bytes total.
+ * Changes: layout locked by _Static_assert; added gs_base for user GS (TLS); 12 fields, 104 bytes total.
  */
 #ifndef STITCH_CPU_CONTEXT_H
 #define STITCH_CPU_CONTEXT_H
@@ -21,7 +20,8 @@ typedef struct cinux_cpu_context {
     uint64_t rflags;
     uint64_t kgs_base;
     uint64_t fs_base;
-    uint64_t _pad;  /* padding to reach 96 bytes for 16-byte alignment */
+    uint64_t gs_base;
+    uint64_t _pad;  /* padding to reach 104 bytes for 16-byte alignment */
 } cinux_cpu_context_t;
 
 _Static_assert(offsetof(cinux_cpu_context_t, r15)      == 0,  "r15 offset");
@@ -35,7 +35,8 @@ _Static_assert(offsetof(cinux_cpu_context_t, rip)      == 56, "rip offset");
 _Static_assert(offsetof(cinux_cpu_context_t, rflags)   == 64, "rflags offset");
 _Static_assert(offsetof(cinux_cpu_context_t, kgs_base) == 72, "kgs_base offset");
 _Static_assert(offsetof(cinux_cpu_context_t, fs_base)  == 80, "fs_base offset");
-_Static_assert(sizeof(cinux_cpu_context_t) == 96, "context size");
+_Static_assert(offsetof(cinux_cpu_context_t, gs_base)  == 88, "gs_base offset");
+_Static_assert(sizeof(cinux_cpu_context_t) == 104, "context size");
 
 /* Context switch function (implemented in context_switch.S). */
 void cinux_context_switch(cinux_cpu_context_t *from, cinux_cpu_context_t *to);

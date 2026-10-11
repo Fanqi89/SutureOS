@@ -20,4 +20,10 @@ void  naos_ioapic_mask_irq(uint8_t irq);
 void  naos_ioapic_unmask_irq(uint8_t irq);
 uint8_t naos_ioapic_get_rte_count(void);
 
+/* Wrapper functions with hanos_ prefix for consistency */
+bool hanos_ioapic_init(void);
+void hanos_ioapic_set_irq(uint8_t irq, uint8_t vector, uint8_t delivery_mode);
+void hanos_ioapic_mask_irq(uint8_t irq);
+void hanos_ioapic_unmask_irq(uint8_t irq);
+
 #endif /* STITCH_IOAPIC_H */
