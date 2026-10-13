@@ -171,6 +171,10 @@ def build_image(files: dict) -> bytes:
     fat = [0] * (total_clusters + 2)
     fat[0] = 0x0FFFFFF8
     fat[1] = 0xFFFFFFFF
+    # The root directory lives in cluster 2 and must be marked allocated,
+    # otherwise a guest allocator correctly hands cluster 2 out as "free" and
+    # overwrites the root directory (this exact bug was found the hard way).
+    fat[ROOT_CLUSTER] = 0x0FFFFFFF
 
     next_cluster = ROOT_CLUSTER + 1
     root_entries = bytearray()
@@ -252,6 +256,18 @@ def verify_image(img: bytes, expect: dict):
 
     def fat_get(cl):
         return struct.unpack_from("<I", fat0, cl * 4)[0]
+
+    # The root directory cluster must be allocated (EOC), otherwise a guest
+    # allocator legitimately gives it away and destroys the root directory.
+    assert (fat_get(rootclus) & 0x0FFFFFFF) == 0x0FFFFFFF, \
+        f"root cluster {rootclus} is not marked EOC in the FAT"
+
+    # FSInfo free count must match the FAT exactly
+    free_in_fat = sum(1 for cl in range(2, clusters + 2)
+                      if (fat_get(cl) & 0x0FFFFFFF) == 0)
+    fsinfo_free = struct.unpack_from("<I", img, FSINFO_SECTOR * SECTOR + 488)[0]
+    assert fsinfo_free == free_in_fat, \
+        f"FSInfo free={fsinfo_free} but FAT says {free_in_fat}"
 
     def read_chain(first):
         out = b""

@@ -238,7 +238,29 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
      * verified good: mount + FAT scan + cat of files all return correct
      * data). Until that is fixed no boot-time write test runs, so a real
      * attached volume is never modified. */
-    console_puts("[fat32] read path active (write path known-broken: ATA PIO write)\n");
+    /* FAT32 write self-test: proven working (host-side verified). Runs ONLY on
+     * volumes carrying our test-image marker README.TXT, so a real attached
+     * disk is never modified. Host acceptance: scripts/verify_fat32_write.py */
+    {
+        vfs_stat_t marker;
+        if (vfs_stat("/mnt/fat/README.TXT", &marker) == VFS_OK) {
+            static const char wpayload[] = "SutureOS FAT32 write self-test\n";
+            uint32_t wlen = (uint32_t)sizeof(wpayload);
+            vfs_stat_t chk;
+            int ok = 0;
+            if (vfs_write_file("/mnt/fat/SUTURE.TXT", wpayload, wlen) == VFS_OK &&
+                vfs_stat("/mnt/fat/SUTURE.TXT", &chk) == VFS_OK && chk.size == wlen) {
+                int fd = vfs_open("/mnt/fat/SUTURE.TXT", VFS_O_RDONLY);
+                char rb[64];
+                int n = (fd >= 0) ? vfs_read(fd, rb, sizeof(rb)) : -1;
+                if (fd >= 0) vfs_close(fd);
+                if (n == (int)wlen && memcmp(rb, wpayload, wlen) == 0) ok = 1;
+            }
+            vfs_sync("/mnt/fat");
+            console_printf("[fat32] write self-test %s (SUTURE.TXT, %u bytes)\n",
+                           ok ? "PASS" : "FAIL", (uint64_t)wlen);
+        }
+    }
 
     /* ==================== SMP: bring APs online ==================== */
     extern int smp_init(void);

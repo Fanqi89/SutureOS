@@ -94,7 +94,7 @@ SutureOS（缝合怪系统）是一个实验性的 x86_64 单内核操作系统�
 ### Phase 3: 文件系统
 - ✅ **统一 VFS 核心**: 驱动注册、挂载表、fd 表、目录游标、`vfs_read_file/vfs_write_file/vfs_mkdir_p/vfs_list_mounts`、seek 修复
 - ✅ **xj_vfs (ramfs)**: 真实目录游标 + stat + O_TRUNC + 空间统计；作为根文件系统，启动时种入 `/hello.txt`、`/etc/motd`
-- ✅ **FAT32（自写驱动，替代原 CoolPotOS 桩）**: superfloppy 挂载（BPB 严格校验，实测 `clusters=70544 fat_lba=32 fat_sz=552 root=2`）、8.3 目录项、FAT1/FAT2 双写、FSInfo、簇链、create/read/write/truncate/mkdir/rmdir/unlink/sync 代码路径完整；**读路径已在 QEMU 实测**（`cat /mnt/fat/hello.txt` 返回正确内容、`df` 显示真实空闲簇）；**写路径已知有缺陷**（见"已知问题"）
+- ✅ **FAT32（自写驱动，替代原 CoolPotOS 桩）**: superfloppy 挂载（BPB 严格校验，实测 `clusters=70544 fat_lba=32 fat_sz=552 root=2`）、8.3 目录项、FAT1/FAT2 双写、FSInfo 同步、簇链、create/read/write/truncate/mkdir/rmdir/unlink/sync；**读路径实测**（`cat /mnt/fat/hello.txt` 正确、`df` 显示真实空闲簇）；**写路径实测通过**（启动自检 `[fat32] write self-test PASS`，并由宿主侧独立解析镜像验收 `checks=10 ok=10`：新文件逐字节正确、旧文件未改动、FAT1==FAT2、FSInfo 计数与实测一致、整盘 CRC 变化）。rename 未实现（如实返回 `VFS_EPERM`）；mkdir/rmdir/unlink 代码完整但尚未做宿主侧验收
 - ❌ **ext2 / SquashFS**: 仍是桩（`*_mount` 打印 stub，`*_vfs.c` 适配器存在但后端未实现）
 - ❌ **VimtuFS2 (vfs64)**: 已改为真实委托到统一 VFS（不再是假成功），但 VimtuFS2 自身的磁盘格式（超级块/inode/位图）与多卷槽位 ❌ 未实现
 
@@ -149,17 +149,34 @@ This file lives on a real FAT32 volume (driver: fat32).
 (83 bytes)
 ```
 
-宿主侧校验：`scripts/mkfat32_testimg.py` 自建 superfloppy FAT32 镜像（70544 簇、FAT1==FAT2、FSInfo 合法）与真实 `.deb`（ar + control.tar.gz + data.tar.gz），并用独立解析器逐字节校验；启动前后整盘 CRC32 一致（`20B5EAF8`），证明只读路径不会改动介质。
+宿主侧校验：`scripts/mkfat32_testimg.py` 自建 superfloppy FAT32 镜像（70544 簇、FAT1==FAT2、FSInfo 合法、根簇标记为 EOC）与真实 `.deb`（ar + control.tar.gz + data.tar.gz），并用独立解析器逐字节校验；只读启动（无写测试时）前后整盘 CRC32 一致。
+
+**写路径验收（`scripts/verify_fat32_write.py`）**：
+
+```
+[fat32] write self-test PASS (SUTURE.TXT, 32 bytes)
+  [ok] whole-image CRC32 changed (write reached the medium)  (1F9AD269 -> 4CE352AE)
+  [ok] FAT1 == FAT2
+  [ok] root cluster marked allocated  (fat[2]=0xfffffff)
+  [ok] SUTURE.TXT exists with correct size  (size=32)
+  [ok] SUTURE.TXT content byte-for-byte  (b'SutureOS FAT32 write self-test\n\x00')
+  [ok] SUTURE.TXT cluster not the root cluster  (first=7)
+  [ok] HELLO.TXT unchanged (83 bytes)
+  [ok] README.TXT unchanged (149 bytes)
+  [ok] HELLO.DEB unchanged (746 bytes)
+  [ok] FSInfo free count == measured free clusters  (fsinfo=70538 measured=70538)
+=== RESULT: PASS ===  checks=10 ok=10 fail=0
+```
 
 ## ⚠️ 已知问题（如实记录）
 
-1. **FAT32 写路径不可信**：guest 写测试中 payload 出现在根目录扇区、目标簇里是陈旧内存数据——缺陷在**ATA PIO 写路径**（读路径已被 `cat`/mount 实测证明正常）。因此当前引导**不执行任何写盘操作**，不会破坏真实介质；修复 ATA 写后再启用 FAT32 写。
-2. **`[selftest][moos_intr] FAIL`**：moos 中断自检故意注入异常（`err=0xbad`），处理函数会打印告警并把该自检判为 FAIL——属该自检与框架的判定不一致，非本次引入。
-3. **两套调度器并存**：`task.c` 的协作轮转与 `eevdf.c` 的 EEVDF 双轨运行，任务内调用 `sched_yield()` 会切到 EEVDF 循环的陈旧上下文（实测表现为跳到 0x3）。Shell 输入循环因此改为有界 pause 自旋，未再暴露；根治需要合并调度器。
-4. **`context.kgs_base` 被两用**：`cinux_context_switch` 把它写进 MSR_GS_BASE，而 EEVDF 用同一字段存放 `sched_entity*`；建议为实体指针另设字段。
-5. **IDT 未铺满**：仅 0-47 与 0x80 有门，IPI 向量 0xE0/0xE1 与 LAPIC 假中断向量 0xFF 仍是 not-present（会 #GP）；AP 目前只 `sti; hlt` 空转，未接入调度。
-6. **无帧缓冲（BIOS 模式）**：GUI 主循环已实现但当前启动路径 `limine_fb_addr=0`，无法可视化验证；fbcon 软光标仍由定时器闪烁。
-7. **键盘无 IRQ**：只轮询 8042 单字节缓冲，快速输入丢键。
+0. **曾经误判过的"FAT32 写缺陷"其实是测试镜像的错**：`mkfat32_testimg.py` 最初忘了把根目录簇（簇 2）在 FAT 里标记为 EOC，于是内核"正确地"把第一个空闲簇（=根目录）分配给了新文件，表现为"payload 写进根目录、目标簇是陈旧数据"。排查时用块层隔离自检证明 **ATA PIO 读/写/写后读全部正确**（`read lba32 head=f8 ff ff 0f…`、`write lba70000 rc=0`、`readback same=1`），再用 `[fat32] dbg raw sec_read(32)` 看到 FAT[2] 在盘上就是 0，才定位到镜像生成器。两个脚本现已加入断言（根簇必须 EOC、FSInfo 必须等于实测空闲簇数），避免回归。教训：**宿主侧解析镜像比任何 guest 自报都可靠**。
+1. **`[selftest][moos_intr] FAIL`**：moos 中断自检故意注入异常（`err=0xbad`），处理函数会打印告警并把该自检判为 FAIL——属该自检与框架的判定不一致，非本次引入。
+2. **两套调度器并存**：`task.c` 的协作轮转与 `eevdf.c` 的 EEVDF 双轨运行，任务内调用 `sched_yield()` 会切到 EEVDF 循环的陈旧上下文（实测表现为跳到 0x3）。Shell 输入循环因此改为有界 pause 自旋，未再暴露；根治需要合并调度器。
+3. **`context.kgs_base` 被两用**：`cinux_context_switch` 把它写进 MSR_GS_BASE，而 EEVDF 用同一字段存放 `sched_entity*`；建议为实体指针另设字段。
+4. **IDT 未铺满**：仅 0-47 与 0x80 有门，IPI 向量 0xE0/0xE1 与 LAPIC 假中断向量 0xFF 仍是 not-present（会 #GP）；AP 目前只 `sti; hlt` 空转，未接入调度。
+5. **无帧缓冲（BIOS 模式）**：GUI 主循环已实现但当前启动路径 `limine_fb_addr=0`，无法可视化验证；fbcon 软光标仍由定时器闪烁。
+6. **键盘无 IRQ**：只轮询 8042 单字节缓冲，快速输入丢键。
 
 ---
 
