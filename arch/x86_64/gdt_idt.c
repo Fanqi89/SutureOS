@@ -24,7 +24,12 @@
 #include <stitch/io.h>
 #include <stitch/selftest.h>
 
-/* ---- interrupt stub symbols provided by arch\x86_64\isr_stubs.S (MOOS) ---- */
+/* ---- interrupt stub symbols provided by arch\x86_64\isr_stubs.S (MOOS) ----
+ * Vectors 0..47 are the CPU exceptions + the remapped legacy PIC (0x20-0x2F),
+ * 0x80 is the syscall gate, and 0xE0/0xE1/0xFF are the SMP IPI vectors plus the
+ * LAPIC spurious-interrupt vector: without gates for those three, a reschedule
+ * IPI or a spurious LAPIC interrupt raised #NP on the receiving CPU (the AP
+ * could never be driven by the BSP). */
 #define VIM_ISR_LIST(_)  \
     _(0)   _(1)   _(2)   _(3)   _(4)   _(5)   _(6)   _(7)   \
     _(8)   _(9)   _(10)  _(11)  _(12)  _(13)  _(14)  _(15)  \
@@ -32,7 +37,17 @@
     _(24)  _(25)  _(26)  _(27)  _(28)  _(29)  _(30)  _(31)  \
     _(32)  _(33)  _(34)  _(35)  _(36)  _(37)  _(38)  _(39)  \
     _(40)  _(41)  _(42)  _(43)  _(44)  _(45)  _(46)  _(47)  \
-    _(128)
+    _(128) _(224) _(225) _(255)
+
+/* Vectors in VIM_ISR_LIST order, so the IDT install loop needs no special
+ * cases. Keep the two in sync (the array length is checked below). */
+static const uint16_t g_isr_vectors[] = {
+    0,1,2,3,4,5,6,7, 8,9,10,11,12,13,14,15,
+    16,17,18,19,20,21,22,23, 24,25,26,27,28,29,30,31,
+    32,33,34,35,36,37,38,39, 40,41,42,43,44,45,46,47,
+    128, 224, 225, 255
+};
+#define VIM_ISR_COUNT ((int)(sizeof(g_isr_vectors) / sizeof(g_isr_vectors[0])))
 
 #define VIM_DECLARE_STUB(n) extern void moos_isr_stub_##n(void);
 VIM_ISR_LIST(VIM_DECLARE_STUB)
@@ -122,7 +137,7 @@ static bool g_gdt_loaded = false;   /* ltr may run only once (busy bit) */
 
 typedef void (*vim_isr_fn)(void);
 #define VIM_REF_STUB(n) moos_isr_stub_##n,
-static const vim_isr_fn g_isr_table[49] = {
+static const vim_isr_fn g_isr_table[VIM_ISR_COUNT] = {
     VIM_ISR_LIST(VIM_REF_STUB)
 };
 #undef VIM_REF_STUB
@@ -200,9 +215,9 @@ void vim_idt_init(void)
     for (uint32_t n = 0; n < VIM_IDT_ENTRIES; n++)
         vim_idt_set_gate((uint8_t)n, 0, VIM_KERNEL_CS, 0x0E, 0);
 
-    /* table order matches VIM_ISR_LIST: vectors 0..47, then 0x80 */
-    for (uint32_t i = 0; i < 49; i++) {
-        const uint8_t vec = (i < 48) ? (uint8_t)i : (uint8_t)0x80;
+    /* install the vectors listed in g_isr_vectors (order matches g_isr_table) */
+    for (uint32_t i = 0; i < (uint32_t)VIM_ISR_COUNT; i++) {
+        const uint8_t vec = (uint8_t)g_isr_vectors[i];
         /* 0x8E = P=1 DPL=0 interrupt gate; int 0x80 uses 0xEE (DPL=3) */
         const uint8_t flags = (vec == 0x80) ? 0xEEu : 0x8Eu;
         vim_idt_set_gate(vec, (uint64_t)(uintptr_t)g_isr_table[i],

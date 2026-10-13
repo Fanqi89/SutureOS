@@ -60,8 +60,13 @@ bool hanos_lapic_init(void) {
     lapic_write(LAPIC_REG_LVT_TIMER, 0x10000);     /* Mask timer */
     lapic_write(LAPIC_REG_LVT_THERMAL, 0x10000);   /* Mask thermal */
     lapic_write(LAPIC_REG_LVT_PMI, 0x10000);       /* Mask PMI */
-    lapic_write(LAPIC_REG_LVT_LINT0, 0x10000);     /* Mask LINT0 */
-    lapic_write(LAPIC_REG_LVT_LINT1, 0x10000);     /* Mask LINT1 */
+    /* LINT0 must stay UNMASKED and in ExtINT delivery mode: on this machine
+     * (QEMU/i440fx, legacy PIC mode) the 8259 delivers its INTR to the CPU
+     * through LINT0, so masking it silently kills every legacy IRQ on the BSP -
+     * the PIT system tick and the PS/2 keyboard. That is what kept
+     * g_tick_count at 0 forever while the AP's own LAPIC timer worked fine. */
+    lapic_write(LAPIC_REG_LVT_LINT0, 0x700);       /* ExtINT, unmasked */
+    lapic_write(LAPIC_REG_LVT_LINT1, 0x10000);     /* Mask LINT1 (NMI) */
     lapic_write(LAPIC_REG_LVT_ERROR, 0x10000);     /* Mask error */
     lapic_write(LAPIC_REG_LVT_CMCI, 0x10000);      /* Mask CMCI */
     
@@ -79,6 +84,53 @@ void hanos_lapic_eoi(void) {
     }
 }
 
+/* ---- LAPIC timer calibration -------------------------------------------
+ * The LAPIC timer counts at the (unknown) bus clock divided by 16, so the old
+ * "assume 1 MHz" constant made the system tick run ~2.4x too fast. Measure it
+ * once against the 8254 PIT: channel 0 keeps counting at 1.193182 MHz even on
+ * machines where its interrupt is not routed to the CPU (which is exactly the
+ * situation here), so its latched counter is a usable time reference.
+ * Returns LAPIC ticks per second at the current divider. */
+static uint32_t lapic_measure_ticks_per_sec(void) {
+    /* read the PIT channel-0 counter (latch, then low/high) */
+    #define PIT_CTRL_PORT 0x43u
+    #define PIT_CH0_PORT  0x40u
+    #define PIT_HZ        1193182u
+
+    outb(PIT_CTRL_PORT, 0x00);            /* latch channel 0 */
+    uint8_t lo = inb(PIT_CH0_PORT), hi = inb(PIT_CH0_PORT);
+    uint32_t prev = (uint32_t)lo | ((uint32_t)hi << 8);
+
+    /* start a long one-shot measurement run. The LVT entry must be UNMASKED for
+     * the counter to actually run (a masked LAPIC timer does not decrement),
+     * but interrupts are still disabled here (cli at boot / before sti), so the
+     * single pending timer IRQ it raises is simply handled later by the normal
+     * vector-0x20 path, which EOIs the LAPIC. */
+    lapic_write(LAPIC_REG_TIMER_DIVIDE, 0x3);          /* divide by 16 */
+    lapic_write(LAPIC_REG_LVT_TIMER, 0x20);            /* one-shot, unmasked  */
+    lapic_write(LAPIC_REG_TIMER_INIT_COUNT, 0x00FFFFFFu);
+
+    /* wait until the PIT has advanced ~55000 counts (~46 ms), tracking wraps */
+    uint32_t pit_ticks = 0;
+    while (pit_ticks < 55000u) {
+        outb(PIT_CTRL_PORT, 0x00);
+        lo = inb(PIT_CH0_PORT); hi = inb(PIT_CH0_PORT);
+        const uint32_t now = (uint32_t)lo | ((uint32_t)hi << 8);
+        pit_ticks += (now <= prev) ? (prev - now) : (prev + 65536u - now);
+        prev = now;
+    }
+
+    const uint32_t remaining = lapic_read(LAPIC_REG_TIMER_CURRENT_COUNT);
+    lapic_write(LAPIC_REG_TIMER_INIT_COUNT, 0);        /* stop */
+    const uint32_t lapic_ticks = 0x00FFFFFFu - remaining;
+
+    if (pit_ticks == 0 || lapic_ticks == 0) return 1000000u;   /* give up, keep old default */
+    /* ticks/sec = lapic_ticks * PIT_HZ / pit_ticks */
+    uint64_t rate = ((uint64_t)lapic_ticks * PIT_HZ) / pit_ticks;
+    if (rate == 0 || rate > 0xFFFFFFFFull) return 1000000u;
+    return (uint32_t)rate;
+}
+
 /* Initialize LAPIC timer */
 void hanos_lapic_timer_init(uint32_t hz, bool periodic) {
     if (!lapic_base) return;
@@ -88,17 +140,27 @@ void hanos_lapic_timer_init(uint32_t hz, bool periodic) {
     
     if (hz == 0) return;
     
-    /* Calibrate: run timer for a known period using PIT or HPET */
-    /* For now, use a reasonable default divide value */
-    lapic_write(LAPIC_REG_TIMER_DIVIDE, 0x3);  /* Divide by 16 */
-    
+    /* Measure the real LAPIC tick rate once, then reuse it for the BSP and for
+     * every AP (same bus clock, same divider). */
+    static uint32_t ticks_per_sec = 0;
+    if (ticks_per_sec == 0) {
+        ticks_per_sec = lapic_measure_ticks_per_sec();
+        console_printf("[lapic] timer calibrated: %u ticks/s at divide 16\n",
+                       (uint64_t)ticks_per_sec);
+    }
+    lapic_write(LAPIC_REG_TIMER_DIVIDE, 0x3);  /* divide by 16 */
+
     /* Calculate initial count */
-    uint32_t ticks_per_sec = 1000000;  /* Approximate - should be calibrated */
     uint32_t initial_count = ticks_per_sec / hz;
+    if (initial_count == 0) initial_count = 1;
     
     lapic_write(LAPIC_REG_TIMER_INIT_COUNT, initial_count);
     
-    uint32_t lvt = periodic ? LAPIC_TIMER_PERIODIC : LAPIC_TIMER_ONESHOT;
+    /* LVT timer MODE lives in bits 17:18, so the periodic selector must be
+     * shifted: writing the raw value 1 here selected one-shot mode and an AP
+     * LAPIC timer fired at most once (observed: AP jiffies stayed 0 forever and
+     * the idle loop never woke up again). */
+    uint32_t lvt = periodic ? (1u << 17) : 0u;
     lvt |= 0x20;  /* Vector 0x20 for timer interrupt */
     lapic_write(LAPIC_REG_LVT_TIMER, lvt);
 }

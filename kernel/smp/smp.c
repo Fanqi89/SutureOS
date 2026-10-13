@@ -470,8 +470,16 @@ void smp_ap_entry64(void) {
     __sync_fetch_and_add(&g_ap_online_count, 1);
     g_ap_online[index] = 1;
 
-    /* AP 不接调度器（无 per-CPU runqueue）：开中断后空转，只响应 IPI */
-    for (;;) __asm__ volatile("sti; hlt");
+    /* AP 参与内核执行（本轮新增，取代原来的 `sti; hlt` 空转）：
+     *   ① 本核 LAPIC 定时器 100 Hz（向量 0x20）——AP 也有时间基准与节拍，
+     *      中断处理里按本核计数（BSP 才递增 g_tick_count，避免计时翻倍）；
+     *   ② 空闲/派发循环：取 SMP 工作队列并执行（work_done 计数），无事可做
+     *      时 hlt 等中断，同时响应 0xE0/0xE1 IPI（IDT 门已注册）。
+     * 刻意不进 task.c/eevdf 的上下文切换：那两套调度器共用 context 结构，
+     * 合并之前让 AP 切任务会重演 vector=6 (#UD) 洪水。 */
+    hanos_lapic_timer_init(100, true);
+    console_puts("[SMP] AP timer 100 Hz armed, entering idle/work loop\n");
+    smp_ap_idle_loop(index);
 }
 
 /* ==================== SMP 初始化入口 ==================== */
@@ -497,6 +505,15 @@ int smp_init(void) {
                        (uint64_t)svr);
         return 0;
     }
+
+    /* System tick for the BSP comes from its own LAPIC timer (vector 0x20).
+     * Dependency on the legacy PIT was removed after QEMU's `-d int` trace showed
+     * that this machine delivers NO IRQ0 to the CPU at all: it powers up in APIC
+     * mode (IOAPIC present), so the 8259's INTR is not routed to LINT0 and the
+     * PIC path is dead whatever we do with the IMCR. The LAPIC timer already
+     * ticks on the APs, so it is the mechanism that actually works here. */
+    hanos_lapic_timer_init(100, true);
+    console_puts("[SMP] BSP LAPIC timer armed (~100 Hz system tick)\n");
 
     /* MADT: enabled 的本地 APIC ID（含 BSP 自己；一次调用拿全量） */
     uint8_t *ids = NULL;
@@ -615,4 +632,180 @@ void smp_wake_idle_cpu(void) {
 /* ==================== 在线 CPU 计数 ==================== */
 uint32_t smp_online_cpu_count(void) {
     return (uint32_t)g_ap_online_count;   /* BSP=1，每个上线 AP lock xadd +1 */
+}
+
+/* ==================== SMP 工作队列（让 AP 真正参与内核执行） ====================
+ * 背景：AP 上线后只 `sti; hlt`，是"停着的核"。这里给出最小可验证的参与机制：
+ *   - BSP 用 smp_submit_work() 把内核工作项投进队列；
+ *   - 每个 CPU 的空闲/主循环用 smp_drain_work_here() 取走并执行（AP 在自己的
+ *     idle 循环里，BSP 在 shell 输入循环里），并给本核 work_done 计数。
+ * 这与 Linux 的 per-CPU workqueue 思路一致，但刻意不碰 task.c/eevdf 那套
+ * 上下文切换（两套调度器共用 context 是已知雷区），因此是"AP 执行内核任务"
+ * 而不是"AP 调度用户任务"——后者需要先合并调度器。 */
+#define SMP_WORK_MAX 64
+struct smp_work { void (*fn)(void*); void* arg; };
+static struct smp_work g_work[SMP_WORK_MAX];
+static volatile uint32_t g_work_head, g_work_tail;
+static volatile int g_work_lock;
+
+static void smp_work_lock(void) {
+    while (__sync_lock_test_and_set(&g_work_lock, 1)) __asm__ volatile("pause");
+}
+static void smp_work_unlock(void) { __sync_lock_release(&g_work_lock); }
+
+int smp_submit_work(void (*fn)(void*), void* arg) {
+    if (!fn) return -1;
+    int rc = -1;
+    smp_work_lock();
+    uint32_t next = (g_work_tail + 1u) % SMP_WORK_MAX;
+    if (next != g_work_head) {              /* not full */
+        g_work[g_work_tail].fn = fn;
+        g_work[g_work_tail].arg = arg;
+        g_work_tail = next;
+        rc = 0;
+    }
+    smp_work_unlock();
+
+    /* Wake the other CPUs: an idle AP sits in `hlt`, so it will not look at the
+     * queue until an interrupt arrives. This is the same "wake an idle CPU"
+     * step Linux does when work is queued to a per-CPU worker. */
+    if (rc == 0 && g_ap_online_count > 1)
+        smp_send_ipi_all_others(SMP_IPI_RESCHEDULE);
+    return rc;
+}
+
+static int smp_work_pop(void (**fn)(void*), void** arg) {
+    int got = 0;
+    smp_work_lock();
+    if (g_work_head != g_work_tail) {
+        *fn = g_work[g_work_head].fn;
+        *arg = g_work[g_work_head].arg;
+        g_work_head = (g_work_head + 1u) % SMP_WORK_MAX;
+        got = 1;
+    }
+    smp_work_unlock();
+    return got;
+}
+
+uint32_t smp_work_pending(void) {
+    uint32_t h, t;
+    smp_work_lock();
+    h = g_work_head; t = g_work_tail;
+    smp_work_unlock();
+    return (t + SMP_WORK_MAX - h) % SMP_WORK_MAX;
+}
+
+void smp_drain_work_here(uint32_t cpu_index) {
+    void (*fn)(void*) = NULL;
+    void* arg = NULL;
+    while (smp_work_pop(&fn, &arg)) {
+        fn(arg);
+        if (cpu_index < (uint32_t)SMP_MAX_CPUS)
+            cpu_locals[cpu_index].work_done++;
+    }
+}
+
+void smp_ap_timer_tick(uint32_t cpu_index) {
+    if (cpu_index < (uint32_t)SMP_MAX_CPUS) {
+        cpu_locals[cpu_index].jiffies++;
+        cpu_locals[cpu_index].lapic_timer_count++;
+    }
+}
+
+/* 找出本核的 cpu_locals（用本核 LAPIC ID 匹配，不依赖任何 per-CPU 寄存器） */
+static struct cpu_local* smp_local_by_lapic(void) {
+    const uint32_t id = (hanos_lapic_read(LAPIC_REG_ID) >> 24) & 0xFFu;
+    for (uint32_t i = 0; i < (uint32_t)SMP_MAX_CPUS; i++) {
+        if (cpu_locals[i].online && cpu_locals[i].apic_id == id)
+            return &cpu_locals[i];
+    }
+    return NULL;
+}
+
+void smp_ipi_dispatch(uint64_t vec) {
+    struct cpu_local* cl = smp_local_by_lapic();
+    if (cl) cl->ipis++;
+
+    switch (vec) {
+    case SMP_IPI_RESCHEDULE:
+        smp_reschedule_ipi_handler();      /* 内含 LAPIC EOI */
+        break;
+    case SMP_IPI_SHOOTDOWN:
+        smp_shootdown_ipi_handler(NULL);   /* 内含 LAPIC EOI */
+        break;
+    default:
+        /* 0xFF = LAPIC spurious：只 EOI，不做任何事 */
+        hanos_lapic_eoi();
+        break;
+    }
+}
+
+void smp_ap_idle_loop(uint32_t cpu_index) {
+    for (;;) {
+        __asm__ volatile("sti");
+        smp_drain_work_here(cpu_index);
+        if (cpu_index < (uint32_t)SMP_MAX_CPUS)
+            cpu_locals[cpu_index].idle_jiffies++;
+        __asm__ volatile("hlt");
+    }
+}
+
+/* ---- 验收自检：投 n 个任务，看是谁执行的 ---- */
+static volatile uint32_t g_selftest_done;
+
+static void smp_selftest_work(void* arg) {
+    (void)arg;
+    __sync_fetch_and_add(&g_selftest_done, 1);
+}
+
+extern volatile uint64_t g_tick_count;   /* kernel/main/init.c, ~100 Hz */
+
+void smp_work_selftest(uint32_t n) {
+    if (n == 0) n = 8;
+    if (n > (uint32_t)(SMP_WORK_MAX - 1)) n = (uint32_t)(SMP_WORK_MAX - 1);
+
+    const uint32_t cpus = smp_online_cpu_count();
+    uint64_t before[SMP_MAX_CPUS];
+    for (uint32_t i = 0; i < (uint32_t)SMP_MAX_CPUS; i++) before[i] = cpu_locals[i].work_done;
+
+    console_printf("[SMP] work selftest: queuing %u items for %u CPU(s)\n",
+                   (uint64_t)n, (uint64_t)cpus);
+    g_selftest_done = 0;
+    uint32_t queued = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (smp_submit_work(smp_selftest_work, NULL) == 0) queued++;
+    }
+    console_printf("[SMP] work selftest: queued=%u pending=%u\n",
+                   (uint64_t)queued, (uint64_t)smp_work_pending());
+
+    /* Give the APs a real chance first: smp_submit_work() woke them with an IPI,
+     * so wait a bounded number of PAUSE iterations WITHOUT draining on this CPU.
+     * The bound is a raw spin count on purpose (not g_tick_count): a stalled
+     * system timer must never be able to wedge the shell. Only afterwards does
+     * the BSP pick up whatever is left. */
+    for (volatile uint64_t spin = 0; spin < 200000000ull && g_selftest_done < queued; spin++) {
+        __asm__ volatile("pause");
+    }
+    const uint32_t ap_took = (uint32_t)g_selftest_done;
+    console_printf("[SMP] work selftest: APs finished %u of %u before the BSP helped\n",
+                   (uint64_t)ap_took, (uint64_t)queued);
+    while (g_selftest_done < queued) smp_drain_work_here(0);
+
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < cpus && i < (uint32_t)SMP_MAX_CPUS; i++) {
+        const uint64_t d = cpu_locals[i].work_done - before[i];
+        total += d;
+        console_printf("[SMP]   cpu%u (%s): same-window work_done=%u jiffies=%u ipis=%u\n",
+                       (uint64_t)i, cpu_locals[i].is_bsp ? "BSP" : "AP",
+                       d, cpu_locals[i].jiffies, cpu_locals[i].ipis);
+    }
+    console_printf("[SMP] work selftest: completed %u/%u in window, total executed=%u\n",
+                   (uint64_t)g_selftest_done, (uint64_t)queued, total);
+    if (cpus > 1 && cpu_locals[1].work_done > before[1]) {
+        console_puts("[SMP] work selftest PASS (an AP executed kernel work)\n");
+    } else if (cpus <= 1) {
+        console_puts("[SMP] work selftest PASS (single CPU, BSP executed the work)\n");
+    } else {
+        console_puts("[SMP] work selftest PARTIAL (AP online but executed nothing)\n");
+    }
 }

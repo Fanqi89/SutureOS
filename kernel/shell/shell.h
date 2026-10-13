@@ -73,6 +73,8 @@ int shell_cmd_sudo(int argc, char **argv);
 int shell_cmd_mount(int argc, char **argv);
 int shell_cmd_umount(int argc, char **argv);
 int shell_cmd_df(int argc, char **argv);
+int shell_cmd_cpus(int argc, char **argv);
+int shell_cmd_smptest(int argc, char **argv);
 
 /* Terminal output helpers */
 void shell_putc(char c);

@@ -30,6 +30,8 @@ extern int fatfs_mount(uint8_t drv, void* fs);
 extern int ext2_mount(int drive, uint32_t start_lba);
 extern int squashfs_mount(int drive, uint32_t start_lba);
 
+#include "smp.h"    /* per-CPU state for the `cpus` command + work queue draining */
+
 /* Global shell state */
 static struct shell_state g_shell = {0};
 
@@ -58,6 +60,8 @@ static const struct shell_cmd g_commands[] = {
     {"mount",   shell_cmd_mount,   "Mount filesystem"},
     {"umount",  shell_cmd_umount,  "Unmount filesystem"},
     {"df",      shell_cmd_df,      "Show disk usage"},
+    {"cpus",    shell_cmd_cpus,    "Show per-CPU state (jiffies, IPIs, work done)"},
+    {"smptest", shell_cmd_smptest, "Queue work items and report which CPU ran them" },
     {NULL, NULL, NULL}
 };
 
@@ -201,6 +205,11 @@ int shell_run(void) {
         for (;;) {
             int c = console_getc();
             if (c < 0) {
+                /* Nothing to read: the BSP is idle here, so it also drains the
+                 * SMP work queue (the APs drain it in their own idle loops).
+                 * This is what makes queued kernel work run even when only the
+                 * BSP has anything to do. */
+                smp_drain_work_here(0);
                 for (volatile int spin = 0; spin < 20000; spin++) {
                     __asm__ volatile("pause");
                 }
@@ -625,8 +634,79 @@ int shell_cmd_df(int argc, char **argv) {
     return 0;
 }
 
-/* ==================== Console input helper ==================== */
-/* Uses PS/2 keyboard driver for input */
+/* ==================== SMP inspection (per-CPU state / AP work) ==================== */
+
+int shell_cmd_cpus(int argc, char **argv) {
+    (void)argc; (void)argv;
+    extern uint32_t smp_online_cpu_count(void);
+    const uint32_t online = smp_online_cpu_count();
+
+    shell_printf("CPUs online: %u\n", (unsigned)online);
+    {
+        /* Liveness of the two independent time sources: the BSP's system tick
+         * (PIT/LAPIC vector 0x20) and the caller's own idea of its CPU id. */
+        extern volatile uint64_t g_tick_count;
+        extern uint32_t smp_get_cpu_id(void);
+        uint64_t rflags = 0;
+        __asm__ volatile("pushfq; pop %0" : "=r"(rflags));
+        struct { uint16_t limit; uint64_t base; } __attribute__((packed)) idtr;
+        __asm__ volatile("sidt %0" : "=m"(idtr));
+        const uint8_t *gate = (const uint8_t *)(uintptr_t)(idtr.base + 0x20 * 16);
+        uint64_t off = (uint64_t)gate[0] | ((uint64_t)gate[1] << 8) |
+                       ((uint64_t)gate[6] << 16) | ((uint64_t)gate[7] << 24) |
+                       ((uint64_t)gate[8] << 32) | ((uint64_t)gate[9] << 40) |
+                       ((uint64_t)gate[10] << 48) | ((uint64_t)gate[11] << 56);
+        shell_printf("system tick g_tick_count=%llu (shell on cpu%u, IF=%u)\n",
+                     (unsigned long long)g_tick_count, (unsigned)smp_get_cpu_id(),
+                     (unsigned)((rflags >> 9) & 1u));
+        shell_printf("IDT gate 0x20: present=%u handler=0x%llx\n",
+                     (unsigned)(gate[5] >> 7), (unsigned long long)off);
+
+        /* Measure the achieved tick rate against the 8254 PIT (1.193182 MHz).
+         * The PIT's interrupt is not routed on this machine, but its counter
+         * still runs, so this is an independent check of the LAPIC time base. */
+        {
+            extern uint16_t mbos_pit_counter(void);
+            const uint64_t t0 = g_tick_count;
+            uint32_t prev = mbos_pit_counter(), acc = 0;
+            while (acc < 1193182u && acc + 65536u > acc) {   /* ~1 s of PIT time */
+                const uint32_t now = mbos_pit_counter();
+                acc += (now <= prev) ? (prev - now) : (prev + 65536u - now);
+                prev = now;
+            }
+            shell_printf("measured system tick rate: %u Hz (requested 100 Hz)\n",
+                         (unsigned)(g_tick_count - t0));
+        }
+    }
+    shell_puts("id  role  apic  jiffies   ipis   work   idle\n");
+    for (uint32_t i = 0; i < online && i < 32u; i++) {
+        const struct cpu_local *cl = smp_get_cpu_local(i);
+        if (!cl || !cl->online) continue;
+        shell_printf("%-3u %-5s %-5u %-9llu %-6llu %-6llu %-6llu\n",
+                     (unsigned)i, cl->is_bsp ? "BSP" : "AP",
+                     (unsigned)cl->apic_id,
+                     (unsigned long long)cl->jiffies,
+                     (unsigned long long)cl->ipis,
+                     (unsigned long long)cl->work_done,
+                     (unsigned long long)cl->idle_jiffies);
+    }
+    shell_puts("(jiffies = LAPIC timer ticks, ipis = IPI/spurious vectors taken,\n"
+               " work = kernel work-queue items executed by that CPU)\n");
+    return 0;
+}
+
+int shell_cmd_smptest(int argc, char **argv) {
+    uint32_t n = 8;
+    if (argc > 1) {
+        const int v = shell_atoi(argv[1]);
+        if (v > 0) n = (uint32_t)v;
+    }
+    extern void smp_work_selftest(uint32_t n);
+    smp_work_selftest(n);
+    return 0;
+}
+
+/* ==================== Console input helper ==================== *//* Uses PS/2 keyboard driver for input */
 int console_getc(void) {
     /* Poll keyboard for scancode */
     int scancode = mbos_kbd_poll();

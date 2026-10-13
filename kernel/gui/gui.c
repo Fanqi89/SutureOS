@@ -311,8 +311,7 @@ static void gui_draw_taskbar(void) {
 }
 
 /* decorative title buttons (min/max/close) - keyboard-only build: drawn for
- * looks; there is no mouse driver, so they are not clickable */
-static void gui_draw_title_buttons(struct gui_window* w) {
+ * looks; there is no mouse driver, so they are not clickable */static void gui_draw_title_buttons(struct gui_window* w) {
     const int bx = w->x + w->w - GUI_BORDER - GUI_BTN_W * 3;
     const int by = w->y + GUI_BORDER + 4;
     for (int b = 0; b < 3; b++) {
@@ -482,6 +481,13 @@ int gui_run(void) {
     }
 
     gui_invalidate();                 /* first frame = full repaint */
+
+    /* create the desktop applications once (Task Manager / Calculator / About) */
+    {
+        extern void gui_apps_init(void);
+        gui_apps_init();
+        gui_invalidate();             /* their windows must appear in frame 1 */
+    }
 
     uint64_t sec_tick = g_tick_count;
     uint64_t sec_tsc = gui_rdtsc();
@@ -813,10 +819,59 @@ void gui_invalidate(void) {
 uint32_t gui_fps(void) { return g_fps_meas; }
 uint8_t gui_cpu_busy_pct(void) { return g_busy_meas; }
 
+/* ---- drawing helpers for application callbacks (kernel/gui/apps.c) ----
+ * Thin public wrappers over the compositor's own primitives, so applications do
+ * not need access to gui.c internals. The compositor clips every callback to
+ * its window's client rectangle, so absolute coordinates are safe. */
+void gui_fill_rect(int x, int y, int w, int h, uint32_t rgb) { gui_fill(x, y, w, h, rgb); }
+void gui_frame_rect(int x, int y, int w, int h, uint32_t rgb) { gui_rect(x, y, w, h, rgb); }
+void gui_draw_str(int x, int y, const char* s, uint32_t rgb) { gui_draw_text(x, y, s, rgb); }
+
+void gui_draw_u32(int x, int y, uint32_t v, uint32_t rgb) {
+    char buf[12];
+    const int n = gui_u32_dec(v, buf);
+    buf[n] = 0;
+    gui_draw_text(x, y, buf, rgb);
+}
+
 void gui_set_cursor(int shape) { (void)shape; }
 int gui_get_cursor(void) { return MOUSE_CUR_ARROW; }
 
+/* Real self-test: verify the composition path can actually reach pixels rather
+ * than printing an unconditional PASS (the previous version did exactly that).
+ * Draws a 16x16 marker into the top-left corner, reads the pixels back through
+ * the same volatile pointer the compositor uses, then restores the desktop. */
 int gui_selftest(void) {
-    console_puts("[gui] selftest (stub) PASS\n");
+    if (gui_fb_setup() != NULL) {
+        console_printf("[gui] selftest SKIP (no framebuffer: %s)\n",
+                       g_fb_fail ? g_fb_fail : "unknown");
+        return -1;
+    }
+    if (g_gui_screen_w < 32 || g_gui_screen_h < 32) {
+        console_puts("[gui] selftest FAIL (implausible geometry)\n");
+        return -1;
+    }
+
+    const uint32_t marker = 0x00FF00FFu;   /* magenta: not used by the desktop */
+    const int px = 4, py = 4;
+    gui_clip_full();
+    gui_fill(px, py, 16, 16, marker);
+
+    volatile uint32_t* base = (volatile uint32_t*)g_fb;
+    const uint32_t stride = g_fb_pitch / 4;
+    uint32_t seen = 0;
+    if (base) seen = base[(py + 8) * stride + (px + 8)];
+
+    /* repaint the desktop area so the marker does not linger */
+    gui_dirty(px, py, 16, 16);
+    gui_render();
+
+    if (seen != marker) {
+        console_printf("[gui] selftest FAIL (wrote 0x%x, read back 0x%x)\n",
+                       (uint64_t)marker, (uint64_t)seen);
+        return -1;
+    }
+    console_printf("[gui] selftest PASS (composition path intact, %ux%u)\n",
+                   (uint64_t)g_gui_screen_w, (uint64_t)g_gui_screen_h);
     return 0;
 }

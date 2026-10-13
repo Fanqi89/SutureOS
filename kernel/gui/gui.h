@@ -125,6 +125,16 @@ bool gui_click_is_right(void);
 int gui_window_count(void);
 struct gui_window* gui_window_at(int i);
 int gui_app_windows(int app_id);
+uint32_t gui_fps(void);            /* measured frames per second (taskbar value) */
+uint8_t  gui_cpu_busy_pct(void);   /* 0..100: frame time / wall time */
+
+/* Drawing helpers for application draw callbacks (gui/apps.c).
+ * Absolute screen coordinates; the compositor already clipped the callback to
+ * the window's client rectangle, so a draw can never bleed into neighbours. */
+void gui_fill_rect(int x, int y, int w, int h, uint32_t rgb);
+void gui_frame_rect(int x, int y, int w, int h, uint32_t rgb);
+void gui_draw_str(int x, int y, const char* s, uint32_t rgb);
+void gui_draw_u32(int x, int y, uint32_t v, uint32_t rgb);   /* decimal helper */
 void gui_close_all_windows(void);
 int gui_close_app(int app_id);
 

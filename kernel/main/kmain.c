@@ -189,6 +189,16 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
 
     /* Set timer interrupt handler (vector 0x20) AFTER self-tests (which reinitialize IDT) */
     vim_idt_set_timer_gate();
+    /* Re-program the PIT to a clean 100 Hz: the PIT self-test above re-programmed
+     * channel 0 several times (1 Hz / 0 / 100 Hz) and may have left it with a
+     * different divisor or mid-count. */
+    {
+        extern void mbos_pit_init(uint32_t hz);
+        extern uint32_t mbos_pit_hz(void);
+        mbos_pit_init(100);
+        console_printf("[init] PIT re-programmed to %u Hz for the system tick\n",
+                       (uint64_t)mbos_pit_hz());
+    }
     console_puts("[init] Timer IRQ handler registered at vector 0x20 (direct IDT gate)\n");
 
     /* Repair the allocator state the PMM self-test left behind (see the
@@ -255,6 +265,25 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
         console_puts("[init] FAT32 volume auto-mounted at /mnt/fat\n");
     } else {
         console_printf("[init] no FAT32 on drive 0 (mount=%d), skipping\n", r);
+    }
+
+    /* ext2 (read-only) on the second IDE disk (-hdb build/ext2.img). The driver
+     * reports mount geometry, then proves the read path (direct blocks, single
+     * and double indirect, hole) against the generated test image. */
+    {
+        extern int ext2_mount(int drive, uint32_t start_lba);
+        extern int ext2_selftest(void);
+        extern int ext2_is_mounted(void);
+        if (ext2_mount(1, 0) == 0) {
+            if (vfs_mount("1", "/mnt/ext2", "ext2") == VFS_OK) {
+                console_puts("[  OK  ] ext2 volume (read-only) mounted at /mnt/ext2\n");
+            } else {
+                console_puts("[init] ext2: volume mounted but vfs_mount failed\n");
+            }
+            if (ext2_is_mounted()) ext2_selftest();
+        } else {
+            console_puts("[init] ext2: no ext2 volume on drive 1 (expected without -hdb)\n");
+        }
     }
 
     /* deb package manager demo: install /mnt/fat/hello.deb when present */

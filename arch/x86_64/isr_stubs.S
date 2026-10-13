@@ -135,4 +135,11 @@ ISR_STUB_ERR \vec
 /* ---- int 0x80 system call gate ------------------------------------------ */
 ISR_STUB_NOERR 128
 
+/* ---- SMP: IPI vectors + LAPIC spurious interrupt -------------------------
+ * 0xE0 = reschedule IPI, 0xE1 = TLB shootdown, 0xFF = LAPIC spurious.
+ * Real IRQs (not CPU exceptions), so no error code: NOERR stubs. */
+ISR_STUB_NOERR 224
+ISR_STUB_NOERR 225
+ISR_STUB_NOERR 255
+
 .section .note.GNU-stack,"",@progbits

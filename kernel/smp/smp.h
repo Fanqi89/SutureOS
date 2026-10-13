@@ -42,6 +42,8 @@ struct cpu_local {
     uint64_t lapic_timer_count;
     uint64_t idle_jiffies;
     uint64_t jiffies;
+    uint64_t ipis;            /* IPIs (0xE0/0xE1/0xFF) received by this CPU */
+    uint64_t work_done;       /* SMP work-queue items executed by this CPU */
     bool is_bsp;
 };
 
@@ -118,6 +120,30 @@ void smp_wake_idle_cpu(void);
 
 /* Get online CPU count */
 uint32_t smp_online_cpu_count(void);
+
+/* ==================== SMP work queue (AP participation) ====================
+ * The BSP can hand kernel work to the other CPUs and every CPU's idle path
+ * drains the queue, so an AP is no longer a parked core. Jobs must be short and
+ * must not sleep. smp_submit_work returns 0 on success, -1 if full/invalid. */
+int      smp_submit_work(void (*fn)(void*), void* arg);
+uint32_t smp_work_pending(void);
+
+/* Drain the queue on the calling CPU; cpu_index is the caller's cpu_locals
+ * index (0 for the BSP). Used by the shell input loop and by the AP idle loop. */
+void smp_drain_work_here(uint32_t cpu_index);
+
+/* AP entry: program this CPU's LAPIC timer and run the idle/work loop forever. */
+void smp_ap_idle_loop(uint32_t cpu_index) __attribute__((noreturn));
+
+/* Called from the timer ISR when it fires on an AP (the BSP keeps g_tick_count). */
+void smp_ap_timer_tick(uint32_t cpu_index);
+
+/* IPI / LAPIC-spurious dispatch, called by moos_intr_handler for 0xE0/0xE1/0xFF. */
+void smp_ipi_dispatch(uint64_t vec);
+
+/* Acceptance test: submit n items, pump until they complete (bounded) and report
+ * per-CPU execution counts, proving the APs actually ran kernel work. */
+void smp_work_selftest(uint32_t n);
 
 /* LAPIC access (from arch/x86_64/lapic.c) */
 uint32_t hanos_lapic_read(uint32_t reg);

@@ -185,6 +185,59 @@ This file lives on a real FAT32 volume (driver: fat32).
 === RESULT: PASS ===  checks=10 ok=10 fail=0
 ```
 
+## 🖥️ 终端、GUI 应用、多核与 ext2
+
+### 默认进终端，`startgui` 才进 GUI
+引导成功后屏幕是**黑底白字的终端**（移植 flanterm，BSD-2，见"已知问题"第 7 条），GUI 必须显式输入 **`startgui`**。
+
+GUI 里现在有**三个真实应用**（`kernel/gui/apps.c`，用公开的 `gui_create_window()` + `gui_fill_rect/gui_draw_str` API 构建）：
+
+| 窗口 | 内容 |
+|------|------|
+| **Task Manager** | 实时：CPUs online、PMM 空闲页/MiB、堆空闲 KiB、Uptime、FPS、窗口数、CPU busy 进度条 |
+| **Calculator** | 键盘驱动：`0-9` `+ - * /` `=` `c`，算式与结果显示在客户区 |
+| **About SutureOS** | 版本、14 个上游项目、flanterm(BSD-2) 与 GPL-3.0 |
+
+GUI 键盘：`Tab` 切焦点、方向键移动窗口、`r` 重绘、`q`/`ESC` 退出回终端（退出会恢复终端并清屏）。
+
+### 多核：AP 真正参与内核执行
+- IDT 补齐 **0xE0（重调度 IPI）/0xE1（TLB shootdown）/0xFF（LAPIC 假中断）** 三扇门（此前 not-present，收到即 #NP）；
+- 每个 AP 用**自己的 LAPIC 定时器**（向量 0x20，周期模式）计时，`cpu_local.jiffies` 独立计数；
+- **SMP 工作队列**：`smp_submit_work()` 投递内核工作并**发 IPI 唤醒空闲核**，各核在空闲循环里 `smp_drain_work_here()` 取活执行，`cpu_local.work_done` 计数；
+- Shell 新增 `cpus`（每核 jiffies / IPI / 执行工作数 / 空闲次数 + 实测时钟频率）与 `smptest [n]`。
+
+实测：
+```
+[SMP] work selftest: APs finished 32 of 32 before the BSP helped
+[SMP]   cpu0 (BSP): same-window work_done=0  jiffies=6089
+[SMP]   cpu1 (AP):  same-window work_done=32 jiffies=6233
+[SMP] work selftest PASS (an AP executed kernel work)
+```
+范围：AP 现在执行**内核工作项 + 定时器 + IPI**，但仍不进 task.c/eevdf 的上下文切换（两套调度器共用 context，合并前让 AP 切任务会重演 #UD 洪水）。
+
+### ext2（只读，真实驱动）
+`kernel/fs/ext2.c`：superblock/BGDT 校验、单/双/三级间接块、稀疏空洞、readdir/stat/read、越界钳制与告警；`ext2_vfs.c` 接入统一 VFS，写操作返回 EROFS(→EPERM)。挂第二块 IDE 盘即可：
+```powershell
+py -3 scripts\mkfs_ext2_testimg.py     # build/ext2.img (1KiB 块) + 4KiB 变体 + 三重间接夹具
+# QEMU 加 -hdb build/ext2.img；kmain 自动 ext2_mount(1,0) + vfs_mount("1","/mnt/ext2","ext2") + 自检
+py -3 scripts\verify_ext2_read.py build\ext2.img     # 宿主侧独立验收
+```
+实测：`[ext2] mount blocksz=1024 blocks=4096 inodes=64 groups=1 rev=1`、`[ext2] selftest PASS (hello=0xccc16a4b big=0x7beec92a nested=0xa31a867d sparse=0x8f7abe7d double=0xeb83dd9b)`（含 300 KiB 双间接文件与稀疏空洞）。宿主侧另有 91/91 + 20/20（含第三方 mke2fs 镜像）与 38/38 解析校验。
+
+### 本机测试（QEMU / VMware）
+```powershell
+& "C:\Program Files\qemu\qemu-system-x86_64.exe" -machine pc -m 256 -vga std `
+  -display none -serial file:build\serial.log `
+  -cdrom build\sutureos.iso -boot d -hda build\fat32.img -hdb build\ext2.img -smp 2 `
+  -no-reboot -no-shutdown -monitor tcp:127.0.0.1:45470,server,nowait
+```
+- `-vga std` 提供 0xFD000000 线性帧缓冲（终端/GUI 才可见）；`-hdb build/ext2.img` 挂 ext2 测试卷。
+- 截图：monitor 里 `screendump build\screen.ppm`；**退出前务必 monitor `quit`**（强杀会丢 `-serial file:` 尾部日志）。
+- 输入模拟：`sendkey`，键名如 `ret`/`spc`/`slash`/`tab`/`shift-equal`；键盘是轮询无 IRQ，按键间隔 ≥400 ms。
+- **VMware**：新建 *Other 64-bit* 虚拟机 → 内存 ≥256 MB、≥2 核 → 光驱指向 `build/sutureos.iso`（可再加两块 IDE 盘分别挂 fat32.img / ext2.img）→ 启动进终端，`startgui` 进 GUI，`shutdown`/`reboot` 走 ACPI；可加串口重定向到文件抓同样的 `[  OK  ]` 日志。
+
+---
+
 ## ⚠️ 已知问题（如实记录）
 
 0. **曾经误判过的"FAT32 写缺陷"其实是测试镜像的错**：`mkfat32_testimg.py` 最初忘了把根目录簇（簇 2）在 FAT 里标记为 EOC，于是内核"正确地"把第一个空闲簇（=根目录）分配给了新文件，表现为"payload 写进根目录、目标簇是陈旧数据"。排查时用块层隔离自检证明 **ATA PIO 读/写/写后读全部正确**（`read lba32 head=f8 ff ff 0f…`、`write lba70000 rc=0`、`readback same=1`），再用 `[fat32] dbg raw sec_read(32)` 看到 FAT[2] 在盘上就是 0，才定位到镜像生成器。两个脚本现已加入断言（根簇必须 EOC、FSInfo 必须等于实测空闲簇数），避免回归。教训：**宿主侧解析镜像比任何 guest 自报都可靠**。
@@ -196,6 +249,8 @@ This file lives on a real FAT32 volume (driver: fat32).
 6. **键盘无 IRQ**：只轮询 8042 单字节缓冲，快速输入丢键（自动化测试请把按键间隔设为 ≥400 ms）。
 7. **flanterm 上游缺陷（已在本仓库标注修复）**：`canvas == NULL` 时使用的 `plot_char_*_uncanvas()` 把默认**前景色**也取成 `default_bg`，导致未指定 SGR 的普通文本是黑底黑字。已在 `fb.c` 两处修正并加 `SutureOS fix` 注释（BSD-2 允许修改，许可证头保持原样）。
 8. **（已修复，影响面最大的一个）PMM 把自己的页标志数组分配了出去**：`moe_pmm_init()` 用区域开头 1 字节/页 存标志，而 `moe_pmm_alloc()` 从第 0 页开始扫描——于是 `kmain` 的 `moe_pmm_alloc(2048)` 把**标志数组本身**当成了内核堆（8 MiB 堆 == 标志数组），此后每次分配/释放都把 `0x01/0x00` 写进活堆：堆头、flanterm 上下文（`text_fg` 被写成 `0x00000001` → 文字不可见、只剩残留光标块）、以及之后分配的 AP/任务栈。已修：`moe_pmm_init()` 把标志占用的页标记为 `TAKEN` 并从空闲计数里扣除，自检也改成断言"标志页绝不出借"（防回归）。同类症状的"AP 栈落进内核镜像"一并消失。
+9. **系统时钟改用 LAPIC 定时器（PIT 中断在这台机器上送不到 CPU）**：QEMU `-d int` 追踪显示内核重映射 PIC 之后**没有任何 IRQ0**——该机器带 IOAPIC、上电即 APIC 模式，8259 的 INTR 并不走 LINT0（试过 IMCR 切 PIC 模式也无效）。因此系统节拍由 BSP 的 LAPIC 定时器提供（与 AP 同机制），并**实测频率**（`cpus` 命令会打印，当前约 57–100 Hz，标定基于 8254 计数器、仍偏保守）。PIT 仍被编程为 100 Hz 并保留自检。这类"时间基准"问题此前被掩盖，是因为 `g_tick_count` 从未真正推进过（FPS 显示的是初值 60）。
+10. **`smp_get_cpu_id()` 之外的宽泛地址守卫已清理**：`fbcon.c`/`gui.c`/`limine.c` 里"帧缓冲 ≥1 GiB 就拒绝"的旧判断都删了（LFB 现在由 `mmu_map_mmio_identity()` 显式映射）。
 
 ---
 

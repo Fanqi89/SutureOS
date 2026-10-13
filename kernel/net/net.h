@@ -1,7 +1,14 @@
-/* SutureOS module: Network stack - 移植自 SpiritFoxOS
+/* SutureOS module: IPv4 network stack (ARP + IPv4 + ICMP + UDP) over RTL8139
  * Source: C:\Users\fanqi\Desktop\自研操作系统\SpiritFoxOS\kernel\include\net.h
- * Original license: GPL-3.0
- * Changes: Adapted to SutureOS; prefix net_; integrated with SutureOS VFS/block/sched
+ *         + kernel/src/net/{arp,ip,icmp,udp}.c (protocol shapes and naming)
+ * Original license: GPL-3.0 - same license as this project.
+ * Changes: adapted to SutureOS; the stub socket layer is kept for ABI stability
+ *          but only the datagram paths below are implemented. Addresses are
+ *          stored in host byte order (0x0A00020F == 10.0.2.15 == "first octet
+ *          in the high byte"), matching the convention the stub net.c already
+ *          used, and converted with htonl()/ntohl() on the way to/from the
+ *          wire. Ports are kept in host order for the public API and converted
+ *          internally. No libc, no dynamic allocation: every buffer is static.
  */
 #ifndef STITCH_NET_H
 #define STITCH_NET_H
@@ -25,6 +32,10 @@ typedef uint32_t socklen_t;
 #define IP_PROTO_TCP    6
 #define IP_PROTO_UDP    17
 
+/* Ethernet header length / minimum frame (without FCS) */
+#define NET_ETH_HDR_LEN   14
+#define NET_ETH_MIN_FRAME 60
+
 /* Address families */
 #define AF_UNIX         1
 #define AF_LOCAL        AF_UNIX
@@ -42,6 +53,9 @@ typedef uint32_t socklen_t;
 /* INADDR_ANY */
 #define INADDR_ANY      0
 #define INADDR_LOOPBACK 0x7F000001
+
+/* Broadcast / netmask helpers (host byte order) */
+#define NET_IP_BROADCAST 0xFFFFFFFFu
 
 /* TCP states */
 #define TCP_CLOSED       0
@@ -76,6 +90,18 @@ typedef uint32_t socklen_t;
 #define NET_TCP_MSS        1460
 #define NET_TCP_BACKLOG    16
 
+/* ARP cache size and entry lifetime (the lifetime counts net_poll() calls
+ * rather than seconds, because the stack has no wall clock of its own -
+ * net_poll() is called at least once per shell command and every millisecond
+ * inside a ping). Entries also fall back to round-robin replacement. */
+#define NET_ARP_CACHE_SIZE  8
+#define NET_ARP_TTL_POLLS   60000u
+
+/* Ping round-trip unit: 1 tick == 1 PIT channel-0 count == 1/1193182 s
+ * ~= 0.838 us. net_ping() reports rtt_ticks in those units; net_ping_us()
+ * converts a tick count to microseconds. */
+#define NET_TICKS_PER_MS 1193u       /* 1193182 / 1000, floor             */
+
 /* Ethernet header */
 typedef struct __attribute__((packed)) {
     uint8_t  dst_mac[6];
@@ -104,7 +130,13 @@ typedef struct __attribute__((packed)) {
     uint32_t rest_of_header;
 } icmp_header_t;
 
-/* IPv4 address */
+/* ICMP types / codes */
+#define ICMP_TYPE_ECHO_REPLY   0
+#define ICMP_TYPE_DEST_UNREACH 3
+#define ICMP_TYPE_ECHO_REQUEST 8
+#define ICMP_TYPE_TIME_EXCEED  11
+
+/* IPv4 address (host byte order) */
 typedef uint32_t ipv4_addr_t;
 
 /* Port */
@@ -169,7 +201,7 @@ typedef struct __attribute__((packed)) {
     uint16_t checksum;
 } udp_header_t;
 
-/* TCP unacknowledged segment (linked list) */
+/* TCP unacknowledged segment (linked list) - kept for ABI stability only. */
 typedef struct net_tcp_seg {
     uint32_t    seq;
     uint32_t    len;
@@ -206,7 +238,7 @@ struct msghdr {
 #define CMSG_SPACE(len) (CMSG_ALIGN(sizeof(struct cmsghdr)) + CMSG_ALIGN(len))
 #define CMSG_LEN(len)   (CMSG_ALIGN(sizeof(struct cmsghdr)) + (len))
 
-/* Socket structure */
+/* Socket structure (unchanged layout; the datagram subset is implemented) */
 typedef struct net_socket {
     int         fd;
     int         domain;
@@ -267,15 +299,114 @@ typedef struct net_socket {
     void *pending_files[8];
 } net_socket_t;
 
-/* Network configuration globals */
+/* ===================== network configuration globals ===================== */
+/* Addresses are in host byte order (10.0.2.15 == 0x0A00020F). */
 extern uint32_t net_local_ip;
 extern uint32_t net_gateway_ip;
 extern uint32_t net_netmask;
+extern uint32_t net_dns_ip;
 extern uint8_t  net_local_mac[6];
 extern int      net_hw_initialized;
 
-/* Public API */
+/* ===================== byte order helpers ===================== */
+static inline uint16_t htons(uint16_t v) { return (uint16_t)(((v & 0x00FFu) << 8) | ((v >> 8) & 0x00FFu)); }
+static inline uint16_t ntohs(uint16_t v) { return htons(v); }
+static inline uint32_t htonl(uint32_t v)
+{
+    return ((v & 0x000000FFu) << 24) | ((v & 0x0000FF00u) << 8) |
+           ((v & 0x00FF0000u) >> 8)  | ((v & 0xFF000000u) >> 24);
+}
+static inline uint32_t ntohl(uint32_t v) { return htonl(v); }
+
+/* ===================== link / bring-up ===================== */
+/* Find + reset the RTL8139, read its MAC, program the RX ring and TX
+ * descriptors and apply the static slirp configuration. Idempotent; returns 0
+ * on success and -1 after logging "[net] init failed: <reason>". */
 int net_init(void);
+
+/* Non-blocking: drain the RX ring and hand every frame to the stack. Safe to
+ * call from a shell command, an idle loop or inside a ping. NEVER call it from
+ * an interrupt handler (it calls user callbacks and does bounded polling). */
+void net_poll(void);
+
+/* Feed one complete ethernet frame (14-byte header + payload, no FCS) into the
+ * stack. This is what the polled RX path calls per frame; it is public so a
+ * test harness (or a future loopback/packet-socket) can inject frames. The
+ * buffer must stay valid for the call. Returns nothing; frames that are too
+ * short or that arrive before net_init() are counted as drops. */
+void net_input(const void *frame, uint32_t len);
+
+/* 1 once net_init() brought the NIC up (frames can actually flow). */
+int net_ready(void);
+
+/* Primary IPv4 address / gateway / netmask / DNS in host byte order. */
+uint32_t net_ip(void);
+uint32_t net_gw(void);
+uint32_t net_mask(void);
+uint32_t net_dns(void);
+/* Copy the NIC MAC (6 bytes). Returns 0, or -1 when the stack is down. */
+int net_mac(uint8_t out[6]);
+
+/* ===================== address helpers ===================== */
+/* "10.0.2.15" -> 0x0A00020F. Returns 0, or -1 when the text is not a plain
+ * dotted-quad (no hostnames, no CIDR suffix). */
+int net_ip_from_str(const char *s, uint32_t *out);
+/* 0x0A00020F -> "10.0.2.15" in the caller's buffer (>= 16 bytes). */
+void net_ip_to_str(uint32_t ip, char *buf, uint32_t buflen);
+
+/* ===================== ARP ===================== */
+/* Look up `ip` in the cache. Returns 0 and copies 6 bytes into mac_out, or -1
+ * on a miss. Never sends anything. */
+int net_arp_lookup(uint32_t ip, uint8_t mac_out[6]);
+/* Resolve `ip`, sending up to `retries` requests and pumping net_poll() while
+ * waiting. timeout_ms is a wall-clock budget (PIT-derived). Returns 0 and
+ * copies the MAC, or -1 on timeout. */
+int net_arp_resolve(uint32_t ip, uint8_t mac_out[6]);
+/* Number of live cache entries. */
+int net_arp_entries(void);
+/* Send one ARP request for `ip` (broadcast) and return 0, or -1 when the
+ * stack is down / the frame could not be queued. */
+int net_arp_request(uint32_t ip);
+
+/* ===================== ICMP ===================== */
+/* Send an echo request to `ip` and wait for the matching reply. `timeout_ms`
+ * is a wall-clock budget. Returns 0 when the first reply arrived and stores
+ * the round-trip time in *rtt_ticks (1 tick = 1/1193182 s ~ 0.838 us; 0 is
+ * possible for a slirp round trip faster than one PIT count). Returns -1 on
+ * timeout or when the NIC is down. `rtt_ticks` may be NULL. */
+int net_ping(uint32_t ip, int timeout_ms, uint32_t *rtt_ticks);
+/* Same round trip expressed in microseconds (rtt_ticks * 1000000 / 1193182). */
+uint32_t net_ping_us(uint32_t rtt_ticks);
+
+/* ===================== UDP ===================== */
+/* Inbound datagram hook. `data` points into a static 1500-byte buffer that is
+ * reused by the next datagram, so copy what must outlive the call. */
+typedef void (*net_udp_handler_t)(uint32_t src_ip, uint16_t sport,
+                                  uint16_t dport, const void *data, uint32_t len);
+void net_udp_set_handler(net_udp_handler_t cb);
+
+/* Send one UDP datagram. Ports are in host order. Returns 0 on success, -1
+ * when the NIC is down or the frame could not be queued, -2 when the payload
+ * exceeds the 1472-byte ethernet limit. ARP resolution for the next hop is
+ * attempted first (bounded). */
+int net_udp_send(uint32_t ip, uint16_t sport, uint16_t dport,
+                 const void *data, uint32_t len);
+
+/* ===================== statistics / diagnostics ===================== */
+/* Print one "[net] ..." line per counter plus the last received packet's
+ * summary. */
+void net_dump_stats(void);
+
+/* Reset every counter (does not touch the ARP cache or the NIC). */
+void net_stats_reset(void);
+
+/* Boot/shell self test: ping the gateway and print exactly one of
+ * "[net] selftest ping 10.0.2.2 -> reply in <n>" (n = microseconds) or
+ * "[net] selftest ping TIMEOUT". Returns 0 on reply, -1 on timeout (or when
+ * the NIC is down, in which case the error is logged first). */
+int net_selftest(void);
+
+/* ===================== socket API (kept for ABI; datagram subset) ========= */
 int net_socket(int domain, int type, int protocol);
 int net_bind(int fd, const net_sockaddr_t *addr, socklen_t addrlen);
 int net_listen(int fd, int backlog);
@@ -295,9 +426,14 @@ int net_getsockname(int fd, net_sockaddr_t *addr, socklen_t *addrlen);
 int net_getpeername(int fd, net_sockaddr_t *addr, socklen_t *addrlen);
 int net_sendmsg(int fd, const struct msghdr *msg, int flags);
 int net_recvmsg(int fd, struct msghdr *msg, int flags);
+
+/* Configuration setters kept from the stub API. */
 void net_configure_ip(uint32_t ip, uint32_t gateway, uint32_t netmask);
 uint32_t net_get_tcp_initial_seq(void);
 port_t net_alloc_port(void);
+
+/* Kept for callers that already tick the stack from a timer; harmless no-op
+ * because this stack is fully synchronous/polled. */
 void net_tick(void);
 
 #ifdef __cplusplus

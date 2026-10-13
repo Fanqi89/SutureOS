@@ -80,9 +80,38 @@ void moos_intr_handler(struct moos_regs *frame, uint64_t vec)
         return;
     }
 
+    /* SMP vectors (0xE0 reschedule IPI, 0xE1 TLB shootdown, 0xFF LAPIC
+     * spurious): real IRQs with their own IDT gates now, so handle and
+     * acknowledge them instead of falling through to the exception path. */
+    if (vec == 0xE0u || vec == 0xE1u || vec == 0xFFu) {
+        extern void smp_ipi_dispatch(uint64_t vec);
+        smp_ipi_dispatch(vec);
+        return;
+    }
+
     if (vec < 256u)
         g_counts[vec]++;
     g_last_vector = vec;
+
+    /* Legacy PIC IRQs (0x20-0x2F). These normally have a dedicated ISR (the
+     * timer uses timer_handler.S via vim_idt_set_timer_gate), but an IRQ that
+     * arrives BEFORE that gate is installed lands here through the generic stub.
+     * The 8259 keeps an unacknowledged IRQ in service forever, so the missing
+     * EOI here is what permanently killed the PIT system tick at boot
+     * (g_tick_count stayed 0 while IF=1 and the IDT gate existed). Acknowledge
+     * on whichever controller owns this CPU: PIC on the BSP, LAPIC on an AP. */
+    if (vec >= 0x20u && vec <= 0x2Fu) {
+        extern uint32_t smp_get_cpu_id(void);
+        extern void hanos_lapic_eoi(void);
+        if (smp_get_cpu_id() == 0) {
+            if (vec >= 0x28u)
+                __asm__ volatile("outb %%al, %w0" : : "Nd"(0xA0) : "al");  /* slave PIC */
+            __asm__ volatile("outb %%al, %w0" : : "Nd"(0x20) : "al");      /* master PIC */
+        } else {
+            hanos_lapic_eoi();
+        }
+        return;
+    }
 
     if (vec < 32u && !vector_expected(vec)) {
         /* MOOS IDT.cs panicked here; bring-up must not die on a stray
