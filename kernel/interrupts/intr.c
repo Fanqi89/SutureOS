@@ -86,10 +86,13 @@ void moos_intr_handler(struct moos_regs *frame, uint64_t vec)
 
     if (vec < 32u && !vector_expected(vec)) {
         /* MOOS IDT.cs panicked here; bring-up must not die on a stray
-         * exception, so only report (numeric args go as uint64_t). */
-        console_printf("[moos] unexpected cpu exception vector=%u err=0x%x (no panic: interrupts masked in this phase)\n",
+         * exception, so only report (numeric args go as uint64_t).
+         * rip/cs identify the faulting instruction. */
+        console_printf("[moos] unexpected cpu exception vector=%u err=0x%x rip=0x%x cs=0x%x (no panic)\n",
                        (uint64_t)vec,
-                       frame ? (uint64_t)frame->error_code : 0u);
+                       frame ? (uint64_t)frame->error_code : 0u,
+                       frame ? (uint64_t)frame->rip : 0u,
+                       frame ? (uint64_t)frame->cs : 0u);
     }
 
     if (vec < 256u && g_table[vec] != NULL)

@@ -8,6 +8,11 @@ void syscall_init(void);
 void syscall_register(uint64_t nr, uint64_t (*fn)(uint64_t, uint64_t, uint64_t,
                                                  uint64_t, uint64_t, uint64_t));
 
+/* Direct dispatch with explicit arguments (used by the Linux ABI layer) */
+uint64_t syscall_invoke(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3,
+                        uint64_t a4, uint64_t a5, uint64_t a6);
+int syscall_is_registered(uint64_t nr);
+
 /* syscall numbers - Linux/x86_64 兼容 */
 #define SYS_READ            0
 #define SYS_WRITE           1

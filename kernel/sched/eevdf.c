@@ -470,6 +470,22 @@ void sched_eevdf_start(void) {
         }
     }
     
+    /* 兜底：sched_create() 创建的任务没有调度实体（只有 sched_eevdf_create
+     * 才会建实体），调度启动前把所有 RUNNABLE 且未入队的任务补挂进红黑树，
+     * 否则这类任务永远不会被 pick_eevdf 选中。kgs_base 复用为实体指针。 */
+    for (int i = 0; i < SCHED_MAX_TASKS; i++) {
+        struct sched_task *t = &sched_cpu.tasks[i];
+        if (t->state == SCHED_TASK_RUNNABLE && t->context.kgs_base == 0) {
+            struct sched_entity *se = eevdf_new_entity(t, NICE_TO_PRIO(0));
+            if (se) {
+                se->handle = &g_eevdf;
+                t->context.kgs_base = (uint64_t)(uintptr_t)se;
+                eevdf_enqueue_entity(se);
+                console_printf("[eevdf] task %d auto-enqueued\n", i);
+            }
+        }
+    }
+
     // 启用中断开始调度
     __asm__ volatile("sti");
     

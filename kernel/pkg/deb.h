@@ -132,6 +132,10 @@ struct deb_package {
     char **conffiles;   /* 配置文件列表 */
     int conffiles_count;
     
+    /* 安装时解出的文件清单（deb_install 记录，deb_remove 按此删除） */
+    char **installed_files;
+    int installed_files_count;
+    
     /* 安装状态 */
     deb_pkg_status_t status;
     char *install_path;  /* 安装根目录 */

@@ -5,7 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-ROOT = Path(r"C:\Users\fanqi\Desktop\缝合怪系统")
+ROOT = Path(r"C:\Users\fanqi\Desktop\SutureOS")
 CC = Path(r"C:\msys64\mingw64\bin\clang.exe")
 OBJCOPY = Path(r"C:\msys64\mingw64\bin\objcopy.exe")
 NASM = Path(r"C:\msys64\usr\bin\nasm.exe")
@@ -114,13 +114,22 @@ def main():
         return 1
     
     # ---- 2. Convert trampoline binary to object file with objcopy ----
-    # Workaround for MSYS2 objcopy not handling Unicode paths: copy to temp location first
+    # Workaround for MSYS2 objcopy not handling Unicode paths: copy to a
+    # FIXED ASCII temp location and run objcopy with the bare file name
+    # (cwd=temp_dir). objcopy derives the symbol name from the path it is
+    # given: an absolute path yields
+    # _binary_C__Users_..._ap_trampoline_bin_start, which the
+    # --redefine-sym lines below cannot match. Passing "ap_trampoline.bin"
+    # makes the symbols exactly _binary_ap_trampoline_bin_start/_end/_size,
+    # so the rename works and the kernel gets stable C-visible symbols.
     trampoline_obj = OBJ / "ap_trampoline.bin.o"
-    temp_bin = Path(r"C:\ap_trampoline_temp.bin")
-    temp_obj = Path(r"C:\ap_trampoline_temp.bin.o")
+    import tempfile, shutil
+    temp_dir = Path(tempfile.gettempdir()) / "sutureos_build"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    temp_bin = temp_dir / "ap_trampoline.bin"
+    temp_obj = temp_dir / "ap_trampoline.bin.o"
     
     # Copy to temp location
-    import shutil
     shutil.copy2(trampoline_bin_str, temp_bin)
     
     print("Converting trampoline binary to object file...")
@@ -130,15 +139,13 @@ def main():
         "--redefine-sym", "_binary_ap_trampoline_bin_start=ap_trampoline_bin_start",
         "--redefine-sym", "_binary_ap_trampoline_bin_end=ap_trampoline_bin_end",
         "--redefine-sym", "_binary_ap_trampoline_bin_size=ap_trampoline_bin_size",
-        str(temp_bin), str(temp_obj)
-    ])
+        "ap_trampoline.bin", "ap_trampoline.bin.o"
+    ], cwd=str(temp_dir))
     if result.returncode != 0:
         print("objcopy failed to convert trampoline binary")
         return 1
-    print(f"Trampoline object created at temp location")
     
     # Copy back to build directory
-    import shutil
     shutil.copy2(temp_obj, trampoline_obj)
     print(f"Trampoline object created: {trampoline_obj}")
     

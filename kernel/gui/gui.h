@@ -95,8 +95,9 @@ extern int g_gui_screen_h;
 extern bool g_gui_initialized;
 
 /* GUI 初始化 */
-int gui_init(int screen_w, int screen_h);
-int gui_run(void);  /* 主循环，不返回 */
+int gui_init(int screen_w, int screen_h);   /* 若有真实帧缓冲则以它覆盖 (w,h) */
+/* 主循环：有帧缓冲做合成渲染；q/ESC 退出返回 0，无帧缓冲记录 [gui] no framebuffer 并返回 -1 */
+int gui_run(void);
 
 /* 窗口管理 */
 struct gui_window* gui_create_window(const char* title, int x, int y, int w, int h,
@@ -136,7 +137,7 @@ const char* gui_tr(const char* en, const char* zh);
 void sys_reboot(void);
 void sys_shutdown(void);
 
-/* 脏矩形 */
+/* 脏矩形：gui_dirty 合并并集矩形，主循环每帧只重绘并集区域；gui_invalidate = 整屏 */
 void gui_dirty(int x, int y, int w, int h);
 void gui_invalidate(void);
 

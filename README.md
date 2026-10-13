@@ -77,47 +77,89 @@ SutureOS（缝合怪系统）是一个实验性的 x86_64 单内核操作系统�
 
 ---
 
-## ✨ 已实现功能清单
+## ✨ 功能状态清单（2026-10-13 按代码与 QEMU 实测重新核对）
+
+> 说明：本节按"代码里是否真的实现 + QEMU 里是否被验证"标注，不再沿用早期把桩代码标成 ✅ 的写法。
+> 图例：✅ 已实现且实测通过 ｜ 🟡 部分实现/未实测 ｜ ❌ 仍是桩实现
 
 ### Phase 1-2: 基础架构与驱动
 - ✅ **多引导支持**: Multiboot1 + Limine (UEFI/BIOS 双模式)
-- ✅ **内存管理**: 物理页分配 (PMM)、Slab 分配器、堆分配、页表管理 (4 级页表)
-- ✅ **调度器**: EEVDF (公平调度)、优先级调度、协作式轮转、SMP 支持
-- ✅ **中断/异常**: IDT、ISR、APIC、IOAPIC、HPET、PIT、串口中断
-- ✅ **SMP 支持**: AP 启动 trampoline (16→32→64 位)、IPI 重调度/射击
-- ✅ **驱动**: 帧缓冲/字体/PS2键盘/PIT/串口/RTL8139/RTL8168/AHCI/NVMe/VirtIO-blk
+- ✅ **内存管理**: PMM（启动时按 multiboot mem_upper 初始化真实区间，实测 31979 页）、8 MiB 内核堆、Slab、4 级页表
+- ✅ **调度器**: EEVDF（红黑树按 deadline 选实体）+ 协作式轮转；`sched_eevdf_start()` 现在会把没有实体的 RUNNABLE 任务自动入队
+- ✅ **中断/异常**: IDT 256 门（0-47 + 0x80）、ISR、PIC 重映射、LAPIC（基址已真正赋值 + MMIO 已映射）、HPET(回退 PIT)、串口
+- ✅ **SMP**: AP 启动闭环 —— trampoline 拷贝到 0x8000、INIT-SIPI-SIPI、AP 进入 C 入口并 LAPIC 上线；QEMU `-smp 2` 实测 `[SMP] AP 1 online (lapic=1)`、`online=2/2`
+- 🟡 **驱动**: 帧缓冲/字体/PS2 键盘（轮询式，无 IRQ 环形缓冲）/PIT/串口 ✅；ATA PIO ✅（读已验证，写有缺陷见下）；NVMe/AHCI/VirtIO-blk ❌ 桩；RTL8139/e1000 ❌ 桩
+- 🟡 **GUI**: 主循环/合成/脏矩形/键盘事件已从 VimtuOS gui64 移植成真实实现，但 BIOS 模式下没有帧缓冲（`limine_fb_addr=0`），仅在 UEFI/有 fb 时可实测；鼠标 ❌（无驱动）
 
-### Phase 3: 文件系统 (4 种)
-- ✅ **VimtuFS2 (v4)**: 原生文件系统，支持权限(uid/gid/mode)、多卷挂载、COW
-- ✅ **FatFS**: FAT32 读写、VFAT 长文件名
-- ✅ **ext2/ext4**: 从 Cinux 移植，支持基本读写、目录遍历
-- ✅ **SquashFS**: 只读压缩文件系统，支持 gzip/lz4/lzma/xz/zstd 多压缩算法
+### Phase 3: 文件系统
+- ✅ **统一 VFS 核心**: 驱动注册、挂载表、fd 表、目录游标、`vfs_read_file/vfs_write_file/vfs_mkdir_p/vfs_list_mounts`、seek 修复
+- ✅ **xj_vfs (ramfs)**: 真实目录游标 + stat + O_TRUNC + 空间统计；作为根文件系统，启动时种入 `/hello.txt`、`/etc/motd`
+- ✅ **FAT32（自写驱动，替代原 CoolPotOS 桩）**: superfloppy 挂载（BPB 严格校验，实测 `clusters=70544 fat_lba=32 fat_sz=552 root=2`）、8.3 目录项、FAT1/FAT2 双写、FSInfo、簇链、create/read/write/truncate/mkdir/rmdir/unlink/sync 代码路径完整；**读路径已在 QEMU 实测**（`cat /mnt/fat/hello.txt` 返回正确内容、`df` 显示真实空闲簇）；**写路径已知有缺陷**（见"已知问题"）
+- ❌ **ext2 / SquashFS**: 仍是桩（`*_mount` 打印 stub，`*_vfs.c` 适配器存在但后端未实现）
+- ❌ **VimtuFS2 (vfs64)**: 已改为真实委托到统一 VFS（不再是假成功），但 VimtuFS2 自身的磁盘格式（超级块/inode/位图）与多卷槽位 ❌ 未实现
 
 ### Phase 4: 用户态与系统调用
-- ✅ **系统调用**: 334 个 syscall (Linux x86_64 兼容编号)、syscall/sysret 快速路径
-- ✅ **ELF 加载器**: PT_LOAD 段加载、用户页表构建、动态链接准备
-- ✅ **EL0 切换**: syscall/sysret、swapgs、MSR_FS/GS_BASE、用户栈管理
-- ✅ **内存管理**: brk/mmap/munmap/mprotect、COW fork、用户堆
-- ✅ **musl libc 支持**: clock_gettime/getrandom/arch_prctl/futex/madvise/fcntl/set_tid_address/exit_group
+- 🟡 **系统调用**: syscall 表 512 槽 + `syscall_invoke()`；read/write/open/close/brk/mmap/munmap/fork/execve/exit/yield 及 musl 相关（clock_gettime/getrandom/arch_prctl/futex/madvise/fcntl/set_tid_address/exit_group）已注册；其余 Linux 号大多 ❌ 未注册（现返回 ENOSYS）
+- ✅ **ELF 加载器 / EL0 切换**: PT_LOAD 加载、用户页表、syscall/sysret、MSR_FS/GS_BASE
+- ✅ **Linux ABI 兼容层**: `linux_syscall_entry()` 现在真正分发——先查已注册的 Linux 处理器，再按映射表调用原生 syscall（此前无条件返回 ENOSYS）
+- ✅ **动态链接器**: ELF 解析 + 符号解析 + `dlopen/dlsym/dlclose`；**TLS 重定位已实现**（R_X86_64_DTPMOD64/DTPOFF64/TPOFF64 + PT_TLS 解析），替代原"WARNING: TLS relocation not implemented"
+- ✅ **deb 安装器（真实现）**: ar 解析（十进制 size 字段）、内建 RFC1951 inflate 解 gzip、ustar 解包并写入 VFS、control 字段/依赖解析、dpkg 风格版本比较、安装/卸载/查询/DB；QEMU 实测 `[deb] installed hello 1.0-1`；❌ xz/zstd 成员与维护者脚本（无内核 shell，如实报错）
 
-### Phase 5: 网络与 GUI
-- ✅ **TCP/IP 协议栈**: 以太网/ARP/IPv4/ICMP/UDP/TCP、拥塞控制(慢启动/拥塞避免/快速重传)、重传定时器、Unix 域套接字、SCM_RIGHTS fd 传递
-- ✅ **GUI 框架**: 窗口管理(创建/销毁/移动/缩放/最小化/最大化)、脏矩形重绘、标题栏/边框/客户区、回调机制(绘制/键盘/鼠标/定时/关闭)、任务栏/开始菜单/桌面图标、中英双语、重启/关机
+### Phase 5: 网络
+- ❌ **TCP/IP 协议栈**: `kernel/net/net.c` 仍是桩（无 ARP/IP/ICMP/UDP/TCP 收发路径），`net.h` 里的 socket API 无实现；`linux_compat` 里的 socket 号也因未注册而返回 ENOSYS
 
 ### Phase 6: 专业 ISO 发布
-- ✅ **双引导 ISO**: Limine (UEFI + BIOS 双模式)、GRUB 预留
-- ✅ **标准布局**: `/boot` `/system` `/EFI` 标准目录结构
-- ✅ **内核双份**: `/boot/kernel.elf` + `/system/kernel/kernel.elf`
-- ✅ **EFI 启动**: `/EFI/BOOT/BOOTX64.EFI` (Limine UEFI)
-- ✅ **BIOS 启动**: `boot/limine/limine-bios-cd.bin`
-- ✅ **初始化镜像**: `/system/initrd/initrd.tar.gz`
-- ✅ **系统清单**: `/system/manifest.json`
-- ✅ **ISO 大小**: 10.8 MB
+- ✅ **双引导 ISO**: Limine (BIOS 已实测启动；UEFI 路径未实测)、`/boot` `/system` `/EFI` 布局、内核双份、initrd、manifest.json
+- ✅ **ISO 大小**: ~11.5 MB
 
-### Phase 7: Linux 兼容层 (进行中)
-- ✅ **syscall ABI**: 334 个 Linux syscall 号完整映射到 SutureOS 原生 syscall
-- ✅ **musl 动态链接器**: 基础框架完成 (ld.so + dlopen/dlsym/dlclose/stubs)
-- ✅ **deb 包安装器**: 基础框架完成 (ar 解析、control.tar.gz/data.tar.gz 解压、依赖 DB、版本比较、维护脚本桩)
+### Phase 7: Shell 与应用
+- ✅ **Shell**: 真实 `ls/cd/pwd/cat/ps/kill/df/mount/umount/echo/help/clear/startgui/reboot/shutdown`；`ls` 走 VFS readdir、`cat` 走 VFS 读、`df` 读真实挂载与空间、`mount` 走统一 VFS、`kill` 真从 EEVDF 队列摘除实体；实测输出见下"验证记录"
+- 🟡 **键盘输入**: 轮询 8042；无 IRQ 环形缓冲，快速注入按键会丢字（实测现象），建议后续加 IRQ1 处理
+
+---
+
+## 🧪 验证记录（2026-10-13，QEMU BIOS + `-hda build/fat32.img` + `-smp 2`）
+
+实测串口日志关键行：
+
+```
+[boot] init: pmm region 0x30cb00-0x8000000, 31979 pages free
+[boot] init: heap 8 MiB at 0x30d000
+[selftest][moe_pmm] PASS / [lemis_heap] PASS / [eevdf] PASS ... 12/13 passed
+[blk] Registered device: ram0 (drive=9) / ata0 (drive=0, 71680 sectors)
+[vfs] Mounted ram on / (xj_vfs)
+[fat32] mount drive=0 lba0=0x539058eb spc=1 clusters=70544 fat_lba=32 fat_sz=552 root=2 free=70539
+[deb] parsed hello 1.0-1 (all) / [deb] unpacked hello: 2 files, 3 dirs / [deb] installed hello 1.0-1
+[SMP] AP 1 online (lapic=1) / [SMP] online=2/2 bsp_lapic_id=0
+sutureos#
+```
+
+交互实测（QEMU monitor `sendkey` 注入，宿主侧核对）：
+
+```
+sutureos# ls /
+etc/  hello.txt  usr/
+sutureos# df
+Filesystem   Device  1K-blocks  Used  Available  Mounted on
+xj_vfs       ram            4     0          3   /
+fat32        0          35272     2      35269   /mnt/fat
+sutureos# cat /mnt/fat/hello.txt
+Hello from SutureOS FAT32!
+This file lives on a real FAT32 volume (driver: fat32).
+(83 bytes)
+```
+
+宿主侧校验：`scripts/mkfat32_testimg.py` 自建 superfloppy FAT32 镜像（70544 簇、FAT1==FAT2、FSInfo 合法）与真实 `.deb`（ar + control.tar.gz + data.tar.gz），并用独立解析器逐字节校验；启动前后整盘 CRC32 一致（`20B5EAF8`），证明只读路径不会改动介质。
+
+## ⚠️ 已知问题（如实记录）
+
+1. **FAT32 写路径不可信**：guest 写测试中 payload 出现在根目录扇区、目标簇里是陈旧内存数据——缺陷在**ATA PIO 写路径**（读路径已被 `cat`/mount 实测证明正常）。因此当前引导**不执行任何写盘操作**，不会破坏真实介质；修复 ATA 写后再启用 FAT32 写。
+2. **`[selftest][moos_intr] FAIL`**：moos 中断自检故意注入异常（`err=0xbad`），处理函数会打印告警并把该自检判为 FAIL——属该自检与框架的判定不一致，非本次引入。
+3. **两套调度器并存**：`task.c` 的协作轮转与 `eevdf.c` 的 EEVDF 双轨运行，任务内调用 `sched_yield()` 会切到 EEVDF 循环的陈旧上下文（实测表现为跳到 0x3）。Shell 输入循环因此改为有界 pause 自旋，未再暴露；根治需要合并调度器。
+4. **`context.kgs_base` 被两用**：`cinux_context_switch` 把它写进 MSR_GS_BASE，而 EEVDF 用同一字段存放 `sched_entity*`；建议为实体指针另设字段。
+5. **IDT 未铺满**：仅 0-47 与 0x80 有门，IPI 向量 0xE0/0xE1 与 LAPIC 假中断向量 0xFF 仍是 not-present（会 #GP）；AP 目前只 `sti; hlt` 空转，未接入调度。
+6. **无帧缓冲（BIOS 模式）**：GUI 主循环已实现但当前启动路径 `limine_fb_addr=0`，无法可视化验证；fbcon 软光标仍由定时器闪烁。
+7. **键盘无 IRQ**：只轮询 8042 单字节缓冲，快速输入丢键。
 
 ---
 

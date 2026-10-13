@@ -9,4 +9,7 @@ void fbcon_clear(void);
 void fbcon_putc(char c);
 void fbcon_puts(const char *s);
 
+/* Timer tick callback for cursor blink (called from timer ISR) */
+void fbcon_timer_tick(void);
+
 #endif /* STITCH_FBCON_H */

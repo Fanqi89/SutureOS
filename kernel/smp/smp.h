@@ -4,7 +4,7 @@
  *   - Cinux: C:\Users\fanqi\Desktop\自研操作系统\Cinux\kernel\arch\x86_64\smp.hpp
  * Original licenses: GPL-3.0 (both)
  * Changes: Combined best parts; per-CPU EEVDF runqueues; IPI reschedule/shootdown
- *          简化版：只实现框架，AP 启动留待后续
+ *          Real AP bring-up: INIT-SIPI-SIPI via ap_trampoline.asm shared block.
  */
 #ifndef STITCH_SMP_H
 #define STITCH_SMP_H
@@ -17,6 +17,12 @@
 #define SMP_AP_STACK_PAGES 4  /* 16 KB per AP */
 #define SMP_AP_STACK_BYTES (SMP_AP_STACK_PAGES * 4096)
 #define SMP_AP_ONLINE_TIMEOUT_MS 500
+
+/* Shared trampoline data block lives at page offset 0x800 of the trampoline
+ * page (physical 0x8800); layout matches ap_trampoline.asm S_* offsets and
+ * struct smp_shared below. */
+#define SMP_SHARED_PHYS (SMP_TRAMPOLINE_PHYS + 0x800)  /* 0x8800 */
+#define SMP_SHARED_MAGIC 0x544D5053u                   /* 'SMPT' */
 
 /* IPI vectors (match Cinux) */
 #define SMP_IPI_RESCHEDULE 0xE0
@@ -77,6 +83,19 @@ extern uint64_t g_ticks;
 
 /* SMP initialization (call from kmain after ACPI/MADT ready) */
 int smp_init(void);
+
+/* Start the prepared APs with the INIT-INIT deassert-SIPI-SIPI sequence.
+ * Called at the end of smp_init(); exposed so APs can be started later
+ * if the BSP collected the AP list earlier. */
+void smp_start_aps(void);
+
+/* 64-bit AP C entry point. Reached from ap_trampoline.asm _start64 via the
+ * two-level chain in the shared block: [0x8830] holds &s_ap_entry_var and
+ * [[0x8830]] is this function's address. Runs on the AP with the BSP's
+ * CR3/IDT and the per-AP stack; brings the AP's LAPIC up, publishes
+ * cpu_locals[index] + the online flag, then idles with `sti; hlt`.
+ * Never returns. */
+void smp_ap_entry64(void) __attribute__((noreturn));
 
 /* IPI functions */
 void smp_send_ipi(uint32_t dest_apic_id, uint32_t vector);

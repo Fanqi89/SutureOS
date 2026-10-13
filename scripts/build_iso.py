@@ -8,7 +8,7 @@ import shutil
 import json
 from pathlib import Path
 
-ROOT = Path(r"C:\Users\fanqi\Desktop\缝合怪系统")
+ROOT = Path(r"C:\Users\fanqi\Desktop\SutureOS")
 BUILD = ROOT / "build"
 ISO_DIR = BUILD / "iso_root"
 ISO_OUTPUT = BUILD / "sutureos.iso"

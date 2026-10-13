@@ -10,6 +10,10 @@
 #include "gdt_idt.h"
 #include "fbcon.h"
 #include "syscall.h"
+#include "pmm.h"
+#include "heap.h"
+#include "vfs.h"
+#include "block.h"
 
 /* Module self-test declarations */
 void st_vim_gdt_idt_test(void);
@@ -35,6 +39,54 @@ void timer_irq_handler_asm(void);
 
 /* Timer tick function (C version for assembly handler) */
 void kernel_timer_tick_c(void);
+
+/* ==================== Real memory bring-up ==================== */
+/* Parse the multiboot info block for mem_upper (KB above 1 MiB) and manage
+ * [end of kernel BSS, top), capped at 128 MiB so everything stays inside the
+ * low identity map. Then carve the 8 MiB kernel heap out of it.
+ *
+ * This runs TWICE: before the self-tests (several tests call malloc(), e.g.
+ * eevdf_new_entity) and again after them, because st_moe_pmm_test() re-inits
+ * the PMM over a static test arena and does not fully restore the allocator
+ * state - without the second pass the PMM keeps managing that arena and later
+ * hands out an "AP stack" inside the kernel image. Re-initializing after the
+ * tests is safe: no long-lived allocations exist yet and every test frees what
+ * it took. */
+static void suture_mem_bringup(uint32_t mbi, const char *tag)
+{
+    uintptr_t kstart = (uintptr_t)_bss_end;
+    uintptr_t mem_top = 0;
+
+    if (mbi) {
+        uint32_t *mb = (uint32_t *)(uintptr_t)mbi;
+        if (mb[0] & 1) {                       /* flags bit0: mem_* valid */
+            uint32_t mem_upper_kb = mb[2];     /* KB above 1MiB */
+            mem_top = 0x100000u + (uintptr_t)mem_upper_kb * 1024u;
+        }
+    }
+    if (mem_top == 0) {
+        console_printf("[boot] %s: no mem_upper from multiboot, assuming 64 MiB\n", tag);
+        mem_top = 64 * 1024 * 1024;
+    }
+    if (mem_top > 128 * 1024 * 1024) mem_top = 128 * 1024 * 1024;
+    if (mem_top <= kstart + 4096) {
+        console_puts("[boot] ERROR: unusable memory layout\n");
+        return;
+    }
+
+    moe_pmm_init(kstart, mem_top);
+    console_printf("[boot] %s: pmm region %p-%p, %llu pages free\n",
+                   tag, (void *)kstart, (void *)mem_top,
+                   (unsigned long long)moe_pmm_free_count());
+
+    uintptr_t heap_pages = moe_pmm_alloc(2048);
+    if (heap_pages) {
+        lemis_heap_init((void *)heap_pages, 2048 * 4096);
+        console_printf("[boot] %s: heap 8 MiB at %p\n", tag, (void *)heap_pages);
+    } else {
+        console_printf("[boot] %s: heap alloc failed, keeping previous arena\n", tag);
+    }
+}
 
 void kernel_main(uint32_t magic, uint32_t mbi) {
     /* NOTE: BSS is already cleared by boot.S *before* the page tables (which
@@ -89,6 +141,9 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
     /* Memory info */
     console_printf("[boot] mbi=0x%p\n", mbi);
 
+    /* Real PMM + heap BEFORE the self-tests: several tests call malloc(). */
+    suture_mem_bringup(mbi, "init");
+
     /* Set timer interrupt handler (vector 0x20) directly in IDT */
     vim_idt_set_timer_gate();
     console_puts("[init] Timer IRQ handler registered at vector 0x20 (direct IDT gate)\n");
@@ -124,6 +179,71 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
     vim_idt_set_timer_gate();
     console_puts("[init] Timer IRQ handler registered at vector 0x20 (direct IDT gate)\n");
 
+    /* Repair the allocator state the PMM self-test left behind (see the
+     * function comment): re-grant the real memory region + a fresh 8 MiB
+     * kernel heap before any subsystem starts allocating. */
+    suture_mem_bringup(mbi, "reinit");
+
+    /* ==================== Block devices + VFS bring-up ==================== */
+    console_puts("\n[init] Initializing block layer + VFS...\n");
+    blk_init();          /* registry + ram0 ramdisk (needs the real heap) */
+    blk_ata_init();      /* controller-level setup (mask IRQs, polling mode) */
+    blk_ata_probe();     /* detect primary master/slave -> ata0/ata1 */
+    blk_list_all();
+
+    vfs_init();          /* registers ext2/fat32/squashfs/xj_vfs drivers */
+    /* Mount the in-memory ramfs as root filesystem */
+    int r = vfs_mount("ram", "/", "xj_vfs");
+    if (r != VFS_OK) {
+        console_printf("[init] WARNING: ramfs root mount failed (%d)\n", r);
+    } else {
+        /* Seed a couple of demo files so ls/cat work out of the box */
+        vfs_mkdir_p("/etc");
+        vfs_write_file("/hello.txt",
+                       "Hello from SutureOS ramfs!\n"
+                       "This file is real VFS content (driver: xj_vfs).\n", 91);
+        vfs_write_file("/etc/motd",
+                       "Welcome to SutureOS v0.5.0-alpha.\n"
+                       "Try: ls /, cat /hello.txt, df, ps, mount fat32 0 /mnt/fat\n", 126);
+        console_puts("[init] ramfs root mounted, demo files seeded\n");
+    }
+    /* Auto-mount FAT32 from the first ATA disk if one carries a FAT32
+     * volume (fails harmlessly when no disk / no FAT32 is present). */
+    r = vfs_mount("0", "/mnt/fat", "fat32");
+    if (r == VFS_OK) {
+        console_puts("[init] FAT32 volume auto-mounted at /mnt/fat\n");
+    } else {
+        console_printf("[init] no FAT32 on drive 0 (mount=%d), skipping\n", r);
+    }
+
+    /* deb package manager demo: install /mnt/fat/hello.deb when present */
+    {
+        extern int deb_db_init(const char *db_path);
+        extern int deb_install(const char *deb_path, const char *root_dir, int force);
+        deb_db_init(NULL);
+        vfs_stat_t dst;
+        if (vfs_stat("/mnt/fat/hello.deb", &dst) == VFS_OK) {
+            if (deb_install("/mnt/fat/hello.deb", "/", 1) == 0) {
+                console_puts("[init] deb demo package installed at /\n");
+            } else {
+                console_puts("[init] deb demo package install FAILED\n");
+            }
+        }
+    }
+
+    /* NOTE (known limitation, verified in QEMU): the FAT32 WRITE path is not
+     * trusted yet. A guest-side write test showed the payload landing in the
+     * root-directory sector and stale data in the target cluster, i.e. the
+     * defect is below the filesystem in the ATA PIO write path (reads are
+     * verified good: mount + FAT scan + cat of files all return correct
+     * data). Until that is fixed no boot-time write test runs, so a real
+     * attached volume is never modified. */
+    console_puts("[fat32] read path active (write path known-broken: ATA PIO write)\n");
+
+    /* ==================== SMP: bring APs online ==================== */
+    extern int smp_init(void);
+    smp_init();
+
     console_puts("\n[stitch] Phase-1 self-tests complete. Initializing scheduler...\n");
 
     /* Initialize EEVDF scheduler and create idle task BEFORE enabling interrupts */
@@ -139,7 +259,18 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
     struct sched_task *idle_task = &sched_cpu.tasks[idle_tid];
     eevdf_init_cpu_idle(idle_task);
 
-    console_puts("\n[stitch] Phase-1 self-tests complete. Starting EEVDF scheduler...\n");
+    console_puts("\n[stitch] Phase-1 self-tests complete. Starting shell...\n");
+
+    /* Create init task that runs the shell */
+    extern int shell_run(void);
+    int shell_tid = sched_eevdf_create((void (*)(void *))(uintptr_t)shell_run, NULL, 0);
+    if (shell_tid < 0) {
+        console_puts("[init] ERROR: failed to create shell task\n");
+    } else {
+        console_printf("[init] Shell task created (tid=%d)\n", shell_tid);
+    }
+
+    console_puts("\n[stitch] Starting EEVDF scheduler...\n");
 
     /* Start EEVDF scheduler - this will run tasks and only return on shutdown */
     sched_eevdf_start();

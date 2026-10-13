@@ -28,11 +28,16 @@ static void idle_task(void *arg) {
 }
 
 /* Trampoline: called as initial rip for new tasks.
- * Sets rdi = task->arg, calls task->func, then sched_shutdown if it returns. */
+ * Sets rdi = task->arg, calls task->func, then sched_shutdown if it returns.
+ * Never returns itself: it is entered via `jmp` (no return address on the
+ * stack), so a `ret` here would pop garbage and crash the CPU. */
 static void sched_trampoline(void) {
     sched_task_t *t = &sched_cpu.tasks[sched_cpu.current];
     t->func(t->arg);
     sched_shutdown();
+    for (;;) {
+        __asm__ volatile("hlt");
+    }
 }
 
 void sched_init(void) {

@@ -18,6 +18,10 @@ extern "C" {
 #define BLK_TYPE_AHCI     2
 #define BLK_TYPE_VIRTIO   3
 #define BLK_TYPE_ATA      4
+#define BLK_TYPE_RAM      5
+
+/* 驱动器号分配：ATA 主盘/从盘 = 0/1，RAM 磁盘 = 9 */
+#define BLK_DRIVE_RAM     9
 
 /* 块设备标志 */
 #define BLK_FLAG_READONLY  (1 << 0)

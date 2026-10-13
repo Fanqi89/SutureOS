@@ -25,7 +25,8 @@
 pml4:       .skip 4096
 pdpt:       .skip 4096
 pd0:        .skip 4096
-pd_high:    .skip 4096          /* PD for high memory (LAPIC/IOAPIC) */
+pd_high:    .skip 4096          /* PD for the top-2GiB alias window (PDPT[511]) */
+pd_io:      .skip 4096          /* PD for 0xC0000000-0xFFFFFFFF (LAPIC/IOAPIC) */
 .align 16
 stack_bottom:
             .skip 16384                 /* 16 KiB kernel stack */
@@ -86,13 +87,22 @@ _start:
     cmpl $512, %ecx
     jne 1b
 
-    /* Map LAPIC (0xFEE00000) and IOAPIC (0xFEC00000) in pd_high */
-    /* 0xFEE00000 = 4094 * 2MB, 0xFEC00000 = 4093 * 2MB */
-    /* PD index 4094 = LAPIC, 4093 = IOAPIC */
-    movl $0x10000011, %eax             /* present | writable | page-size(2MB) | address=0xFEE00000 */
-    movl %eax, pd_high+32752          /* pd_high[4094] at offset 4094*8=32752 */
-    movl $0x10000011, %eax             /* address=0xFEC00000 */
-    movl %eax, pd_high+32744          /* pd_high[4093] at offset 4093*8=32744 */
+    /* Map LAPIC (0xFEE00000) and IOAPIC (0xFEC00000) at their REAL virtual
+     * addresses. They live in the 3rd GiB (0xC0000000-0xFFFFFFFF), so they
+     * need PDPT entry index 3 -> a dedicated PD, with PDE indices
+     *   502: 0xC0000000 + 502*2MiB = 0xFEC00000 (IOAPIC)
+     *   503: 0xC0000000 + 503*2MiB = 0xFEE00000 (LAPIC)
+     * (The previous version wrote address 0x10000011 into pd_high via
+     * PDPT[511], which mapped physical 0x10000000 at VA 0x7FC0000000+ and
+     * left the LAPIC unreachable - every MMIO access faulted.) */
+    movl $pd_io, %eax
+    orl  $0b11, %eax                    /* present | writable */
+    movl %eax, pdpt+24                  /* PDPT[3] at offset 3*8 = 24 */
+
+    movl $0xFEC00083, %eax              /* IOAPIC: present|writable|PS|0xFEC00000 */
+    movl %eax, pd_io+4016               /* pd_io[502] at 502*8 */
+    movl $0xFEE00083, %eax              /* LAPIC: present|writable|PS|0xFEE00000 */
+    movl %eax, pd_io+4024               /* pd_io[503] at 503*8 */
 
     /* enable PAE */
     movl %cr4, %eax

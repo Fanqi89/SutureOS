@@ -38,11 +38,15 @@ bool hanos_lapic_init(void) {
     
     console_printf("[lapic] LAPIC base address: 0x%lx\n", addr);
     
-    /* Check if LAPIC address is within identity-mapped range (1 GiB) */
-    if (addr >= 0x40000000) {
-        console_printf("[lapic] WARNING: LAPIC at 0x%lx outside 1GiB identity map, deferring to Phase-3\n", addr);
-        return false;
+    /* boot.S identity-maps the LAPIC window (0xFEE00000 via pd_high, see
+     * boot.S maps of 0xFEE00000/0xFEC00000), so a >=1GiB LAPIC base is
+     * accessible. Warn only for truly unusual bases. */
+    if (addr >= 0x40000000 && addr != 0xFEE00000 && addr != 0xFEC00000) {
+        console_printf("[lapic] WARNING: unusual LAPIC base 0x%lx, assuming mapped\n", addr);
     }
+    
+    /* Assign the register window - without this every read/write is a no-op */
+    lapic_base = (volatile uint32_t *)addr;
     
     console_puts("[lapic] Mapping LAPIC...\n");
     

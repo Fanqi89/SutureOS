@@ -9,20 +9,29 @@
 #include "mmu.h"
 #include "heap.h"
 
-/* 文件描述符表 (每任务静态) */
+/* 文件描述符表 (每任务静态) - 存储 VFS fd */
 #define MAX_FDS 32
 struct fd_entry {
-    xj_vfs_node_t *node;
-    uint32_t offset;
+    int vfs_fd;  /* VFS layer file descriptor */
     uint32_t flags;  /* O_RDONLY=0, O_WRONLY=1, O_RDWR=2 */
 };
 
 static struct fd_entry fd_tables[SCHED_MAX_TASKS][MAX_FDS];
 
+/* Initialize fd tables - call from task creation */
+void fd_tables_init(void) {
+    for (int i = 0; i < SCHED_MAX_TASKS; i++) {
+        for (int j = 0; j < MAX_FDS; j++) {
+            fd_tables[i][j].vfs_fd = -1;
+            fd_tables[i][j].flags = 0;
+        }
+    }
+}
+
 /* 分配空闲 fd */
 static int fd_alloc(int tid) {
     for (int i = 0; i < MAX_FDS; i++) {
-        if (fd_tables[tid][i].node == NULL) return i;
+        if (fd_tables[tid][i].vfs_fd < 0) return i;
     }
     return -1;
 }
@@ -35,10 +44,9 @@ uint64_t sys_read(uint64_t fd, uint64_t buf, uint64_t len,
     int tid = sched_cpu.current;
     if (fd >= MAX_FDS) return (uint64_t)-1;
     struct fd_entry *f = &fd_tables[tid][fd];
-    if (!f->node) return (uint64_t)-1;
+    if (f->vfs_fd < 0) return (uint64_t)-1;
     EL0_CHECK(buf, len);
-    int ret = xj_vfs_read(f->node, f->offset, len, (void *)(uintptr_t)buf);
-    if (ret >= 0) f->offset += ret;
+    int ret = vfs_read(f->vfs_fd, (void *)(uintptr_t)buf, (uint32_t)len);
     return ret;
 }
 
@@ -50,7 +58,7 @@ uint64_t sys_write(uint64_t fd, uint64_t buf, uint64_t len,
     int tid = sched_cpu.current;
     if (fd >= MAX_FDS) return (uint64_t)-1;
     struct fd_entry *f = &fd_tables[tid][fd];
-    if (!f->node) {
+    if (f->vfs_fd < 0) {
         /* fd 1/2 默认 stdout/stderr */
         if (fd == 1 || fd == 2) {
             EL0_CHECK(buf, len);
@@ -64,8 +72,7 @@ uint64_t sys_write(uint64_t fd, uint64_t buf, uint64_t len,
         return (uint64_t)-1;
     }
     EL0_CHECK(buf, len);
-    int ret = xj_vfs_write(f->node, f->offset, len, (const void *)(uintptr_t)buf);
-    if (ret >= 0) f->offset += ret;
+    int ret = vfs_write(f->vfs_fd, (const void *)(uintptr_t)buf, (uint32_t)len);
     return ret;
 }
 
@@ -77,12 +84,22 @@ uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode,
     int tid = sched_cpu.current;
     EL0_STR((const char *)(uintptr_t)path_ptr);
     const char *path = (const char *)(uintptr_t)path_ptr;
-    xj_vfs_node_t *node = xj_vfs_lookup(path);
-    if (!node) return (uint64_t)-2;  /* ENOENT */
+    
+    int vfs_flags = VFS_O_RDONLY;
+    if ((flags & 3) == 1) vfs_flags = VFS_O_WRONLY;
+    else if ((flags & 3) == 2) vfs_flags = VFS_O_RDWR;
+    if (flags & 0x40) vfs_flags |= VFS_O_CREAT;  /* O_CREAT */
+    if (flags & 0x200) vfs_flags |= VFS_O_TRUNC; /* O_TRUNC */
+    
+    int vfs_fd = vfs_open(path, vfs_flags);
+    if (vfs_fd < 0) return (uint64_t)-2;  /* ENOENT */
+    
     int fd = fd_alloc(sched_cpu.current);
-    if (fd < 0) return (uint64_t)-1;  /* EMFILE */
-    fd_tables[tid][fd].node = node;
-    fd_tables[tid][fd].offset = 0;
+    if (fd < 0) {
+        vfs_close(vfs_fd);
+        return (uint64_t)-1;  /* EMFILE */
+    }
+    fd_tables[tid][fd].vfs_fd = vfs_fd;
     fd_tables[tid][fd].flags = flags & 3;
     return fd;
 }
@@ -94,11 +111,11 @@ uint64_t sys_close(uint64_t fd, uint64_t a2, uint64_t a3,
     extern sched_cpu_t sched_cpu;
     int tid = sched_cpu.current;
     if (fd >= MAX_FDS) return (uint64_t)-1;
-    if (!fd_tables[tid][fd].node) return (uint64_t)-1;
-    fd_tables[tid][fd].node = NULL;
-    fd_tables[tid][fd].offset = 0;
+    if (fd_tables[tid][fd].vfs_fd < 0) return (uint64_t)-1;
+    int ret = vfs_close(fd_tables[tid][fd].vfs_fd);
+    fd_tables[tid][fd].vfs_fd = -1;
     fd_tables[tid][fd].flags = 0;
-    return 0;
+    return ret;
 }
 
 /* 简易 fork：复制页表、上下文、fd 表，实现 COW */
@@ -131,7 +148,6 @@ uint64_t sys_fork(uint64_t a1, uint64_t a2, uint64_t a3,
     /* 子进程返回 0 - 通过 user_context_t 的 rax 在 syscall 返回时设置 */
 
     /* 复制 fd 表 */
-    extern struct fd_entry fd_tables[SCHED_MAX_TASKS][MAX_FDS];
     memcpy(&fd_tables[child], &fd_tables[parent], sizeof(fd_tables[0]));
 
     /* 复制页表并建立 COW 映射 */
@@ -181,17 +197,28 @@ uint64_t sys_execve(uint64_t path_ptr, uint64_t argv_ptr, uint64_t envp_ptr,
     
     /* 使用 loader 模块加载 ELF */
     extern uint64_t elf_load_user(const void *buf, uint64_t len, uint64_t *entry, uint64_t *base, uint64_t *end);
-    extern xj_vfs_node_t *xj_vfs_lookup(const char *path);
     
-    xj_vfs_node_t *node = xj_vfs_lookup(path);
-    if (!node) return (uint64_t)-2;  /* ENOENT */
+    /* Open file via VFS */
+    int vfs_fd = vfs_open(path, VFS_O_RDONLY);
+    if (vfs_fd < 0) return (uint64_t)-2;  /* ENOENT */
+    
+    /* Get file size via stat */
+    vfs_stat_t st;
+    if (vfs_stat(path, &st) != VFS_OK) {
+        vfs_close(vfs_fd);
+        return (uint64_t)-2;
+    }
+    uint64_t size = st.size;
     
     /* 读取文件到缓冲区 */
-    uint64_t size = node->size;
     void *buf = lemis_heap_alloc(size);
-    if (!buf) return (uint64_t)-12;  /* ENOMEM */
+    if (!buf) {
+        vfs_close(vfs_fd);
+        return (uint64_t)-12;  /* ENOMEM */
+    }
     
-    int ret = xj_vfs_read(node, 0, size, buf);
+    int ret = vfs_read(vfs_fd, buf, (uint32_t)size);
+    vfs_close(vfs_fd);
     if (ret < 0) {
         lemis_heap_free(buf);
         return (uint64_t)-5;  /* EIO */

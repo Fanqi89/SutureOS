@@ -10,6 +10,7 @@
 
 #include "hpet.h"
 #include "task.h"
+#include "fbcon.h"
 
 volatile uint64_t g_tick_count = 0;
 extern volatile bool g_need_resched;
@@ -41,6 +42,9 @@ void kernel_timer_tick_c(void)
 {
     g_tick_count++;
     g_need_resched = true;
+    
+    /* Update framebuffer console cursor blink */
+    fbcon_timer_tick();
     
     /* Send EOI to PIC master */
     __asm__ volatile("outb %%al, %w0" : : "Nd"(0x20) : "al");

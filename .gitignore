@@ -19,3 +19,6 @@ Thumbs.db
 .idea/
 *.suo
 *.user
+# transient logs
+build_log.txt
+iso_log.txt

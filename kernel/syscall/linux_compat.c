@@ -299,14 +299,9 @@ static const int g_linux_to_suture[LINUX_SYSCALL_MAX] = {
 
 int linux_compat_init(void) {
     console_puts("[linux_compat] Initializing Linux syscall ABI compatibility layer\n");
-    
-    /* Register all Linux syscalls that map directly to SutureOS syscalls */
-    for (int i = 0; i < 400; i++) {
-        if (g_linux_to_suture[i] != 0) {
-            g_linux_syscall_table[i] = (uint64_t(*)(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t))1;  // placeholder
-        }
-    }
-    
+    /* Handlers are registered via linux_register_syscall(); mapped syscalls
+     * fall through to the native table through syscall_invoke(). The old
+     * placeholder fill poisoned every mapped slot with (void*)1 - removed. */
     console_puts("[linux_compat] Linux syscall ABI compatibility layer initialized\n");
     return 0;
 }
@@ -340,28 +335,30 @@ void suture_utsname_to_linux(const void* suture_utsname, void* linux_utsname) {
     memcpy(linux_utsname, suture_utsname, sizeof(struct linux_utsname));
 }
 
-/* Linux syscall entry point (called from assembly) */
+/* Linux syscall entry point (called from assembly).
+ * Dispatch order: 1) an explicitly registered Linux handler, 2) the mapped
+ * native SutureOS syscall through syscall_invoke(). */
 uint64_t linux_syscall_entry(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3,
                              uint64_t a4, uint64_t a5, uint64_t a6) {
-    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
-    if (nr >= 400) {
+    if (nr >= LINUX_SYSCALL_MAX) {
         return (uint64_t)-ENOSYS;
     }
-    
+
+    /* 1) Linux-specific handler registered through linux_register_syscall() */
+    uint64_t (*fn)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) =
+        g_linux_syscall_table[nr];
+    if (fn) {
+        return fn(a1, a2, a3, a4, a5, a6);
+    }
+
+    /* 2) Map to the native syscall number and invoke it for real */
     int suture_nr = linux_to_suture_syscall(nr);
-    if (suture_nr < 0) {
-        console_printf("[linux_compat] Unimplemented Linux syscall %lu\n", nr);
+    if (suture_nr < 0 || !syscall_is_registered((uint64_t)suture_nr)) {
+        console_printf("[linux_compat] unimplemented Linux syscall %lu\n", nr);
         return (uint64_t)-ENOSYS;
     }
-    
-    /* Call the SutureOS syscall handler */
-    extern uint64_t syscall_dispatch_c(void*);  /* This expects user_context_t* */
-    
-    /* For direct syscall dispatch, we need to call the actual handler */
-    /* This is a simplified implementation - in reality we'd need to build a user_context_t */
-    
-    /* For now, return ENOSYS for unhandled syscalls */
-    return (uint64_t)-ENOSYS;
+
+    return syscall_invoke((uint64_t)suture_nr, a1, a2, a3, a4, a5, a6);
 }
 
 int linux_register_syscall(int linux_nr, uint64_t (*fn)(uint64_t, uint64_t, uint64_t,

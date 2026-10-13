@@ -23,6 +23,23 @@ void syscall_register(uint64_t nr, syscall_fn_t fn)
     if (nr < SYSCALL_MAX) syscall_table[nr] = fn;
 }
 
+/* Direct dispatch by syscall number with explicit arguments (also used by
+ * the Linux ABI compatibility layer, which cannot fabricate a
+ * user_context_t on the ring-3 stack). */
+uint64_t syscall_invoke(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3,
+                        uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    if (nr >= SYSCALL_MAX || syscall_table[nr] == NULL) {
+        return (uint64_t)-1;
+    }
+    return syscall_table[nr](a1, a2, a3, a4, a5, a6);
+}
+
+int syscall_is_registered(uint64_t nr)
+{
+    return nr < SYSCALL_MAX && syscall_table[nr] != NULL;
+}
+
 /* 初始化 MSR：IA32_LSTAR, IA32_STAR, IA32_FMASK */
 void syscall_init(void)
 {
