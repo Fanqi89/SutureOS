@@ -161,8 +161,11 @@ static const char* gui_fb_setup(void) {
     if (!limine_fb_addr || !limine_fb_width || !limine_fb_height) {
         return (g_fb_fail = "not available");            /* -> "[gui] no framebuffer" */
     }
-    if (limine_fb_addr >= 0x40000000ull)                 /* same guard as fbcon.c */
-        return (g_fb_fail = "outside 1 GiB identity map");
+    /* No address-range guard here any more: limine_parse_fb() identity-maps the
+     * linear framebuffer window with mmu_map_mmio_identity() even when it lives
+     * above 1 GiB (QEMU/VMware report 0xFD000000), so writing to it is safe.
+     * The old "outside 1 GiB identity map" rejection made `startgui` refuse to
+     * start on exactly the machines this kernel targets. */
     if (limine_fb_bpp != 32 && limine_fb_bpp != 24)
         return (g_fb_fail = "unsupported bpp (need 24 or 32)");
     if (limine_fb_pitch < limine_fb_width * (limine_fb_bpp / 8))
@@ -406,12 +409,17 @@ static void gui_render(void) {
 }
 
 /* frame pacing: wait for one g_tick_count increment (PIT ~100 Hz), bounded so
- * a dead timer cannot hang the loop; yields while waiting. No wall clock. */
+ * a dead timer cannot hang the loop. No wall clock.
+ * NOTE: do NOT call sched_yield() from here. task.c's cooperative round-robin
+ * and eevdf.c's EEVDF loop are two schedulers over one context struct; yielding
+ * from inside the GUI task switched to a stale EEVDF context and made the CPU
+ * execute garbage (observed as an endless "unexpected cpu exception vector=6"
+ * (#UD) flood at rip=0x3, painted over the GUI by the console). The shell input
+ * loop uses the same bounded-pause approach for the same reason. */
 static void gui_pace(void) {
     const uint64_t start = g_tick_count;
     for (int i = 0; i < GUI_PACE_MAX_SPINS && g_tick_count == start; i++) {
         __asm__ volatile("pause");
-        if ((i & 0x3FF) == 0) sched_yield();
     }
 }
 
@@ -457,6 +465,12 @@ int gui_run(void) {
                    (unsigned)limine_fb_pitch, (unsigned)limine_fb_bpp);
     console_puts("[gui] main loop start\n");
     console_puts("[gui] keys: arrows=move Tab=focus r=repaint q/ESC=exit\n");
+
+    /* The GUI owns the framebuffer from here on: suspend the terminal renderer so
+     * kernel log lines (still written to COM1) cannot paint over the desktop.
+     * Restored, with a terminal clear, when gui_run() returns. */
+    extern void console_screen_enable(int on);
+    console_screen_enable(0);
 
     /* give initial focus to the topmost window so title bars read active */
     {
@@ -508,6 +522,7 @@ int gui_run(void) {
     }
 
     console_puts("[gui] main loop exit (q/ESC)\n");
+    console_screen_enable(1);      /* hand the screen back to the terminal */
     return 0;
 }
 

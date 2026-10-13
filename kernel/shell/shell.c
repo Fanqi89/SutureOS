@@ -310,6 +310,8 @@ int shell_cmd_startgui(int argc, char **argv) {
     /* If GUI exits or fails, return to terminal */
     extern int term_available(void);
     extern void term_clear(void);
+    extern void console_screen_enable(int on);
+    console_screen_enable(1);        /* the GUI suspends the screen while it runs */
     if (term_available()) term_clear();
     else fbcon_clear();
     shell_puts("GUI exited, returning to terminal\n");

@@ -34,6 +34,13 @@ void console_init(void)
     outb(REG_MCR, MCR_DTR_RTS);
 }
 
+/* Screen enable switch. The GUI turns this off while it owns the framebuffer so
+ * that kernel log output (which still goes to COM1) cannot paint over the
+ * desktop; the terminal is suspended rather than the logging being disabled. */
+static int g_screen_enabled = 1;
+void console_screen_enable(int on) { g_screen_enabled = on ? 1 : 0; }
+int  console_screen_enabled(void) { return g_screen_enabled; }
+
 /* SutureOS console sink.
  *
  * Every character goes to COM1 (so automated boots always have a complete
@@ -50,8 +57,12 @@ void console_putc(char c)
         ;
     outb(REG_DATA, (uint8_t)c);
 
-    /* screen second: flanterm is fed character by character but flushed once
-     * per line (it batches internally and per-character flushes mislay text). */
+    /* screen second (skipped entirely while the GUI owns the framebuffer) */
+    if (!g_screen_enabled)
+        return;
+
+    /* flanterm is fed character by character but flushed once per line (it
+     * batches internally and per-character flushes mislay text). */
     extern int term_available(void);
     extern void term_putc(char c);
     extern void term_refresh(void);
