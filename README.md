@@ -251,6 +251,7 @@ py -3 scripts\verify_ext2_read.py build\ext2.img     # 宿主侧独立验收
 8. **（已修复，影响面最大的一个）PMM 把自己的页标志数组分配了出去**：`moe_pmm_init()` 用区域开头 1 字节/页 存标志，而 `moe_pmm_alloc()` 从第 0 页开始扫描——于是 `kmain` 的 `moe_pmm_alloc(2048)` 把**标志数组本身**当成了内核堆（8 MiB 堆 == 标志数组），此后每次分配/释放都把 `0x01/0x00` 写进活堆：堆头、flanterm 上下文（`text_fg` 被写成 `0x00000001` → 文字不可见、只剩残留光标块）、以及之后分配的 AP/任务栈。已修：`moe_pmm_init()` 把标志占用的页标记为 `TAKEN` 并从空闲计数里扣除，自检也改成断言"标志页绝不出借"（防回归）。同类症状的"AP 栈落进内核镜像"一并消失。
 9. **系统时钟改用 LAPIC 定时器（PIT 中断在这台机器上送不到 CPU）**：QEMU `-d int` 追踪显示内核重映射 PIC 之后**没有任何 IRQ0**——该机器带 IOAPIC、上电即 APIC 模式，8259 的 INTR 并不走 LINT0（试过 IMCR 切 PIC 模式也无效）。因此系统节拍由 BSP 的 LAPIC 定时器提供（与 AP 同机制），并**实测频率**（`cpus` 命令会打印，当前约 57–100 Hz，标定基于 8254 计数器、仍偏保守）。PIT 仍被编程为 100 Hz 并保留自检。这类"时间基准"问题此前被掩盖，是因为 `g_tick_count` 从未真正推进过（FPS 显示的是初值 60）。
 10. **`smp_get_cpu_id()` 之外的宽泛地址守卫已清理**：`fbcon.c`/`gui.c`/`limine.c` 里"帧缓冲 ≥1 GiB 就拒绝"的旧判断都删了（LFB 现在由 `mmu_map_mmio_identity()` 显式映射）。
+11. **（未完成）RTL8139 发送路径在图里跑不通**：NIC 已被正确识别并初始化——`[net] rtl8139 found at 0xc000, irq=11, mac=52:54:00:12:34:56`、`[net] IPv4 10.0.2.15/24 gw 10.0.2.2 (mode=poll)`；ARP/IPv4/ICMP/UDP 协议栈已实现并由宿主 harness 验证（89 项断言，过程中还修掉两个真实 bug：TX 校验和字节序、UDP 校验和判定）。但实际发包仍失败：`tsd=0x2000`（芯片接管描述符、SIZE 归零）后传输永不完成 → `frames tx=0 drops=5`、`ping 10.0.2.2` 三个请求全超时。已做的修复：PCI 机制 #1 必须用 32 位访问（逐字节写 0xCF8 读回全总线同一个常量）、短帧补位到 60B、TSD 带上 8139too 的 `tx_flag`。**下一步**：核对 QEMU 模型对 TSAD/TSD 与 C+ 模式的要求（可能需要 `Cfg9346` 解锁后配置 `C+` 命令寄存器的 TxPoll，或 TCR 的 DMA burst），或改用 IRQ11 + 读 ISR 的完成判定。Shell 命令 `ping <ipv4>` / `netstat` 已就位，网络修好后可直接用。
 
 ---
 

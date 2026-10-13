@@ -95,11 +95,13 @@
 #define RTL_TX_DESCRIPTORS 4u
 #define RTL_TX_BUF_SIZE    2048u
 #define RTL_TX_MAX_FRAME   1514u
+#define RTL_TX_MIN_FRAME   60u    /* ETH_ZLEN: the chip aborts shorter frames */
 
 /* TSD bits 0-12 hold the length; bit 13 LS, 14 TUN, 15 TOK, 16-30 size,
  * 18 TABT (transmit abort). The 8139 has no OWN bit: writing the size starts
  * the transfer and the chip raises TOK when the frame is on the wire. */
 #define RTL_TSD_SIZE_MASK 0x00001FFFu
+#define RTL_TSD_TX_FLAG   0x00003000u  /* (TX_FIFO_THRESH 6 << 11): 8139too's tx_flag */
 #define RTL_TSD_TUN       (1u << 14)
 #define RTL_TSD_TOK       (1u << 15)
 #define RTL_TSD_TABT      (1u << 18)
@@ -119,6 +121,8 @@
  * (QEMU enforces it). */
 static uint8_t g_rx_ring[RTL_RX_RING_TOTAL] __attribute__((aligned(4096)));
 static uint8_t g_tx_buf[RTL_TX_DESCRIPTORS][RTL_TX_BUF_SIZE] __attribute__((aligned(256)));
+/* Scratch for the rare frame that wraps the 8 KiB ring boundary. */
+static uint8_t g_wrap_buf[RTL_TX_MAX_FRAME] __attribute__((aligned(16)));
 
 /* ===================== driver state ===================== */
 static int      g_rtl_state;                 /* 0 = down, 1 = up            */
@@ -127,6 +131,7 @@ static uint8_t  g_irq;
 static uint8_t  g_mac[6];
 static uint16_t g_last_isr;
 static uint32_t g_rx_drops;
+static uint32_t g_rx_wraps;                  /* frames linearised at the ring end */
 static uint32_t g_tx_drops;
 static uint32_t g_tx_next;                   /* round-robin descriptor      */
 static uint32_t g_rx_ring_head;              /* our own CAPR-16 offset      */
@@ -154,6 +159,22 @@ static inline uint32_t rtl_inl(uint16_t off)
 }
 
 /* ===================== PCI config space ===================== */
+/* Mechanism #1 needs DWORD accesses: writing the address register 0xCF8
+ * byte-by-byte does not stick on QEMU (every slot then reads back the same
+ * constant, which is how this driver first failed to find a NIC that `info pci`
+ * clearly showed on bus 0). stitch/io.h has no outl/inl, so they live here. */
+static inline void pci_outl(uint16_t port, uint32_t v)
+{
+    __asm__ volatile("outl %0, %1" : : "a"(v), "Nd"(port));
+}
+
+static inline uint32_t pci_inl(uint16_t port)
+{
+    uint32_t v;
+    __asm__ volatile("inl %1, %0" : "=a"(v) : "Nd"(port));
+    return v;
+}
+
 static uint32_t pci_cfg_read32(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t off)
 {
     uint32_t addr = 0x80000000u
@@ -161,20 +182,9 @@ static uint32_t pci_cfg_read32(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t off
                   | ((uint32_t)dev << 11)
                   | ((uint32_t)fn << 8)
                   | (uint32_t)(off & 0xFCu);
-    uint32_t b0, b1, b2, b3;
 
-    /* Write the address cycle on 0xCF8, then read 0xCFC. Ports are accessed
-     * byte-wise so the helper does not depend on an outl()/inl() helper. */
-    outb(PCI_CONFIG_ADDR + 0u, (uint8_t)(addr & 0xFFu));
-    outb(PCI_CONFIG_ADDR + 1u, (uint8_t)((addr >> 8) & 0xFFu));
-    outb(PCI_CONFIG_ADDR + 2u, (uint8_t)((addr >> 16) & 0xFFu));
-    outb(PCI_CONFIG_ADDR + 3u, (uint8_t)((addr >> 24) & 0xFFu));
-
-    b0 = (uint32_t)inb(PCI_CONFIG_DATA + 0u);
-    b1 = (uint32_t)inb(PCI_CONFIG_DATA + 1u);
-    b2 = (uint32_t)inb(PCI_CONFIG_DATA + 2u);
-    b3 = (uint32_t)inb(PCI_CONFIG_DATA + 3u);
-    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+    pci_outl(PCI_CONFIG_ADDR, addr);
+    return pci_inl(PCI_CONFIG_DATA);
 }
 
 static void pci_cfg_write32(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t off, uint32_t v)
@@ -185,14 +195,8 @@ static void pci_cfg_write32(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t off, u
                   | ((uint32_t)fn << 8)
                   | (uint32_t)(off & 0xFCu);
 
-    outb(PCI_CONFIG_ADDR + 0u, (uint8_t)(addr & 0xFFu));
-    outb(PCI_CONFIG_ADDR + 1u, (uint8_t)((addr >> 8) & 0xFFu));
-    outb(PCI_CONFIG_ADDR + 2u, (uint8_t)((addr >> 16) & 0xFFu));
-    outb(PCI_CONFIG_ADDR + 3u, (uint8_t)((addr >> 24) & 0xFFu));
-    outb(PCI_CONFIG_DATA + 0u, (uint8_t)(v & 0xFFu));
-    outb(PCI_CONFIG_DATA + 1u, (uint8_t)((v >> 8) & 0xFFu));
-    outb(PCI_CONFIG_DATA + 2u, (uint8_t)((v >> 16) & 0xFFu));
-    outb(PCI_CONFIG_DATA + 3u, (uint8_t)((v >> 24) & 0xFFu));
+    pci_outl(PCI_CONFIG_ADDR, addr);
+    pci_outl(PCI_CONFIG_DATA, v);
 }
 
 /* Scan bus 0..255 / device 0..31 / function 0..7 for 10EC:8139. Returns 0 and
@@ -258,6 +262,7 @@ uint8_t rtl8139_irq(void)        { return g_irq; }
 uint16_t rtl8139_io_base(void)   { return g_io_base; }
 uint16_t rtl8139_last_isr(void)  { return g_last_isr; }
 uint32_t rtl8139_rx_drops(void)  { return g_rx_drops; }
+uint32_t rtl8139_rx_wraps(void)  { return g_rx_wraps; }
 uint64_t rtl8139_tx_frames(void) { return g_frames_tx; }
 uint64_t rtl8139_rx_frames(void) { return g_frames_rx; }
 
@@ -399,11 +404,28 @@ int rtl8139_send_frame(const void *frame, uint32_t len)
     g_tx_next = (idx + 1u) % RTL_TX_DESCRIPTORS;
 
     /* Copy the frame into the descriptor buffer, flush it out of the cache
-     * (real-hardware requirement), arm TSAD then TSD to start the DMA. */
+     * (real-hardware requirement), arm TSAD then TSD to start the DMA.
+     *
+     * Minimum-frame padding: the RTL8139 does NOT pad short frames itself and
+     * aborts the transmission (TSD.TABT) for anything below the Ethernet
+     * minimum, so an ARP request (42 bytes) was dropped and ICMP could never
+     * follow - the symptom was rx=0 tx=0 drops=N and a ping that always timed
+     * out. 8139too pads in software for exactly this reason; pad to ETH_ZLEN
+     * (60 bytes) and let the controller append the FCS. */
+    uint32_t txlen = len;
+    if (txlen < RTL_TX_MIN_FRAME) {
+        txlen = RTL_TX_MIN_FRAME;
+        memset(g_tx_buf[idx], 0, txlen);
+    }
     memcpy(g_tx_buf[idx], frame, len);
-    rtl_clflush(g_tx_buf[idx], len);
+    rtl_clflush(g_tx_buf[idx], txlen);
     rtl_outl((uint16_t)(RTL_TSAD0 + 4u * idx), (uint32_t)(uintptr_t)g_tx_buf[idx]);
-    rtl_outl((uint16_t)(RTL_TSD0 + 4u * idx), (uint32_t)len);
+    /* The descriptor must be armed with the early-TX/FIFO threshold bits as well
+     * as the length: Linux's 8139too writes `tx_flag | max(len, ETH_ZLEN)` with
+     * tx_flag = (TX_FIFO_THRESH << 11) & 0x3f0000 = 0x3000. Writing the bare
+     * length made the chip take ownership (TSD read back as OWN=1, SIZE=0) and
+     * then never complete the transfer, so every ARP/ICMP frame was dropped. */
+    rtl_outl((uint16_t)(RTL_TSD0 + 4u * idx), RTL_TSD_TX_FLAG | txlen);
 
     /* Wait for the descriptor to complete (bounded). QEMU finishes a short
      * frame in a few hundred iterations; a real link takes ~150 us, which is
@@ -415,10 +437,28 @@ int rtl8139_send_frame(const void *frame, uint32_t len)
             break;
         if ((tsd & (RTL_TSD_TABT | RTL_TSD_TUN)) != 0u) {
             g_tx_drops++;
+            /* Diagnostics for the first abort: the raw TSD bits say whether the
+             * chip aborted (TABT/TUN) and the CR/TCR values show whether the
+             * transmitter was actually enabled. */
+            if (g_tx_drops == 1u) {
+                console_printf("[rtl8139] tx abort: tsd=0x%x len=%u cr=0x%x tcr=0x%x isr=0x%x\n",
+                               (uint64_t)tsd, (uint64_t)txlen,
+                               (uint64_t)rtl_inb(RTL_CMD),
+                               (uint64_t)rtl_inl(RTL_TCR),
+                               (uint64_t)rtl_inw(RTL_ISR));
+            }
             return -3;                           /* chip aborted the transfer */
         }
-        if (--spins == 0u)
+        if (--spins == 0u) {
+            if (g_tx_drops == 0u) {
+                console_printf("[rtl8139] tx never completed: tsd=0x%x len=%u cr=0x%x tcr=0x%x\n",
+                               (uint64_t)tsd, (uint64_t)txlen,
+                               (uint64_t)rtl_inb(RTL_CMD),
+                               (uint64_t)rtl_inl(RTL_TCR));
+                g_tx_drops++;                /* only report the first one */
+            }
             return -2;                           /* never completed           */
+        }
         io_wait();
     }
     g_frames_tx++;
@@ -525,18 +565,31 @@ int rtl8139_receive(void (*fn)(const uint8_t *frame, uint32_t len))
             uint32_t data_off = (off + 4u) % RTL_RX_RING_SIZE;
 
             if (data_off + data_len <= RTL_RX_RING_TOTAL) {
-                /* Contiguous (the RCR WRAP bit guarantees this on QEMU and on
-                 * hardware); deliver straight out of the ring. The callback
+                /* Contiguous: deliver straight out of the ring. The callback
                  * runs before CAPR advances, so the chip cannot overwrite the
                  * frame while the stack parses it. */
                 fn(g_rx_ring + data_off, data_len);
                 g_frames_rx++;
                 delivered++;
             } else {
-                /* Defensive: a frame wrapping the 8 KiB boundary. Present only
-                 * when the WRAP bit did not take effect, which we never rely
-                 * on; drop it rather than hand the stack a split frame. */
-                g_rx_drops++;
+                /* The frame wraps the 8 KiB boundary: the chip's write pointer
+                 * reached the end of the ring and continued at offset 0 (with
+                 * the 1500-byte pad the RCR/NIC keeps). Linearise it into a
+                 * scratch frame so the stack still receives one contiguous
+                 * buffer -- a plain drop here would lose real traffic, e.g. a
+                 * 1500-byte segment that lands on the boundary. */
+                uint32_t first = RTL_RX_RING_SIZE - data_off;
+
+                if (data_len <= sizeof(g_wrap_buf) && first <= data_len) {
+                    memcpy(g_wrap_buf, g_rx_ring + data_off, first);
+                    memcpy(g_wrap_buf + first, g_rx_ring, data_len - first);
+                    fn(g_wrap_buf, data_len);
+                    g_frames_rx++;
+                    delivered++;
+                    g_rx_wraps++;
+                } else {
+                    g_rx_drops++;
+                }
             }
         } else {
             g_rx_drops++;                        /* RER / runt / bad CRC */
@@ -564,6 +617,14 @@ void st_rtl8139_test(void)
     if (pci_find_rtl8139(&bus, &dev, &fn) != 0) {
         console_printf("[selftest][rtl8139] no 10EC:8139 on the PCI bus "
                        "(add -device rtl8139,netdev=...)\n");
+        /* Diagnostics: report what the config-space scan actually reads, so a
+         * broken mechanism #1 is distinguishable from a missing device. */
+        for (uint32_t d = 0; d < 6u; d++) {
+            const uint32_t id = pci_cfg_read32(0, (uint8_t)d, 0, PCI_CFG_VENDOR_ID);
+            console_printf("[selftest][rtl8139]   probe 0:%u.0 -> vendor=0x%x device=0x%x\n",
+                           (uint64_t)d, (uint64_t)(id & 0xFFFFu),
+                           (uint64_t)((id >> 16) & 0xFFFFu));
+        }
         st_run("rtl8139", true);
         return;
     }

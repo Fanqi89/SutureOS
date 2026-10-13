@@ -167,6 +167,8 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
     st_moos_intr_test();
     st_mbos_kbd_test();
     st_mbos_pit_test();
+    extern void st_rtl8139_test(void);
+    st_rtl8139_test();
     st_moe_pmm_test();
     st_lemis_heap_test();
     st_sfox_slab_test();
@@ -341,6 +343,23 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
     extern void power_init(void);
     power_init();
     console_puts("[  OK  ] ACPI power management\n");
+
+    /* ==================== Network (RTL8139 + IPv4/ARP/ICMP/UDP) ============
+     * Polling mode on purpose: the IDT only has gates for 0-47 + 0x80 and the
+     * kernel runs the legacy PIC, so the driver's IRQ is not used; the shell's
+     * idle loop and net_ping() call net_poll() instead. net_selftest() pings the
+     * QEMU slirp gateway, which is the end-to-end proof that frames really
+     * leave and re-enter the guest. */
+    {
+        extern int net_init(void);
+        extern int net_selftest(void);
+        if (net_init() == 0) {
+            console_puts("[  OK  ] Network: IPv4/ARP/ICMP/UDP up (polling mode)\n");
+            net_selftest();
+        } else {
+            console_puts("[init] no RTL8139 (start QEMU with -device rtl8139,netdev=n0)\n");
+        }
+    }
 
     console_puts("\n[stitch] Phase-1 self-tests complete. Initializing scheduler...\n");
 

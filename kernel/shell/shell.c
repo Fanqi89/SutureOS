@@ -62,6 +62,8 @@ static const struct shell_cmd g_commands[] = {
     {"df",      shell_cmd_df,      "Show disk usage"},
     {"cpus",    shell_cmd_cpus,    "Show per-CPU state (jiffies, IPIs, work done)"},
     {"smptest", shell_cmd_smptest, "Queue work items and report which CPU ran them" },
+    {"ping",    shell_cmd_ping,    "Send ICMP echo requests: ping <ipv4>"},
+    {"netstat", shell_cmd_netstat, "Show network statistics"},
     {NULL, NULL, NULL}
 };
 
@@ -210,6 +212,14 @@ int shell_run(void) {
                  * This is what makes queued kernel work run even when only the
                  * BSP has anything to do. */
                 smp_drain_work_here(0);
+                /* Keep the NIC's RX ring drained while the shell is idle: the
+                 * driver runs in polling mode (no IRQ gate for it), so this is
+                 * what lets ARP/ICMP replies arrive during `ping`. */
+                {
+                    extern int net_ready(void);
+                    extern void net_poll(void);
+                    if (net_ready()) net_poll();
+                }
                 for (volatile int spin = 0; spin < 20000; spin++) {
                     __asm__ volatile("pause");
                 }
@@ -703,6 +713,51 @@ int shell_cmd_smptest(int argc, char **argv) {
     }
     extern void smp_work_selftest(uint32_t n);
     smp_work_selftest(n);
+    return 0;
+}
+
+/* ==================== Network commands (kernel/net, polling mode) ==================== */
+
+int shell_cmd_ping(int argc, char **argv) {
+    extern int net_ip_from_str(const char* s, uint32_t* out);
+    extern int net_ping(uint32_t ip, int timeout_ms, uint32_t* rtt_ticks);
+    extern uint32_t net_ping_us(uint32_t rtt_ticks);
+    extern int net_ready(void);
+
+    if (!net_ready()) {
+        shell_puts("ping: network is not up (no RTL8139 / net_init failed)\n");
+        return -1;
+    }
+    if (argc < 2) {
+        shell_puts("usage: ping <ipv4>      e.g. ping 10.0.2.2\n");
+        return -1;
+    }
+    uint32_t ip = 0;
+    if (net_ip_from_str(argv[1], &ip) != 0) {
+        shell_printf("ping: bad address '%s'\n", argv[1]);
+        return -1;
+    }
+
+    shell_printf("PING %s (ICMP echo, 3 probes)\n", argv[1]);
+    int replies = 0;
+    for (int i = 0; i < 3; i++) {
+        uint32_t rtt = 0;
+        if (net_ping(ip, 1000, &rtt) == 0) {
+            shell_printf("  64 bytes from %s: icmp_seq=%d time=%u us\n",
+                         argv[1], (unsigned)(i + 1), (unsigned)net_ping_us(rtt));
+            replies++;
+        } else {
+            shell_printf("  request timeout for icmp_seq=%d\n", (unsigned)(i + 1));
+        }
+    }
+    shell_printf("--- %s: %d/3 replies ---\n", argv[1], (unsigned)replies);
+    return replies ? 0 : -1;
+}
+
+int shell_cmd_netstat(int argc, char **argv) {
+    extern void net_dump_stats(void);
+    (void)argc; (void)argv;
+    net_dump_stats();
     return 0;
 }
 

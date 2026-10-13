@@ -218,7 +218,6 @@ static void hexdump(const char *tag, const uint8_t *f, uint32_t n)
     }
 }
 
-static uint16_t be16(uint16_t v) { return (uint16_t)((v << 8) | (v >> 8)); }
 static uint32_t be32(uint32_t v)
 {
     return ((v & 0xFFu) << 24) | ((v & 0xFF00u) << 8) |
@@ -439,9 +438,6 @@ static void udp_cb(uint32_t src, uint16_t sport, uint16_t dport,
                    const void *data, uint32_t len)
 {
     g_udp_cb_count++;
-    if (getenv("NET_HARNESS_DUMP"))
-        printf("  info : udp_cb fired #%u src=%08x sport=%u dport=%u len=%u\n",
-               g_udp_cb_count, src, sport, dport, len);
     g_udp_cb_src = src;
     g_udp_cb_sport = sport;
     g_udp_cb_dport = dport;
@@ -460,24 +456,6 @@ static void banner(const char *s) { printf("\n=== %s ===\n", s); }
  * value, which is how a real echo responder behaves (it copies the request's
  * id/sequence back verbatim). `id` and `seq` are written as wire bytes. */
 static uint32_t g_ping_seq;
-
-static uint32_t build_icon_echo_wire(uint8_t *out, uint32_t src, uint32_t dst,
-                                     uint16_t id, uint16_t seq)
-{
-    uint8_t icmp[512];
-    uint16_t c;
-    uint32_t i;
-    memset(icmp, 0, sizeof(icmp));
-    icmp[0] = 0;                                   /* echo reply */
-    icmp[1] = 0;
-    icmp[4] = (uint8_t)(id >> 8);   icmp[5] = (uint8_t)(id & 0xFFu);
-    icmp[6] = (uint8_t)(seq >> 8);  icmp[7] = (uint8_t)(seq & 0xFFu);
-    for (i = 0; i < 56u; i++)
-        icmp[8 + i] = (uint8_t)('a' + (i % 26u));
-    c = test_ip_checksum(icmp, 64);
-    memcpy(&icmp[2], &c, 2);                       /* native load/store, like the kernel */
-    return build_ip_frame(out, src, dst, 1, icmp, 64);
-}
 
 /* Teach the stack a peer MAC by injecting an ARP reply for it. Returns 0 when
  * the entry was cached. */
@@ -629,36 +607,11 @@ static void test_icmp_reply(void)
     net_stats_reset();
     n = build_icmp_echo(frame, 0x0A00020Fu, 0x0A00020Fu, 8, 0x1234, 0x0007,
                         payload, sizeof(payload));
-    if (getenv("NET_HARNESS_DUMP")) {
-        uint8_t z[20];
-        uint16_t ck;
-        printf("  info : built echo request len=%u\n", n);
-        printf("  hdr  : %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
-               frame[14],frame[15],frame[16],frame[17],frame[18],frame[19],frame[20],frame[21],
-               frame[22],frame[23],frame[24],frame[25],frame[26],frame[27],frame[28],frame[29],
-               frame[30],frame[31],frame[32],frame[33]);
-        memcpy(z, frame + 14, 20);
-        z[10] = 0; z[11] = 0;
-        ck = test_ip_checksum(z, 20);
-        printf("  want : zeroed-field checksum=0x%04x -> wire bytes %02x %02x\n",
-               ck, (uint8_t)(ck >> 8), (uint8_t)(ck & 0xFF));
-        printf("  field: %02x %02x | verify-after-store=0x%04x\n",
-               frame[24], frame[25], test_ip_checksum(frame + 14, 20));
-        hexdump("echo request in", frame, n);
-    }
     fake_rx_push(frame, n);
     net_poll();
 
     {
         int idx = fake_tx_find(0x0800);
-        if (getenv("NET_HARNESS_DUMP")) {
-            int k;
-            printf("  info : txq has %d frames after net_poll:\n", (int)g_txq_count);
-            for (k = 0; k < (int)g_txq_count; k++)
-                printf("         [%d] len=%u type=0x%02x%02x\n", k, g_txq[k].len,
-                       g_txq[k].data[12], g_txq[k].data[13]);
-            net_dump_stats();
-        }
         CHECK(idx >= 0, "echo request produced an IPv4 frame");
         if (idx >= 0) {
             const uint8_t *f = g_txq[idx].data;
@@ -666,13 +619,6 @@ static void test_icmp_reply(void)
             const uint8_t *oic = f + 34;
             if (getenv("NET_HARNESS_DUMP"))
                 hexdump("icmp reply", f, g_txq[idx].len);
-            printf("  info : txf[%d] len=%u ipfld=%02x%02x icmpfld=%02x%02x ipsum=%04x icmpsum=%04x\n",
-                   idx, g_txq[idx].len, oip[10], oip[11], oic[2], oic[3],
-                   test_ip_checksum(oip, 20), test_ip_checksum(oic, 8u + sizeof(payload)));
-            printf("  info : eth dst=%02x:%02x:%02x:%02x:%02x:%02x peer=%02x:%02x:%02x:%02x:%02x:%02x\n",
-                   f[0], f[1], f[2], f[3], f[4], f[5],
-                   g_fake_mac[0], g_fake_mac[1], g_fake_mac[2],
-                   g_fake_mac[3], g_fake_mac[4], g_fake_mac[5]);
             CHECK(oic[0] == 0, "  ICMP type == 0 (echo reply)");
             CHECK(oic[1] == 0, "  ICMP code == 0");
             CHECK(checksum_verifies(oic, 8u + sizeof(payload), 2),
@@ -868,15 +814,6 @@ static void test_udp(void)
             CHECK(wire16(oudp + 2) == 53, "  dest port 53");
             CHECK(wire16(oudp + 4) == ulen, "  udp length == 40");
             CHECK(wire16(oip + 2) == (uint16_t)(20u + ulen), "  ip total length == 60");
-            if (getenv("NET_HARNESS_DUMP")) {
-                uint8_t z[1600];
-                uint16_t want;
-                memcpy(z, oudp, ulen);
-                z[6] = 0; z[7] = 0;
-                want = test_udp_checksum(0x0A00020Fu, 0x0A000202u, z, ulen, 17);
-                printf("  info : udp stored=%02x%02x want=%04x (%02x %02x)\n",
-                       oudp[6], oudp[7], want, (uint8_t)(want >> 8), (uint8_t)(want & 0xFF));
-            }
             CHECK(udp_checksum_verifies(0x0A00020Fu, 0x0A000202u, oudp, ulen),
                   "  UDP pseudo-header checksum field verifies");
             CHECK(memcmp(oudp + 8, data, 32) == 0, "  payload byte-identical");
@@ -886,10 +823,9 @@ static void test_udp(void)
     /* --- RX: feed our own datagram back in and require delivery --- */
     fake_tx_reset();
     n = build_udp(frame, 0x0A000202u, 0x0A00020Fu, 53, 5555, 17, data, 32, 0);
+    g_udp_cb_count = 0;
     fake_rx_push(frame, n);
     net_poll();
-    printf("  info : after RX poll, cb_count=%u src=%08x sport=%u dport=%u len=%u\n",
-           g_udp_cb_count, g_udp_cb_src, g_udp_cb_sport, g_udp_cb_dport, g_udp_cb_len);
     CHECK(g_udp_cb_count == 1, "inbound UDP datagram reached the handler");
     CHECK(g_udp_cb_src == 0x0A000202u, "  src ip == 10.0.2.2");
     CHECK(g_udp_cb_sport == 53, "  src port == 53");

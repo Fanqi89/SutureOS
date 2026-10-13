@@ -779,16 +779,15 @@ static void udp_rx(const ipv4_header_t *ip, const uint8_t *payload,
         g_udp_drops++;
         return;
     }
-    /* The checksum field is carried in network order (see net_udp_send), while
-     * udp_checksum() returns a value in host order. A valid datagram makes the
-     * byte-pair sum over pseudo-header + datagram (checksum field included)
-     * equal 0xFFFF, i.e. its complement is 0 -- compare in the field's order. */
-    /* A present checksum must verify: with the transmitted field included the
-     * byte-pair sum over pseudo-header + datagram must be 0xFFFF, i.e. this
-     * complemented form must be zero. */
+    /* udp_checksum() folds the pseudo-header, the datagram AND the transmitted
+     * checksum field, and returns the complemented byte-pair sum. A valid
+     * datagram therefore evaluates to 0xFFFF (not 0): the field is written as
+     * `c` and re-reading it adds `c` back, leaving the carry-folded total at
+     * 0xFFFF, whose complement is 0 -- which udp_checksum() substitutes with
+     * 0xFFFF because 0 means "no checksum" on the wire. */
     if (udp->checksum != 0u) {
         uint32_t sum = udp_checksum(src, net_local_ip, payload, (uint32_t)ulen);
-        if (sum != 0u) {
+        if (sum != 0xFFFFu) {
             g_bad_checksum++;
             return;
         }

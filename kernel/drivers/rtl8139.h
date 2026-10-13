@@ -65,9 +65,11 @@ int rtl8139_receive(void (*fn)(const uint8_t *frame, uint32_t len));
 /* Last raw IntrStatus (0x3E) sample taken by rtl8139_receive(). */
 uint16_t rtl8139_last_isr(void);
 
-/* Number of frames dropped on RX (bad header, incoherent length, oversized,
- * or a ring wrap that could not be linearised). */
+/* Number of frames dropped on RX (bad header, incoherent length or oversized)
+ * and the number that wrapped the 8 KiB ring boundary and were linearised into
+ * scratch memory before delivery. */
 uint32_t rtl8139_rx_drops(void);
+uint32_t rtl8139_rx_wraps(void);
 
 /* Frame counters (incremented by the driver itself). */
 uint64_t rtl8139_tx_frames(void);
