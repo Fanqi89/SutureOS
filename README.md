@@ -151,6 +151,8 @@ This file lives on a real FAT32 volume (driver: fat32).
 
 宿主侧校验：`scripts/mkfat32_testimg.py` 自建 superfloppy FAT32 镜像（70544 簇、FAT1==FAT2、FSInfo 合法、根簇标记为 EOC）与真实 `.deb`（ar + control.tar.gz + data.tar.gz），并用独立解析器逐字节校验；只读启动（无写测试时）前后整盘 CRC32 一致。
 
+> **操作教训（踩过的坑）**：`-serial file:` 是带缓冲的，**强杀 QEMU 会丢掉日志尾部**——曾因此误判"AP 没起来/shell 没启动"。读日志前请用 QEMU monitor 发 `quit` 优雅退出（或用 `-serial stdio` 重定向），再用 `Get-Content` 读取。
+
 **写路径验收（`scripts/verify_fat32_write.py`）**：
 
 ```
