@@ -72,11 +72,12 @@ static bool g_boot_complete = false;
 /* ==================== Terminal Output Helpers ==================== */
 
 void shell_putc(char c) {
-    if (g_shell.fg_color != 0xFFFFFF || g_shell.bg_color != 0x000000) {
-        fbcon_putc(c);  /* Use framebuffer console with colors */
-    } else {
-        console_putc(c);  /* Fallback to serial console */
-    }
+    /* Always go through the console layer: it writes COM1 and drives whichever
+     * screen renderer owns the framebuffer (the flanterm terminal when it is
+     * up, fbcon otherwise). Calling fbcon_putc() directly here would paint with
+     * a second renderer behind the terminal's back whenever coloured output is
+     * requested, leaving stale glyphs on screen. */
+    console_putc(c);
 }
 
 void shell_puts(const char *s) {
@@ -114,9 +115,10 @@ void shell_init(void) {
     g_shell.bg_color = TERM_COLOR_BLACK;
     g_shell.running = true;
     strcpy(g_shell.prompt, "sutureos# ");
-    
-    /* Initialize framebuffer console with black/white colors */
-    fbcon_init(0, 0, 0, 0, 0);  /* Will be properly initialized by kmain */
+    /* NOTE: the screen is owned by the kernel terminal (flanterm) / fbcon,
+     * both initialised by kmain. A previous version called
+     * fbcon_init(0,0,0,0,0) here, which clobbered that state whenever the
+     * shell task started. */
 }
 
 void shell_add_history(const char *cmd) {
@@ -245,7 +247,13 @@ int shell_cmd_help(int argc, char **argv) {
 
 int shell_cmd_clear(int argc, char **argv) {
     (void)argc; (void)argv;
-    fbcon_clear();
+    /* Clear through whichever renderer owns the screen: fbcon_clear() would wipe
+     * the framebuffer behind flanterm's back while its grid still believes the
+     * old text is displayed, so the terminal would never repaint it. */
+    extern int term_available(void);
+    extern void term_clear(void);
+    if (term_available()) term_clear();
+    else fbcon_clear();
     return 0;
 }
 
@@ -300,8 +308,11 @@ int shell_cmd_startgui(int argc, char **argv) {
     ret = gui_run();
     
     /* If GUI exits or fails, return to terminal */
+    extern int term_available(void);
+    extern void term_clear(void);
+    if (term_available()) term_clear();
+    else fbcon_clear();
     shell_puts("GUI exited, returning to terminal\n");
-    fbcon_clear();
     shell_puts(g_shell.prompt);
     return ret;
 }

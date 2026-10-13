@@ -22,3 +22,4 @@ Thumbs.db
 # transient logs
 build_log.txt
 iso_log.txt
+commit_msg.txt

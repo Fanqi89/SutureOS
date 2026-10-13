@@ -65,8 +65,49 @@ uint64_t *mmu_walk(uint64_t *table, int level, uint64_t vaddr, int create)
     return mmu_walk(next_table, level + 1, vaddr, create);
 }
 
-/* 克隆内核页表到用户 TTBR0：仅提升 [base, base+len) 到 U/S=1 */
-int mmu_clone_for_el0(uint64_t kernel_pml4, uint64_t *out_user_pml4,
+/* 把物理区间按 2 MiB 页恒等映射进当前页表（用于 1 GiB 之外的开机恒等映射
+ * 覆盖不到的 MMIO/线性帧缓冲，例如 0xFD000000）。
+ * 注意：不能复用 mmu_walk()——那个函数总是递归到 PTE 级（level 3），
+ * 在 PD 级遇到空项时还会分配一张空 PT 顶掉 2 MiB 页映射。这里显式逐级下降。
+ * 返回 0 = 成功，-1 = 失败。 */
+static uint64_t *mmu_next_table(uint64_t *entry, int create)
+{
+    uint64_t pa = *entry & ~0xFFFULL;
+    if (pa) return (uint64_t *)(uintptr_t)pa;      /* 已存在（1:1 映射） */
+    if (!create) return NULL;
+    uint64_t *nt = mmu_alloc_page();
+    if (!nt) return NULL;
+    for (int i = 0; i < 512; i++) nt[i] = 0;
+    *entry = (uint64_t)(uintptr_t)nt | PTE_P | PTE_W;
+    return nt;
+}
+
+int mmu_map_mmio_identity(uint64_t phys, uint64_t bytes)
+{
+    if (bytes == 0) return -1;
+    uint64_t start = phys & ~0x1FFFFFULL;
+    uint64_t end   = (phys + bytes + 0x1FFFFFULL) & ~0x1FFFFFULL;
+
+    for (uint64_t a = start; a < end; a += 0x200000ULL) {
+        uint64_t *pml4 = (uint64_t *)(uintptr_t)read_cr3();
+        uint64_t *pdpt = mmu_next_table(&pml4[(a >> 39) & 0x1FF], 1);
+        if (!pdpt) return -1;
+        if (pdpt[(a >> 30) & 0x1FF] & PTE_PS) continue;  /* 1 GiB 页已覆盖 */
+        uint64_t *pd = mmu_next_table(&pdpt[(a >> 30) & 0x1FF], 1);
+        if (!pd) return -1;
+        uint64_t *pde = &pd[(a >> 21) & 0x1FF];
+        if (*pde & PTE_PS) continue;                     /* 已映射为 2 MiB 页 */
+        *pde = a | PTE_P | PTE_W | PTE_PS;
+    }
+
+    /* 刷新 TLB：重载 CR3 */
+    uint64_t cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    __asm__ volatile("mov %0, %%cr3" : : "r"(cr3) : "memory");
+    return 0;
+}
+
+/* 克隆内核页表到用户 TTBR0：仅提升 [base, base+len) 到 U/S=1 */int mmu_clone_for_el0(uint64_t kernel_pml4, uint64_t *out_user_pml4,
                       uint64_t base, uint64_t len)
 {
     uint64_t *user_pml4 = mmu_alloc_page();

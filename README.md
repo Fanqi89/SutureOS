@@ -88,8 +88,8 @@ SutureOS（缝合怪系统）是一个实验性的 x86_64 单内核操作系统�
 - ✅ **调度器**: EEVDF（红黑树按 deadline 选实体）+ 协作式轮转；`sched_eevdf_start()` 现在会把没有实体的 RUNNABLE 任务自动入队
 - ✅ **中断/异常**: IDT 256 门（0-47 + 0x80）、ISR、PIC 重映射、LAPIC（基址已真正赋值 + MMIO 已映射）、HPET(回退 PIT)、串口
 - ✅ **SMP**: AP 启动闭环 —— trampoline 拷贝到 0x8000、INIT-SIPI-SIPI、AP 进入 C 入口并 LAPIC 上线；QEMU `-smp 2` 实测 `[SMP] AP 1 online (lapic=1)`、`online=2/2`
-- 🟡 **驱动**: 帧缓冲/字体/PS2 键盘（轮询式，无 IRQ 环形缓冲）/PIT/串口 ✅；ATA PIO ✅（读已验证，写有缺陷见下）；NVMe/AHCI/VirtIO-blk ❌ 桩；RTL8139/e1000 ❌ 桩
-- 🟡 **GUI**: 主循环/合成/脏矩形/键盘事件已从 VimtuOS gui64 移植成真实实现，但 BIOS 模式下没有帧缓冲（`limine_fb_addr=0`），仅在 UEFI/有 fb 时可实测；鼠标 ❌（无驱动）
+- 🟡 **驱动**: 帧缓冲/字体/PS2 键盘（轮询式，无 IRQ 环形缓冲）/PIT/串口 ✅；ATA PIO ✅（读写在宿主侧均已验收）；NVMe/AHCI/VirtIO-blk ❌ 桩；RTL8139/e1000 ❌ 桩
+- ✅ **显示与终端**: 开机向固件请求 1024x768x32 线性帧缓冲（multiboot1 头 flag bit 2 + 运行时 `mmu_map_mmio_identity` 把 1 GiB 以外的 LFB 映射进来，实测 `[fb] ready: 1024x768 32 bpp pitch=4096 at 0xfd000000`）；屏幕默认是**黑底白字的终端**（见下节），GUI 需在终端里输入 `startgui` 才进入
 
 ### Phase 3: 文件系统
 - ✅ **统一 VFS 核心**: 驱动注册、挂载表、fd 表、目录游标、`vfs_read_file/vfs_write_file/vfs_mkdir_p/vfs_list_mounts`、seek 修复
@@ -153,6 +153,21 @@ This file lives on a real FAT32 volume (driver: fat32).
 
 > **操作教训（踩过的坑）**：`-serial file:` 是带缓冲的，**强杀 QEMU 会丢掉日志尾部**——曾因此误判"AP 没起来/shell 没启动"。读日志前请用 QEMU monitor 发 `quit` 优雅退出（或用 `-serial stdio` 重定向），再用 `Get-Content` 读取。
 
+**终端 / 电源路径验收（QEMU `-vga std`，monitor `screendump` 截图后量化）**：
+
+```
+[term] selftest: 25 px visible at cell(0,0) (expect 25)     <- 渲染通路自检（画 H，数 25 个白像素）
+[term] flanterm arena 316 KiB of 1024 KiB used
+[term] flanterm ready 113x48 on 1024x768@32bpp
+[stitch] selftests: 12/13 passed
+[fat32] write self-test PASS (SUTURE.TXT, 32 bytes)
+[SMP] AP 1 online (lapic=1) / online=2/2
+```
+- 截屏量化：1024x768 画面里 **493 行有内容**、约 3 万个白色像素；目视为黑底白字的完整英文启动日志 + `sutureos#` 提示符 + 光标块（修复前：整屏只有 10 个 `[` 字形）。
+- 关机：`shutdown` → `[power] ACPI S5: outw(0x604, 0x3400)` → monitor 报告 **`VM status: paused (shutdown)`**。
+- 重启：`reboot` → `[     ] Trying chipset reset port 0xCF9` → 串口日志出现**第二次完整启动**（boot marker 计数 1 → 2）。
+- 宿主侧 FAT32 写验收在同一版本上复跑：`checks=10 ok=10 fail=0`。
+
 **写路径验收（`scripts/verify_fat32_write.py`）**：
 
 ```
@@ -177,8 +192,10 @@ This file lives on a real FAT32 volume (driver: fat32).
 2. **两套调度器并存**：`task.c` 的协作轮转与 `eevdf.c` 的 EEVDF 双轨运行，任务内调用 `sched_yield()` 会切到 EEVDF 循环的陈旧上下文（实测表现为跳到 0x3）。Shell 输入循环因此改为有界 pause 自旋，未再暴露；根治需要合并调度器。
 3. **`context.kgs_base` 被两用**：`cinux_context_switch` 把它写进 MSR_GS_BASE，而 EEVDF 用同一字段存放 `sched_entity*`；建议为实体指针另设字段。
 4. **IDT 未铺满**：仅 0-47 与 0x80 有门，IPI 向量 0xE0/0xE1 与 LAPIC 假中断向量 0xFF 仍是 not-present（会 #GP）；AP 目前只 `sti; hlt` 空转，未接入调度。
-5. **无帧缓冲（BIOS 模式）**：GUI 主循环已实现但当前启动路径 `limine_fb_addr=0`，无法可视化验证；fbcon 软光标仍由定时器闪烁。
-6. **键盘无 IRQ**：只轮询 8042 单字节缓冲，快速输入丢键。
+5. **（已修复）帧缓冲曾长期不可用**：原因是 (a) `boot.S` 的 multiboot1 视频字段写在了偏移 12..27，而规范要求放在跳过的 a.out kludge 区之后（32/36/40/44），固件因此读到"0x0 分辨率"只给 VGA 文本模式；(b) `limine.c` 把 multiboot1 的 MBI 当 Limine tag 流解析，永远得到 0；(c) 线性帧缓冲位于 1 GiB 以上（0xFD000000），开机恒等映射覆盖不到。三点均已修复（正确的头字段 + 规范解析 + `mmu_map_mmio_identity`），实测 `1024x768 32 bpp pitch=4096`。
+6. **键盘无 IRQ**：只轮询 8042 单字节缓冲，快速输入丢键（自动化测试请把按键间隔设为 ≥400 ms）。
+7. **flanterm 上游缺陷（已在本仓库标注修复）**：`canvas == NULL` 时使用的 `plot_char_*_uncanvas()` 把默认**前景色**也取成 `default_bg`，导致未指定 SGR 的普通文本是黑底黑字。已在 `fb.c` 两处修正并加 `SutureOS fix` 注释（BSD-2 允许修改，许可证头保持原样）。
+8. **（已修复，影响面最大的一个）PMM 把自己的页标志数组分配了出去**：`moe_pmm_init()` 用区域开头 1 字节/页 存标志，而 `moe_pmm_alloc()` 从第 0 页开始扫描——于是 `kmain` 的 `moe_pmm_alloc(2048)` 把**标志数组本身**当成了内核堆（8 MiB 堆 == 标志数组），此后每次分配/释放都把 `0x01/0x00` 写进活堆：堆头、flanterm 上下文（`text_fg` 被写成 `0x00000001` → 文字不可见、只剩残留光标块）、以及之后分配的 AP/任务栈。已修：`moe_pmm_init()` 把标志占用的页标记为 `TAKEN` 并从空闲计数里扣除，自检也改成断言"标志页绝不出借"（防回归）。同类症状的"AP 栈落进内核镜像"一并消失。
 
 ---
 

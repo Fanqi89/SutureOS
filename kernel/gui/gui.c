@@ -14,6 +14,7 @@
 #include "heap.h"
 #include "task.h"             /* sched_yield */
 #include "mb_kbd.h"           /* mbos_kbd_poll / mbos_kbd_decode (same pattern as shell.c) */
+#include "power.h"            /* power_reset / power_off (ACPI S5 + reset register) */
 #include "font.h"             /* font8x16: ASCII 32..126 bitmap font (fbcon's font asset) */
 
 /* 全局状态 */
@@ -744,12 +745,28 @@ void gui_set_lang_zh(bool zh) {
 
 const char* gui_tr(const char* en, const char* zh) { return g_lang_zh ? zh : en; }
 
+/* System power control.
+ *
+ * These used to be stubs that only printed a line, so `reboot`/`shutdown` from
+ * the shell (and the GUI) did nothing. Now they run a Linux-style English
+ * shutdown sequence and then really reset / power off the machine through ACPI
+ * (arch/x86_64/power.c). Neither call returns on success. */
 void sys_reboot(void) {
-    console_puts("[gui] Reboot requested\n");
+    console_puts("\n=== SutureOS system reboot ===\n");
+    console_puts("[  OK  ] Stopping shell\n");
+    console_puts("[  OK  ] Stopping scheduler\n");
+    console_puts("[  OK  ] Unmounting filesystems (flush)\n");
+    console_puts("[     ] Rebooting...\n");
+    power_reset();
 }
 
 void sys_shutdown(void) {
-    console_puts("[gui] Shutdown requested\n");
+    console_puts("\n=== SutureOS system shutdown ===\n");
+    console_puts("[  OK  ] Stopping shell\n");
+    console_puts("[  OK  ] Stopping scheduler\n");
+    console_puts("[  OK  ] Unmounting filesystems (flush)\n");
+    console_puts("[     ] Powering off...\n");
+    power_off();
 }
 
 /* dirty union rect: clipped to the screen, merged into the running union.

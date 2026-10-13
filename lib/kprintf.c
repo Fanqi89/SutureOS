@@ -1,9 +1,12 @@
 /* SutureOS (缝合怪系统) - minimal kernel printf
  * Uses compiler builtins only (no libc, no headers).
  * Formatting approach kept deliberately small: %s %c %d %u %x %p %%.
+ *
+ * Output goes through console_putc(), which fans out to COM1 and to the
+ * on-screen terminal (flanterm) or fbcon - so every kernel log line is both
+ * capturable over serial and visible on the black/white console.
  */
 #include <stitch/console.h>
-#include "../../kernel/drivers/fbcon.h"
 
 typedef __builtin_va_list va_list;
 #define va_start(v, l) __builtin_va_start(v, l)
@@ -22,7 +25,7 @@ static void print_unsigned(uint64_t v, unsigned base, int width, char pad)
     while (i < width && i < (int)sizeof(buf))
         buf[i++] = pad;
     while (i--)
-        fbcon_putc(buf[i]);
+        console_putc(buf[i]);
 }
 
 void console_printf(const char *fmt, ...)
@@ -32,7 +35,7 @@ void console_printf(const char *fmt, ...)
 
     for (; *fmt; fmt++) {
         if (*fmt != '%') {
-            fbcon_putc(*fmt);
+            console_putc(*fmt);
             continue;
         }
         fmt++;
@@ -50,15 +53,15 @@ void console_printf(const char *fmt, ...)
         case 's': {
             const char *s = va_arg(ap, const char *);
             if (!s) s = "(null)";
-            while (*s) fbcon_putc(*s++);
+            while (*s) console_putc(*s++);
             break;
         }
         case 'c':
-            fbcon_putc((char)va_arg(ap, int));
+            console_putc((char)va_arg(ap, int));
             break;
         case 'd': {
             int64_t v = va_arg(ap, int64_t);   /* callers must pass int64_t/uint64_t */
-            if (v < 0) { fbcon_putc('-'); v = -v; }
+            if (v < 0) { console_putc('-'); v = -v; }
             print_unsigned((uint64_t)v, 10, width, pad);
             break;
         }
@@ -69,15 +72,16 @@ void console_printf(const char *fmt, ...)
             print_unsigned((uint64_t)va_arg(ap, uint64_t), 16, width, pad);
             break;
         case 'p':
-            fbcon_puts("0x");
+            console_putc('0');
+            console_putc('x');
             print_unsigned((uint64_t)va_arg(ap, uint64_t), 16, 16, '0');
             break;
         case '%':
-            fbcon_putc('%');
+            console_putc('%');
             break;
         default:
-            fbcon_putc('%');
-            fbcon_putc(*fmt);
+            console_putc('%');
+            console_putc(*fmt);
             break;
         }
     }

@@ -38,6 +38,11 @@ static inline uint64_t read_cr3(void) {
 uint64_t *mmu_walk(uint64_t *table, int level, uint64_t vaddr, int create);
 void *loader_alloc_page(void);
 
+/* Map [phys, phys+bytes) at the SAME virtual addresses using 2 MiB pages.
+ * Needed for MMIO/framebuffer windows outside the boot identity map (e.g. a
+ * linear framebuffer at 0xFD000000). Returns 0 on success, -1 on failure. */
+int mmu_map_mmio_identity(uint64_t phys, uint64_t bytes);
+
 /* COW 支持 */
 void mmu_mark_cow(uint64_t *pte);
 bool mmu_is_cow(uint64_t pte);

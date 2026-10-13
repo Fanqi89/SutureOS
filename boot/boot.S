@@ -16,8 +16,23 @@
 .section .multiboot, "a"
 .align 4
 .long 0x1BADB002                        /* magic */
-.long 0x00000003                        /* flags: page-align modules + memory map */
-.long -(0x1BADB002 + 0x00000003)        /* checksum */
+.long 0x00000007                        /* flags: align modules | memory map | VIDEO MODE */
+.long -(0x1BADB002 + 0x00000007)        /* checksum */
+/* Multiboot1 header layout (spec order): the a.out kludge fields follow the
+ * checksum (offsets 12..31, unused because flag bit 16 is clear) and the
+ * VIDEO MODE fields come AFTER them at offsets 32/36/40/44. Putting the video
+ * fields at 12..27 makes a spec-compliant loader read mode_type/width/height/
+ * depth as 0, silently leaving the machine in VGA text mode - which is exactly
+ * why the framebuffer used to be an 80x25 text buffer at 0xB8000. */
+.long 0                                 /* header_addr  \                                */
+.long 0                                 /* load_addr     | a.out kludge (unused)         */
+.long 0                                 /* load_end_addr | flag bit 16 is clear          */
+.long 0                                 /* bss_end_addr  |                               */
+.long 0                                 /* entry_addr   /                                */
+.long 0                                 /* mode_type: 0 = linear graphics framebuffer    */
+.long 1024                              /* width  */
+.long 768                               /* height */
+.long 32                                /* depth (bpp) */
 
 /* ---------------- Static storage (page tables, stack) ---------------- */
 .section .bss

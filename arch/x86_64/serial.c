@@ -34,13 +34,35 @@ void console_init(void)
     outb(REG_MCR, MCR_DTR_RTS);
 }
 
+/* SutureOS console sink.
+ *
+ * Every character goes to COM1 (so automated boots always have a complete
+ * log) AND to the screen: the framebuffer terminal (flanterm, black background
+ * with white text) when it is available, otherwise the simple fbcon text
+ * renderer. This is what makes the boot log and the shell visible on screen
+ * like a Linux console while still being capturable over the serial line. */
 void console_putc(char c)
 {
+    /* serial first: never lose a line because of a screen problem */
     if (c == '\n')
         console_putc('\r');
     while (!(inb(REG_LSR) & LSR_THRE))
         ;
     outb(REG_DATA, (uint8_t)c);
+
+    /* screen second: flanterm is fed character by character but flushed once
+     * per line (it batches internally and per-character flushes mislay text). */
+    extern int term_available(void);
+    extern void term_putc(char c);
+    extern void term_refresh(void);
+    extern void fbcon_putc(char c);
+    if (term_available()) {
+        term_putc(c);
+        if (c == '\n')
+            term_refresh();
+    } else {
+        fbcon_putc(c);
+    }
 }
 
 void console_puts(const char *s)

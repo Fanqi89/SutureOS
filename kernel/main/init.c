@@ -44,7 +44,12 @@ void kernel_timer_tick_c(void)
     g_need_resched = true;
     
     /* Update framebuffer console cursor blink */
-    fbcon_timer_tick();
+    /* fbcon's blinking cursor must not paint onto a screen the terminal owns. */
+    {
+        extern int term_available(void);
+        if (!term_available())
+            fbcon_timer_tick();
+    }
     
     /* Send EOI to PIC master */
     __asm__ volatile("outb %%al, %w0" : : "Nd"(0x20) : "al");

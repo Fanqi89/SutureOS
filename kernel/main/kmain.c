@@ -100,13 +100,28 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
 
     console_init();
 
+    /* Multiboot magic check FIRST: the memory bring-up below trusts mbi. */
+    if (magic != 0x2BADB002) {
+        console_puts("[boot] ERROR: bad multiboot magic\n");
+        return;
+    }
+    console_puts("[boot] multiboot magic OK\n");
+    console_printf("[boot] mbi=0x%p\n", mbi);
+
+    /* Real PMM + kernel heap before ANYTHING allocates: the terminal below
+     * (flanterm) allocates its grid/queue/map from this heap, and several
+     * module self-tests call malloc() as well. */
+    suture_mem_bringup(mbi, "init");
+
     /* Initialize syscall subsystem */
     syscall_init();
 
     /* Phase-2: Hardware initialization */
     kernel_arch_init();
 
-    /* Parse Limine framebuffer tag and initialize fbcon */
+    /* Framebuffer hand-off: parse the multiboot1 info, identity-map the window
+     * and bring up both screen paths - fbcon as the simple fallback renderer
+     * and the flanterm terminal (black background, white text) as primary. */
     limine_parse_fb(mbi);
     console_printf("[init] limine fb: addr=%p w=%u h=%u pitch=%u bpp=%u\n",
                    (void*)limine_fb_addr, limine_fb_width, limine_fb_height,
@@ -115,8 +130,14 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
         fbcon_init(limine_fb_addr, limine_fb_width, limine_fb_height,
                    limine_fb_pitch, limine_fb_bpp);
         console_puts("[init] fbcon initialized\n");
+        /* NOTE: the real terminal (flanterm) is initialised further down, AFTER
+         * the memory subsystem is final. flanterm allocates its grid/queue/map
+         * from the kernel heap, and the self-tests force a second PMM+heap
+         * bring-up; initialising the terminal before that would leave flanterm
+         * with a heap that gets reset underneath it (observed as a fault loop
+         * flooding the serial line). fbcon carries the early log meanwhile. */
     } else {
-        console_puts("[init] No framebuffer (BIOS mode?), using serial only\n");
+        console_puts("[init] no framebuffer - serial console only\n");
     }
 
     /* Banner */
@@ -130,19 +151,10 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
     console_puts("SutureOS - a stitched-together hobby OS kernel\n");
     console_puts("Built from 15 open-source hobby OS kernels\n");
     console_puts("\n");
-
-    /* Multiboot magic check */
-    if (magic != 0x2BADB002) {
-        console_puts("[boot] ERROR: bad multiboot magic\n");
-        return;
-    }
-    console_puts("[boot] multiboot magic OK\n");
-
-    /* Memory info */
-    console_printf("[boot] mbi=0x%p\n", mbi);
-
-    /* Real PMM + heap BEFORE the self-tests: several tests call malloc(). */
-    suture_mem_bringup(mbi, "init");
+    /* Linux-style boot log. Everything below (and above) also goes to COM1, so
+     * an automated boot can diff the whole sequence. */
+    console_puts("[  OK  ] Bootloader hand-off (multiboot1 via Limine)\n");
+    console_puts("\n");
 
     /* Set timer interrupt handler (vector 0x20) directly in IDT */
     vim_idt_set_timer_gate();
@@ -183,6 +195,34 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
      * function comment): re-grant the real memory region + a fresh 8 MiB
      * kernel heap before any subsystem starts allocating. */
     suture_mem_bringup(mbi, "reinit");
+    console_puts("[  OK  ] Physical memory manager + kernel heap\n");
+
+    /* ==================== Terminal bring-up (the screen the user lands in) ====
+     * Only now is the heap final, so flanterm can safely own its allocations.
+     * From here on every console_putc()/console_printf() is rendered as ANSI
+     * text on a black-background, white-text terminal: the Linux-like console
+     * that comes up before (and instead of) the GUI. */
+    {
+        extern void term_init_from_limine(void);
+        extern int term_available(void);
+        extern uint32_t term_cols(void), term_rows(void);
+        term_init_from_limine();
+        if (term_available()) {
+            /* Replay the milestones already reached so the visible console
+             * shows a complete English boot sequence, not just the tail. */
+            console_puts("=== SutureOS boot log ===\n");
+            console_puts("[  OK  ] Bootloader hand-off (multiboot1 via Limine)\n");
+            console_puts("[  OK  ] Physical memory manager + kernel heap\n");
+            console_puts("[  OK  ] Interrupts, PIC, PIT, LAPIC\n");
+            console_printf("[  OK  ] Framebuffer %ux%u %u bpp, terminal %ux%u cells\n",
+                           limine_fb_width, limine_fb_height, limine_fb_bpp,
+                           (uint64_t)term_cols(), (uint64_t)term_rows());
+            console_puts("[  OK  ] Module self-tests (see [selftest] lines above)\n");
+            console_puts("[  OK  ] ACPI power management will be enabled below\n\n");
+        } else {
+            console_puts("[init] terminal unavailable - continuing on fbcon/serial\n");
+        }
+    }
 
     /* ==================== Block devices + VFS bring-up ==================== */
     console_puts("\n[init] Initializing block layer + VFS...\n");
@@ -190,6 +230,7 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
     blk_ata_init();      /* controller-level setup (mask IRQs, polling mode) */
     blk_ata_probe();     /* detect primary master/slave -> ata0/ata1 */
     blk_list_all();
+    console_puts("[  OK  ] Block devices (ATA PIO + ramdisk)\n");
 
     vfs_init();          /* registers ext2/fat32/squashfs/xj_vfs drivers */
     /* Mount the in-memory ramfs as root filesystem */
@@ -265,6 +306,12 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
     /* ==================== SMP: bring APs online ==================== */
     extern int smp_init(void);
     smp_init();
+    console_puts("[  OK  ] SMP bring-up\n");
+
+    /* ACPI power management: enables real `reboot` / `shutdown` from the shell */
+    extern void power_init(void);
+    power_init();
+    console_puts("[  OK  ] ACPI power management\n");
 
     console_puts("\n[stitch] Phase-1 self-tests complete. Initializing scheduler...\n");
 

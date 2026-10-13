@@ -38,8 +38,21 @@ void moe_pmm_init(uintptr_t start, uintptr_t end) {
     pmm_num_pages  = np;
     pmm_start      = start;
     pmm_flags      = (uint8_t *)start;
-    pmm_free_count = np;
     memset(pmm_flags, 0, np);
+
+    /* CRITICAL: the flag array itself occupies the first ceil(np/4096) pages of
+     * the region, and moe_pmm_alloc() hands out pages starting at index 0.
+     * Without this reservation the very first allocation (the kernel heap in
+     * kmain: lemis_heap_init(moe_pmm_alloc(2048), 8 MiB)) returns the flag
+     * array itself, so every later alloc/free writes 0x01/0x00 flag bytes
+     * straight into the live heap - corrupting the heap header, flanterm's
+     * context (invisible text: text_fg became 0x00000001) and any AP/task
+     * stack allocated afterwards. Mark the flag pages as taken and do not
+     * count them as free. */
+    uint64_t flag_pages = (np + PAGE_SIZE - 1) / PAGE_SIZE;
+    for (uint64_t i = 0; i < flag_pages && i < np; i++)
+        pmm_flags[i] = PMM_FLAG_TAKEN;
+    pmm_free_count = (np > flag_pages) ? (np - flag_pages) : 0;
 }
 
 uintptr_t moe_pmm_alloc(uint32_t n) {
@@ -100,20 +113,32 @@ void st_moe_pmm_test(void) {
     moe_pmm_init((uintptr_t)arena, (uintptr_t)arena + sizeof(arena));
     if (pmm_num_pages != 23) pass = false;
 
-    /* alloc 3 pages -> contiguous, flags set. */
+    /* The flag array lives at the start of the region, i.e. inside its first
+     * page, so that page must be reserved and never handed out. This is a
+     * regression test for the bug where moe_pmm_alloc(2048) returned the flag
+     * array itself and the kernel heap ended up overlapping it. */
+    uint64_t flag_pages = (23 + 4095) / 4096;
+    if (pmm_free_count != 23 - flag_pages) pass = false;
+    if (!(pmm_flags[0] & PMM_FLAG_TAKEN)) pass = false;
+
+    /* alloc 3 pages -> contiguous, starts after the reserved flag page(s). */
     uintptr_t a = moe_pmm_alloc(3);
-    if (a == 0 || pmm_free_count != 20) pass = false;
-    if (pmm_flags[0] != (PMM_FLAG_TAKEN) || pmm_flags[1] != PMM_FLAG_TAKEN ||
-        pmm_flags[2] != (PMM_FLAG_TAKEN | PMM_FLAG_LAST)) pass = false;
+    if (a == 0 || a != (uintptr_t)arena + flag_pages * 4096) pass = false;
+    if (pmm_free_count != 23 - flag_pages - 3) pass = false;
+    if (pmm_flags[flag_pages] != PMM_FLAG_TAKEN ||
+        pmm_flags[flag_pages + 1] != PMM_FLAG_TAKEN ||
+        pmm_flags[flag_pages + 2] != (PMM_FLAG_TAKEN | PMM_FLAG_LAST)) pass = false;
 
     /* alloc 1 page -> next free. */
     uintptr_t b = moe_pmm_alloc(1);
     if (b != a + 3 * 4096) pass = false;
 
-    /* free the 3-page run. */
+    /* free the 3-page run (the single page allocated as `b` is still held). */
     moe_pmm_free(a, 3);
-    if (pmm_free_count != 22) pass = false;
-    if (pmm_flags[0] || pmm_flags[1] || pmm_flags[2]) pass = false;
+    if (pmm_free_count != 23 - flag_pages - 1) pass = false;
+    if (pmm_flags[flag_pages] || pmm_flags[flag_pages + 1] ||
+        pmm_flags[flag_pages + 2]) pass = false;
+    if (!(pmm_flags[0] & PMM_FLAG_TAKEN)) pass = false;   /* still reserved */
 
     /* alloc 2 pages -> reuses the freed run. */
     uintptr_t c = moe_pmm_alloc(2);
