@@ -101,6 +101,18 @@ int blk_register(struct blk_device* dev) {
     /* 幂等保护：同一设备重复注册直接返回，避免链表成环 */
     if (blk_find_by_drive(dev->drive) == dev) return 0;
 
+    /* 驱动器号冲突告警：blk_find_by_drive() 只返回最后注册的那个，另一个会
+     * 变成"幽灵设备"（能被 ls 列出来但读不到），mount 失败时报的错也毫无线索。
+     * 全树分配表见 block.h；这里只告警不拒绝，避免把历史行为变成硬失败。 */
+    {
+        struct blk_device* clash = blk_find_by_drive(dev->drive);
+        if (clash)
+            console_printf("[blk] WARNING: drive %d already taken by '%s', "
+                           "'%s' shadows it (see the drive map in block.h)\n",
+                           dev->drive, clash->name ? clash->name : "?",
+                           dev->name ? dev->name : "?");
+    }
+
     dev->next = g_blk_devices;
     g_blk_devices = dev;
     
