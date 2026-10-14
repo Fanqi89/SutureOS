@@ -7,7 +7,8 @@
  *
  * Scope (honest): superfloppy volumes only (BPB at device LBA 0 - no MBR
  * partition scan). 8.3 names, no LFN. Writable: create/write/truncate/
- * mkdir/rmdir/unlink/sync; rename is not implemented (returns error).
+ * mkdir/rmdir/unlink/sync and same-directory rename (name-field rewrite;
+ * cross-directory move is refused with a log).
  */
 #ifndef STITCH_FATFS_H
 #define STITCH_FATFS_H
@@ -32,6 +33,7 @@ typedef enum fatfs_err {
     FATFS_ENOTEMPTY    = -8,
     FATFS_EBUSY        = -9,
     FATFS_ENAMETOOLONG = -10,
+    FATFS_EEXIST       = -11,  /* rename target already present */
 } fatfs_err_t;
 
 /* Volume lifecycle */
@@ -59,6 +61,9 @@ int fatfs_stat(const char *path, uint32_t *size, int *is_dir);
 int fatfs_mkdir(const char *path);
 int fatfs_rmdir(const char *path);
 int fatfs_unlink(const char *path);
+/* Rename within one directory (8.3). FATFS_EEXIST when the target exists,
+ * FATFS_EINVAL for a cross-directory move or the root. */
+int fatfs_rename(const char *old_path, const char *new_path);
 int fatfs_sync(void);
 int fatfs_get_free_space(uint64_t *free_bytes, uint64_t *total_bytes);
 

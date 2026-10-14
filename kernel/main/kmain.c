@@ -378,6 +378,56 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
             vfs_sync("/mnt/fat");
             console_printf("[fat32] write self-test %s (SUTURE.TXT, %u bytes)\n",
                            ok ? "PASS" : "FAIL", (uint64_t)wlen);
+
+            /* Directory + rename + unlink self-test, on the same marker-gated
+             * test volume (a real disk is never modified).
+             * Final on-disk state: SUTURE.TXT and RENAMED.TXT exist, while
+             * SUTDIR/, TMPFILE.TXT and DELME.TXT are gone -- the host-side
+             * verifier checks exactly that, byte-for-byte, in the image. */
+            {
+                static const char rpayload[] = "SutureOS rename/unlink test\n";
+                uint32_t rlen = (uint32_t)sizeof(rpayload);
+                int ops = 0;
+                vfs_stat_t st;
+                int r_mk, r_st1, r_rm, r_st2, r_wr, r_rn, r_st3, r_st4, r_wr2, r_un, r_st5;
+
+                r_mk  = vfs_mkdir("/mnt/fat/SUTDIR", 0);
+                r_st1 = vfs_stat("/mnt/fat/SUTDIR", &st);
+                r_rm  = vfs_rmdir("/mnt/fat/SUTDIR");
+                r_st2 = vfs_stat("/mnt/fat/SUTDIR", &st);
+                if (r_mk == VFS_OK && r_st1 == VFS_OK && r_rm == VFS_OK && r_st2 != VFS_OK)
+                    ops++;
+                else
+                    console_printf("[fat32] ops: mkdir=%d stat=%d rmdir=%d stat_after=%d\n",
+                                   (int64_t)r_mk, (int64_t)r_st1, (int64_t)r_rm, (int64_t)r_st2);
+
+                r_wr  = vfs_write_file("/mnt/fat/TMPFILE.TXT", rpayload, rlen);
+                r_rn  = vfs_rename("/mnt/fat/TMPFILE.TXT", "/mnt/fat/RENAMED.TXT");
+                r_st3 = vfs_stat("/mnt/fat/TMPFILE.TXT", &st);
+                r_st4 = vfs_stat("/mnt/fat/RENAMED.TXT", &st);
+                if (r_wr == VFS_OK && r_rn == VFS_OK && r_st3 != VFS_OK &&
+                    r_st4 == VFS_OK && st.size == rlen)
+                    ops++;
+                else
+                    console_printf("[fat32] ops: write=%d rename=%d old_stat=%d new_stat=%d "
+                                   "size=%u want=%u\n",
+                                   (int64_t)r_wr, (int64_t)r_rn, (int64_t)r_st3,
+                                   (int64_t)r_st4, (uint64_t)st.size, (uint64_t)rlen);
+
+                r_wr2 = vfs_write_file("/mnt/fat/DELME.TXT", "x", 2);
+                r_un  = vfs_unlink("/mnt/fat/DELME.TXT");
+                r_st5 = vfs_stat("/mnt/fat/DELME.TXT", &st);
+                if (r_wr2 == VFS_OK && r_un == VFS_OK && r_st5 != VFS_OK)
+                    ops++;
+                else
+                    console_printf("[fat32] ops: write=%d unlink=%d stat_after=%d\n",
+                                   (int64_t)r_wr2, (int64_t)r_un, (int64_t)r_st5);
+
+                vfs_sync("/mnt/fat");
+                console_printf("[fat32] ops self-test %s "
+                               "(mkdir/rmdir, rename, unlink: %d/3)\n",
+                               ops == 3 ? "PASS" : "FAIL", (int64_t)ops);
+            }
         }
     }
 

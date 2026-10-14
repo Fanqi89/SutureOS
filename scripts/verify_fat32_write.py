@@ -10,7 +10,10 @@ requires, without trusting anything the guest printed:
   3. FAT1 == FAT2 and the root cluster is still marked allocated,
   4. the FSInfo free count equals the measured free-cluster count,
   5. the whole-image CRC32 changed versus the pristine image (a write really
-     reached the medium).
+     reached the medium),
+  6. the directory/rename/unlink self-test left exactly the expected state:
+     SUTDIR/ and DELME.TXT gone, TMPFILE.TXT renamed to RENAMED.TXT with its
+     bytes intact, and no orphaned cluster chains anywhere in the FAT.
 
 Usage:
   py -3 scripts/verify_fat32_write.py <dirty.img> [pristine.img]
@@ -134,6 +137,39 @@ def main():
     check("FSInfo free count == measured free clusters",
           v["fsinfo_free"] == v["free_measured"],
           f"fsinfo={v['fsinfo_free']} measured={v['free_measured']}")
+
+    # 5) mkdir/rmdir + rename + unlink (the ops self-test in kmain). The guest's
+    # final on-disk state must be exactly: SUTDIR/ removed, DELME.TXT removed,
+    # TMPFILE.TXT renamed to RENAMED.TXT with its bytes intact.
+    RENAME_PAYLOAD = b"SutureOS rename/unlink test\n\x00"   # sizeof() includes the NUL
+    check("TMPFILE.TXT is gone after the rename", "TMPFILE.TXT" not in v["entries"])
+    if "RENAMED.TXT" in v["entries"]:
+        rfirst, rsize = v["entries"]["RENAMED.TXT"]
+        rdata = v["read_chain"](rfirst, rsize)
+        check("RENAMED.TXT exists with the pre-rename size",
+              rsize == len(RENAME_PAYLOAD), f"size={rsize}")
+        check("RENAMED.TXT content survived the rename byte-for-byte",
+              rdata == RENAME_PAYLOAD, repr(rdata[:48]))
+        check("RENAMED.TXT is a real file, not the root directory",
+              rfirst != v["rootclus"], f"first={rfirst}")
+    else:
+        check("RENAMED.TXT exists after the rename", False, "missing from root")
+    check("DELME.TXT is gone after the unlink", "DELME.TXT" not in v["entries"])
+    check("SUTDIR is gone after the rmdir", "SUTDIR" not in v["entries"])
+    # A removed directory/file must have released its clusters: with no leaked
+    # chains the FAT contains nothing but the root chain and the file chains.
+    live = set()
+    for nm, (first, _sz) in v["entries"].items():
+        cl, guard = first, 0
+        while 2 <= cl < 0x0FFFFFF8 and guard < 4096:
+            live.add(cl)
+            cl = v["fget"](cl)
+            guard += 1
+    live.add(v["rootclus"])
+    orphan = [cl for cl in range(2, v["clusters"] + 2)
+              if v["fget"](cl) != 0 and cl not in live]
+    check("no orphaned cluster chains left behind (rmdir/unlink freed them)",
+          not orphan, f"{len(orphan)} orphan(s): {orphan[:8]}")
 
     print(f"image: {dirty_path} ({len(img)} bytes, {v['clusters']} clusters)")
     ok_count = 0

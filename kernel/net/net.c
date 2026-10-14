@@ -25,6 +25,7 @@
  * Redirect handling, and IGMP.
  */
 #include "net.h"
+#include "tcp.h"                 /* kernel/net/tcp.c: TCP protocol module     */
 #include "rtl8139.h"
 
 #include <stitch/types.h>
@@ -134,7 +135,9 @@ static int      g_last_valid;
 static uint64_t g_clock_us;
 static uint16_t g_clock_last;
 
-static uint64_t net_now_us(void)
+/* Public (declared in net.h): TCP uses the same monotonic clock for its
+ * retransmission timer, and the shell/monitor use it for timing. */
+uint64_t net_now_us(void)
 {
     uint16_t now = mbos_pit_counter();
     uint16_t delta = (uint16_t)(g_clock_last - now);   /* wraps naturally */
@@ -592,8 +595,15 @@ static void ip_rx(const uint8_t *frame, uint32_t len, uint32_t off)
         udp_rx(ip, payload, payload_len, src);
         break;
     case IP_PROTO_TCP:
+        /* kernel/net/tcp.c owns the protocol; it may send an ACK/RST from here.
+         * That is safe: the reply is built in g_tx_frame, never in the RX ring
+         * the caller is parsing, and the peer's MAC is in the ARP cache (the
+         * nested net_poll() is a no-op while g_poll_busy is set, but no ARP
+         * resolution is needed on this path). */
+        tcp_input(src, payload, payload_len);
+        break;
     default:
-        break;                                   /* TCP is out of scope here */
+        break;
     }
 }
 
@@ -700,30 +710,56 @@ static void icmp_rx(const ipv4_header_t *ip, const uint8_t *payload,
 }
 
 /* ===================== UDP ===================== */
-/* Pseudo-header checksum over src/dst/zero/proto/udp_len + the UDP datagram. */
-static uint16_t udp_checksum(uint32_t src, uint32_t dst,
-                             const uint8_t *udp, uint32_t udp_len)
+/* One's-complement pseudo-header checksum over src/dst/zero/proto/len + data.
+ * Public (net.h) so TCP can reuse it with proto 6. Unlike udp_checksum below
+ * this returns the raw complement: a valid received segment sums to 0. */
+uint16_t net_pseudo_checksum(uint32_t src, uint32_t dst, uint8_t proto,
+                             const uint8_t *data, uint32_t len)
 {
     uint32_t sum = 0;
     uint32_t i;
 
-    /* src (4) + dst (4) + zero + proto (2) + udp_len (2), big endian pairs */
+    /* src (4) + dst (4) + zero + proto (2) + length (2), big endian pairs */
     sum += (uint32_t)((src >> 24) & 0xFFu) << 8 | ((src >> 16) & 0xFFu);
     sum += (uint32_t)((src >> 8) & 0xFFu) << 8  | (src & 0xFFu);
     sum += (uint32_t)((dst >> 24) & 0xFFu) << 8 | ((dst >> 16) & 0xFFu);
     sum += (uint32_t)((dst >> 8) & 0xFFu) << 8  | (dst & 0xFFu);
-    sum += (uint32_t)IP_PROTO_UDP;
-    sum += (uint32_t)((udp_len >> 8) & 0xFFu) << 8 | (udp_len & 0xFFu);
+    sum += (uint32_t)proto;
+    sum += (uint32_t)((len >> 8) & 0xFFu) << 8 | (len & 0xFFu);
 
-    for (i = 0; i + 1u < udp_len; i += 2u)
-        sum += ((uint32_t)udp[i] << 8) | (uint32_t)udp[i + 1u];
-    if ((udp_len & 1u) != 0u)
-        sum += (uint32_t)udp[udp_len - 1u] << 8;   /* pad byte is zero */
+    for (i = 0; i + 1u < len; i += 2u)
+        sum += ((uint32_t)data[i] << 8) | (uint32_t)data[i + 1u];
+    if ((len & 1u) != 0u)
+        sum += (uint32_t)data[len - 1u] << 8;   /* pad byte is zero */
 
     while ((sum >> 16) != 0u)
         sum = (sum & 0xFFFFu) + (sum >> 16);
-    sum = ~sum & 0xFFFFu;
-    return (uint16_t)(sum == 0u ? 0xFFFFu : sum);  /* 0 means "no checksum" */
+    return (uint16_t)(~sum & 0xFFFFu);
+}
+
+/* UDP is the one protocol whose 0 checksum means "not computed", so a true
+ * zero result must be transmitted as 0xffff (RFC 768). */
+static uint16_t udp_checksum(uint32_t src, uint32_t dst,
+                             const uint8_t *udp, uint32_t udp_len)
+{
+    uint16_t s = net_pseudo_checksum(src, dst, IP_PROTO_UDP, udp, udp_len);
+    return (uint16_t)(s == 0u ? 0xFFFFu : s);
+}
+
+/* ===================== raw IPv4 TX bridge (net.h) ===================== */
+uint8_t *net_tx_payload(void)
+{
+    return g_tx_frame + NET_ETH_HDR_LEN + 20u;
+}
+
+uint32_t net_tx_payload_max(void)
+{
+    return NET_IP_PAYLOAD_MAX;
+}
+
+int net_ip_send(uint32_t dst_ip, uint8_t proto, uint32_t payload_len)
+{
+    return net_ip_tx(dst_ip, proto, payload_len);
 }
 
 int net_udp_send(uint32_t ip, uint16_t sport, uint16_t dport,
@@ -942,6 +978,8 @@ void net_poll(void)
     /* rtl8139_receive() invokes the callback once per complete frame while the
      * frame is still in the ring; net_input() counts it and dispatches it. */
     (void)rtl8139_receive(net_rx_from_driver);
+    /* TCP retransmission timers / TIME_WAIT expiry ride on the same tick. */
+    tcp_poll();
     {
         /* Keep the drop counters in one place: the driver tracks its own ring
          * drops, the stack counts protocol-level drops. */

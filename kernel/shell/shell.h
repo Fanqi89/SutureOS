@@ -77,6 +77,10 @@ int shell_cmd_cpus(int argc, char **argv);
 int shell_cmd_smptest(int argc, char **argv);
 int shell_cmd_ping(int argc, char **argv);
 int shell_cmd_netstat(int argc, char **argv);
+/* TCP (kernel/net/tcp.c): connect + send + receive + close, all polled. */
+int shell_cmd_tcpecho(int argc, char **argv);
+int shell_cmd_tcpsend(int argc, char **argv);
+int shell_cmd_tcpstat(int argc, char **argv);
 
 /* Terminal output helpers */
 void shell_putc(char c);

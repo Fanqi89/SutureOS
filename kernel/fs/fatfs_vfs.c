@@ -52,6 +52,7 @@ static int map_err(int e) {
         case FATFS_EINVAL:      return VFS_EINVAL;
         case FATFS_EIO:         return VFS_EIO;
         case FATFS_ENAMETOOLONG:return VFS_EINVAL;
+        case FATFS_EEXIST:      return VFS_ECONFLICT;   /* rename target taken */
         default:                return VFS_ERR;
     }
 }
@@ -232,11 +233,14 @@ static int fatfs_vfs_unlink(void *fs_data, const char *path) {
 }
 
 static int fatfs_vfs_rename(void *fs_data, const char *oldpath, const char *newpath) {
-    (void)fs_data; (void)oldpath; (void)newpath;
-    /* Honest: FAT32 rename is not implemented in the core (no LFN support
-     * means name rewriting needs a fresh dirent; out of current scope). */
-    console_puts("[fat32] rename not supported\n");
-    return VFS_EPERM;
+    (void)fs_data;
+    char vo[VFS_MAX_PATH], vn[VFS_MAX_PATH];
+    int r = vol_path(oldpath, vo, sizeof(vo));
+    if (r != VFS_OK) return r;
+    r = vol_path(newpath, vn, sizeof(vn));
+    if (r != VFS_OK) return r;
+    /* The core rewrites the 8.3 name field in place; same-directory only. */
+    return map_err(fatfs_rename(vo, vn));
 }
 
 static int fatfs_vfs_sync(void *fs_data) {

@@ -1174,8 +1174,81 @@ out:
     return r;
 }
 
-int fatfs_sync(void) {
+/* Rename an entry inside one directory (8.3 names, no LFN).
+ *
+ * A FAT rename is a name-field rewrite: attributes, timestamps, first cluster
+ * and size all stay where they are, so the cluster chain (and therefore the
+ * data) is untouched. This implementation is honest about its scope:
+ *   - same directory only; a cross-directory move would need a fresh dirent in
+ *     the destination plus the source's first-cluster/size copied over and is
+ *     refused with a log instead of being faked;
+ *   - the destination must not already exist (FATFS_EEXIST);
+ *   - renaming to the same 8.3 name (case-insensitive) is a no-op success.
+ * The rewritten sector is read back and compared byte-for-byte before the call
+ * is considered successful, like every other write in this driver. */
+int fatfs_rename(const char *old_path, const char *new_path) {
     if (!g_vol.mounted) return FATFS_EBUSY;
+    if (!old_path || !new_path || old_path[0] != '/' || new_path[0] != '/')
+        return FATFS_EINVAL;
+
+    uint8_t *s = lemis_heap_alloc(512);
+    if (!s) return FATFS_ERR;
+    uint8_t *v = lemis_heap_alloc(512);
+    if (!v) { lemis_heap_free(s); return FATFS_ERR; }
+
+    uint32_t old_parent = 0, new_parent = 0;
+    char old_raw[11], new_raw[11];
+    struct dir_slot oslot;
+    uint8_t oent[DIR_ENTRY_SIZE];
+    int r = path_resolve(old_path, s, v, &old_parent, old_raw);
+    if (r != FATFS_OK) goto out;
+    r = path_resolve(new_path, s, v, &new_parent, new_raw);
+    if (r != FATFS_OK) goto out;
+
+    if (old_raw[0] == '\0' || new_raw[0] == '\0') {   /* "/" is not renameable */
+        r = FATFS_EINVAL;
+        goto out;
+    }
+    if (old_parent != new_parent) {
+        console_printf("[fat32] rename: cross-directory move not supported (%s -> %s)\n",
+                       old_path, new_path);
+        r = FATFS_EINVAL;
+        goto out;
+    }
+
+    r = dir_find(old_parent, old_raw, s, &oslot, oent);
+    if (r != FATFS_OK) {
+        r = FATFS_ENOENT;
+        goto out;
+    }
+    if (raw_equal(old_raw, new_raw)) {                /* already that name */
+        r = FATFS_OK;
+        goto out;
+    }
+    {
+        struct dir_slot nslot;
+        uint8_t nent[DIR_ENTRY_SIZE];
+        if (dir_find(new_parent, new_raw, s, &nslot, nent) == FATFS_OK) {
+            console_printf("[fat32] rename: target '%s' already exists\n", new_path);
+            r = FATFS_EEXIST;
+            goto out;
+        }
+    }
+
+    r = sec_read(oslot.lba, s);
+    if (r != FATFS_OK) goto out;
+    memcpy(s + oslot.offset, new_raw, 11);
+    r = sec_write_checked(oslot.lba, s, v, new_path, oslot.offset);
+    if (r == FATFS_OK)
+        console_printf("[fat32] renamed %s -> %s\n", old_path, new_path);
+
+out:
+    lemis_heap_free(s);
+    lemis_heap_free(v);
+    return r;
+}
+
+int fatfs_sync(void) {    if (!g_vol.mounted) return FATFS_EBUSY;
     uint8_t *s = lemis_heap_alloc(512);
     if (!s) return FATFS_ERR;
     uint8_t *v = lemis_heap_alloc(512);

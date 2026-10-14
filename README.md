@@ -94,7 +94,7 @@ SutureOS（缝合怪系统）是一个实验性的 x86_64 单内核操作系统�
 ### Phase 3: 文件系统
 - ✅ **统一 VFS 核心**: 驱动注册、挂载表、fd 表、目录游标、`vfs_read_file/vfs_write_file/vfs_mkdir_p/vfs_list_mounts`、seek 修复
 - ✅ **xj_vfs (ramfs)**: 真实目录游标 + stat + O_TRUNC + 空间统计；作为根文件系统，启动时种入 `/hello.txt`、`/etc/motd`
-- ✅ **FAT32（自写驱动，替代原 CoolPotOS 桩）**: superfloppy 挂载（BPB 严格校验，实测 `clusters=70544 fat_lba=32 fat_sz=552 root=2`）、8.3 目录项、FAT1/FAT2 双写、FSInfo 同步、簇链、create/read/write/truncate/mkdir/rmdir/unlink/sync；**读路径实测**（`cat /mnt/fat/hello.txt` 正确、`df` 显示真实空闲簇）；**写路径实测通过**（启动自检 `[fat32] write self-test PASS`，并由宿主侧独立解析镜像验收 `checks=10 ok=10`：新文件逐字节正确、旧文件未改动、FAT1==FAT2、FSInfo 计数与实测一致、整盘 CRC 变化）。rename 未实现（如实返回 `VFS_EPERM`）；mkdir/rmdir/unlink 代码完整但尚未做宿主侧验收
+- ✅ **FAT32（自写驱动，替代原 CoolPotOS 桩）**: superfloppy 挂载（BPB 严格校验，实测 `clusters=70544 fat_lba=32 fat_sz=552 root=2`）、8.3 目录项、FAT1/FAT2 双写、FSInfo 同步、簇链、create/read/write/truncate/mkdir/rmdir/unlink/sync；**读路径实测**（`cat /mnt/fat/hello.txt` 正确、`df` 显示真实空闲簇）；**写路径实测通过**（启动自检 `[fat32] write self-test PASS` + `[fat32] ops self-test PASS (mkdir/rmdir, rename, unlink: 3/3)`，并由宿主侧独立解析镜像验收 `checks=17 ok=17`：新文件逐字节正确、旧文件未改动、FAT1==FAT2、FSInfo 计数与实测一致、整盘 CRC 变化、**rename 后内容逐字节保留且旧名消失、unlink/rmdir 后条目消失且 FAT 里没有孤儿簇链**）。**rename 已实现**（同一目录内的 8.3 名字段就地改写，簇链/时间戳/属性不动；跨目录移动如实拒绝并打日志，因为 8.3-only 需要新建目录项）。
 - ✅ **ext2（只读，真实驱动）**: `kernel/fs/ext2.c` 解析 superblock/BGDT、单/双/三级间接块、稀疏空洞、readdir/stat/read，写操作返回 EROFS；`ext2_vfs.c` 接入统一 VFS，kmain 自动挂 `-hdb`（drive 1）并自检。**SquashFS 仍是桩**
 - ❌ **VimtuFS2 (vfs64)**: 已改为真实委托到统一 VFS（不再是假成功），但 VimtuFS2 自身的磁盘格式（超级块/inode/位图）与多卷槽位 ❌ 未实现
 
@@ -116,27 +116,40 @@ SutureOS（缝合怪系统）是一个实验性的 x86_64 单内核操作系统�
     64 bytes from 10.0.2.2: icmp_seq=1 time=82 us   (3/3 应答)
   ```
   修复记录见"已知问题"第 11 条（TX 描述符门铃、ChipCmd/CBR 不可信、RX 条目步长、ICMP id/seq 字节序共 4 个真实 bug）。
-- ❌ **TCP**: 未实现（无三次握手/重传/窗口）；`linux_compat` 里的 socket 号也未注册（返回 ENOSYS）
+- ✅ **TCP（RFC 793 子集，真实三次握手/双向数据/重传/关闭）**: `kernel/net/tcp.c` + `tcp.h`。主动打开（SYN + 超时重传）、按 IP+端口匹配连接、序号/确认号记账、单段停等发送（按 MSS 分片）、RTO 重传（500 ms × 4）、双向数据（只接受**按序**到达的段，乱序丢弃并重 ACK）、主动/被动关闭与 TIME_WAIT、RST 收发、伪头校验和。
+  主机侧端到端验收 `scripts/tcp_acceptance.py`（宿主跑真实 TCP 服务器，QEMU slirp 把 guest→10.0.2.2 转发到宿主 loopback）：
+  ```
+  [guest] TCP connect 10.0.2.2:5599 / TCP connected (handle 0, state 4=ESTABLISHED)
+          TCP sent 7 bytes hex=68656c6c6f3432 ascii="hello42"
+          TCP received 12 bytes hex=504f4e473a68656c6c6f3432 ascii="PONG:hello42" / TCP close OK
+  [host ] accepted peer=127.0.0.1:63216, received exactly b'hello42', sent b'PONG:hello42'
+  === RESULT: PASS === checks=7 ok=7 fail=0          # echo 模式（双向）
+  === RESULT: PASS === checks=6 ok=6 fail=0          # bulk 模式（3000 字节 = 3 个 MSS 段，逐字节一致）
+  ```
+  Shell 有 `tcpecho <ip> <port> <text>`、`tcpsend <ip> <port> [text]`（缺省发 3000 字节）、`tcpstat`。
+  **未实现**：`listen()`/`accept()` 监听队列、乱序重组、快速重传/SACK、窗口缩放、时间戳、零窗口探测、拥塞控制（固定停等窗口）、MSS 协商。`linux_compat` 里的 socket 号仍未注册（返回 ENOSYS）。
 
 ### Phase 6: 专业 ISO 发布
 - ✅ **双引导 ISO**: Limine (BIOS 已实测启动；UEFI 路径未实测)、`/boot` `/system` `/EFI` 布局、内核双份、initrd、manifest.json
 - ✅ **ISO 大小**: ~11.5 MB
 
 ### Phase 7: Shell 与应用
-- ✅ **Shell**: 真实 `ls/cd/pwd/cat/ps/kill/df/mount/umount/echo/help/clear/startgui/reboot/shutdown`；`ls` 走 VFS readdir、`cat` 走 VFS 读、`df` 读真实挂载与空间、`mount` 走统一 VFS、`kill` 真从 EEVDF 队列摘除实体；实测输出见下"验证记录"
+- ✅ **Shell**: 真实 `ls/cd/pwd/cat/ps/kill/df/mount/umount/echo/help/clear/startgui/reboot/shutdown/cpus/smptest/ping/netstat/tcpecho/tcpsend/tcpstat`；`ls` 走 VFS readdir、`cat` 走 VFS 读、`df` 读真实挂载与空间、`mount` 走统一 VFS、`kill` 真从 EEVDF 队列摘除实体；实测输出见下"验证记录"
 - 🟡 **键盘输入**: 轮询 8042；无 IRQ 环形缓冲，快速注入按键会丢字（实测现象），建议后续加 IRQ1 处理
 
 ---
 
-## 🧪 验证记录（2026-10-14 复测：存储四控制器 + 网络；QEMU BIOS + `-smp 2`）
+## 🧪 验证记录（2026-10-14 复测：存储四控制器 + 网络收发 + TCP + FAT32 目录操作）
 
 ```
 [selftest] 13/14 passed（仅既有的 moos_intr 判定问题）
-[blk] ATA driver init / ahci / nvme / virtio-blk 四个控制器全部上线，驱动器号 0/4/8/9/10 互不重叠
-[fat32] mount drive=0|4|8|10 ... write self-test PASS    → 宿主 verify_fat32_write.py 各 checks=10 ok=10
+[blk] ATA / ahci / nvme / virtio-blk 四个控制器全部上线，驱动器号 0/4/8/9/10 互不重叠
+[fat32] mount drive=0|4|8|10 ... write self-test PASS + ops self-test PASS (3/3)
+      → 宿主 verify_fat32_write.py 各 checks=17 ok=17（含 rename/unlink/rmdir 与孤儿簇链检查）
 [ext2] selftest PASS (hello=0xccc16a4b big=0x7beec92a nested=0xa31a867d sparse=0x8f7abe7d double=0xeb83dd9b)
 [net] selftest ping 10.0.2.2 -> reply in 1288 us / sutureos# ping 10.0.2.2 → 3/3 应答
       → 宿主 scripts/net_probe.py: ALL PASS 22 checks, 0 failed
+[TCP] scripts/tcp_acceptance.py：echo 7/7（双向逐字节）、bulk 6/6（3000 字节 3 段）
 ```
 
 ## 🧪 验证记录（2026-10-13，QEMU BIOS + `-hda build/fat32.img` + `-smp 2`）
@@ -317,6 +330,8 @@ py -3 scripts\verify_fat32_write.py build\fat32_virtio.img build\fat32.img
     残留限制：RX 的"条目写完整了吗"用有界 settle 自旋近似（QEMU/TCG 够用；真机若头先于负载可见，理论上仍有窄窗口）。TCP 未实现。
 12. **多驱动共用块层的驱动器号只能靠约定**：`blk_register()` 不拒绝重复的驱动器号，`blk_find_by_drive()` 返回最后注册的那个。现行分配见 `block.h`（ata0/1=0/1、AHCI=4..7、NVMe=8、ram0=9、vda=10），四个控制器同时接入的实测输出见"验证记录"。
 13. **`scripts/qemu_boot.ps1`（新）**：本机自动化跑 QEMU 的封装——工作目录固定为项目根（QEMU 打不开非 ASCII 绝对路径）、monitor 走 **QMP**（干净 JSON，无 readline 回显）、支持按顺序 `sendkey` 注入与任意 monitor 命令（`i /4 0xc100`、`xp /96bx ...` 这类寄存器/内存取证就是靠它做的），并且**始终以 `quit` 收尾**再读日志（强杀会丢 `-serial file:` 尾部，曾因此误判 AP 未上线）。
+14. **TCP 是"停等 + 只收按序段"的子集**（见 Phase 5）：没有监听队列（`listen/accept` 仍返回 ENOSYS）、没有乱序重组、没有拥塞控制和窗口缩放；`net_alloc_port()` 只查 UDP socket 表，TCP 端口不与它去重。RTO 固定 500 ms × 4 次，失败即如实报错（`[tcp] give up: ...`），不假装成功。
+15. **FAT32 只支持 8.3 名字**：因此 rename 是"同目录名字段改写"，跨目录移动与超过 8.3 的名字会被拒绝（实测中 `SUTESTDIR` 这种 9 字符名字会被 `make_raw` 以 `FATFS_EINVAL` 拒绝——不是缺陷，是如实拒绝）；LFN 未实现。
 
 ---
 

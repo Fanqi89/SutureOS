@@ -392,6 +392,28 @@ void net_udp_set_handler(net_udp_handler_t cb);
 int net_udp_send(uint32_t ip, uint16_t sport, uint16_t dport,
                  const void *data, uint32_t len);
 
+/* ===================== raw IPv4 TX bridge (kernel/net/tcp.c) =============
+ * The stack owns one static TX frame; these three calls let another protocol
+ * module (TCP) build a payload in it and hand it to the link layer without
+ * duplicating the IPv4/ARP path. Only one packet can be under construction at
+ * a time. */
+/* Writable payload area (NET_IP payload limit) of the shared TX frame. */
+uint8_t *net_tx_payload(void);
+/* Bytes available at the pointer returned by net_tx_payload(). */
+uint32_t net_tx_payload_max(void);
+/* Send payload_len staged bytes as one IPv4 packet to dst_ip (host order).
+ * Resolves the next hop (bounded). Returns 0, or -1 when the frame could not
+ * be queued (no NIC, ARP failure, oversized). */
+int net_ip_send(uint32_t dst_ip, uint8_t proto, uint32_t payload_len);
+/* One's-complement pseudo-header checksum (src/dst/proto/length + data).
+ * Unlike the UDP helper this never maps a zero result to 0xffff, so a received
+ * TCP segment validates with `net_pseudo_checksum(...) == 0`. */
+uint16_t net_pseudo_checksum(uint32_t src, uint32_t dst, uint8_t proto,
+                             const uint8_t *data, uint32_t len);
+/* Monotonic microsecond clock (PIT channel 0; wrap-safe). Also used by TCP for
+ * its retransmission timer. */
+uint64_t net_now_us(void);
+
 /* ===================== statistics / diagnostics ===================== */
 /* Print one "[net] ..." line per counter plus the last received packet's
  * summary. */

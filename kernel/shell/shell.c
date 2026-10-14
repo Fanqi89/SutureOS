@@ -64,6 +64,9 @@ static const struct shell_cmd g_commands[] = {
     {"smptest", shell_cmd_smptest, "Queue work items and report which CPU ran them" },
     {"ping",    shell_cmd_ping,    "Send ICMP echo requests: ping <ipv4>"},
     {"netstat", shell_cmd_netstat, "Show network statistics"},
+    {"tcpecho", shell_cmd_tcpecho, "TCP round trip: tcpecho <ipv4> <port> <text>"},
+    {"tcpsend", shell_cmd_tcpsend, "TCP one-way send: tcpsend <ipv4> <port> <text>"},
+    {"tcpstat", shell_cmd_tcpstat, "Show TCP connection/segment counters"},
     {NULL, NULL, NULL}
 };
 
@@ -758,6 +761,163 @@ int shell_cmd_netstat(int argc, char **argv) {
     extern void net_dump_stats(void);
     (void)argc; (void)argv;
     net_dump_stats();
+    return 0;
+}
+
+/* ==================== TCP commands (kernel/net/tcp.c) ====================
+ * These are the host-verifiable end-to-end path for the TCP implementation:
+ * `tcpecho` performs a full active open, sends the given bytes, waits for the
+ * peer's data, prints exactly what came back (hex + printable), then closes.
+ * Pair it with a TCP server on the host (QEMU slirp forwards guest traffic for
+ * 10.0.2.2 to the host's loopback), e.g. scripts/tcp_acceptance.py. */
+static void tcp_print_payload(const char *tag, const uint8_t *b, uint32_t n)
+{
+    uint32_t i;
+    shell_printf("%s %u bytes hex=", tag, (unsigned)n);
+    for (i = 0; i < n && i < 64u; i++)
+        shell_printf("%02x", (unsigned)b[i]);
+    if (n > 64u)
+        shell_puts("...");
+    shell_puts(" ascii=\"");
+    for (i = 0; i < n && i < 64u; i++) {
+        unsigned char ch = b[i];
+        shell_putc((ch >= 32u && ch < 127u) ? (char)ch : '.');
+    }
+    shell_puts("\"\n");
+}
+
+int shell_cmd_tcpecho(int argc, char **argv) {
+    extern int net_ip_from_str(const char* s, uint32_t* out);
+    extern int net_ready(void);
+    extern void tcp_init(void);
+    extern int tcp_connect(uint32_t ip, uint16_t port, int timeout_ms);
+    extern int tcp_send(int h, const void* data, uint32_t len);
+    extern int tcp_recv(int h, void* buf, uint32_t cap, int timeout_ms);
+    extern int tcp_close(int h);
+    extern int tcp_state(int h);
+    extern uint32_t tcp_rx_available(int h);
+
+    static uint8_t rx[1024];
+
+    if (!net_ready()) {
+        shell_puts("tcpecho: network is not up\n");
+        return -1;
+    }
+    if (argc < 4) {
+        shell_puts("usage: tcpecho <ipv4> <port> <text>\n"
+                   "   e.g. tcpecho 10.0.2.2 5000 hello\n");
+        return -1;
+    }
+
+    uint32_t ip = 0;
+    if (net_ip_from_str(argv[1], &ip) != 0) {
+        shell_printf("tcpecho: bad address '%s'\n", argv[1]);
+        return -1;
+    }
+    int port = shell_atoi(argv[2]);
+    if (port <= 0 || port > 65535) {
+        shell_printf("tcpecho: bad port '%s'\n", argv[2]);
+        return -1;
+    }
+
+    /* Join argv[3..] with single spaces so `tcpecho ip port hello world` sends
+     * "hello world". */
+    char msg[256];
+    uint32_t mlen = 0;
+    for (int i = 3; i < argc && mlen < sizeof(msg) - 2u; i++) {
+        if (i > 3 && mlen < sizeof(msg) - 2u) msg[mlen++] = ' ';
+        const char *s = argv[i];
+        while (*s && mlen < sizeof(msg) - 1u) msg[mlen++] = *s++;
+    }
+    msg[mlen] = '\0';
+
+    shell_printf("TCP connect %s:%d (local port auto)\n", argv[1], port);
+    int h = tcp_connect(ip, (uint16_t)port, 4000);
+    if (h < 0) {
+        shell_printf("tcpecho: connect FAILED (%d)\n", h);
+        return -1;
+    }
+    shell_printf("TCP connected (handle %d, state %d)\n", h, tcp_state(h));
+
+    if (tcp_send(h, msg, mlen) != 0)
+        shell_printf("tcpecho: send FAILED (%u bytes)\n", (unsigned)mlen);
+    else
+        tcp_print_payload("TCP sent", (const uint8_t*)msg, mlen);
+
+    int n = tcp_recv(h, rx, sizeof(rx), 3000);
+    if (n > 0)
+        tcp_print_payload("TCP received", rx, (uint32_t)n);
+    else
+        shell_printf("tcpecho: no data received (%d, rx_available=%u)\n",
+                     n, (unsigned)tcp_rx_available(h));
+
+    int cl = tcp_close(h);
+    shell_printf("TCP close %s\n", cl == 0 ? "OK" : "unacknowledged");
+
+    return n > 0 ? 0 : -1;
+}
+
+int shell_cmd_tcpsend(int argc, char **argv) {
+    extern int net_ip_from_str(const char* s, uint32_t* out);
+    extern int net_ready(void);
+    extern int tcp_connect(uint32_t ip, uint16_t port, int timeout_ms);
+    extern int tcp_send(int h, const void* data, uint32_t len);
+    extern int tcp_close(int h);
+    extern uint32_t tcp_rx_available(int h);
+
+    if (!net_ready()) {
+        shell_puts("tcpsend: network is not up\n");
+        return -1;
+    }
+    if (argc < 3) {
+        shell_puts("usage: tcpsend <ipv4> <port> [text...]\n");
+        return -1;
+    }
+    uint32_t ip = 0;
+    if (net_ip_from_str(argv[1], &ip) != 0) {
+        shell_printf("tcpsend: bad address '%s'\n", argv[1]);
+        return -1;
+    }
+    int port = shell_atoi(argv[2]);
+    if (port <= 0 || port > 65535) {
+        shell_printf("tcpsend: bad port '%s'\n", argv[2]);
+        return -1;
+    }
+
+    /* Static, and large enough for the default 3000-byte payload: a 512-byte
+     * stack buffer here used to be overflowed by the pattern below, which
+     * smashed the shell's frame and #GP'd inside the payload bytes. */
+    static char msg[4096];
+    uint32_t mlen = 0;
+    for (int i = 3; i < argc; i++) {
+        if (i > 3 && mlen < sizeof(msg) - 2u) msg[mlen++] = ' ';
+        const char *s = argv[i];
+        while (*s && mlen < sizeof(msg) - 1u) msg[mlen++] = *s++;
+    }
+    if (mlen == 0u) {
+        /* A payload big enough to exercise MSS splitting (3 segments). */
+        const uint32_t want = 3000u;
+        for (uint32_t i = 0; i < want && mlen < sizeof(msg) - 1u; i++)
+            msg[mlen++] = (char)('A' + (i % 26u));
+    }
+
+    int h = tcp_connect(ip, (uint16_t)port, 4000);
+    if (h < 0) {
+        shell_printf("tcpsend: connect FAILED (%d)\n", h);
+        return -1;
+    }
+    int rc = tcp_send(h, msg, mlen);
+    shell_printf("tcpsend: %u bytes %s (rx_available=%u)\n",
+                 (unsigned)mlen, rc == 0 ? "ACKed" : "FAILED",
+                 (unsigned)tcp_rx_available(h));
+    (void)tcp_close(h);
+    return rc;
+}
+
+int shell_cmd_tcpstat(int argc, char **argv) {
+    extern void tcp_dump_stats(void);
+    (void)argc; (void)argv;
+    tcp_dump_stats();
     return 0;
 }
 
