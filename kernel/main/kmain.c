@@ -345,6 +345,38 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
         }
     }
 
+    /* SquashFS 4.0 (read-only, real driver in kernel/fs/squashfs.c). Like ext2
+     * it probes drive 1 (the second IDE disk, -hdb), but it also accepts a
+     * virtio-blk disk so that ext2 and SquashFS can be present at the same time
+     * (-hdb build/ext2.img plus -device virtio-blk-pci,drive=...). A drive whose
+     * magic does not match fails cleanly with a log line and no side effects. */
+    {
+        extern int squashfs_mount(int drive, uint32_t start_lba);
+        extern int squashfs_selftest(void);
+        extern int squashfs_is_mounted(void);
+        static const int sq_candidates[] = { 1, BLK_DRIVE_VIRTIO0 };
+        int sq_done = 0;
+
+        for (unsigned i = 0;
+             i < sizeof(sq_candidates) / sizeof(sq_candidates[0]) && !sq_done; i++) {
+            int d = sq_candidates[i];
+            if (!blk_find_by_drive(d)) continue;
+            if (squashfs_mount(d, 0) != 0) continue;
+            char src[8];
+            snprintf(src, sizeof(src), "%d", d);
+            if (vfs_mount(src, "/mnt/squash", "squashfs") == VFS_OK) {
+                console_printf("[  OK  ] squashfs volume (read-only) mounted at "
+                               "/mnt/squash (drive %d)\n", (int64_t)d);
+            } else {
+                console_puts("[init] squashfs: volume mounted but vfs_mount failed\n");
+            }
+            if (squashfs_is_mounted()) squashfs_selftest();
+            sq_done = 1;
+        }
+        if (!sq_done)
+            console_puts("[init] squashfs: no SquashFS volume on drive 1/virtio\n");
+    }
+
     /* deb package manager demo: install /mnt/fat/hello.deb when present */
     {
         extern int deb_db_init(const char *db_path);
