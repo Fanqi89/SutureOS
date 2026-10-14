@@ -103,13 +103,22 @@ void moos_intr_handler(struct moos_regs *frame, uint64_t vec)
     if (vec >= 0x20u && vec <= 0x2Fu) {
         extern uint32_t smp_get_cpu_id(void);
         extern void hanos_lapic_eoi(void);
+        /* A registered handler (e.g. IRQ1 -> the keyboard ring) runs before the
+         * EOI. Everything is drained from the device inside the handler, so the
+         * acknowledgement is safe afterwards. */
+        if (g_table[vec] != NULL)
+            g_table[vec](frame);
         if (smp_get_cpu_id() == 0) {
             if (vec >= 0x28u)
                 __asm__ volatile("outb %%al, %w0" : : "Nd"(0xA0) : "al");  /* slave PIC */
             __asm__ volatile("outb %%al, %w0" : : "Nd"(0x20) : "al");      /* master PIC */
-        } else {
-            hanos_lapic_eoi();
         }
+        /* The LAPIC delivered this interrupt too (the legacy PIC IRQs arrive as
+         * an ExtINT through IOAPIC pin 0, and the LAPIC demands an EOI for
+         * whatever it delivered). Without this the LAPIC's in-service bit stays
+         * set and only the FIRST legacy IRQ ever reaches the CPU - measured:
+         * one scancode in the keyboard ring, the rest fell back to polling. */
+        hanos_lapic_eoi();
         return;
     }
 

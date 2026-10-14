@@ -86,7 +86,7 @@ SutureOS（缝合怪系统）是一个实验性的 x86_64 单内核操作系统�
 - ✅ **多引导支持**: Multiboot1 + Limine (UEFI/BIOS 双模式)
 - ✅ **内存管理**: PMM（启动时按 multiboot mem_upper 初始化真实区间，实测 31979 页）、8 MiB 内核堆、Slab、4 级页表
 - ✅ **调度器**: EEVDF（红黑树按 deadline 选实体）+ 协作式轮转；`sched_eevdf_start()` 现在会把没有实体的 RUNNABLE 任务自动入队
-- ✅ **中断/异常**: IDT 256 门（0-47 + 0x80）、ISR、PIC 重映射、LAPIC（基址已真正赋值 + MMIO 已映射）、HPET(回退 PIT)、串口
+- ✅ **中断/异常**: IDT 256 门（0-47 + 0x80 + 0xE0/0xE1/0xFF）、ISR、PIC 重映射、LAPIC（基址已真正赋值 + MMIO 已映射）、**IOAPIC 真正初始化**（ABAR 式 2 MiB 恒等映射 + MADT 取址，并把 8259 级联按 ExtINT 路由到 LINT0）、HPET(回退 PIT)、串口；系统节拍仍由每核 LAPIC 定时器提供
 - ✅ **SMP**: AP 启动闭环 —— trampoline 拷贝到 0x8000、INIT-SIPI-SIPI、AP 进入 C 入口并 LAPIC 上线；QEMU `-smp 2` 实测 `[SMP] AP 1 online (lapic=1)`、`online=2/2`
 - ✅ **驱动**: 帧缓冲/字体/PS2 键盘（轮询式，无 IRQ 环形缓冲）/PIT/串口 ✅；**ATA PIO ✅**、**AHCI/SATA ✅**（`kernel/drivers/ahci.c`，QEMU `-device ahci` + `ide-hd` 实测 71680 扇区、注册 sata0=drive 4、FAT32 写自检 + 宿主验收 10/10）、**NVMe ✅**（`nvme.c`，admin+IO 队列、PRP、Identify，注册 nvme0=drive 8，同样 10/10）、**VirtIO-blk ✅**（`virtio_blk.c`，legacy 0.9.5 传输 + split virtqueue，注册 vda=drive 10，同样 10/10）、**RTL8139 ✅**（见 Phase 5）；e1000 ❌ 未实现
 - ✅ **显示与终端**: 开机向固件请求 1024x768x32 线性帧缓冲（multiboot1 头 flag bit 2 + 运行时 `mmu_map_mmio_identity` 把 1 GiB 以外的 LFB 映射进来，实测 `[fb] ready: 1024x768 32 bpp pitch=4096 at 0xfd000000`）；屏幕默认是**黑底白字的终端**（见下节），GUI 需在终端里输入 `startgui` 才进入
@@ -134,8 +134,8 @@ SutureOS（缝合怪系统）是一个实验性的 x86_64 单内核操作系统�
 - ✅ **ISO 大小**: ~11.5 MB
 
 ### Phase 7: Shell 与应用
-- ✅ **Shell**: 真实 `ls/cd/pwd/cat/ps/kill/df/mount/umount/echo/help/clear/startgui/reboot/shutdown/cpus/smptest/ping/netstat/tcpecho/tcpsend/tcpstat`；`ls` 走 VFS readdir、`cat` 走 VFS 读、`df` 读真实挂载与空间、`mount` 走统一 VFS、`kill` 真从 EEVDF 队列摘除实体；实测输出见下"验证记录"
-- 🟡 **键盘输入**: 轮询 8042；无 IRQ 环形缓冲，快速注入按键会丢字（实测现象），建议后续加 IRQ1 处理
+- ✅ **Shell**: 真实 `ls/cd/pwd/cat/ps/kill/df/mount/umount/echo/help/clear/startgui/reboot/shutdown/cpus/smptest/ping/netstat/tcpecho/tcpsend/tcpstat/kbdstat`；`ls` 走 VFS readdir、`cat` 走 VFS 读、`df` 读真实挂载与空间、`mount` 走统一 VFS、`kill` 真从 EEVDF 队列摘除实体；实测输出见下"验证记录"
+- 🟡 **键盘输入**: **IRQ1 已接通**（IOAPIC 级联 ExtINT + `moos_irq_register(0x21)` + 8042 命令字节开 IRQ1），scancode 进 64 字节环形缓冲，`mbos_kbd_poll()` 先从环取再由端口轮询兜底——这样"内核忙时到达的按键"不再丢（此前 8042 单字节缓冲会丢掉）。但实测本机 QEMU 11.1 上 IRQ1 **只送前 ~2 个中断就停**（`kbdstat` 显示 `vector0x21=2`、ring 只收到 1 个 scancode），所以**轮询仍是主力**，中断只当增强。Shell 新增 `kbdstat`。
 
 ---
 
@@ -332,6 +332,9 @@ py -3 scripts\verify_fat32_write.py build\fat32_virtio.img build\fat32.img
 13. **`scripts/qemu_boot.ps1`（新）**：本机自动化跑 QEMU 的封装——工作目录固定为项目根（QEMU 打不开非 ASCII 绝对路径）、monitor 走 **QMP**（干净 JSON，无 readline 回显）、支持按顺序 `sendkey` 注入与任意 monitor 命令（`i /4 0xc100`、`xp /96bx ...` 这类寄存器/内存取证就是靠它做的），并且**始终以 `quit` 收尾**再读日志（强杀会丢 `-serial file:` 尾部，曾因此误判 AP 未上线）。
 14. **TCP 是"停等 + 只收按序段"的子集**（见 Phase 5）：没有监听队列（`listen/accept` 仍返回 ENOSYS）、没有乱序重组、没有拥塞控制和窗口缩放；`net_alloc_port()` 只查 UDP socket 表，TCP 端口不与它去重。RTO 固定 500 ms × 4 次，失败即如实报错（`[tcp] give up: ...`），不假装成功。
 15. **FAT32 只支持 8.3 名字**：因此 rename 是"同目录名字段改写"，跨目录移动与超过 8.3 的名字会被拒绝（实测中 `SUTESTDIR` 这种 9 字符名字会被 `make_raw` 以 `FATFS_EINVAL` 拒绝——不是缺陷，是如实拒绝）；LFN 未实现。
+16. **（已修复一半）IOAPIC 从来没有被初始化过**：`arch/x86_64/ioapic.c` 的移植版把地址硬编码成 0xFEC00000，然后因为"地址 ≥1 GiB、不在恒等映射里"直接 `return false`（注释写"deferring to Phase-3"），于是 IOAPIC 一个寄存器都没碰过。这台机器上电即 APIC 模式、8259 的 INTR 接到 IOAPIC pin 0，而该重定向项默认是屏蔽的——**这就是"IRQ0 永远送不到"的真正原因**（系统节拍因此改用 LAPIC 定时器，现在依然如此，两路都用 0x20 会双倍计数，所以 IRQ0 保持屏蔽）。修法：用 `hanos_madt_get_ioapic_addr()` 取地址 + `mmu_map_mmio_identity(0xFEC00000, 0x2000)`（与 LAPIC/帧缓冲/AHCI 同一套路），再把 pin 0 设成 ExtINT 并解除屏蔽，同时把 IRQ1 从 8259 IMR 里放出来。另外 **ExtINT 交付的 IRQ 还必须给 LAPIC 发 EOI**（`hanos_lapic_eoi()`），否则 LAPIC 的 in-service 位一直挂着——实测不发就只有**第一个** legacy IRQ 能进来。残留：IRQ1 实际只送 2 个中断就停（`kbdstat` 可查），键盘因此保持轮询为主。
+17. **`arch/x86_64/acpi.h` 与 `madt.h` 重复定义 `acpi_madt`/`acpi_madt_t`**，任何同时包含两者的翻译单元都编不过（本次在 ioapic.c 里用 `extern` 声明绕开，未合并这两个头）。
+18. **FAT32 的 ops 自检需要"干净"的测试镜像**：第二次在同一个盘上开机时，`TMPFILE.TXT → RENAMED.TXT` 会因为目标已存在而**正确地**返回 `FATFS_EEXIST`，于是自检打印 `2/3`（这恰好证明"不覆盖已存在目标"生效）。每次验证前用 `scripts/mkfat32_testimg.py` 重新生成或从 `build/fat32.img` 复制一份。
 
 ---
 

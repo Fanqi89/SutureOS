@@ -184,12 +184,112 @@ int mbos_kbd_decode(uint8_t scancode)
     }
 }
 
+/* ==================== IRQ-driven input ring ====================
+ * The 8042 has a single-byte output buffer: a scancode that arrives while the
+ * kernel is busy (running a command, or inside a long poll) is simply gone.
+ * That is why quick `sendkey` bursts used to lose characters. With IRQ1 wired
+ * up the interrupt drains the byte immediately into this ring and the shell
+ * picks characters out of it whenever it gets around to reading.
+ *
+ * Sized in bytes of *scancodes* (1 or 2 per key), so 64 covers a long burst;
+ * on overflow the oldest entry is dropped rather than the newest. */
+#define MBOS_KBD_RING 64u
+static volatile uint8_t  g_kbd_ring[MBOS_KBD_RING];
+static volatile uint32_t g_kbd_head, g_kbd_tail;
+static volatile uint32_t g_kbd_irqs, g_kbd_drops;
+static volatile int      g_kbd_irq_on;      /* 1 = the 8042 asserts IRQ1 */
+static uint32_t          g_kbd_starve;      /* polls with data but no IRQ */
+static volatile uint32_t g_kbd_fallbacks;   /* port reads taken as fallback */
+
+/* IRQ1 handler: two port reads and a ring push, nothing that can block. */
+void mbos_kbd_irq_handler(void)
+{
+    uint8_t sc;
+    uint32_t next;
+
+    g_kbd_irqs++;
+    if ((inb(MBOS_KBD_STAT) & MBOS_KBD_STAT_OBF) == 0)
+        return;                                  /* spurious IRQ1 */
+    sc = inb(MBOS_KBD_DATA);
+
+    next = (g_kbd_head + 1u) % MBOS_KBD_RING;
+    if (next == g_kbd_tail) {                    /* full: drop the oldest */
+        g_kbd_tail = (g_kbd_tail + 1u) % MBOS_KBD_RING;
+        g_kbd_drops++;
+    }
+    g_kbd_ring[g_kbd_head] = sc;
+    g_kbd_head = next;
+}
+
+uint32_t mbos_kbd_irq_count(void)  { return g_kbd_irqs; }
+uint32_t mbos_kbd_dropped_count(void) { return g_kbd_drops; }
+
+/* Ask the 8042 to assert IRQ1 (configuration byte bit 0). Every wait is
+ * bounded: the controller may be absent on an exotic machine. */
+void mbos_kbd_enable_irq(void)
+{
+    uint32_t spins;
+    uint8_t  cfg;
+
+    /* Flush anything already sitting in the output buffer first, so the first
+     * interrupt does not carry a stale byte. */
+    for (spins = 0; spins < 100000u; spins++) {
+        if ((inb(MBOS_KBD_STAT) & MBOS_KBD_STAT_OBF) == 0)
+            break;
+        (void)inb(MBOS_KBD_DATA);
+    }
+
+    /* Command 0x20: read the configuration byte. */
+    for (spins = 0; spins < 100000u; spins++)
+        if ((inb(MBOS_KBD_STAT) & 0x02u) == 0) break;
+    outb(MBOS_KBD_CMD, 0x20);
+    for (spins = 0; spins < 100000u; spins++)
+        if ((inb(MBOS_KBD_STAT) & MBOS_KBD_STAT_OBF) != 0) break;
+    if ((inb(MBOS_KBD_STAT) & MBOS_KBD_STAT_OBF) == 0)
+        return;                                  /* no 8042: stay polled */
+    cfg = inb(MBOS_KBD_DATA);
+
+    cfg |= 0x01u;                                /* enable IRQ1            */
+    cfg &= (uint8_t)~0x10u;                      /* enable the keyboard clk */
+
+    /* Command 0x60: write the configuration byte back. */
+    for (spins = 0; spins < 100000u; spins++)
+        if ((inb(MBOS_KBD_STAT) & 0x02u) == 0) break;
+    outb(MBOS_KBD_CMD, 0x60);
+    for (spins = 0; spins < 100000u; spins++)
+        if ((inb(MBOS_KBD_STAT) & 0x02u) == 0) break;
+    outb(MBOS_KBD_DATA, cfg);
+
+    /* From here the interrupt owns the output buffer: mbos_kbd_poll() stops
+     * reading 0x60 directly, otherwise the shell's tight poll loop would race
+     * the IRQ and steal the byte (measured: 15 typed keys, only 1 caught by the
+     * interrupt). The starvation guard in mbos_kbd_poll() still covers a machine
+     * whose IRQ1 never arrives. */
+    g_kbd_irq_on = 1;
+}
+
 int mbos_kbd_poll(void)
 {
+    /* The IRQ-fed ring first: it holds exactly the bytes that arrived while the
+     * kernel was busy doing something else (which is when a polled 8042 loses
+     * them). Then the raw port, which is what actually keeps typing alive -
+     * measured in QEMU 11.1: IRQ1 is delivered through the IOAPIC ExtINT route
+     * but stops after a couple of interrupts, so the interrupt can only ever be
+     * an enhancement here, never the sole source. */
+    if (g_kbd_head != g_kbd_tail) {
+        uint8_t sc = g_kbd_ring[g_kbd_tail];
+        g_kbd_tail = (g_kbd_tail + 1u) % MBOS_KBD_RING;
+        return (int)sc;
+    }
     if ((inb(MBOS_KBD_STAT) & MBOS_KBD_STAT_OBF) == 0)
         return -1;                      /* nothing to read */
+    if (g_kbd_irq_on)
+        g_kbd_starve++;                 /* port read while IRQ1 should own it */
     return (int)inb(MBOS_KBD_DATA);
 }
+
+uint32_t mbos_kbd_fallback_count(void) { return g_kbd_fallbacks; }
+int      mbos_kbd_irq_active(void)     { return g_kbd_irq_on; }
 
 /* ==================== self test ==================== */
 /* Synthetic scancode sequences only - no hardware, no IRQ (kernel is cli).

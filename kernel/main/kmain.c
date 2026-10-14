@@ -42,6 +42,16 @@ void timer_irq_handler_asm(void);
 /* Timer tick function (C version for assembly handler) */
 void kernel_timer_tick_c(void);
 
+/* IRQ1 trampoline: moos_irq_fn takes the interrupt frame, the keyboard handler
+ * does not need it. Registered for vector 0x21 once the IOAPIC can deliver the
+ * 8259 cascade (see the legacy-IRQ block further down). */
+static void kbd_irq_trampoline(struct moos_regs *frame)
+{
+    extern void mbos_kbd_irq_handler(void);
+    (void)frame;
+    mbos_kbd_irq_handler();
+}
+
 /* ==================== Real memory bring-up ==================== */
 /* Parse the multiboot info block for mem_upper (KB above 1 MiB) and manage
  * [end of kernel BSS, top), capped at 128 MiB so everything stays inside the
@@ -440,6 +450,39 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
     extern void power_init(void);
     power_init();
     console_puts("[  OK  ] ACPI power management\n");
+
+    /* ==================== Legacy IRQ delivery (IOAPIC + keyboard IRQ1) =====
+     * This machine boots in APIC mode: the 8259's INTR is wired to IOAPIC pin 0,
+     * and while that redirection entry is masked (the firmware/QEMU default) NO
+     * legacy IRQ reaches the CPU - which is exactly why the PIT tick never
+     * arrived and the system tick had to move to the per-CPU LAPIC timer.
+     * Bring the IOAPIC up (its MMIO lives far above 1 GiB, so it must be mapped
+     * first) and route the cascade as ExtINT; LINT0 is already ExtINT.
+     * Then IRQ1 can feed the keyboard scancode ring instead of the keys being
+     * polled (and lost when the shell is busy).
+     * IRQ0 stays masked on purpose: the tick source is the LAPIC timer and a
+     * second source on vector 0x20 would double-count it. */
+    {
+        extern bool hanos_ioapic_init(void);
+        extern void hanos_ioapic_enable_pic_extint(void);
+        extern void moos_irq_register(int vec, moos_irq_fn fn);
+        extern void mbos_kbd_enable_irq(void);
+        extern uint32_t mbos_kbd_irq_count(void);
+
+        if (hanos_ioapic_init()) {
+            hanos_ioapic_enable_pic_extint();
+            /* 8259 IMR: only IRQ1 unmasked (bit set = masked). */
+            outb(0x21, 0xFDu);
+            outb(0xA1, 0xFFu);
+            moos_irq_register(0x21, kbd_irq_trampoline);
+            mbos_kbd_enable_irq();
+            console_puts("[  OK  ] IOAPIC: 8259 cascade routed (ExtINT), "
+                         "keyboard IRQ1 enabled (scancode ring)\n");
+        } else {
+            console_puts("[init] IOAPIC unavailable: legacy IRQs stay masked, "
+                         "keyboard remains polled\n");
+        }
+    }
 
     /* ==================== Network (RTL8139 + IPv4/ARP/ICMP/UDP) ============
      * Polling mode on purpose: the IDT only has gates for 0-47 + 0x80 and the

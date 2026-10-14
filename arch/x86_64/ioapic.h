@@ -25,5 +25,9 @@ bool hanos_ioapic_init(void);
 void hanos_ioapic_set_irq(uint8_t irq, uint8_t vector, uint8_t delivery_mode);
 void hanos_ioapic_mask_irq(uint8_t irq);
 void hanos_ioapic_unmask_irq(uint8_t irq);
+/* Route the 8259 cascade (pin 0) as ExtINT and unmask it, so legacy PIC IRQs
+ * reach the CPU through LINT0 on an APIC-mode machine. Call after
+ * hanos_ioapic_init() and after the LAPIC has LINT0 = ExtINT. */
+void hanos_ioapic_enable_pic_extint(void);
 
 #endif /* STITCH_IOAPIC_H */

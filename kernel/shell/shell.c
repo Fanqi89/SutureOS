@@ -67,6 +67,7 @@ static const struct shell_cmd g_commands[] = {
     {"tcpecho", shell_cmd_tcpecho, "TCP round trip: tcpecho <ipv4> <port> <text>"},
     {"tcpsend", shell_cmd_tcpsend, "TCP one-way send: tcpsend <ipv4> <port> <text>"},
     {"tcpstat", shell_cmd_tcpstat, "Show TCP connection/segment counters"},
+    {"kbdstat", shell_cmd_kbdstat, "Show keyboard IRQ1 ring counters"},
     {NULL, NULL, NULL}
 };
 
@@ -918,6 +919,24 @@ int shell_cmd_tcpstat(int argc, char **argv) {
     extern void tcp_dump_stats(void);
     (void)argc; (void)argv;
     tcp_dump_stats();
+    return 0;
+}
+
+/* Keyboard input path diagnostics: irqs > 0 proves IRQ1 is actually delivered
+ * (the ring is only fed from the interrupt); dropped counts ring overflows. */
+int shell_cmd_kbdstat(int argc, char **argv) {
+    extern uint32_t mbos_kbd_irq_count(void);
+    extern uint32_t mbos_kbd_dropped_count(void);
+    extern uint32_t mbos_kbd_fallback_count(void);
+    extern int      mbos_kbd_irq_active(void);
+    extern uint32_t moos_intr_count(int vec);
+    (void)argc; (void)argv;
+    shell_printf("[kbd] irq1=%s scancodes=%u dropped=%u vector0x21=%u "
+                 "(ring=64, polled fallback always on)\n",
+                 mbos_kbd_irq_active() ? "enabled" : "off",
+                 (unsigned)mbos_kbd_irq_count(),
+                 (unsigned)mbos_kbd_dropped_count(),
+                 (unsigned)moos_intr_count(0x21));
     return 0;
 }
 

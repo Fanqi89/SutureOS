@@ -40,9 +40,23 @@ void mbos_kbd_init(void);
 int mbos_kbd_decode(uint8_t scancode);
 
 /* Polling read (source kbdhandler used the same two ports): returns the next
- * scancode from 0x60 when 0x64 bit0 says output-buffer-full, else -1.
+ * scancode, preferring the IRQ-fed ring and falling back to 0x60 when 0x64 bit0
+ * says output-buffer-full, else -1.
  * Self test never calls it - it injects synthetic codes into the decoder. */
 int mbos_kbd_poll(void);
+
+/* IRQ1 path: the handler drains 0x60 into a 64-byte scancode ring (so a burst
+ * injected faster than the shell polls is no longer lost) and mbos_kbd_poll()
+ * pops from it. Register with moos_irq_register(0x21, ...) and call
+ * mbos_kbd_enable_irq() once IRQ1 can actually be delivered. */
+void mbos_kbd_irq_handler(void);
+void mbos_kbd_enable_irq(void);
+uint32_t mbos_kbd_irq_count(void);
+uint32_t mbos_kbd_dropped_count(void);
+/* Fallback port reads taken because IRQ1 stopped delivering (0 = healthy),
+ * and whether the interrupt currently owns the input path. */
+uint32_t mbos_kbd_fallback_count(void);
+int      mbos_kbd_irq_active(void);
 
 /* boot-time self test (st_run("mandelbrot_kbd", ...)) */
 void st_mbos_kbd_test(void);
