@@ -101,17 +101,19 @@
  * 18 TABT (transmit abort). The 8139 has no OWN bit: writing the size starts
  * the transfer and the chip raises TOK when the frame is on the wire. */
 #define RTL_TSD_SIZE_MASK 0x00001FFFu
-#define RTL_TSD_TX_FLAG   0x00003000u  /* (TX_FIFO_THRESH 6 << 11): 8139too's tx_flag */
-#define RTL_TSD_TUN       (1u << 14)
-#define RTL_TSD_TOK       (1u << 15)
-#define RTL_TSD_TABT      (1u << 18)
+#define RTL_TSD_HOST_OWNS 0x00002000u  /* TSD.OWN: 1 = descriptor owned by the HOST */
+#define RTL_TSD_TUN       (1u << 14)   /* transmit underrun                        */
+#define RTL_TSD_TOK       (1u << 15)   /* transmit OK (transfer completed)         */
+#define RTL_TSD_TABT      (1u << 30)   /* transmit aborted (was wrongly 1<<18)     */
 
 /* Poll guards: every hardware handshake is bounded by a spin counter so a
  * broken chip can never wedge the kernel (QEMU completes each one in a few
  * hundred iterations). */
 #define RTL_RESET_SPINS   1000000
 #define RTL_TX_SPINS      2000000
-#define RTL_RX_HEAD_SPINS 200000
+/* Short settle after a valid RX header is seen, so the payload DMA (which may
+ * land after the header) is complete before the stack parses the frame. */
+#define RTL_RX_SETTLE_SPINS 256
 
 /* ===================== DMA-visible buffers (.bss) =====================
  * Everything the chip touches lives here: physical == virtual (the kernel
@@ -143,19 +145,21 @@ static inline uint8_t  rtl_inb(uint16_t off) { return inb((uint16_t)(g_io_base +
 static inline uint16_t rtl_inw(uint16_t off) { return inw((uint16_t)(g_io_base + off)); }
 static inline void     rtl_outb(uint16_t off, uint8_t v)  { outb((uint16_t)(g_io_base + off), v); }
 static inline void     rtl_outw(uint16_t off, uint16_t v) { outw((uint16_t)(g_io_base + off), v); }
-/* <stitch/io.h> ships only outb/inb/outw/inw, so the dword helpers the 8139
- * register file needs live here. They are also the only 32-bit accesses in
- * this file. */
+
+/* Dword accessors. These previously synthesised a 32-bit access from two
+ * 16-bit halves, which does NOT work: QEMU's 8139 model implements the
+ * transmit doorbell (TxStatus0) and the descriptor addresses (TxAddr0) only in
+ * its 32-bit handlers, so a pair of outw() calls was silently discarded and the
+ * chip never started a single transfer (symptom: frames tx=0, drops=N, ping
+ * always timed out). outl()/inl() now live in stitch/io.h. */
 static inline void rtl_outl(uint16_t off, uint32_t v)
 {
-    outw((uint16_t)(g_io_base + off), (uint16_t)(v & 0xFFFFu));
-    outw((uint16_t)(g_io_base + off + 2u), (uint16_t)((v >> 16) & 0xFFFFu));
+    outl((uint16_t)(g_io_base + off), v);
 }
+
 static inline uint32_t rtl_inl(uint16_t off)
 {
-    uint32_t lo = (uint32_t)inw((uint16_t)(g_io_base + off));
-    uint32_t hi = (uint32_t)inw((uint16_t)(g_io_base + off + 2u));
-    return lo | (hi << 16);
+    return inl((uint16_t)(g_io_base + off));
 }
 
 /* ===================== PCI config space ===================== */
@@ -378,8 +382,17 @@ int rtl8139_send_frame(const void *frame, uint32_t len)
     uint32_t slot;
     uint32_t idx = RTL_TX_DESCRIPTORS;          /* invalid until a slot is found */
 
-    if (!g_rtl_state || !frame || len < 14u || len > RTL_TX_MAX_FRAME)
+    if (!g_rtl_state || !frame || len < 14u || len > RTL_TX_MAX_FRAME) {
+        /* SutureOS fix: this early return used to be silent, so a rejected frame
+         * (state down / bad length) produced the same bare -1 as an ARP or
+         * descriptor failure and the network never said why. */
+        if (g_tx_drops == 0u)
+            console_printf("[rtl8139] tx rejected: state=%d len=%u (want 14..%u)\n",
+                           (int64_t)g_rtl_state, (uint64_t)len,
+                           (uint64_t)RTL_TX_MAX_FRAME);
+        g_tx_drops++;
         return -1;
+    }
 
     /* Round-robin over the four descriptors; take the first one whose previous
      * transfer completed (TOK), was never used (size == 0) or was aborted. */
@@ -398,6 +411,17 @@ int rtl8139_send_frame(const void *frame, uint32_t len)
         }
     }
     if (idx == RTL_TX_DESCRIPTORS) {
+        /* Every descriptor still has a non-zero size and no TOK: the chip never
+         * completed a previous transfer. Report it once with the raw TSDs. */
+        if (g_tx_drops == 0u)
+            console_printf("[rtl8139] tx: all %u descriptors busy "
+                           "(tsd0=0x%x tsd1=0x%x tsd2=0x%x tsd3=0x%x cr=0x%x)\n",
+                           (uint64_t)RTL_TX_DESCRIPTORS,
+                           (uint64_t)rtl_inl(RTL_TSD0),
+                           (uint64_t)rtl_inl((uint16_t)(RTL_TSD0 + 4u)),
+                           (uint64_t)rtl_inl((uint16_t)(RTL_TSD0 + 8u)),
+                           (uint64_t)rtl_inl((uint16_t)(RTL_TSD0 + 12u)),
+                           (uint64_t)rtl_inb(RTL_CMD));
         g_tx_drops++;
         return -2;                               /* all descriptors busy */
     }
@@ -420,12 +444,12 @@ int rtl8139_send_frame(const void *frame, uint32_t len)
     memcpy(g_tx_buf[idx], frame, len);
     rtl_clflush(g_tx_buf[idx], txlen);
     rtl_outl((uint16_t)(RTL_TSAD0 + 4u * idx), (uint32_t)(uintptr_t)g_tx_buf[idx]);
-    /* The descriptor must be armed with the early-TX/FIFO threshold bits as well
-     * as the length: Linux's 8139too writes `tx_flag | max(len, ETH_ZLEN)` with
-     * tx_flag = (TX_FIFO_THRESH << 11) & 0x3f0000 = 0x3000. Writing the bare
-     * length made the chip take ownership (TSD read back as OWN=1, SIZE=0) and
-     * then never complete the transfer, so every ARP/ICMP frame was dropped. */
-    rtl_outl((uint16_t)(RTL_TSD0 + 4u * idx), RTL_TSD_TX_FLAG | txlen);
+    /* Arm the descriptor with the LENGTH ONLY, i.e. TSD.OWN = 0 ("the chip owns
+     * it now"): that is what starts the transfer. Writing the extra early-TX
+     * threshold bits (0x3000, as some drivers do) sets OWN, which QEMU's model
+     * treats as "still owned by the host" and refuses to transmit - the frame
+     * then sits in the descriptor forever. The threshold bits are optional. */
+    rtl_outl((uint16_t)(RTL_TSD0 + 4u * idx), txlen);
 
     /* Wait for the descriptor to complete (bounded). QEMU finishes a short
      * frame in a few hundred iterations; a real link takes ~150 us, which is
@@ -466,11 +490,35 @@ int rtl8139_send_frame(const void *frame, uint32_t len)
 }
 
 /* ===================== receive (polling) ===================== */
-/* One ring entry is: 4-byte header, then the ethernet frame (no FCS), padded
- * to a 4-byte boundary. Header bits 0..15: ROK, FAE, CRC, LONG, RUNT, ISE,
- * reserved, BAR, PAM, MAR, and bits 16..30 hold the length *including* the
- * 4-byte header. CAPR is kept one entry behind our read pointer: the chip
- * writes to offset (CAPR+16) % ring. */
+/* Diagnostics for the RX drop paths. The counters alone cannot tell a desynced
+ * ring from an honest RER: print the first few events with the full state. */
+static uint32_t g_rx_dbg;
+static void rtl_rx_dbg(uint32_t reason, uint32_t off, uint32_t cbr, uint32_t avail,
+                       uint32_t header)
+{
+    if (g_rx_dbg >= 4u)
+        return;
+    g_rx_dbg++;
+    console_printf("[rtl8139] rx drop #%u reason=%u off=0x%x cbr=0x%x avail=%u "
+                   "hdr=0x%x cmd=0x%x\n",
+                   (uint64_t)g_rx_dbg, (uint64_t)reason, (uint64_t)off,
+                   (uint64_t)cbr, (uint64_t)avail, (uint64_t)header,
+                   (uint64_t)rtl_inb(RTL_CMD));
+}
+
+/* One ring entry is: 4-byte header, then the ethernet frame, then 4 bytes the
+ * header's length does not count (FCS), padded so the next entry starts on a
+ * 4-byte boundary. Header bits 16..30 hold the length *including* the 4-byte
+ * header. CAPR is programmed as (read pointer - 16); the chip adds the 16 back.
+ *
+ * Emptiness detection deliberately does NOT use ChipCmd.BUFE or CBR:
+ *   - writing RXEN|TXEN clears BUFE and the QEMU model never re-asserts it;
+ *   - in this QEMU (11.1) CBR reads back 0 even while the ring holds frames
+ *     (verified with the monitor: CAPR=0, CBR=0, ChipCmd=0 while 612 bytes of
+ *     ARP/ICMP traffic sat in the ring), so a CBR-derived write pointer cannot
+ *     be trusted. The ring is zeroed at init and only the chip writes to it, so
+ *     "the slot at the read pointer carries a valid ROK header" is the reliable
+ *     empty/full signal, and it needs no device register at all. */
 int rtl8139_receive(void (*fn)(const uint8_t *frame, uint32_t len))
 {
     uint32_t delivered = 0;
@@ -479,89 +527,53 @@ int rtl8139_receive(void (*fn)(const uint8_t *frame, uint32_t len))
     if (!g_rtl_state || !fn)
         return 0;
 
-    /* Sample (and clear) the status register: purely diagnostics here since
-     * the mask is zero, but it also keeps the overflow bits from sticking. */
+    /* Latch and clear the status register (diagnostics + keeps the latched
+     * overrun bits from sticking). */
     g_last_isr = rtl_inw(RTL_ISR);
     if (g_last_isr != 0u)
         rtl_outw(RTL_ISR, g_last_isr);
 
     if ((g_last_isr & (RTL_ISR_RXOVW | RTL_ISR_FOVW | RTL_ISR_RER)) != 0u) {
-        /* Receive overrun: stop the receiver, re-sync CAPR to the chip's own
-         * write pointer, then restart. Without this the ring stays desynced
-         * forever and every later poll reads garbage. */
-        uint16_t cbr = rtl_inw(RTL_CBR);
-        rtl_outb(RTL_CMD, (uint8_t)(rtl_inb(RTL_CMD) & ~RTL_CMD_RXEN));
-        g_rx_ring_head = (uint32_t)((uint16_t)(cbr - 16u)) % RTL_RX_RING_SIZE;
-        rtl_outw(RTL_CAPR, (uint16_t)((cbr - 16u) & 0xFFF0u));
-        rtl_outb(RTL_CMD, (uint8_t)(rtl_inb(RTL_CMD) | RTL_CMD_RXEN));
+        /* The chip dropped frame(s). We cannot resync from CBR here (see the
+         * header comment), so just count it and re-assert our read pointer: the
+         * header-validity scan below keeps the ring consistent. */
         g_rx_drops++;
+        rtl_outw(RTL_CAPR, (uint16_t)((g_rx_ring_head - 16u) & 0xFFFFu));
     }
 
-    /* Bounded to the number of slots an 8 KiB ring can hold so a bogus header
-     * cannot spin us here forever. */
+    /* Bounded: an 8 KiB ring cannot hold more 4-byte slots than this. */
     for (guard = 0; guard < (RTL_RX_RING_SIZE / 4u); guard++) {
         uint32_t off = g_rx_ring_head;
-        uint32_t avail;
         uint32_t header;
         uint32_t pkt_len;
         uint32_t data_len;
-        uint16_t cbr;
         uint32_t spins;
 
-        if ((rtl_inb(RTL_CMD) & RTL_CMD_BUFE) != 0u)
-            break;                               /* ring drained */
+        header = (uint32_t)g_rx_ring[off]
+               | ((uint32_t)g_rx_ring[off + 1u] << 8)
+               | ((uint32_t)g_rx_ring[off + 2u] << 16)
+               | ((uint32_t)g_rx_ring[off + 3u] << 24);
+        pkt_len = (header >> 16) & 0x7FFFu;      /* includes the 4-byte header */
 
-        cbr = rtl_inw(RTL_CBR);
-        avail = (uint32_t)((uint16_t)(cbr - (uint16_t)off)) % RTL_RX_RING_SIZE;
-        if (avail < 4u)
-            break;                               /* header not fully written */
-
-        /* The chip may still be filling the tail of this entry. Poll briefly
-         * for the complete header before trusting its length field. */
-        spins = RTL_RX_HEAD_SPINS;
-        for (;;) {
-            header = (uint32_t)g_rx_ring[off]
-                   | ((uint32_t)g_rx_ring[off + 1u] << 8)
-                   | ((uint32_t)g_rx_ring[off + 2u] << 16)
-                   | ((uint32_t)g_rx_ring[off + 3u] << 24);
-            pkt_len = (header >> 16) & 0x7FFFu;  /* includes the 4-byte header */
-            if (pkt_len >= 4u && pkt_len <= RTL_TX_MAX_FRAME + 4u)
-                break;
-            if (--spins == 0u)
-                break;
-            io_wait();
-        }
-
-        if (pkt_len < 4u || pkt_len > RTL_TX_MAX_FRAME + 4u) {
-            /* Incoherent length: the ring is desynced (overrun). Re-sync to
-             * the chip's write pointer and stop; the next poll resumes clean. */
-            uint16_t now_cbr = rtl_inw(RTL_CBR);
-            rtl_outb(RTL_CMD, (uint8_t)(rtl_inb(RTL_CMD) & ~RTL_CMD_RXEN));
-            g_rx_ring_head   = (uint32_t)((uint16_t)(now_cbr - 16u)) % RTL_RX_RING_SIZE;
-            rtl_outw(RTL_CAPR, (uint16_t)((now_cbr - 16u) & 0xFFF0u));
-            rtl_outb(RTL_CMD, (uint8_t)(rtl_inb(RTL_CMD) | RTL_CMD_RXEN));
-            g_rx_drops++;
+        if ((header & 0x1u) == 0u ||             /* ROK: not a received packet  */
+            pkt_len < 4u || pkt_len > RTL_TX_MAX_FRAME + 4u) {
+            /* Ring empty (an untouched slot reads back as 0), or an entry the
+             * chip has not finished writing. Do not advance: a later poll will
+             * see the completed header. */
             break;
         }
 
-        /* Wait until the whole entry is really in the ring (the length field
-         * can be observed one poll before the payload lands). */
-        spins = RTL_RX_HEAD_SPINS;
-        while ((uint32_t)((uint16_t)(rtl_inw(RTL_CBR) - (uint16_t)off)) % RTL_RX_RING_SIZE < pkt_len) {
-            if (--spins == 0u)
-                break;
+        /* Give the chip a moment to land the payload: the header can become
+         * visible one DMA burst before the frame bytes do. Bounded and short. */
+        for (spins = RTL_RX_SETTLE_SPINS; spins != 0u; spins--)
             io_wait();
-        }
-        avail = (uint32_t)((uint16_t)(rtl_inw(RTL_CBR) - (uint16_t)off)) % RTL_RX_RING_SIZE;
-        if (avail < pkt_len)
-            break;                               /* try again on the next poll */
 
         data_len = pkt_len - 4u;
 
         /* Invalidate the cache lines the chip just wrote before parsing. */
         rtl_clflush(g_rx_ring + off, pkt_len);
 
-        if ((header & 0x1u) != 0u) {             /* ROK */
+        {
             uint32_t data_off = (off + 4u) % RTL_RX_RING_SIZE;
 
             if (data_off + data_len <= RTL_RX_RING_TOTAL) {
@@ -574,10 +586,10 @@ int rtl8139_receive(void (*fn)(const uint8_t *frame, uint32_t len))
             } else {
                 /* The frame wraps the 8 KiB boundary: the chip's write pointer
                  * reached the end of the ring and continued at offset 0 (with
-                 * the 1500-byte pad the RCR/NIC keeps). Linearise it into a
-                 * scratch frame so the stack still receives one contiguous
-                 * buffer -- a plain drop here would lose real traffic, e.g. a
-                 * 1500-byte segment that lands on the boundary. */
+                 * the 1500-byte pad the RIC keeps). Linearise it into a scratch
+                 * frame so the stack still receives one contiguous buffer -- a
+                 * plain drop here would lose real traffic, e.g. a 1500-byte
+                 * segment that lands on the boundary. */
                 uint32_t first = RTL_RX_RING_SIZE - data_off;
 
                 if (data_len <= sizeof(g_wrap_buf) && first <= data_len) {
@@ -588,15 +600,26 @@ int rtl8139_receive(void (*fn)(const uint8_t *frame, uint32_t len))
                     delivered++;
                     g_rx_wraps++;
                 } else {
+                    rtl_rx_dbg(3u, off, 0u, 0u, header);
                     g_rx_drops++;
                 }
             }
-        } else {
-            g_rx_drops++;                        /* RER / runt / bad CRC */
         }
 
-        /* Advance: the next entry starts at off + pkt_len rounded up to 4. */
-        g_rx_ring_head = (off + pkt_len + 3u) & ~3u;
+        /* Advance: the next entry starts at off + pkt_len + 4 rounded up to 4.
+         *
+         * SutureOS fix: the extra 4 bytes are the FCS/reserved word the chip
+         * writes after the frame and which the header length does NOT count.
+         * Measured directly in the guest ring (monitor `xp /96bx` on g_rx_ring):
+         *   +0x00: 01 00 44 00   header, ROK|len=0x44=68
+         *   +0x04: 52 54 00 12 ..  the 42-byte ARP reply, padded with zeros
+         *   +0x44: d8 ac 72 f8   FCS (not counted by len)
+         *   +0x48: 01 00 44 00   next entry's header  -> the real stride is 72.
+         * Without the +4 the driver landed exactly on the FCS, read it as a
+         * header (0xf872acd8 -> bogus length), took the desync path, resynced to
+         * the chip's write pointer and thereby skipped every buffered frame: one
+         * ARP reply was learned per boot and ping always timed out. */
+        g_rx_ring_head = (off + pkt_len + 4u + 3u) & ~3u;
         g_rx_ring_head %= RTL_RX_RING_SIZE;
         /* CAPR holds (read pointer - 16); the chip adds the 16 back. */
         rtl_outw(RTL_CAPR, (uint16_t)((g_rx_ring_head - 16u) & 0xFFFFu));

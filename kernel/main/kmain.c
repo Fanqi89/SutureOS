@@ -14,6 +14,8 @@
 #include "heap.h"
 #include "vfs.h"
 #include "block.h"
+#include "ahci.h"    /* blk_ahci_device_count() (block.h only has init/probe) */
+#include "nvme.h"    /* blk_nvme_present()/mmio_base()/version() diagnostics */
 
 /* Module self-test declarations */
 void st_vim_gdt_idt_test(void);
@@ -241,8 +243,36 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
     blk_init();          /* registry + ram0 ramdisk (needs the real heap) */
     blk_ata_init();      /* controller-level setup (mask IRQs, polling mode) */
     blk_ata_probe();     /* detect primary master/slave -> ata0/ata1 */
+
+    /* ---- SATA (AHCI), NVMe and virtio-blk ---------------------------------
+     * All three are PCI controllers: each driver discovers its own hardware and
+     * logs exactly why it found nothing, so this runs unchanged on a machine
+     * that only has the legacy ATA path. Every driver is idempotent, polled (no
+     * IRQ dependency), and allocates from static .bss DMA arenas, never the
+     * kernel heap. Drive numbers are disjoint by convention (see block.h):
+     * ATA 0/1, AHCI 4..7, NVMe 8, ram0 9, virtio-blk 10. */
+    if (blk_ahci_init() == 0) {
+        console_printf("[  OK  ] AHCI/SATA: %d device(s) online\n",
+                       (int64_t)blk_ahci_device_count());
+    } else {
+        console_puts("[init] no AHCI controller on PCI (no SATA disks)\n");
+    }
+    if (blk_nvme_init() == 0 && blk_nvme_present()) {
+        console_printf("[  OK  ] NVMe: %d namespace(s), MMIO 0x%llx, version 0x%x\n",
+                       (int64_t)blk_nvme_namespace_count(),
+                       (unsigned long long)blk_nvme_mmio_base(),
+                       (uint64_t)blk_nvme_version());
+    } else {
+        console_puts("[init] no NVMe controller on PCI\n");
+    }
+    if (blk_virtio_init() == 0) {
+        console_puts("[  OK  ] VirtIO-blk: vda online (drive 10)\n");
+    } else {
+        console_puts("[init] no virtio-blk device on PCI\n");
+    }
+
     blk_list_all();
-    console_puts("[  OK  ] Block devices (ATA PIO + ramdisk)\n");
+    console_puts("[  OK  ] Block devices (ATA PIO + SATA/AHCI + NVMe + VirtIO-blk + ramdisk)\n");
 
     vfs_init();          /* registers ext2/fat32/squashfs/xj_vfs drivers */
     /* Mount the in-memory ramfs as root filesystem */
@@ -260,13 +290,30 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
                        "Try: ls /, cat /hello.txt, df, ps, mount fat32 0 /mnt/fat\n", 126);
         console_puts("[init] ramfs root mounted, demo files seeded\n");
     }
-    /* Auto-mount FAT32 from the first ATA disk if one carries a FAT32
-     * volume (fails harmlessly when no disk / no FAT32 is present). */
-    r = vfs_mount("0", "/mnt/fat", "fat32");
-    if (r == VFS_OK) {
-        console_puts("[init] FAT32 volume auto-mounted at /mnt/fat\n");
-    } else {
-        console_printf("[init] no FAT32 on drive 0 (mount=%d), skipping\n", r);
+    /* Auto-mount FAT32 from the first block device that carries a FAT32 volume.
+     * Candidate order keeps the historical ATA layout first, then the newer
+     * controllers brought up above; a device that is not present is skipped
+     * without a mount attempt. Fails harmlessly with no disk / no FAT32. */
+    r = -1;
+    {
+        static const int fat_candidates[] = {
+            0, 1, BLK_DRIVE_AHCI_BASE, BLK_DRIVE_NVME0, BLK_DRIVE_VIRTIO0
+        };
+        for (unsigned i = 0; i < sizeof(fat_candidates) / sizeof(fat_candidates[0]); i++) {
+            int d = fat_candidates[i];
+            if (!blk_find_by_drive(d)) continue;
+            char src[8];
+            snprintf(src, sizeof(src), "%d", d);
+            r = vfs_mount(src, "/mnt/fat", "fat32");
+            if (r == VFS_OK) {
+                console_printf("[init] FAT32 volume auto-mounted at /mnt/fat (drive %d)\n",
+                               (int64_t)d);
+                break;
+            }
+            console_printf("[init] drive %d present but no FAT32 volume (mount=%d)\n",
+                           (int64_t)d, (int64_t)r);
+        }
+        if (r != VFS_OK) console_puts("[init] no FAT32 volume on any block device\n");
     }
 
     /* ext2 (read-only) on the second IDE disk (-hdb build/ext2.img). The driver

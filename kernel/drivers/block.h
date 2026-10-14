@@ -20,8 +20,19 @@ extern "C" {
 #define BLK_TYPE_ATA      4
 #define BLK_TYPE_RAM      5
 
-/* 驱动器号分配：ATA 主盘/从盘 = 0/1，RAM 磁盘 = 9 */
+/* 驱动器号分配（全树必须保持互不重叠——blk_register() 不会拒绝重复的
+ * 驱动器号，blk_find_by_drive() 返回最后注册的那个，所以冲突只能靠约定避免）：
+ *   0,  1   ATA PIO 主/从盘            (block.c blk_ata_probe)
+ *   2,  3   保留给 ATA 次通道
+ *   4..7    AHCI/SATA 盘 sata0..sata3  (AHCI_DRIVE_BASE + 序号)
+ *   8       NVMe 命名空间 nvme0        (NVME_DRIVE_NVME0)
+ *   9       RAM 磁盘 ram0              (BLK_DRIVE_RAM)
+ *   10      VirtIO-blk 盘 vda          (VIRTIO_BLK_DRIVE)
+ */
 #define BLK_DRIVE_RAM     9
+#define BLK_DRIVE_AHCI_BASE 4
+#define BLK_DRIVE_NVME0     8
+#define BLK_DRIVE_VIRTIO0   10
 
 /* 块设备标志 */
 #define BLK_FLAG_READONLY  (1 << 0)

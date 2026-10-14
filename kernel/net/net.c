@@ -1052,10 +1052,18 @@ static int icmp_send_echo(uint32_t ip, uint16_t seq)
     icmp->type = ICMP_TYPE_ECHO_REQUEST;
     icmp->code = 0u;
     icmp->checksum = 0u;
-    icmp->rest_of_header = htons((uint16_t)(((uint32_t)NET_ICMP_ID << 16) | seq));
-    /* rest_of_header is a 32-bit field: bytes = id_hi, id_lo, seq_hi, seq_lo */
-    icmp->rest_of_header = (uint32_t)((uint32_t)htons(NET_ICMP_ID) << 16)
-                         | (uint32_t)htons(seq);
+    /* SutureOS fix: rest_of_header covers bytes 4..7 of the ICMP header, i.e.
+     * identifier (4..5) then sequence (6..7). On a little-endian CPU the LOW
+     * half of the u32 is the identifier, which is exactly how the receive path
+     * decodes it:
+     *     id  = ntohs(rest_of_header & 0xFFFF);
+     *     seq = ntohs(rest_of_header >> 16);
+     * The sender used to build it the other way round (id in the high half), so
+     * every echo reply was rejected by the `id == NET_ICMP_ID` check: the reply
+     * really arrived (netstat showed icmp rx=1, last rx 10.0.2.2 -> ...) but
+     * ping still reported a timeout. */
+    icmp->rest_of_header = ((uint32_t)htons(seq) << 16)
+                         | (uint32_t)htons(NET_ICMP_ID);
     icmp->checksum = htons(net_checksum(icmp, icmp_len));
 
     if (net_ip_tx(ip, IP_PROTO_ICMP, icmp_len) != 0)
@@ -1143,7 +1151,13 @@ int net_selftest(void)
                        (uint64_t)g_frames_rx, (uint64_t)g_frames_tx,
                        (uint64_t)net_arp_entries());
     } else {
-        console_puts("[net] selftest ping TIMEOUT\n");
+        /* Print the counters even on failure: they say whether the frame never
+         * left (tx=0), left but nothing came back (tx>0 rx=0, e.g. slirp not
+         * answering), or the ARP next-hop lookup is what failed. */
+        console_printf("[net] selftest ping TIMEOUT (frames rx=%llu tx=%llu drops=%llu "
+                       "arp_entries=%llu)\n",
+                       (uint64_t)g_frames_rx, (uint64_t)g_frames_tx, (uint64_t)g_drops,
+                       (uint64_t)net_arp_entries());
     }
 
 #if NET_SELFTEST_UDP

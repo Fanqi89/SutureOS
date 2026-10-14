@@ -190,40 +190,14 @@ void blk_list_all(void) {
     }
 }
 
-/* ==================== 驱动存根实现 ==================== */
-
-/* NVMe 驱动 */
-int blk_nvme_init(void) {
-    console_puts("[blk] NVMe driver init (stub)\n");
-    return 0;
-}
-
-int blk_nvme_probe(void) {
-    console_puts("[blk] NVMe probe (stub)\n");
-    return 0;
-}
-
-/* AHCI 驱动 */
-int blk_ahci_init(void) {
-    console_puts("[blk] AHCI driver init (stub)\n");
-    return 0;
-}
-
-int blk_ahci_probe(void) {
-    console_puts("[blk] AHCI probe (stub)\n");
-    return 0;
-}
-
-/* VirtIO-blk 驱动 */
-int blk_virtio_init(void) {
-    console_puts("[blk] VirtIO-blk driver init (stub)\n");
-    return 0;
-}
-
-int blk_virtio_probe(void) {
-    console_puts("[blk] VirtIO-blk probe (stub)\n");
-    return 0;
-}
+/* ==================== 独立驱动实现已不在本文件 ====================
+ * NVMe / AHCI / VirtIO-blk 的 blk_*_init() / blk_*_probe() 曾经是这里的存根；
+ * 现在三个驱动都是真实实现，分别位于：
+ *   kernel/drivers/nvme.c       -> blk_nvme_init()   / blk_nvme_probe()
+ *   kernel/drivers/ahci.c       -> blk_ahci_init()   / blk_ahci_probe()
+ *   kernel/drivers/virtio_blk.c -> blk_virtio_init() / blk_virtio_probe()
+ * 原型仍在 block.h。存根若保留会与真实实现重复定义导致链接失败，已删除。
+ */
 
 /* ==================== ATA PIO 驱动 (legacy PATA) ====================
  * Ported from Lemis pio/ata.c (C:\Users\fanqi\Desktop\自研操作系统\Lemis)

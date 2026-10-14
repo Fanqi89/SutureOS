@@ -88,14 +88,14 @@ SutureOS（缝合怪系统）是一个实验性的 x86_64 单内核操作系统�
 - ✅ **调度器**: EEVDF（红黑树按 deadline 选实体）+ 协作式轮转；`sched_eevdf_start()` 现在会把没有实体的 RUNNABLE 任务自动入队
 - ✅ **中断/异常**: IDT 256 门（0-47 + 0x80）、ISR、PIC 重映射、LAPIC（基址已真正赋值 + MMIO 已映射）、HPET(回退 PIT)、串口
 - ✅ **SMP**: AP 启动闭环 —— trampoline 拷贝到 0x8000、INIT-SIPI-SIPI、AP 进入 C 入口并 LAPIC 上线；QEMU `-smp 2` 实测 `[SMP] AP 1 online (lapic=1)`、`online=2/2`
-- 🟡 **驱动**: 帧缓冲/字体/PS2 键盘（轮询式，无 IRQ 环形缓冲）/PIT/串口 ✅；ATA PIO ✅（读写在宿主侧均已验收）；NVMe/AHCI/VirtIO-blk ❌ 桩；RTL8139/e1000 ❌ 桩
+- ✅ **驱动**: 帧缓冲/字体/PS2 键盘（轮询式，无 IRQ 环形缓冲）/PIT/串口 ✅；**ATA PIO ✅**、**AHCI/SATA ✅**（`kernel/drivers/ahci.c`，QEMU `-device ahci` + `ide-hd` 实测 71680 扇区、注册 sata0=drive 4、FAT32 写自检 + 宿主验收 10/10）、**NVMe ✅**（`nvme.c`，admin+IO 队列、PRP、Identify，注册 nvme0=drive 8，同样 10/10）、**VirtIO-blk ✅**（`virtio_blk.c`，legacy 0.9.5 传输 + split virtqueue，注册 vda=drive 10，同样 10/10）、**RTL8139 ✅**（见 Phase 5）；e1000 ❌ 未实现
 - ✅ **显示与终端**: 开机向固件请求 1024x768x32 线性帧缓冲（multiboot1 头 flag bit 2 + 运行时 `mmu_map_mmio_identity` 把 1 GiB 以外的 LFB 映射进来，实测 `[fb] ready: 1024x768 32 bpp pitch=4096 at 0xfd000000`）；屏幕默认是**黑底白字的终端**（见下节），GUI 需在终端里输入 `startgui` 才进入
 
 ### Phase 3: 文件系统
 - ✅ **统一 VFS 核心**: 驱动注册、挂载表、fd 表、目录游标、`vfs_read_file/vfs_write_file/vfs_mkdir_p/vfs_list_mounts`、seek 修复
 - ✅ **xj_vfs (ramfs)**: 真实目录游标 + stat + O_TRUNC + 空间统计；作为根文件系统，启动时种入 `/hello.txt`、`/etc/motd`
 - ✅ **FAT32（自写驱动，替代原 CoolPotOS 桩）**: superfloppy 挂载（BPB 严格校验，实测 `clusters=70544 fat_lba=32 fat_sz=552 root=2`）、8.3 目录项、FAT1/FAT2 双写、FSInfo 同步、簇链、create/read/write/truncate/mkdir/rmdir/unlink/sync；**读路径实测**（`cat /mnt/fat/hello.txt` 正确、`df` 显示真实空闲簇）；**写路径实测通过**（启动自检 `[fat32] write self-test PASS`，并由宿主侧独立解析镜像验收 `checks=10 ok=10`：新文件逐字节正确、旧文件未改动、FAT1==FAT2、FSInfo 计数与实测一致、整盘 CRC 变化）。rename 未实现（如实返回 `VFS_EPERM`）；mkdir/rmdir/unlink 代码完整但尚未做宿主侧验收
-- ❌ **ext2 / SquashFS**: 仍是桩（`*_mount` 打印 stub，`*_vfs.c` 适配器存在但后端未实现）
+- ✅ **ext2（只读，真实驱动）**: `kernel/fs/ext2.c` 解析 superblock/BGDT、单/双/三级间接块、稀疏空洞、readdir/stat/read，写操作返回 EROFS；`ext2_vfs.c` 接入统一 VFS，kmain 自动挂 `-hdb`（drive 1）并自检。**SquashFS 仍是桩**
 - ❌ **VimtuFS2 (vfs64)**: 已改为真实委托到统一 VFS（不再是假成功），但 VimtuFS2 自身的磁盘格式（超级块/inode/位图）与多卷槽位 ❌ 未实现
 
 ### Phase 4: 用户态与系统调用
@@ -106,7 +106,17 @@ SutureOS（缝合怪系统）是一个实验性的 x86_64 单内核操作系统�
 - ✅ **deb 安装器（真实现）**: ar 解析（十进制 size 字段）、内建 RFC1951 inflate 解 gzip、ustar 解包并写入 VFS、control 字段/依赖解析、dpkg 风格版本比较、安装/卸载/查询/DB；QEMU 实测 `[deb] installed hello 1.0-1`；❌ xz/zstd 成员与维护者脚本（无内核 shell，如实报错）
 
 ### Phase 5: 网络
-- ❌ **TCP/IP 协议栈**: `kernel/net/net.c` 仍是桩（无 ARP/IP/ICMP/UDP/TCP 收发路径），`net.h` 里的 socket API 无实现；`linux_compat` 里的 socket 号也因未注册而返回 ENOSYS
+- ✅ **RTL8139 驱动 + ARP/IPv4/ICMP/UDP 协议栈（轮询模式，真实收发）**: `kernel/drivers/rtl8139.c` + `kernel/net/net.c`。链路层 DLT 收发、ARP 请求/应答与缓存、IPv4 头校验和、ICMP echo（`ping` 命令与开机自检）、UDP（含伪头校验和），shell 有 `ping <ipv4>` 与 `netstat`。
+  实测（`-netdev user -device rtl8139`，宿主侧 `scripts/net_probe.py` **22 项断言全过**）：
+  ```
+  [net] rtl8139 found at 0xc000, irq=11, mac=52:54:00:12:34:56
+  [net] IPv4 10.0.2.15/24 gw 10.0.2.2 (mode=poll)
+  [net] selftest ping 10.0.2.2 -> reply in 1288 us
+  sutureos# ping 10.0.2.2
+    64 bytes from 10.0.2.2: icmp_seq=1 time=82 us   (3/3 应答)
+  ```
+  修复记录见"已知问题"第 11 条（TX 描述符门铃、ChipCmd/CBR 不可信、RX 条目步长、ICMP id/seq 字节序共 4 个真实 bug）。
+- ❌ **TCP**: 未实现（无三次握手/重传/窗口）；`linux_compat` 里的 socket 号也未注册（返回 ENOSYS）
 
 ### Phase 6: 专业 ISO 发布
 - ✅ **双引导 ISO**: Limine (BIOS 已实测启动；UEFI 路径未实测)、`/boot` `/system` `/EFI` 布局、内核双份、initrd、manifest.json
@@ -117,6 +127,17 @@ SutureOS（缝合怪系统）是一个实验性的 x86_64 单内核操作系统�
 - 🟡 **键盘输入**: 轮询 8042；无 IRQ 环形缓冲，快速注入按键会丢字（实测现象），建议后续加 IRQ1 处理
 
 ---
+
+## 🧪 验证记录（2026-10-14 复测：存储四控制器 + 网络；QEMU BIOS + `-smp 2`）
+
+```
+[selftest] 13/14 passed（仅既有的 moos_intr 判定问题）
+[blk] ATA driver init / ahci / nvme / virtio-blk 四个控制器全部上线，驱动器号 0/4/8/9/10 互不重叠
+[fat32] mount drive=0|4|8|10 ... write self-test PASS    → 宿主 verify_fat32_write.py 各 checks=10 ok=10
+[ext2] selftest PASS (hello=0xccc16a4b big=0x7beec92a nested=0xa31a867d sparse=0x8f7abe7d double=0xeb83dd9b)
+[net] selftest ping 10.0.2.2 -> reply in 1288 us / sutureos# ping 10.0.2.2 → 3/3 应答
+      → 宿主 scripts/net_probe.py: ALL PASS 22 checks, 0 failed
+```
 
 ## 🧪 验证记录（2026-10-13，QEMU BIOS + `-hda build/fat32.img` + `-smp 2`）
 
@@ -224,6 +245,41 @@ py -3 scripts\verify_ext2_read.py build\ext2.img     # 宿主侧独立验收
 ```
 实测：`[ext2] mount blocksz=1024 blocks=4096 inodes=64 groups=1 rev=1`、`[ext2] selftest PASS (hello=0xccc16a4b big=0x7beec92a nested=0xa31a867d sparse=0x8f7abe7d double=0xeb83dd9b)`（含 300 KiB 双间接文件与稀疏空洞）。宿主侧另有 91/91 + 20/20（含第三方 mke2fs 镜像）与 38/38 解析校验。
 
+### 存储栈：ATA / AHCI(SATA) / NVMe / VirtIO-blk
+
+四个控制器驱动都是真实实现（各自的源码头部记录了参考的上游项目与许可证），共用 `kernel/drivers/block.h` 的 `struct blk_device` 接口：
+
+| 驱动 | 文件 | 驱动器号 | 传输方式 | QEMU 设备 |
+|------|------|----------|----------|-----------|
+| ATA PIO | `block.c`（内建） | 0/1 | PIO 轮询、LBA28 分块 | `-hda` / `-hdb` |
+| AHCI/SATA | `ahci.c` | 4..7 | 命令列表 + FIS + PRDT DMA，纯轮询（PxIE=0） | `-device ahci,id=ahci -device ide-hd,drive=d,bus=ahci.0` |
+| NVMe | `nvme.c` | 8 | admin + IO 队列对、PRP、相位位轮询完成 | `-device nvme,drive=d,serial=...` |
+| VirtIO-blk | `virtio_blk.c` | 10 | legacy 0.9.5 BAR0 + split virtqueue（静态 16 KiB DMA 环） | `-device virtio-blk-pci,drive=d` |
+| RAM 盘 | `block.c` | 9 | 内存 | — |
+
+DMA 目标一律是静态 `.bss` 缓冲（物理==虚拟，1 GiB 恒等映射内），不经过内核堆，因此后续 PMM/堆再初始化也不会把环搬走。**驱动器号互不重叠**（`block.h` 有表），kmain 依次探测并把第一个带 FAT32 卷的设备挂到 `/mnt/fat`。
+
+验收方式对四个控制器完全一致——把同一张 FAT32 测试镜像挂上去，内核自动挂载 + 写自检，再由**宿主侧**独立解析镜像：
+
+```powershell
+py -3 scripts\mkfat32_testimg.py                       # 生成 build/fat32.img
+Copy-Item build\fat32.img build\fat32_virtio.img       # 每个控制器一份副本
+powershell -NoProfile -File scripts\qemu_boot.ps1 -SerialLog build\serial_virtio.log `
+    -ArgFile build\qemu_virtio.args -BootWaitSeconds 16
+py -3 scripts\verify_fat32_write.py build\fat32_virtio.img build\fat32.img
+```
+
+四个控制器逐个实测均为 `=== RESULT: PASS ===  checks=10 ok=10 fail=0`（新文件逐字节正确、旧文件未改动、FAT1==FAT2、根簇仍 EOC、FSInfo 计数与实测一致、整盘 CRC 变化）。四者 + NIC 同时接入的一次启动实测：
+
+```
+  drive=10 type=3 name=vda      sectors=71680   (VirtIO-blk)
+  drive=8  type=1 name=nvme0    sectors=71680   (NVMe)
+  drive=4  type=2 name=sata0    sectors=71680   (AHCI/SATA)
+  drive=0  type=4 name=ata0     sectors=71680   (ATA PIO)
+  drive=9  type=5 name=ram0     sectors=2048
+[fat32] write self-test PASS / [net] selftest ping 10.0.2.2 -> reply in 1293 us
+```
+
 ### 本机测试（QEMU / VMware）
 ```powershell
 & "C:\Program Files\qemu\qemu-system-x86_64.exe" -machine pc -m 256 -vga std `
@@ -232,7 +288,9 @@ py -3 scripts\verify_ext2_read.py build\ext2.img     # 宿主侧独立验收
   -no-reboot -no-shutdown -monitor tcp:127.0.0.1:45470,server,nowait
 ```
 - `-vga std` 提供 0xFD000000 线性帧缓冲（终端/GUI 才可见）；`-hdb build/ext2.img` 挂 ext2 测试卷。
-- 截图：monitor 里 `screendump build\screen.ppm`；**退出前务必 monitor `quit`**（强杀会丢 `-serial file:` 尾部日志）。
+- **推荐用封装脚本**（自动以 `quit` 收尾、可注入按键与 monitor 命令）：`powershell -NoProfile -File scripts\qemu_boot.ps1 -SerialLog build\serial.log -ArgFile <含额外 -device 的文件> -BootWaitSeconds 16 -Keys "p;i;n;g;spc;1;0;dot;0;dot;2;dot;2;ret"`
+- 存储控制器加盘：`-device ahci,id=ahci -device ide-hd,drive=d,bus=ahci.0`（SATA）、`-device nvme,drive=d,serial=sutureos0`、`-device virtio-blk-pci,drive=d`（都要配 `-drive id=d,file=...,if=none,format=raw`）。
+- 截图：monitor 里 `screendump build\screen.ppm`；**退出前务必 `quit`**（强杀会丢 `-serial file:` 尾部日志）。
 - 输入模拟：`sendkey`，键名如 `ret`/`spc`/`slash`/`tab`/`shift-equal`；键盘是轮询无 IRQ，按键间隔 ≥400 ms。
 - **VMware**：新建 *Other 64-bit* 虚拟机 → 内存 ≥256 MB、≥2 核 → 光驱指向 `build/sutureos.iso`（可再加两块 IDE 盘分别挂 fat32.img / ext2.img）→ 启动进终端，`startgui` 进 GUI，`shutdown`/`reboot` 走 ACPI；可加串口重定向到文件抓同样的 `[  OK  ]` 日志。
 
@@ -244,14 +302,21 @@ py -3 scripts\verify_ext2_read.py build\ext2.img     # 宿主侧独立验收
 1. **`[selftest][moos_intr] FAIL`**：moos 中断自检故意注入异常（`err=0xbad`），处理函数会打印告警并把该自检判为 FAIL——属该自检与框架的判定不一致，非本次引入。
 2. **两套调度器并存**：`task.c` 的协作轮转与 `eevdf.c` 的 EEVDF 双轨运行，任务内调用 `sched_yield()` 会切到 EEVDF 循环的陈旧上下文（实测表现为跳到 0x3）。Shell 输入循环因此改为有界 pause 自旋，未再暴露；根治需要合并调度器。
 3. **`context.kgs_base` 被两用**：`cinux_context_switch` 把它写进 MSR_GS_BASE，而 EEVDF 用同一字段存放 `sched_entity*`；建议为实体指针另设字段。
-4. **IDT 未铺满**：仅 0-47 与 0x80 有门，IPI 向量 0xE0/0xE1 与 LAPIC 假中断向量 0xFF 仍是 not-present（会 #GP）；AP 目前只 `sti; hlt` 空转，未接入调度。
+4. **（部分修复）IDT 与 AP**：0-47、0x80 以及 IPI 向量 0xE0/0xE1/LAPIC 假中断 0xFF 都已有门（此前 not-present 会 #GP）；`intr.c` 的 0x20-0x2F 通用路径必须发 EOI，否则 8259 ISR 位挂死整条线。AP 现在执行内核工作项 + 定时器 + IPI，但**仍不进 task/EEVDF 的上下文切换**（两套调度器共用 context，见第 2 条）。
 5. **（已修复）帧缓冲曾长期不可用**：原因是 (a) `boot.S` 的 multiboot1 视频字段写在了偏移 12..27，而规范要求放在跳过的 a.out kludge 区之后（32/36/40/44），固件因此读到"0x0 分辨率"只给 VGA 文本模式；(b) `limine.c` 把 multiboot1 的 MBI 当 Limine tag 流解析，永远得到 0；(c) 线性帧缓冲位于 1 GiB 以上（0xFD000000），开机恒等映射覆盖不到。三点均已修复（正确的头字段 + 规范解析 + `mmu_map_mmio_identity`），实测 `1024x768 32 bpp pitch=4096`。
 6. **键盘无 IRQ**：只轮询 8042 单字节缓冲，快速输入丢键（自动化测试请把按键间隔设为 ≥400 ms）。
 7. **flanterm 上游缺陷（已在本仓库标注修复）**：`canvas == NULL` 时使用的 `plot_char_*_uncanvas()` 把默认**前景色**也取成 `default_bg`，导致未指定 SGR 的普通文本是黑底黑字。已在 `fb.c` 两处修正并加 `SutureOS fix` 注释（BSD-2 允许修改，许可证头保持原样）。
 8. **（已修复，影响面最大的一个）PMM 把自己的页标志数组分配了出去**：`moe_pmm_init()` 用区域开头 1 字节/页 存标志，而 `moe_pmm_alloc()` 从第 0 页开始扫描——于是 `kmain` 的 `moe_pmm_alloc(2048)` 把**标志数组本身**当成了内核堆（8 MiB 堆 == 标志数组），此后每次分配/释放都把 `0x01/0x00` 写进活堆：堆头、flanterm 上下文（`text_fg` 被写成 `0x00000001` → 文字不可见、只剩残留光标块）、以及之后分配的 AP/任务栈。已修：`moe_pmm_init()` 把标志占用的页标记为 `TAKEN` 并从空闲计数里扣除，自检也改成断言"标志页绝不出借"（防回归）。同类症状的"AP 栈落进内核镜像"一并消失。
 9. **系统时钟改用 LAPIC 定时器（PIT 中断在这台机器上送不到 CPU）**：QEMU `-d int` 追踪显示内核重映射 PIC 之后**没有任何 IRQ0**——该机器带 IOAPIC、上电即 APIC 模式，8259 的 INTR 并不走 LINT0（试过 IMCR 切 PIC 模式也无效）。因此系统节拍由 BSP 的 LAPIC 定时器提供（与 AP 同机制），并**实测频率**（`cpus` 命令会打印，当前约 57–100 Hz，标定基于 8254 计数器、仍偏保守）。PIT 仍被编程为 100 Hz 并保留自检。这类"时间基准"问题此前被掩盖，是因为 `g_tick_count` 从未真正推进过（FPS 显示的是初值 60）。
 10. **`smp_get_cpu_id()` 之外的宽泛地址守卫已清理**：`fbcon.c`/`gui.c`/`limine.c` 里"帧缓冲 ≥1 GiB 就拒绝"的旧判断都删了（LFB 现在由 `mmu_map_mmio_identity()` 显式映射）。
-11. **（未完成）RTL8139 发送路径在图里跑不通**：NIC 已被正确识别并初始化——`[net] rtl8139 found at 0xc000, irq=11, mac=52:54:00:12:34:56`、`[net] IPv4 10.0.2.15/24 gw 10.0.2.2 (mode=poll)`；ARP/IPv4/ICMP/UDP 协议栈已实现并由宿主 harness 验证（89 项断言，过程中还修掉两个真实 bug：TX 校验和字节序、UDP 校验和判定）。但实际发包仍失败：`tsd=0x2000`（芯片接管描述符、SIZE 归零）后传输永不完成 → `frames tx=0 drops=5`、`ping 10.0.2.2` 三个请求全超时。已做的修复：PCI 机制 #1 必须用 32 位访问（逐字节写 0xCF8 读回全总线同一个常量）、短帧补位到 60B、TSD 带上 8139too 的 `tx_flag`。**下一步**：核对 QEMU 模型对 TSAD/TSD 与 C+ 模式的要求（可能需要 `Cfg9346` 解锁后配置 `C+` 命令寄存器的 TxPoll，或 TCR 的 DMA burst），或改用 IRQ11 + 读 ISR 的完成判定。Shell 命令 `ping <ipv4>` / `netstat` 已就位，网络修好后可直接用。
+11. **（已修复）RTL8139 收发曾经完全跑不通——四个叠加的真实 bug**：修复后 `ping 10.0.2.2` 3/3 应答、`net_probe.py` 22/22 通过。按发现顺序：
+    - **(a) TSD 门铃**：`rtl_outl/rtl_inl` 曾被写成两个 16 位半字，而 QEMU 只在**32 位**写处理器里实现 TSD 发送门铃，于是写被丢弃；同时写 `0x3000|len` 会置上 `TxHostOwns(0x2000)`，QEMU 认为描述符仍归主机所有而拒绝发送。修正：`include/stitch/io.h` 补真正的 `outl/inl`，TSD 只写长度（OWN=0），`RTL_TSD_TABT` 改为 `1u<<30`。
+    - **(b) RX 条目步长少 4 字节**：芯片在每条条目尾部还写 4 字节 FCS，而头里的长度字段**不含**这 4 字节（guest 显存实测：`+0x00: 01 00 44 00` 头、`+0x44: d8 ac 72 f8` FCS、`+0x48` 才是下一条头）。原代码按 `len` 前进，正好落在 FCS 上，把它当成长度 0xf872acd8 的垃圾头 → 走"重新同步"分支跳到写指针，**跳过所有已缓冲帧**：每次开机只能收到 1 个 ARP 应答，ping 永远超时。修正：`head = (off + len + 4 + 3) & ~3`。
+    - **(c) ChipCmd.BUFE / CBR 不可信**：写 `RXEN|TXEN` 会清掉 BUFE，QEMU 模型也不再置回；而本机 QEMU 11.1 的 CBR 即使环里躺着 612 字节数据也读回 0（monitor 实测 `CAPR=0 CBR=0 ChipCmd=0`）。原来基于 CBR 的"有没有数据"判断因此每轮都误判，且读-改-写 ChipCmd 会把 TXEN 一起清掉（之后连发包都停了）。修正：环形缓冲在 init 时清零、只有芯片会写它，于是**用"读指针处的头是否 ROK 且长度合法"**判空/判满，完全不依赖设备寄存器；ChipCmd 只写常量，不再读-改-写。
+    - **(d) ICMP id/seq 字节序**：`rest_of_header` 是 u32，小端下**低半字才是 identifier**，接收路径按此解析；发送路径却把 id 放进高半字，于是每一个 echo 应答都被 `id == NET_ICMP_ID` 判掉——netstat 里 `icmp rx=1` 明明收到了应答，ping 还是超时。修正：`((u32)htons(seq) << 16) | htons(NET_ICMP_ID)`。
+    残留限制：RX 的"条目写完整了吗"用有界 settle 自旋近似（QEMU/TCG 够用；真机若头先于负载可见，理论上仍有窄窗口）。TCP 未实现。
+12. **多驱动共用块层的驱动器号只能靠约定**：`blk_register()` 不拒绝重复的驱动器号，`blk_find_by_drive()` 返回最后注册的那个。现行分配见 `block.h`（ata0/1=0/1、AHCI=4..7、NVMe=8、ram0=9、vda=10），四个控制器同时接入的实测输出见"验证记录"。
+13. **`scripts/qemu_boot.ps1`（新）**：本机自动化跑 QEMU 的封装——工作目录固定为项目根（QEMU 打不开非 ASCII 绝对路径）、monitor 走 **QMP**（干净 JSON，无 readline 回显）、支持按顺序 `sendkey` 注入与任意 monitor 命令（`i /4 0xc100`、`xp /96bx ...` 这类寄存器/内存取证就是靠它做的），并且**始终以 `quit` 收尾**再读日志（强杀会丢 `-serial file:` 尾部，曾因此误判 AP 未上线）。
 
 ---
 
