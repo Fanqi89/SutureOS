@@ -70,6 +70,7 @@ static const struct shell_cmd g_commands[] = {
     {"tcpstat", shell_cmd_tcpstat, "Show TCP connection/segment counters"},
     {"tcpserve",shell_cmd_tcpserve,"TCP echo server: tcpserve <port>"},
     {"tcpooo",  shell_cmd_tcpooo,  "Self-test: TCP passive open + out-of-order reassembly"},
+    {"tcpapi",  shell_cmd_tcpapi,  "TCP echo server over the socket ABI: tcpapi <port>"},
     {"kbdstat", shell_cmd_kbdstat, "Show keyboard IRQ1 ring counters"},
     {NULL, NULL, NULL}
 };
@@ -1127,6 +1128,87 @@ int shell_cmd_tcpserve(int argc, char **argv) {
     return total != 0u ? 0 : -1;
 }
 
+/* Same echo server as tcpserve, but driven ONLY through the socket ABI
+ * (socket/bind/listen/accept/recv/send/close in kernel/net/net.c), which is what
+ * a ring-3 program would call through the syscall layer. Proves the stream
+ * socket routing rather than the raw tcp_* entry points. */
+int shell_cmd_tcpapi(int argc, char **argv) {
+    extern int net_socket(int domain, int type, int protocol);
+    extern int net_bind(int fd, const net_sockaddr_t *addr, socklen_t addrlen);
+    extern int net_listen(int fd, int backlog);
+    extern int net_accept(int fd, net_sockaddr_t *addr, socklen_t *addrlen);
+    extern int net_recv(int fd, void *buf, size_t len, int flags);
+    extern int net_send(int fd, const void *buf, size_t len, int flags);
+    extern int net_close(int fd);
+    extern int net_ready(void);
+    extern void net_ip_to_str(uint32_t ip, char *buf, uint32_t buflen);
+
+    static uint8_t buf[1024];
+    net_sockaddr_t sa;
+    socklen_t sl;
+    char peer[16];
+    int port, lfd, cfd, n, rc;
+    uint32_t total = 0;
+
+    if (!net_ready()) { shell_puts("tcpapi: network is not up\n"); return -1; }
+    if (argc < 2) {
+        shell_puts("usage: tcpapi <port>   (TCP echo server over the socket ABI)\n");
+        return -1;
+    }
+    port = shell_atoi(argv[1]);
+    if (port <= 0 || port > 65535) {
+        shell_printf("tcpapi: bad port '%s'\n", argv[1]);
+        return -1;
+    }
+
+    lfd = net_socket(AF_INET, SOCK_STREAM, 0);
+    if (lfd < 0) { shell_printf("tcpapi: socket() FAILED (%d)\n", lfd); return -1; }
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port   = htons((uint16_t)port);
+    sa.sin_addr   = INADDR_ANY;
+    if (net_bind(lfd, &sa, (socklen_t)sizeof(sa)) != 0) {
+        shell_puts("tcpapi: bind() FAILED\n");
+        net_close(lfd);
+        return -1;
+    }
+    if (net_listen(lfd, 1) != 0) {
+        shell_puts("tcpapi: listen() FAILED\n");
+        net_close(lfd);
+        return -1;
+    }
+    shell_printf("TCPAPI listening on port %d (socket/bind/listen)\n", port);
+
+    sl = (socklen_t)sizeof(sa);
+    cfd = net_accept(lfd, &sa, &sl);
+    if (cfd < 0) {
+        shell_printf("TCPAPI accept() FAILED (%d)\n", cfd);
+        net_close(lfd);
+        return -1;
+    }
+    net_ip_to_str(sa.sin_addr, peer, sizeof(peer));
+    shell_printf("TCPAPI accepted fd=%d from %s:%u\n", cfd, peer,
+                 (unsigned)ntohs(sa.sin_port));
+
+    for (int i = 0; i < 64; i++) {
+        n = net_recv(cfd, buf, sizeof(buf), 0);
+        if (n <= 0)
+            break;                               /* EOF (0) or timeout (-EAGAIN) */
+        total += (uint32_t)n;
+        tcp_print_payload("TCPAPI rx", buf, (uint32_t)n);
+        rc = net_send(cfd, buf, (size_t)n, 0);
+        if (rc != n) {
+            shell_printf("TCPAPI echo send FAILED (%d)\n", rc);
+            break;
+        }
+    }
+    net_close(cfd);
+    net_close(lfd);
+    shell_printf("TCPAPI done: echoed %u bytes\n", (unsigned)total);
+    return total != 0u ? 0 : -1;
+}
+
 int shell_cmd_tcpstat(int argc, char **argv) {
     extern void tcp_dump_stats(void);
     (void)argc; (void)argv;
@@ -1198,3 +1280,4 @@ void shell_log_boot_fail(const char *fmt, ...) {
         shell_printf("[FAILED] %s\n", buf);
     }
 }
+

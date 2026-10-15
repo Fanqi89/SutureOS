@@ -54,13 +54,15 @@ class Client(threading.Thread):
         self.t_connected = None
 
     def run(self):
-        banner = f"TCP listening on port {self.guest_port}"
+        banners = (f"TCP listening on port {self.guest_port}",
+                   f"TCPAPI listening on port {self.guest_port}")
         deadline = time.time() + 90
         while time.time() < deadline:
             try:
                 with open(GUEST_LOG, "r", encoding="utf-8", errors="replace") as fh:
-                    if banner in fh.read():
-                        break
+                    text = fh.read()
+                if any(b in text for b in banners):
+                    break
             except OSError:
                 pass
             time.sleep(0.25)
@@ -110,6 +112,9 @@ def main() -> int:
     ap.add_argument("--guest-port", type=int, default=40404)
     ap.add_argument("--payload", default="HELLO-FROM-HOST-42")
     ap.add_argument("--boot-wait", type=int, default=18)
+    ap.add_argument("--command", default="tcpserve",
+                    help="guest command prefix: tcpserve (raw tcp_* API) or "
+                         "tcpapi (same server driven through the socket ABI)")
     args = ap.parse_args()
 
     payload = args.payload.encode()
@@ -128,7 +133,7 @@ def main() -> int:
     client.start()
     time.sleep(0.5)
 
-    command = f"tcpserve {args.guest_port}"
+    command = f"{args.command.strip()} {args.guest_port}"
     print(f"[host] hostfwd 127.0.0.1:{args.host_port} -> guest :{args.guest_port}")
     print(f"[guest] will type: {command}")
     proc = subprocess.run(
@@ -153,20 +158,23 @@ def main() -> int:
     def check(name, cond, detail=""):
         checks.append((name, bool(cond), detail))
 
-    check("guest announced its listener", f"TCP listening on port {args.guest_port}" in guest)
+    check("guest announced its listener",
+          f"TCP listening on port {args.guest_port}" in guest or
+          f"TCPAPI listening on port {args.guest_port}" in guest)
     check("host TCP connection was established through hostfwd", client.connected,
           f"error={client.error}")
     check("guest accepted a connection (passive open completed)",
-          "TCP accepted from" in guest)
+          "TCP accepted from" in guest or "TCPAPI accepted fd=" in guest)
     check("host received the echo byte-for-byte", client.echo == payload,
           f"host got {client.echo!r}, wanted {payload!r}")
-    m = re.search(r"TCP serve rx (\d+) bytes hex=([0-9a-f]*)", guest)
+    m = re.search(r"TCP(?:API| serve) rx (\d+) bytes hex=([0-9a-f]*)", guest)
     check("guest logged the payload it received", m is not None)
     if m:
         got = bytes.fromhex(m.group(2))
         check("guest received exactly what the host sent", got == payload,
               f"guest got {got!r}")
-    check("guest finished the session cleanly", "TCP serve done: echoed" in guest)
+    check("guest finished the session cleanly",
+          "TCP serve done: echoed" in guest or "TCPAPI done: echoed" in guest)
     check("no bad TCP checksum in the guest",
           "badsum" not in guest or " badsum=0" in guest)
 

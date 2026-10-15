@@ -83,6 +83,7 @@ int shell_cmd_tcpsend(int argc, char **argv);
 int shell_cmd_tcpstat(int argc, char **argv);
 int shell_cmd_tcpserve(int argc, char **argv);
 int shell_cmd_tcpooo(int argc, char **argv);
+int shell_cmd_tcpapi(int argc, char **argv);
 int shell_cmd_kbdstat(int argc, char **argv);
 
 /* Terminal output helpers */
@@ -93,3 +94,4 @@ void shell_set_colors(uint32_t fg, uint32_t bg);
 void shell_scroll_message(const char *msg);  /* For boot/shutdown messages */
 
 #endif /* STITCH_SHELL_H */
+

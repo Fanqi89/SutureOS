@@ -132,7 +132,9 @@ SutureOS（缝合怪系统）是一个实验性的 x86_64 单内核操作系统�
      tcpooo reassembled 30 bytes ascii="ABCDEFGHIJabcdefghijKLMNOPQRST"
      tcpooo: passive open + out-of-order reassembly PASS
   ```
-  Shell 有 `tcpecho <ip> <port> <text>`、`tcpsend <ip> <port> [text]`（缺省 3000 字节）、`tcpserve <port>`、`tcpooo`、`tcpstat`。
+  Shell 有 `tcpecho <ip> <port> <text>`、`tcpsend <ip> <port> [text]`（缺省 3000 字节）、`tcpserve <port>`、`tcpapi <port>`、`tcpooo`、`tcpstat`。
+- ✅ **套接字 ABI（SOCK_STREAM 已真正接到 TCP）**: `kernel/net/net.c` 的 `socket/bind/listen/accept/connect/send/recv/shutdown/close` 现在按 `SOCK_STREAM` 路由到 `kernel/net/tcp.c`（`g_sock_tcp[]` 把 fd 映射到 TCP 连接句柄；accept 会为新连接分配一个新 fd 并回填 peer 地址）。这也是 ring-3 通过 syscall 层会走的入口。验证：`tcpapi <port>` 只用套接字 ABI 起 echo 服务器，宿主侧 `scripts/tcp_server_acceptance.py --command tcpapi` **8/8**（`TCPAPI accepted fd=1 from 10.0.2.2:56195` → 回显 18 字节逐字节一致）；`--command tcpserve`（裸 tcp_* 路径）同样 8/8。
+  **未实现**：`linux_compat` 里的 socket 号仍未在 syscall 表注册（`socket/bind/listen/accept/connect/sendto/recvfrom` 目前只能由内核调用；用户态要等 syscall 表补上），`getsockname/getpeername/setsockopt` 对 TCP 只返回记录值。
   **未实现**：多个待 accept 连接的排队语义（backlog 只体现为槽位上限）、SACK、窗口缩放、时间戳、零窗口探测、拥塞控制（固定停等窗口）、MSS 协商、乱序队列深度 > 1；`linux_compat` 里的 socket 号仍未注册（返回 ENOSYS）。
 
 ### Phase 6: 专业 ISO 发布

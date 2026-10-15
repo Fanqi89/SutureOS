@@ -1328,33 +1328,126 @@ int net_bind(int fd, const net_sockaddr_t *addr, socklen_t addrlen)
     return 0;
 }
 
+/* ===================== SOCK_STREAM (TCP) routing =====================
+ * The socket ABI above is shared with the datagram path; these helpers bind a
+ * socket slot to a TCP connection handle so socket()/bind()/listen()/accept()/
+ * connect()/send()/recv()/close() really drive kernel/net/tcp.c for stream
+ * sockets (this is what a ring-3 program would call through the syscall layer).
+ * -1 means "no TCP connection attached". */
+static int g_sock_tcp[NET_MAX_SOCKETS];
+static int g_sock_tcp_init_done;
+
+static void sock_tcp_init_table(void)
+{
+    int i;
+    if (g_sock_tcp_init_done)
+        return;
+    for (i = 0; i < NET_MAX_SOCKETS; i++)
+        g_sock_tcp[i] = -1;
+    g_sock_tcp_init_done = 1;
+}
+
+static int sock_is_stream(int fd)
+{
+    return fd >= 0 && fd < NET_MAX_SOCKETS && g_socket_used[fd] &&
+           g_sockets[fd].type == SOCK_STREAM;
+}
+
+static void sock_set_addr(net_sockaddr_t *dst, socklen_t *dstlen,
+                          uint32_t ip, uint16_t port)
+{
+    if (!dst)
+        return;
+    dst->sin_family = AF_INET;
+    dst->sin_port   = htons(port);
+    dst->sin_addr   = ip;
+    memset(dst->sin_zero, 0, sizeof(dst->sin_zero));
+    if (dstlen)
+        *dstlen = (socklen_t)sizeof(net_sockaddr_t);
+}
+
 int net_listen(int fd, int backlog)
 {
-    (void)fd; (void)backlog;
-    return -ENOSYS;                              /* TCP is not implemented */
+    int h, port;
+
+    sock_tcp_init_table();
+    if (!sock_is_stream(fd))
+        return -ENOSYS;                          /* datagram: no listeners */
+    (void)backlog;                               /* only the slot count limits */
+    port = g_sockets[fd].local_port;
+    if (port <= 0)
+        return -EINVAL;                          /* bind() first */
+    h = tcp_listen((uint16_t)port);
+    if (h < 0)
+        return -EADDRINUSE;
+    g_sock_tcp[fd] = h;
+    g_sockets[fd].state = TCP_LISTEN;
+    return 0;
 }
 
 int net_accept(int fd, net_sockaddr_t *addr, socklen_t *addrlen)
 {
-    (void)fd; (void)addr; (void)addrlen;
-    return -ENOSYS;
+    uint32_t pip = 0;
+    uint16_t pport = 0;
+    int child, newfd;
+
+    sock_tcp_init_table();
+    if (!sock_is_stream(fd) || g_sock_tcp[fd] < 0)
+        return -ENOSYS;
+
+    child = tcp_listen_accept(g_sock_tcp[fd], 30000, &pip, &pport);
+    if (child < 0)
+        return -EAGAIN;
+
+    newfd = net_socket(AF_INET, SOCK_STREAM, 0);
+    if (newfd < 0) {
+        (void)tcp_close(child);
+        return newfd;
+    }
+    g_sock_tcp[newfd]          = child;
+    g_sockets[newfd].local_port  = g_sockets[fd].local_port;
+    g_sockets[newfd].remote_ip   = pip;
+    g_sockets[newfd].remote_port = pport;
+    g_sockets[newfd].state       = tcp_state(child);
+    sock_set_addr(addr, addrlen, pip, pport);
+    return newfd;
 }
 
 int net_connect(int fd, const net_sockaddr_t *addr, socklen_t addrlen)
 {
     (void)addrlen;
+    sock_tcp_init_table();
     if (fd < 0 || fd >= NET_MAX_SOCKETS || !g_socket_used[fd] || !addr)
         return -EBADF;
     g_sockets[fd].remote_ip = addr->sin_addr;
     g_sockets[fd].remote_port = ntohs(addr->sin_port);
+
+    if (g_sockets[fd].type == SOCK_STREAM) {
+        int h = tcp_connect(addr->sin_addr, ntohs(addr->sin_port), 4000);
+        if (h < 0)
+            return -ECONNREFUSED;                /* timeout or RST */
+        g_sock_tcp[fd] = h;
+        g_sockets[fd].state = tcp_state(h);
+        if (g_sockets[fd].local_port == 0)
+            g_sockets[fd].local_port = 40000u + (uint16_t)fd;
+        return 0;
+    }
     return 0;                                    /* datagram: nothing to do */
 }
 
 int net_send(int fd, const void *buf, size_t len, int flags)
 {
     (void)flags;
+    sock_tcp_init_table();
     if (fd < 0 || fd >= NET_MAX_SOCKETS || !g_socket_used[fd])
         return -EBADF;
+
+    if (g_sockets[fd].type == SOCK_STREAM) {
+        if (g_sock_tcp[fd] < 0)
+            return -ENOTCONN;
+        return tcp_send(g_sock_tcp[fd], buf, (uint32_t)len) == 0 ? (int)len : -EIO;
+    }
+
     return net_udp_send(g_sockets[fd].remote_ip,
                         g_sockets[fd].local_port ? g_sockets[fd].local_port : 40000u,
                         g_sockets[fd].remote_port,
@@ -1363,8 +1456,21 @@ int net_send(int fd, const void *buf, size_t len, int flags)
 
 int net_recv(int fd, void *buf, size_t len, int flags)
 {
-    (void)fd; (void)buf; (void)len; (void)flags;
-    return -EAGAIN;                              /* inbound sockets need a handler */
+    (void)flags;
+    sock_tcp_init_table();
+    if (fd < 0 || fd >= NET_MAX_SOCKETS || !g_socket_used[fd])
+        return -EBADF;
+
+    if (g_sockets[fd].type == SOCK_STREAM) {
+        int n;
+        if (g_sock_tcp[fd] < 0)
+            return -ENOTCONN;
+        n = tcp_recv(g_sock_tcp[fd], buf, (uint32_t)len, 3000);
+        if (n == 0 && tcp_peer_closed(g_sock_tcp[fd]))
+            return 0;                            /* EOF */
+        return n > 0 ? n : -EAGAIN;
+    }
+    return -EAGAIN;                              /* datagrams need a handler */
 }
 
 int net_sendto(int fd, const void *buf, size_t len, int flags,
@@ -1388,13 +1494,23 @@ int net_recvfrom(int fd, void *buf, size_t len, int flags,
 
 int net_shutdown(int fd, int how)
 {
-    (void)fd; (void)how;
+    (void)how;
+    sock_tcp_init_table();
+    if (sock_is_stream(fd) && g_sock_tcp[fd] >= 0) {
+        (void)tcp_close(g_sock_tcp[fd]);
+        g_sock_tcp[fd] = -1;
+    }
     return 0;
 }
 
 int net_close(int fd)
 {
+    sock_tcp_init_table();
     if (fd >= 0 && fd < NET_MAX_SOCKETS) {
+        if (g_sock_tcp[fd] >= 0) {
+            (void)tcp_close(g_sock_tcp[fd]);     /* listener or connection */
+            g_sock_tcp[fd] = -1;
+        }
         g_socket_used[fd] = 0;
         memset(&g_sockets[fd], 0, sizeof(net_socket_t));
     }
