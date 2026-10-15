@@ -17,8 +17,15 @@ uint32_t hanos_madt_get_ioapic_addr(acpi_rsdp_t *rsdp, uint8_t *ioapic_id) {
     if (!madt) return 0;
     uint8_t *p = (uint8_t *)(madt + 1);
     uint8_t *end = (uint8_t *)madt + madt->header.length;
-    while (p < end) {
+
+    /* SutureOS fix: same walk hazard as in acpi.c - `p += hdr->length` with a
+     * zero length field never advances, so a zero-length pad inside the MADT
+     * spins forever (that hung the boot on VMware). Stop on any malformed entry.
+     * hanos_acpi_find_table() already mapped the whole table for us. */
+    while (p + sizeof(acpi_madt_header_t) <= end) {
         acpi_madt_header_t *hdr = (acpi_madt_header_t *)p;
+        if (hdr->length < sizeof(acpi_madt_header_t) || p + hdr->length > end)
+            break;
         if (hdr->type == 1) {  /* MADT_TYPE_IOAPIC = 1 */
             madt_ioapic_t *io = (madt_ioapic_t *)hdr;
             if (ioapic_id) *ioapic_id = io->ioapic_id;
