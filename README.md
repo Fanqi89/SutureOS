@@ -314,6 +314,14 @@ py -3 scripts\verify_fat32_write.py build\fat32_virtio.img build\fat32.img
 - 截图：monitor 里 `screendump build\screen.ppm`；**退出前务必 `quit`**（强杀会丢 `-serial file:` 尾部日志）。
 - 输入模拟：`sendkey`，键名如 `ret`/`spc`/`slash`/`tab`/`shift-equal`；键盘是轮询无 IRQ，按键间隔 ≥400 ms。
 - **VMware**：新建 *Other 64-bit* 虚拟机 → 内存 ≥256 MB、≥2 核 → 光驱指向 `build/sutureos.iso`（可再加两块 IDE 盘分别挂 fat32.img / ext2.img）→ 启动进终端，`startgui` 进 GUI，`shutdown`/`reboot` 走 ACPI；可加串口重定向到文件抓同样的 `[  OK  ]` 日志。
+- **VMware 自动化（新）**：`powershell -NoProfile -File scripts\vmware_boot.ps1 -SerialLog build\vmware_serial.log -DiskImage build\fat32_ahci.img -WaitSeconds 60`——在 `build\` 里生成一次性 VM（不碰你在 Workstation 里已打开的虚拟机）、ISO 挂光驱、raw 测试镜像当 SATA 盘挂上、串口写文件、跑完自动关机。实测（VMware Workstation 17.5.2 + 虚拟 SATA 盘）：
+  ```
+  [ahci] port 0: VMware Virtual SATA Hard Drive sectors=71680 lba48=1 serial=00000000000000000001
+  [ahci] port 0: TFD=0x8 not idle after completion (device quirk); transfer accepted (PxCI clear, no ERR/DF)
+  [fat32] mount drive=4 ... write self-test PASS + ops self-test PASS (3/3)
+  → 宿主 py -3 scripts\verify_fat32_write.py build\fat32_ahci.img build\fat32.img → checks=17 ok=17
+  ```
+  三个 VMware 专属坑（脚本已处理，记在这里免得重踩）：① VMware 不认 raw 镜像，必须是 VMDK——用一个**只有描述符**的 VMDK 把 raw 文件当 FLAT extent（`RW <扇区数> FLAT <file> 0`），好处是 guest 的写直接落在 raw 文件里，宿主侧校验脚本不用改；② FAT32 超级软盘镜像自带 `0x55AA` 引导签名，不加 `bios.bootOrder = "cdrom"` 时 BIOS 会先去引导数据盘，guest 挂死且串口日志为空；③ .vmx 的注释符是 `#`，写成 `;` 会让 Workstation 直接报"无法读取虚拟机的配置文件"。
 
 ---
 
@@ -342,6 +350,7 @@ py -3 scripts\verify_fat32_write.py build\fat32_virtio.img build\fat32.img
 15. **FAT32 只支持 8.3 名字**：因此 rename 是"同目录名字段改写"，跨目录移动与超过 8.3 的名字会被拒绝（实测中 `SUTESTDIR` 这种 9 字符名字会被 `make_raw` 以 `FATFS_EINVAL` 拒绝——不是缺陷，是如实拒绝）；LFN 未实现。
 16. **（已修复一半）IOAPIC 从来没有被初始化过**：`arch/x86_64/ioapic.c` 的移植版把地址硬编码成 0xFEC00000，然后因为"地址 ≥1 GiB、不在恒等映射里"直接 `return false`（注释写"deferring to Phase-3"），于是 IOAPIC 一个寄存器都没碰过。这台机器上电即 APIC 模式、8259 的 INTR 接到 IOAPIC pin 0，而该重定向项默认是屏蔽的——**这就是"IRQ0 永远送不到"的真正原因**（系统节拍因此改用 LAPIC 定时器，现在依然如此，两路都用 0x20 会双倍计数，所以 IRQ0 保持屏蔽）。修法：用 `hanos_madt_get_ioapic_addr()` 取地址 + `mmu_map_mmio_identity(0xFEC00000, 0x2000)`（与 LAPIC/帧缓冲/AHCI 同一套路），再把 pin 0 设成 ExtINT 并解除屏蔽，同时把 IRQ1 从 8259 IMR 里放出来。另外 **ExtINT 交付的 IRQ 还必须给 LAPIC 发 EOI**（`hanos_lapic_eoi()`），否则 LAPIC 的 in-service 位一直挂着——实测不发就只有**第一个** legacy IRQ 能进来。残留：IRQ1 实际只送 2 个中断就停（`kbdstat` 可查），因此键盘保持**纯轮询**：我把中断处理写成"只计数、不读 0x60"，因为一旦让中断去读端口就会和轮询读端口的路径打架（实测同一条 27 字符命令只到 18 字符，比纯轮询更差）。所以 IRQ1 目前只是可观测的接线成果，输入仍走轮询。
 19. **SquashFS 是 gzip-only 的只读子集**（见 Phase 3）：lzo/lzma/xz/lz4/zstd 镜像在 mount 时被明确拒绝而不是误读；xattr/export 表/目录索引项不解析；单文件超过 4096 个数据块（4 KiB 块即 16 MiB）拒绝；uid/gid 只给出 id 表索引；内核没有压缩器，`squashfs_compress()` 返回 ENOTSUP。
+20. **（已修复）VMware 下 SATA 读盘全挂 —— 完成判定太严**：用户 VMware 实测截图里第一次读盘就报 `[ahci] port 0 error: tfd=0x8 serr=0x0 cmd=0x24 (tf not idle after completion)`，接着端口重启重试又撞上 `device busy before cmd=0x24`，最终 `sata0 read failed` → FAT32/ext2/SquashFS 全部挂不上。原因是 **VMware 的 AHCI 模型在命令完成那一瞬间 PxTFD 仍显示 DRQ=0x8**（QEMU 不会），而驱动把"完成但 Task File 未空闲"直接判成失败。已修：判据只认 ERR/DF 与 PxIS 致命位；完成后再给一小段有界等待，若仍显示 DRQ/BSY 就记一次 `(device quirk); transfer accepted (PxCI clear, no ERR/DF)` 并置 sticky 标志，后续命令不再为它付等待。VMware 17.5.2 实测：`VMware Virtual SATA Hard Drive sectors=71680` → FAT32 挂载成功 → write/ops 自检 PASS → 宿主校验 `checks=17 ok=17`；QEMU 侧四控制器回归无变化（不会走到 quirk 分支）。
 17. **`arch/x86_64/acpi.h` 与 `madt.h` 重复定义 `acpi_madt`/`acpi_madt_t`**，任何同时包含两者的翻译单元都编不过（本次在 ioapic.c 里用 `extern` 声明绕开，未合并这两个头）。
 18. **FAT32 的 ops 自检需要"干净"的测试镜像**：第二次在同一个盘上开机时，`TMPFILE.TXT → RENAMED.TXT` 会因为目标已存在而**正确地**返回 `FATFS_EEXIST`，于是自检打印 `2/3`（这恰好证明"不覆盖已存在目标"生效）。每次验证前用 `scripts/mkfat32_testimg.py` 重新生成或从 `build/fat32.img` 复制一份。
 

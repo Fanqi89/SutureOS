@@ -279,6 +279,21 @@ static int ahci_pci_find(struct ahci_pci_loc *out)
  * port 0 插了盘）。所有"先自旋后 hlt"的等待都改成两阶段：自旋 AHCI_SPINS_BEFORE_HLT
  * 次，然后最多 hlt AHCI_HLT_WAITS 次（≈1 s）。 */
 #define AHCI_HLT_WAITS        100u
+/* 完成之后等 Task File 真正空闲的自旋预算（见 ahci_issue_once 的 SutureOS fix） */
+#define AHCI_TF_SETTLE_SPINS 200000u
+
+/* SutureOS fix（VMware 实测）：有的 AHCI 模型/固件在命令完成的那一瞬间 PxTFD
+ * 仍显示 DRQ=1（QEMU 不会）。原实现把"完成但不空闲"直接判失败，于是 VMware 上
+ * 第一次读盘就报
+ *   [ahci] port 0 error: tfd=0x8 serr=0x0 cmd=0x24 (tf not idle after completion)
+ * → 端口重启重试 → 又撞上 pre-check 的 "device busy" → sata0 read failed
+ * → FAT32/ext2/SquashFS 全部挂不上（用户截图为证）。
+ * 正确判据是 ERR/DF 与 PxIS 的致命位：DRQ/BSY 只决定"下一条命令能不能发"。
+ * 第一次遇到时短等一下并记一次日志；若该设备始终如此就置 sticky 标志，
+ * 后续命令不再为它付等待时间（PxCI 已清零且无错误位 ⇒ HBA 已经把数据 DMA 进
+ * 内存，传输本身是成功的）。 */
+static int      g_tf_idle_quirk;
+static uint32_t g_tf_quirk_logged;
 
 /* ===================== DMA 可见缓冲 (.bss) =====================
  * 本内核恒等映射低 1 GiB，且 PMM 从 _bss_end 之后才开始分配，所以这些静态
@@ -543,11 +558,18 @@ static int ahci_issue_once(struct ahci_dev *d, uint8_t cmd, uint64_t lba,
     if (bytes > AHCI_DMA_BUF_SIZE)
         return -1;
 
-    /* 1) 设备必须空闲（BSY/DRQ 落） */
-    if (ahci_poll_port(p, P_TFD, P_TFD_BSY | P_TFD_DRQ, 0u, AHCI_SPIN_SHORT) != 0) {
-        console_printf("[ahci] port %u: device busy before cmd=0x%x tfd=0x%x\n",
-                       (uint64_t)p, (uint64_t)cmd, (uint64_t)ahci_port_rd(p, P_TFD));
-        return -1;
+    /* 1) 设备必须空闲（BSY/DRQ 落）。对已知"完成但 DRQ 残留"的设备（见文件上方
+     * 的 SutureOS fix）在 quirk 标志置位后只要求 BSY 落，否则 VMware 上重试时
+     * 会卡在这里。 */
+    {
+        uint32_t want_mask = P_TFD_BSY | P_TFD_DRQ;
+        if (g_tf_idle_quirk)
+            want_mask = P_TFD_BSY;
+        if (ahci_poll_port(p, P_TFD, want_mask, 0u, AHCI_SPIN_SHORT) != 0) {
+            console_printf("[ahci] port %u: device busy before cmd=0x%x tfd=0x%x\n",
+                           (uint64_t)p, (uint64_t)cmd, (uint64_t)ahci_port_rd(p, P_TFD));
+            return -1;
+        }
     }
     /* 2) 上一条命令必须已经退场（slot 0 的 PxCI 位清零） */
     if (ahci_poll_port(p, P_CI, 1u, 0u, AHCI_SPIN_SHORT) != 0) {
@@ -643,10 +665,25 @@ static int ahci_issue_once(struct ahci_dev *d, uint8_t cmd, uint64_t lba,
                        (uint64_t)count, (uint64_t)ci, (uint64_t)tfd, (uint64_t)serr);
         return -1;
     }
-    if ((tfd & (P_TFD_ERR | P_TFD_DF | P_TFD_DRQ | P_TFD_BSY)) != 0u) {
-        console_printf("[ahci] port %u error: tfd=0x%x serr=0x%x cmd=0x%x (tf not idle after completion)\n",
-                       (uint64_t)p, (uint64_t)tfd, (uint64_t)serr, (uint64_t)cmd);
-        return -1;
+    if ((tfd & (P_TFD_BSY | P_TFD_DRQ)) != 0u) {
+        /* 见文件上方的 SutureOS fix：完成但 Task File 还没空闲。等一小会儿；
+         * 仍然如此就当作设备行为，接受这次已完成（无错误位）的传输并记住它。 */
+        uint32_t spins;
+        for (spins = 0; spins < AHCI_TF_SETTLE_SPINS; spins++) {
+            if ((ahci_port_rd(p, P_TFD) & (P_TFD_BSY | P_TFD_DRQ)) == 0u)
+                break;
+            __asm__ volatile("pause");
+        }
+        tfd = ahci_port_rd(p, P_TFD);
+        if ((tfd & (P_TFD_BSY | P_TFD_DRQ)) != 0u) {
+            g_tf_idle_quirk = 1;
+            if (g_tf_quirk_logged++ < 2u) {
+                console_printf("[ahci] port %u: TFD=0x%x not idle after completion "
+                               "(device quirk); transfer accepted "
+                               "(PxCI clear, no ERR/DF)\n",
+                               (uint64_t)p, (uint64_t)tfd);
+            }
+        }
     }
     return 0;
 }
