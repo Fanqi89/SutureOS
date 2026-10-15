@@ -117,18 +117,23 @@ SutureOS（缝合怪系统）是一个实验性的 x86_64 单内核操作系统�
     64 bytes from 10.0.2.2: icmp_seq=1 time=82 us   (3/3 应答)
   ```
   修复记录见"已知问题"第 11 条（TX 描述符门铃、ChipCmd/CBR 不可信、RX 条目步长、ICMP id/seq 字节序共 4 个真实 bug）。
-- ✅ **TCP（RFC 793 子集，真实三次握手/双向数据/重传/关闭）**: `kernel/net/tcp.c` + `tcp.h`。主动打开（SYN + 超时重传）、按 IP+端口匹配连接、序号/确认号记账、单段停等发送（按 MSS 分片）、RTO 重传（500 ms × 4）、双向数据（只接受**按序**到达的段，乱序丢弃并重 ACK）、主动/被动关闭与 TIME_WAIT、RST 收发、伪头校验和。
-  主机侧端到端验收 `scripts/tcp_acceptance.py`（宿主跑真实 TCP 服务器，QEMU slirp 把 guest→10.0.2.2 转发到宿主 loopback）：
+- ✅ **TCP（RFC 793 子集：主动 + 被动打开、双向数据、重传、关闭）**: `kernel/net/tcp.c` + `tcp.h`。**主动打开**（`tcp_connect`，SYN + 超时重传）与**被动打开**（`tcp_listen`/`tcp_listen_accept`：SYN→SYN+ACK→ACK，子连接进 accept 队列；SYN+ACK 发不出去时保留 TCB 交给重传定时器，而不是丢掉连接）；序号/确认号记账、按 MSS 分片发送（单段停等 + 500 ms×4 重传）、双向数据、**一个乱序段缓冲槽**（先到的未来段暂存并回重复 ACK，缺口补上后按序补投）、主动/被动关闭与 TIME_WAIT、RST 收发、伪头校验和。
+  三条独立验收链路（都能在 guest 串口或宿主侧判定）：
   ```
-  [guest] TCP connect 10.0.2.2:5599 / TCP connected (handle 0, state 4=ESTABLISHED)
-          TCP sent 7 bytes hex=68656c6c6f3432 ascii="hello42"
-          TCP received 12 bytes hex=504f4e473a68656c6c6f3432 ascii="PONG:hello42" / TCP close OK
-  [host ] accepted peer=127.0.0.1:63216, received exactly b'hello42', sent b'PONG:hello42'
-  === RESULT: PASS === checks=7 ok=7 fail=0          # echo 模式（双向）
-  === RESULT: PASS === checks=6 ok=6 fail=0          # bulk 模式（3000 字节 = 3 个 MSS 段，逐字节一致）
+  # 1) guest 当客户端：宿主跑真实 TCP 服务器，slirp 把 guest→10.0.2.2 转到宿主 loopback
+  scripts/tcp_acceptance.py        → echo 7/7（双向逐字节）、bulk 6/6（3000 字节 = 3 个 MSS 段）
+  # 2) guest 当服务端：QEMU -netdev user,hostfwd=tcp::5700-:40404，宿主主动连进来
+  scripts/tcp_server_acceptance.py → 8/8
+     [guest] TCP listening on port 40404 / TCP accepted from 10.0.2.2:56125
+             TCP serve rx 18 bytes hex=48454c4c4f2d46524f4d2d484f53542d3432 ("HELLO-FROM-HOST-42")
+             TCP serve done: echoed 18 bytes, close OK
+  # 3) 内核内自检：手工注入段（对端不答 ARP，纯状态机，不上网线）
+  shell `tcpooo`                   → PASS
+     tcpooo reassembled 30 bytes ascii="ABCDEFGHIJabcdefghijKLMNOPQRST"
+     tcpooo: passive open + out-of-order reassembly PASS
   ```
-  Shell 有 `tcpecho <ip> <port> <text>`、`tcpsend <ip> <port> [text]`（缺省发 3000 字节）、`tcpstat`。
-  **未实现**：`listen()`/`accept()` 监听队列、乱序重组、快速重传/SACK、窗口缩放、时间戳、零窗口探测、拥塞控制（固定停等窗口）、MSS 协商。`linux_compat` 里的 socket 号仍未注册（返回 ENOSYS）。
+  Shell 有 `tcpecho <ip> <port> <text>`、`tcpsend <ip> <port> [text]`（缺省 3000 字节）、`tcpserve <port>`、`tcpooo`、`tcpstat`。
+  **未实现**：多个待 accept 连接的排队语义（backlog 只体现为槽位上限）、SACK、窗口缩放、时间戳、零窗口探测、拥塞控制（固定停等窗口）、MSS 协商、乱序队列深度 > 1；`linux_compat` 里的 socket 号仍未注册（返回 ENOSYS）。
 
 ### Phase 6: 专业 ISO 发布
 - ✅ **双引导 ISO**: Limine (BIOS 已实测启动；UEFI 路径未实测)、`/boot` `/system` `/EFI` 布局、内核双份、initrd、manifest.json

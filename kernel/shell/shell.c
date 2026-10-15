@@ -14,6 +14,7 @@
 #include "eevdf.h"
 #include "syscall.h"
 #include "mb_kbd.h"
+#include "net.h"      /* tcp_header_t / TCP_FLAG_* / htons for the TCP commands */
 
 /* Declare console_getc for keyboard input */
 extern int console_getc(void);
@@ -67,6 +68,8 @@ static const struct shell_cmd g_commands[] = {
     {"tcpecho", shell_cmd_tcpecho, "TCP round trip: tcpecho <ipv4> <port> <text>"},
     {"tcpsend", shell_cmd_tcpsend, "TCP one-way send: tcpsend <ipv4> <port> <text>"},
     {"tcpstat", shell_cmd_tcpstat, "Show TCP connection/segment counters"},
+    {"tcpserve",shell_cmd_tcpserve,"TCP echo server: tcpserve <port>"},
+    {"tcpooo",  shell_cmd_tcpooo,  "Self-test: TCP passive open + out-of-order reassembly"},
     {"kbdstat", shell_cmd_kbdstat, "Show keyboard IRQ1 ring counters"},
     {NULL, NULL, NULL}
 };
@@ -913,6 +916,215 @@ int shell_cmd_tcpsend(int argc, char **argv) {
                  (unsigned)tcp_rx_available(h));
     (void)tcp_close(h);
     return rc;
+}
+
+/* ==================== TCP server + out-of-order self-test ====================
+ * `tcpserve <port>` turns the guest into a TCP echo server (reachable from the
+ * host through QEMU's hostfwd=tcp::HOSTPORT-:GUESTPORT). `tcpooo` is an
+ * in-kernel self-test of the passive open + out-of-order path: it injects
+ * hand-built segments from a peer that never answers ARP, so the state machine
+ * is exercised without any host help and without touching the wire. */
+
+/* Build one segment and hand it to tcp_input() as if it arrived from
+ * src_ip:sport. The checksum is computed exactly like the stack validates it. */
+static void tcp_inject_seg(uint32_t src_ip, uint16_t sport, uint16_t dport,
+                           uint32_t seq, uint32_t ack, uint8_t flags,
+                           const uint8_t *data, uint32_t len)
+{
+    extern uint16_t net_pseudo_checksum(uint32_t src, uint32_t dst, uint8_t proto,
+                                        const uint8_t *data, uint32_t len);
+    extern void tcp_input(uint32_t src_ip, const uint8_t *seg, uint32_t len);
+    extern uint32_t net_local_ip;
+    static uint8_t seg[1600];
+    tcp_header_t *th = (tcp_header_t *)(void *)seg;
+
+    if (20u + len > sizeof(seg)) return;
+    th->src_port    = htons(sport);
+    th->dst_port    = htons(dport);
+    th->seq_num     = htonl(seq);
+    th->ack_num     = htonl(ack);
+    th->data_offset_flags = (uint8_t)(5u << 4);
+    th->flags       = flags;
+    th->window_size = htons(4096);
+    th->checksum    = 0u;
+    th->urgent_ptr  = 0u;
+    if (len != 0u && data != NULL) memcpy(seg + 20u, data, len);
+    th->checksum = htons(net_pseudo_checksum(net_local_ip, src_ip, IP_PROTO_TCP,
+                                             seg, 20u + len));
+    tcp_input(src_ip, seg, 20u + len);
+}
+
+int shell_cmd_tcpooo(int argc, char **argv) {
+    extern void tcp_init(void);
+    extern int tcp_listen(uint16_t local_port);
+    extern int tcp_listen_child(int listener);
+    extern int tcp_listen_accept(int listener, int timeout_ms, uint32_t*, uint16_t*);
+    extern uint32_t tcp_snd_nxt(int h), tcp_rcv_nxt(int h), tcp_rx_available(int h);
+    extern int tcp_recv(int h, void *buf, uint32_t cap, int timeout_ms);
+    extern int tcp_close(int h);
+    extern int tcp_state(int h);
+    extern int net_ready(void);
+
+    /* A peer that never answers ARP: our replies cannot leave the guest, which
+     * keeps this a pure state-machine test (nothing goes on the wire). */
+    const uint32_t peer      = 0x0A000263u;   /* 10.0.2.99 */
+    const uint16_t peer_port = 40000u;
+    const uint16_t local     = 40404u;
+    uint8_t d_in[10], d_gap[10], d_ooo[10], out[64];
+    uint32_t nxt;
+    int l, ch, n, ok;
+
+    (void)argc; (void)argv;
+    if (!net_ready()) { shell_puts("tcpooo: network is not up\n"); return -1; }
+
+    for (int i = 0; i < 10; i++) {
+        d_in[i]  = (uint8_t)('A' + i);        /* in-order block    */
+        d_gap[i] = (uint8_t)('a' + i);        /* the missing gap   */
+        d_ooo[i] = (uint8_t)('K' + i);        /* sent out of order */
+    }
+
+    tcp_init();
+    l = tcp_listen(local);
+    if (l < 0) { shell_printf("tcpooo: listen FAILED (%d)\n", l); return -1; }
+
+    /* 1) SYN creates the child in SYN_RECEIVED. */
+    tcp_inject_seg(peer, peer_port, local, 1000u, 0u, TCP_FLAG_SYN, NULL, 0u);
+    ch = tcp_listen_child(l);
+    if (ch < 0) { shell_puts("tcpooo: FAIL - no child after SYN\n"); return -1; }
+    if (tcp_state(ch) != TCP_SYN_RECEIVED) {
+        shell_printf("tcpooo: FAIL - state after SYN is %d (want %d)\n",
+                     tcp_state(ch), TCP_SYN_RECEIVED);
+        return -1;
+    }
+
+    /* 2) The third handshake segment establishes the child. */
+    tcp_inject_seg(peer, peer_port, local, tcp_rcv_nxt(ch), tcp_snd_nxt(ch),
+                   TCP_FLAG_ACK, NULL, 0u);
+    if (tcp_state(ch) != TCP_ESTABLISHED) {
+        shell_printf("tcpooo: FAIL - state after ACK is %d (want %d)\n",
+                     tcp_state(ch), TCP_ESTABLISHED);
+        return -1;
+    }
+
+    /* 3) accept() hands the established child over (timeout 0 = immediate). */
+    {
+        uint32_t pip = 0;
+        uint16_t pport = 0;
+        int got = tcp_listen_accept(l, 0, &pip, &pport);
+        if (got != ch || pip != peer || pport != peer_port) {
+            shell_printf("tcpooo: FAIL - accept returned %d (want %d) peer=%x:%u\n",
+                         got, ch, (unsigned)pip, (unsigned)pport);
+            return -1;
+        }
+    }
+
+    /* 4) In-order data lands in the ring. */
+    nxt = tcp_rcv_nxt(ch);
+    tcp_inject_seg(peer, peer_port, local, nxt, tcp_snd_nxt(ch),
+                   (uint8_t)(TCP_FLAG_ACK | TCP_FLAG_PSH), d_in, 10u);
+    if (tcp_rx_available(ch) != 10u) {
+        shell_printf("tcpooo: FAIL - in-order rx=%u (want 10)\n",
+                     (unsigned)tcp_rx_available(ch));
+        return -1;
+    }
+
+    /* 5) A future segment is buffered, NOT delivered (rx stays 10). */
+    tcp_inject_seg(peer, peer_port, local, nxt + 20u, tcp_snd_nxt(ch),
+                   (uint8_t)(TCP_FLAG_ACK | TCP_FLAG_PSH), d_ooo, 10u);
+    if (tcp_rx_available(ch) != 10u) {
+        shell_printf("tcpooo: FAIL - out-of-order segment delivered early (rx=%u)\n",
+                     (unsigned)tcp_rx_available(ch));
+        return -1;
+    }
+
+    /* 6) The gap arrives: it and the buffered segment must both be delivered,
+     *    in order -> rx = 30 and the bytes read A..J a..j K..T. */
+    tcp_inject_seg(peer, peer_port, local, nxt + 10u, tcp_snd_nxt(ch),
+                   (uint8_t)(TCP_FLAG_ACK | TCP_FLAG_PSH), d_gap, 10u);
+    if (tcp_rx_available(ch) != 30u) {
+        shell_printf("tcpooo: FAIL - after the gap rx=%u (want 30)\n",
+                     (unsigned)tcp_rx_available(ch));
+        return -1;
+    }
+
+    n = tcp_recv(ch, out, sizeof(out), 0);
+    if (n != 30) {
+        shell_printf("tcpooo: FAIL - recv returned %d (want 30)\n", n);
+        return -1;
+    }
+    ok = (memcmp(out, d_in, 10) == 0) &&
+         (memcmp(out + 10, d_gap, 10) == 0) &&
+         (memcmp(out + 20, d_ooo, 10) == 0);
+    tcp_print_payload("tcpooo reassembled", out, 30u);
+
+    tcp_close(ch);
+    tcp_close(l);
+    shell_printf("tcpooo: passive open + out-of-order reassembly %s\n",
+                 ok ? "PASS" : "FAIL");
+    return ok ? 0 : -1;
+}
+
+int shell_cmd_tcpserve(int argc, char **argv) {
+    extern int net_ready(void);
+    extern void tcp_init(void);
+    extern int tcp_listen(uint16_t local_port);
+    extern int tcp_listen_accept(int listener, int timeout_ms, uint32_t*, uint16_t*);
+    extern int tcp_recv(int h, void *buf, uint32_t cap, int timeout_ms);
+    extern int tcp_send(int h, const void *data, uint32_t len);
+    extern int tcp_close(int h);
+    extern void net_ip_to_str(uint32_t ip, char *buf, uint32_t buflen);
+
+    static uint8_t buf[1024];
+    char peerstr[16];
+    int port, l, ch, n, cl;
+    uint32_t pip = 0, total = 0;
+    uint16_t pport = 0;
+
+    if (!net_ready()) { shell_puts("tcpserve: network is not up\n"); return -1; }
+    if (argc < 2) {
+        shell_puts("usage: tcpserve <port>   e.g. tcpserve 40404, then from the host:\n"
+                   "       QEMU -netdev user,hostfwd=tcp::8080-:40404  and connect :8080\n");
+        return -1;
+    }
+    port = shell_atoi(argv[1]);
+    if (port <= 0 || port > 65535) {
+        shell_printf("tcpserve: bad port '%s'\n", argv[1]);
+        return -1;
+    }
+
+    tcp_init();
+    l = tcp_listen((uint16_t)port);
+    if (l < 0) {
+        shell_printf("tcpserve: listen on %d FAILED (%d)\n", port, l);
+        return -1;
+    }
+    shell_printf("TCP listening on port %d (guest 10.0.2.15)\n", port);
+
+    ch = tcp_listen_accept(l, 20000, &pip, &pport);
+    if (ch < 0) {
+        shell_puts("tcpserve: no connection within 20 s\n");
+        tcp_close(l);
+        return -1;
+    }
+    net_ip_to_str(pip, peerstr, sizeof(peerstr));
+    shell_printf("TCP accepted from %s:%u\n", peerstr, (unsigned)pport);
+
+    for (int i = 0; i < 64; i++) {
+        n = tcp_recv(ch, buf, sizeof(buf), 3000);
+        if (n <= 0)
+            break;                               /* peer closed or idle */
+        total += (uint32_t)n;
+        tcp_print_payload("TCP serve rx", buf, (uint32_t)n);
+        if (tcp_send(ch, buf, (uint32_t)n) != 0) {
+            shell_puts("tcpserve: echo send FAILED\n");
+            break;
+        }
+    }
+    cl = tcp_close(ch);
+    tcp_close(l);
+    shell_printf("TCP serve done: echoed %u bytes, close %s\n",
+                 (unsigned)total, cl == 0 ? "OK" : "unacknowledged");
+    return total != 0u ? 0 : -1;
 }
 
 int shell_cmd_tcpstat(int argc, char **argv) {

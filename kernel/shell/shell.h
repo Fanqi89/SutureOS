@@ -81,6 +81,8 @@ int shell_cmd_netstat(int argc, char **argv);
 int shell_cmd_tcpecho(int argc, char **argv);
 int shell_cmd_tcpsend(int argc, char **argv);
 int shell_cmd_tcpstat(int argc, char **argv);
+int shell_cmd_tcpserve(int argc, char **argv);
+int shell_cmd_tcpooo(int argc, char **argv);
 int shell_cmd_kbdstat(int argc, char **argv);
 
 /* Terminal output helpers */

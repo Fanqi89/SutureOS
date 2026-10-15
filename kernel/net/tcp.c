@@ -51,6 +51,23 @@ struct tcp_conn {
     int      rst_received;
     uint64_t time_wait_until;
 
+    /* Passive open bookkeeping. `listening` marks a listener slot (it owns only
+     * a local port); children point back at it through `parent` and become
+     * visible to tcp_listen_accept() once `established` is set. */
+    int      listening;
+    int      parent;                /* listener index, -1 for an active open  */
+    int      established;           /* handshake completed                    */
+    int      taken;                 /* already handed out by tcp_listen_accept */
+
+    /* One out-of-order segment held back until the gap in front of it is
+     * filled. A full TCP would keep a queue; a single slot already turns the
+     * common "two segments arrived swapped" case into in-order delivery instead
+     * of a lost segment. */
+    int      ooo_valid;
+    uint32_t ooo_seq;
+    uint16_t ooo_len;
+    uint8_t  ooo_buf[TCP_MSS_SZ];
+
     uint32_t rx_head;               /* byte ring (rx_tail == head when empty)  */
     uint32_t rx_tail;
     uint32_t rx_count;
@@ -65,6 +82,7 @@ static uint32_t g_isn_jitter;
 /* Counters (printed by tcp_dump_stats()). */
 static uint64_t g_rx_seg, g_tx_seg, g_retrans, g_badsum, g_ooo, g_rx_dropped;
 static uint64_t g_rst_tx, g_rst_rx, g_connects, g_conn_fail, g_timeouts;
+static uint64_t g_accepts, g_ooo_buffered, g_ooo_drained;
 
 /* ===================== helpers ===================== */
 void tcp_init(void)
@@ -88,6 +106,45 @@ static struct tcp_conn *conn_of(int h)
 static void conn_free(struct tcp_conn *c)
 {
     memset(c, 0, sizeof(*c));
+}
+
+static struct tcp_conn *conn_alloc(void);   /* forward: used by the RX helpers */
+static void rx_push(struct tcp_conn *c, const uint8_t *d, uint32_t n);
+static int  emit(struct tcp_conn *c, uint8_t flags, uint32_t seq,
+                 const uint8_t *data, uint16_t len);
+
+static struct tcp_conn *conn_alloc(void)
+{
+    int i;
+
+    for (i = 0; i < TCP_MAX_CONNS; i++) {
+        if (!g_conns[i].used) {
+            memset(&g_conns[i], 0, sizeof(g_conns[i]));
+            g_conns[i].used   = 1;
+            g_conns[i].parent = -1;
+            return &g_conns[i];
+        }
+    }
+    return NULL;
+}
+
+static uint32_t next_isn(void)
+{
+    g_isn_jitter += 0x9E3779B9u;                /* spread successive ISNs */
+    return net_get_tcp_initial_seq() + g_isn_jitter;
+}
+
+/* Copy received payload into the ring, advancing rcv_nxt. A full window drops
+ * the tail of the segment (counted) - there is no window shrinking. */
+static void tcp_ring_in(struct tcp_conn *c, const uint8_t *data, uint32_t len)
+{
+    uint32_t space = TCP_RX_RING_SZ - c->rx_count;
+    uint32_t n = len > space ? space : len;
+
+    rx_push(c, data, n);
+    c->rcv_nxt += n;
+    if (n < len)
+        g_rx_dropped++;
 }
 
 static uint16_t conn_window(const struct tcp_conn *c)
@@ -185,6 +242,42 @@ static void emit_rst(uint32_t dst_ip, uint16_t dst_port, uint16_t src_port,
         g_rst_tx++;
 }
 
+/* Deliver `len` bytes starting at `seq` into the receive ring, using the
+ * one-slot out-of-order buffer. Always answers with an ACK: the duplicate ACK
+ * sent for a future segment tells the peer exactly which byte we are waiting
+ * for, which is what makes the buffered segment usable once the gap is filled. */
+static void tcp_deliver(struct tcp_conn *c, uint32_t seq,
+                        const uint8_t *data, uint32_t len)
+{
+    if (seq == c->rcv_nxt) {
+        tcp_ring_in(c, data, len);
+        /* The held-back segment may now be contiguous: drain it too. */
+        if (c->ooo_valid && c->ooo_seq == c->rcv_nxt) {
+            c->ooo_valid = 0;
+            tcp_ring_in(c, c->ooo_buf, c->ooo_len);
+            g_ooo_drained++;
+        }
+        (void)emit(c, TCP_FLAG_ACK, c->snd_nxt, NULL, 0);
+        return;
+    }
+    if (seq > c->rcv_nxt) {
+        if (!c->ooo_valid && len <= TCP_MSS_SZ) {
+            memcpy(c->ooo_buf, data, len);
+            c->ooo_seq   = seq;
+            c->ooo_len   = (uint16_t)len;
+            c->ooo_valid = 1;
+            g_ooo_buffered++;
+        } else {
+            g_ooo++;                    /* slot busy or oversized: drop it    */
+        }
+        (void)emit(c, TCP_FLAG_ACK, c->snd_nxt, NULL, 0);
+        return;
+    }
+    /* Below rcv_nxt: a retransmission of data already delivered. */
+    g_ooo++;
+    (void)emit(c, TCP_FLAG_ACK, c->snd_nxt, NULL, 0);
+}
+
 static const char *state_name(int st)
 {
     switch (st) {
@@ -208,32 +301,23 @@ int tcp_connect(uint32_t dst_ip, uint16_t dst_port, int timeout_ms)
 {
     struct tcp_conn *c = NULL;
     uint64_t start, budget;
-    int i;
 
     if (!net_hw_initialized)
         return -2;
     if (dst_port == 0u)
         return -2;
 
-    for (i = 0; i < TCP_MAX_CONNS; i++) {
-        if (!g_conns[i].used) {
-            c = &g_conns[i];
-            break;
-        }
-    }
+    c = conn_alloc();
     if (c == NULL)
         return -3;
 
-    memset(c, 0, sizeof(*c));
-    c->used        = 1;
     c->remote_ip   = dst_ip;
     c->remote_port = dst_port;
     c->local_port  = net_alloc_port();
     if (c->local_port == 0u)
         c->local_port = (uint16_t)(49152u + (uint32_t)(c - g_conns) * 7u);
 
-    g_isn_jitter += 0x9E3779B9u;                 /* spread successive ISNs */
-    c->iss     = net_get_tcp_initial_seq() + g_isn_jitter;
+    c->iss     = next_isn();
     c->snd_una = c->iss;
     c->snd_nxt = c->iss + 1u;                    /* SYN consumes one seq   */
     c->rcv_nxt = 0;
@@ -270,6 +354,93 @@ int tcp_connect(uint32_t dst_ip, uint16_t dst_port, int timeout_ms)
             return -1;
         }
         io_wait();
+    }
+}
+
+/* ===================== passive open ===================== */
+int tcp_listen(uint16_t local_port)
+{
+    struct tcp_conn *c;
+    int i;
+
+    if (!net_hw_initialized)
+        return -2;
+    if (local_port == 0u)
+        return -2;
+
+    for (i = 0; i < TCP_MAX_CONNS; i++) {
+        struct tcp_conn *k = &g_conns[i];
+        if (k->used && k->listening && k->local_port == local_port)
+            return -2;                            /* already listening */
+    }
+
+    c = conn_alloc();
+    if (c == NULL)
+        return -3;
+
+    c->listening  = 1;
+    c->state      = TCP_LISTEN;
+    c->local_port = local_port;
+    return (int)(c - g_conns);
+}
+
+int tcp_listen_accept(int listener, int timeout_ms,
+                      uint32_t *peer_ip, uint16_t *peer_port)
+{
+    struct tcp_conn *l = conn_of(listener);
+    uint64_t start, budget;
+
+    if (l == NULL || !l->listening)
+        return -2;
+
+    start  = net_now_us();
+    budget = (uint64_t)(timeout_ms > 0 ? timeout_ms : 1000) * 1000ull;
+    for (;;) {
+        int i;
+
+        for (i = 0; i < TCP_MAX_CONNS; i++) {
+            struct tcp_conn *k = &g_conns[i];
+            if (k->used && k->parent == listener && !k->taken &&
+                (k->state == TCP_ESTABLISHED || k->state == TCP_CLOSE_WAIT)) {
+                k->taken = 1;
+                if (peer_ip)   *peer_ip   = k->remote_ip;
+                if (peer_port) *peer_port = k->remote_port;
+                return i;
+            }
+        }
+        net_poll();
+        if (net_now_us() - start >= budget)
+            return -1;                            /* nobody connected */
+        io_wait();
+    }
+}
+
+int tcp_listen_child(int listener)
+{
+    int i, best = -1;
+
+    for (i = 0; i < TCP_MAX_CONNS; i++)
+        if (g_conns[i].used && g_conns[i].parent == listener)
+            best = i;                             /* most recently created */
+    return best;
+}
+
+int tcp_is_established(int h)
+{
+    struct tcp_conn *c = conn_of(h);
+
+    if (c == NULL || c->listening)
+        return 0;
+    switch (c->state) {
+    case TCP_ESTABLISHED:
+    case TCP_CLOSE_WAIT:
+    case TCP_FIN_WAIT_1:
+    case TCP_FIN_WAIT_2:
+    case TCP_TIME_WAIT:
+    case TCP_LAST_ACK:
+        return 1;
+    default:
+        return 0;
     }
 }
 
@@ -356,6 +527,20 @@ int tcp_close(int h)
     if (c == NULL)
         return -1;
 
+    if (c->listening) {
+        /* Closing a listener drops it plus any child whose handshake never
+         * completed; established children are the caller's to close. */
+        int i;
+        for (i = 0; i < TCP_MAX_CONNS; i++) {
+            struct tcp_conn *k = &g_conns[i];
+            if (k->used && k->parent == (int)(c - g_conns) && !k->taken &&
+                !k->established)
+                conn_free(k);
+        }
+        conn_free(c);
+        return 0;
+    }
+
     if (c->state == TCP_ESTABLISHED || c->state == TCP_CLOSE_WAIT) {
         c->out_flags   = (uint8_t)(TCP_FLAG_ACK | TCP_FLAG_FIN);
         c->out_len     = 0;
@@ -412,6 +597,21 @@ uint32_t tcp_rx_available(int h)
     return c ? c->rx_count : 0u;
 }
 
+/* Sequence-number introspection: diagnostics and the in-kernel self-test need
+ * to know where the connection thinks it is (the test injects segments by hand
+ * and must acknowledge exactly snd_nxt). */
+uint32_t tcp_snd_nxt(int h)
+{
+    struct tcp_conn *c = conn_of(h);
+    return c ? c->snd_nxt : 0u;
+}
+
+uint32_t tcp_rcv_nxt(int h)
+{
+    struct tcp_conn *c = conn_of(h);
+    return c ? c->rcv_nxt : 0u;
+}
+
 /* ===================== receive path ===================== */
 void tcp_input(uint32_t src_ip, const uint8_t *seg, uint32_t len)
 {
@@ -443,14 +643,57 @@ void tcp_input(uint32_t src_ip, const uint8_t *seg, uint32_t len)
 
     for (i = 0; i < TCP_MAX_CONNS; i++) {
         struct tcp_conn *k = &g_conns[i];
-        if (k->used && k->remote_ip == src_ip && k->remote_port == sport &&
-            k->local_port == dport) {
+        if (k->used && !k->listening && k->remote_ip == src_ip &&
+            k->remote_port == sport && k->local_port == dport) {
             c = k;
             break;
         }
     }
 
     if (c == NULL) {
+        /* Passive open: a bare SYN addressed to a listening port creates a
+         * child connection and answers with SYN+ACK. */
+        struct tcp_conn *l = NULL;
+
+        for (i = 0; i < TCP_MAX_CONNS; i++) {
+            struct tcp_conn *k = &g_conns[i];
+            if (k->used && k->listening && k->local_port == dport) {
+                l = k;
+                break;
+            }
+        }
+        if (l != NULL && (flags & TCP_FLAG_SYN) != 0u &&
+            (flags & TCP_FLAG_ACK) == 0u) {
+            struct tcp_conn *ch = conn_alloc();
+
+            if (ch == NULL) {
+                g_conn_fail++;
+                return;                          /* no slot: peer will retry */
+            }
+            ch->listening   = 0;
+            ch->parent      = (int)(l - g_conns);
+            ch->local_port  = l->local_port;
+            ch->remote_ip   = src_ip;
+            ch->remote_port = sport;
+            ch->rcv_nxt     = seq + 1u;          /* the peer's SYN consumed 1 */
+            ch->iss         = next_isn();
+            ch->snd_una     = ch->iss;
+            ch->snd_nxt     = ch->iss + 1u;      /* our SYN consumes 1        */
+            ch->state       = TCP_SYN_RECEIVED;
+            /* Record the SYN+ACK as the outstanding segment even if the send
+             * itself fails (the peer's MAC may not be resolvable yet): a real
+             * server keeps the TCB and lets tcp_poll() retransmit it, instead of
+             * throwing the connection away because one frame could not leave. */
+            ch->out_flags   = (uint8_t)(TCP_FLAG_SYN | TCP_FLAG_ACK);
+            ch->out_len     = 0;
+            ch->out_seq     = ch->iss;
+            ch->out_active  = 1;
+            ch->out_retries = 0;
+            ch->out_sent_us = net_now_us();
+            (void)emit(ch, ch->out_flags, ch->iss, NULL, 0);
+            g_accepts++;
+            return;
+        }
         if ((flags & TCP_FLAG_RST) == 0u)
             emit_rst(src_ip, sport, dport, ack, seq, plen, flags);
         return;
@@ -477,6 +720,21 @@ void tcp_input(uint32_t src_ip, const uint8_t *seg, uint32_t len)
         return;
     }
 
+    /* Passive open completion: the third handshake segment (ACK of our
+     * SYN+ACK) turns a child of a listener into ESTABLISHED and makes it
+     * available to tcp_listen_accept(). Data may be piggybacked, so fall
+     * through to the normal ACK/data handling instead of returning. */
+    if (c->state == TCP_SYN_RECEIVED) {
+        if ((flags & TCP_FLAG_ACK) != 0u && ack == c->snd_nxt) {
+            c->snd_una     = ack;
+            c->out_active  = 0;
+            c->state       = TCP_ESTABLISHED;
+            c->established = 1;
+        } else {
+            return;                     /* not the completing ACK yet */
+        }
+    }
+
     /* Acknowledge our outstanding segment. */
     if ((flags & TCP_FLAG_ACK) != 0u) {
         if (ack > c->snd_una && ack <= c->snd_nxt) {
@@ -491,23 +749,11 @@ void tcp_input(uint32_t src_ip, const uint8_t *seg, uint32_t len)
         }
     }
 
-    /* In-order data only: out-of-order segments are dropped and re-ACKed, the
-     * sender will retransmit (no reassembly queue in this build). */
-    if (plen > 0u) {
-        if (seq == c->rcv_nxt) {
-            uint32_t space = TCP_RX_RING_SZ - c->rx_count;
-            uint32_t n = plen > space ? space : plen;
-
-            rx_push(c, seg + hlen, n);
-            c->rcv_nxt += n;
-            if (n < plen)
-                g_rx_dropped++;                  /* receive window full     */
-            (void)emit(c, TCP_FLAG_ACK, c->snd_nxt, NULL, 0);
-        } else {
-            g_ooo++;
-            (void)emit(c, TCP_FLAG_ACK, c->snd_nxt, NULL, 0);
-        }
-    }
+    /* Data: in-order delivery plus the single out-of-order slot (see
+     * tcp_deliver()). Anything that cannot be placed is dropped and re-ACKed,
+     * which makes the peer retransmit it. */
+    if (plen > 0u)
+        tcp_deliver(c, seq, (const uint8_t *)(const void *)(seg + hlen), plen);
 
     if ((flags & TCP_FLAG_FIN) != 0u) {
         uint32_t fin_seq = seq + plen;
@@ -592,8 +838,10 @@ void tcp_dump_stats(void)
                    g_rx_seg, g_tx_seg, g_retrans, g_badsum);
     console_printf("[tcp] connects=%llu failed=%llu timeouts=%llu rst_tx=%llu rst_rx=%llu\n",
                    g_connects, g_conn_fail, g_timeouts, g_rst_tx, g_rst_rx);
-    console_printf("[tcp] out_of_order=%llu rx_dropped=%llu conns=%u/%u\n",
-                   g_ooo, g_rx_dropped, (uint64_t)in_use, (uint64_t)TCP_MAX_CONNS);
+    console_printf("[tcp] listens=%llu ooo_buffered=%llu ooo_drained=%llu ooo_dropped=%llu "
+                   "rx_dropped=%llu conns=%u/%u\n",
+                   g_accepts, g_ooo_buffered, g_ooo_drained, g_ooo, g_rx_dropped,
+                   (uint64_t)in_use, (uint64_t)TCP_MAX_CONNS);
 
     for (i = 0; i < TCP_MAX_CONNS; i++) {
         struct tcp_conn *c = &g_conns[i];
