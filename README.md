@@ -313,6 +313,11 @@ py -3 scripts\verify_fat32_write.py build\fat32_virtio.img build\fat32.img
 - 存储控制器加盘：`-device ahci,id=ahci -device ide-hd,drive=d,bus=ahci.0`（SATA）、`-device nvme,drive=d,serial=sutureos0`、`-device virtio-blk-pci,drive=d`（都要配 `-drive id=d,file=...,if=none,format=raw`）。
 - 截图：monitor 里 `screendump build\screen.ppm`；**退出前务必 `quit`**（强杀会丢 `-serial file:` 尾部日志）。
 - 输入模拟：`sendkey`，键名如 `ret`/`spc`/`slash`/`tab`/`shift-equal`；键盘是轮询无 IRQ，按键间隔 ≥400 ms。
+- **启动呈现（按要求）**：开机 = **滚动的英文日志** → **系统名称横幅** → **干净的纯终端**（提示符可用）→ 输入 `startgui` 进入 GUI 桌面。
+  - `boot/limine.conf`：`timeout: 0` + `default_entry: 1` —— **关掉 Limine 自带的菜单/倒计时**，所以屏幕第一眼看到的就是内核英文日志；第二个条目保留 verbose 启动用于调试。
+  - `kernel/term/boot_banner.c`（新）：日志滚完后**清屏**并打印系统名横幅（SutureOS / version 0.5.0-alpha / 一行状态提示），随后 shell 接管，提示符 `sutureos#` 出现。
+  - 清屏踩过的三个坑（都记在代码注释里）：① **flanterm 不支持 `ESC[2J`（整屏擦除）**，只实现了 `ESC[0J/ESC[1J`——发 `ESC[2J` 被静默忽略，于是日志一直留在屏上；现改成**逐行 `ESC[<row>;1H` + `ESC[2K`** 擦除（与光标位置、帧缓冲几何无关）。② 清屏前必须先 `flanterm_flush()`，否则双缓冲里排队的那半行日志会在清屏之后**画回原来的位置**（VMware 上表现为 banner 周围散落日志碎片）。③ 早期日志是 fbcon 直接画进帧缓冲的，flanterm 的网格是空的，所以 `term_clear()` 现在额外用背景色**擦一遍帧缓冲像素**（`term_wipe_framebuffer()`）。
+  - 验收：QEMU `-vga std` + monitor `screendump` → 截图只有横幅/欢迎语/提示符，**无任何残留**；VMware 17.5.2（4 GB 那台）截图同样干净；`startgui` → `[gui] GUI framework init 1024x768` → 三个窗口（Task Manager / Calculator / About SutureOS）→ GUI 主循环。
 - **VMware**：新建 *Other 64-bit* 虚拟机 → 内存 ≥256 MB、≥2 核 → 光驱指向 `build/sutureos.iso`（可再加两块 IDE 盘分别挂 fat32.img / ext2.img）→ 启动进终端，`startgui` 进 GUI，`shutdown`/`reboot` 走 ACPI；可加串口重定向到文件抓同样的 `[  OK  ]` 日志。
 - **VMware 自动化（新）**：`powershell -NoProfile -File scripts\vmware_boot.ps1 -SerialLog build\vmware_serial.log -DiskImage build\fat32_ahci.img -WaitSeconds 60`——在 `build\` 里生成一次性 VM（不碰你在 Workstation 里已打开的虚拟机）、ISO 挂光驱、raw 测试镜像当 SATA 盘挂上、串口写文件、跑完自动关机。实测（VMware Workstation 17.5.2 + 虚拟 SATA 盘）：
   ```

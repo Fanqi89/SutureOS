@@ -191,6 +191,11 @@ int shell_run(void) {
      * when the task is started directly, without an explicit shell_init(). */
     shell_init();
 
+    /* Boot presentation: the scrolling English log has done its job - wipe it
+     * and show the system name, then hand the user a clean terminal. */
+    extern void boot_banner_draw(void);
+    boot_banner_draw();
+
     shell_puts("\n");
     shell_puts("Welcome to SutureOS Terminal\n");
     shell_puts("Type 'help' for available commands\n");

@@ -238,13 +238,96 @@ void term_puts(const char *s)
 
 /* Clear the screen and home the cursor using the standard ANSI sequences
  * flanterm understands (ED 2 = erase whole display, CUP 1;1 = home). */
+/* Wipe the framebuffer pixels with the terminal background colour.
+ *
+ * SutureOS fix (boot presentation): before flanterm takes over, the early boot
+ * log is drawn by the fbcon fallback straight into the framebuffer.  flanterm's
+ * own grid starts out empty, so a "clear" that only touches flanterm's cells
+ * cannot erase those pixels - the tail of the boot log stayed visible on the
+ * top row of the screen even after the banner was printed.  Painting the whole
+ * framebuffer with the background colour first makes the screen really empty. */
+static void term_wipe_framebuffer(void)
+{
+    volatile uint32_t *pixels = (volatile uint32_t *)(uintptr_t)limine_fb_addr;
+    size_t stride = (size_t)(limine_fb_pitch / 4u);
+    uint32_t bg = term_default_bg;
+
+    if (limine_fb_addr == 0 || limine_fb_pitch == 0) {
+        return;
+    }
+    for (uint32_t y = 0; y < limine_fb_height; y++) {
+        volatile uint32_t *line = pixels + (size_t)y * stride;
+        for (uint32_t x = 0; x < limine_fb_width; x++) {
+            line[x] = bg;
+        }
+    }
+}
+
 void term_clear(void)
 {
     if (term_ctx == NULL) {
         return;
     }
-    flanterm_write(term_ctx, "\x1b[2J\x1b[H", 7);
+    /* Flush the double buffer FIRST.
+     *
+     * flanterm queues every cell and paints it on the next flush; a line that
+     * was still queued when the screen was cleared (the boot log is written
+     * while the console is busy, and a concurrent writer can leave a partial
+     * line behind) would be painted at its OLD position afterwards - the boot
+     * log then reappears as scattered fragments under the banner (measured on
+     * VMware: "ahci port 0: V" and other leftovers). Flushing first empties the
+     * queue, so nothing stale can be painted after the clear. */
     flanterm_flush(term_ctx);
+
+    /* Deterministic clear: walk every row of the grid and erase it with
+     * ESC[2K (flanterm implements it: "erase the whole line"), then park the
+     * cursor in the top-left corner.
+     *
+     * Why not ESC[2J: flanterm does NOT implement the "erase whole screen"
+     * variant, so it was silently ignored - the boot log stayed on the screen.
+     * And ESC[1J/ESC[0J only work relative to the cursor, which left the rows
+     * above it untouched on some framebuffer geometries (VMware). Row by row is
+     * geometry independent. */
+    {
+        char seq[16];
+        uint32_t rows = term_rows();
+
+        for (uint32_t r = 0; r < rows; r++) {
+            /* ESC [ <row> ; 1 H  ESC [ 2 K   (no snprintf in this TU) */
+            size_t n = 0;
+            seq[n++] = 0x1B;
+            seq[n++] = '[';
+            if (r + 1u >= 10u) {
+                seq[n++] = (char)('0' + ((r + 1u) / 10u) % 10u);
+            }
+            seq[n++] = (char)('0' + (r + 1u) % 10u);
+            seq[n++] = ';';
+            seq[n++] = '1';
+            seq[n++] = 'H';
+            seq[n++] = 0x1B;
+            seq[n++] = '[';
+            seq[n++] = '2';
+            seq[n++] = 'K';
+            flanterm_write(term_ctx, seq, n);
+        }
+        flanterm_write(term_ctx, "\x1b[H", 3);
+    }
+    flanterm_flush(term_ctx);
+    term_wipe_framebuffer();
+    flanterm_full_refresh(term_ctx);
+    flanterm_flush(term_ctx);
+}
+
+/* Clear the screen AND repaint every cell.
+ *
+ * A plain flush repaints only the cells flanterm considers dirty, so text that
+ * was on the screen before the clear could survive on the framebuffer
+ * (measured: the tail of the boot log stayed visible on the top row after the
+ * banner was drawn). flanterm_full_refresh() repaints the whole grid from the
+ * (now empty) cell buffer, which is what a real "clear the screen" needs. */
+void term_clear_full(void)
+{
+    term_clear();
 }
 
 /* Flush queued cells to the framebuffer.  arch/x86_64/serial.c calls this once

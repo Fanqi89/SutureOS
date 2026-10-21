@@ -16,6 +16,7 @@ void     term_putc(char c);
 void     term_write(const char *s, uint32_t n);
 void     term_puts(const char *s);
 void     term_clear(void);
+void     term_clear_full(void);   /* clear + repaint every cell (a real wipe) */
 void     term_refresh(void);
 uint32_t term_cols(void);
 uint32_t term_rows(void);
