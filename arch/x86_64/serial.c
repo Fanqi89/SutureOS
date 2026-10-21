@@ -50,9 +50,18 @@ int  console_screen_enabled(void) { return g_screen_enabled; }
  * like a Linux console while still being capturable over the serial line. */
 void console_putc(char c)
 {
-    /* serial first: never lose a line because of a screen problem */
-    if (c == '\n')
-        console_putc('\r');
+    /* Keep the log first: capture before touching any hardware so a broken or
+     * slow screen/UART never loses a line. (Captured before the CR inserted
+     * below, otherwise every logged line would end with a stray '\r'.) */
+    extern void log_ring_putc(char c);
+    log_ring_putc(c);
+
+    /* serial next: never lose a line because of a screen problem */
+    if (c == '\n') {
+        while (!(inb(REG_LSR) & LSR_THRE))
+            ;
+        outb(REG_DATA, '\r');
+    }
     while (!(inb(REG_LSR) & LSR_THRE))
         ;
     outb(REG_DATA, (uint8_t)c);

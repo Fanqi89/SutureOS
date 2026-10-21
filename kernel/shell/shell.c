@@ -46,6 +46,8 @@ struct shell_cmd {
 static const struct shell_cmd g_commands[] = {
     {"help",    shell_cmd_help,    "Show this help message"},
     {"clear",   shell_cmd_clear,   "Clear the screen"},
+    {"log",     shell_cmd_log,     "Show the captured console log: log [lines] (auto-scrolls to the tail)"},
+    {"dmesg",   shell_cmd_log,     "Alias for log"},
     {"echo",    shell_cmd_echo,    "Print arguments"},
     {"exit",    shell_cmd_exit,    "Exit shell"},
     {"reboot",  shell_cmd_reboot,  "Reboot the system"},
@@ -301,6 +303,40 @@ int shell_cmd_echo(int argc, char **argv) {
 int shell_cmd_exit(int argc, char **argv) {
     (void)argc; (void)argv;
     g_shell.running = false;
+    return 0;
+}
+
+/* Defined further down; the log command needs it before that point. */
+static int shell_atoi(const char *s);
+
+/* log / dmesg: review the captured console log.
+ *
+ * "Auto-scroll" here means the tail: the last `n` lines are printed through the
+ * normal console path, so the terminal follows the newest line and the prompt
+ * ends up right below it - exactly like tailing a log. Default = one screenful. */
+int shell_cmd_log(int argc, char **argv) {
+    extern int log_ring_count(void);
+    extern uint64_t log_ring_total_lines(void);
+    extern void log_ring_dump_tail(int n, int (*emit)(const char *));
+    extern uint32_t term_rows(void);
+    int want = 0;
+
+    if (argc > 1) {
+        want = shell_atoi(argv[1]);
+        if (want <= 0) {
+            shell_printf("log: '%s' is not a line count\n", argv[1]);
+            return -1;
+        }
+    }
+    if (want == 0) {
+        uint32_t rows = term_rows();
+        want = (rows > 6u) ? (int)(rows - 4u) : 16;
+    }
+
+    shell_printf("--- log: last %d line(s) of %llu captured ---\n",
+                 (int64_t)want, (unsigned long long)log_ring_total_lines());
+    log_ring_dump_tail(want, NULL);          /* NULL = print + auto-scroll */
+    shell_printf("--- end of log (%d line(s) held) ---\n", (int64_t)log_ring_count());
     return 0;
 }
 
@@ -1285,4 +1321,5 @@ void shell_log_boot_fail(const char *fmt, ...) {
         shell_printf("[FAILED] %s\n", buf);
     }
 }
+
 

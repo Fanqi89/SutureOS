@@ -58,6 +58,7 @@ int shell_process_line(const char *line);
 /* Built-in commands */
 int shell_cmd_help(int argc, char **argv);
 int shell_cmd_clear(int argc, char **argv);
+int shell_cmd_log(int argc, char **argv);
 int shell_cmd_echo(int argc, char **argv);
 int shell_cmd_exit(int argc, char **argv);
 int shell_cmd_reboot(int argc, char **argv);
@@ -94,4 +95,5 @@ void shell_set_colors(uint32_t fg, uint32_t bg);
 void shell_scroll_message(const char *msg);  /* For boot/shutdown messages */
 
 #endif /* STITCH_SHELL_H */
+
 

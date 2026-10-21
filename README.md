@@ -318,6 +318,9 @@ py -3 scripts\verify_fat32_write.py build\fat32_virtio.img build\fat32.img
   - `kernel/term/boot_banner.c`（新）：日志滚完后**清屏**并打印系统名横幅（SutureOS / version 0.5.0-alpha / 一行状态提示），随后 shell 接管，提示符 `sutureos#` 出现。
   - 清屏踩过的三个坑（都记在代码注释里）：① **flanterm 不支持 `ESC[2J`（整屏擦除）**，只实现了 `ESC[0J/ESC[1J`——发 `ESC[2J` 被静默忽略，于是日志一直留在屏上；现改成**逐行 `ESC[<row>;1H` + `ESC[2K`** 擦除（与光标位置、帧缓冲几何无关）。② 清屏前必须先 `flanterm_flush()`，否则双缓冲里排队的那半行日志会在清屏之后**画回原来的位置**（VMware 上表现为 banner 周围散落日志碎片）。③ 早期日志是 fbcon 直接画进帧缓冲的，flanterm 的网格是空的，所以 `term_clear()` 现在额外用背景色**擦一遍帧缓冲像素**（`term_wipe_framebuffer()`）。
   - 验收：QEMU `-vga std` + monitor `screendump` → 截图只有横幅/欢迎语/提示符，**无任何残留**；VMware 17.5.2（4 GB 那台）截图同样干净；`startgui` → `[gui] GUI framework init 1024x768` → 三个窗口（Task Manager / Calculator / About SutureOS）→ GUI 主循环。
+- **终端/日志自动滚动**：内核控制台每写一行都会进一个 **128 行的环形缓冲**（`kernel/term/log_ring.c`，捕获点在 `console_putc()` 最前面，屏幕或串口坏了也不丢日志），屏幕输出本身始终跟随最新一行（flanterm 滚屏）。
+  - 新命令 `log [行数]`（别名 `dmesg`）：打印最近 N 行（缺省 = 一屏少 4 行），**自动滚到日志尾部**，提示符紧跟最后一行——`log 200` 会打印环里全部 128 行并停在最新行。
+  - 实测：`log` → 44 行；`log 200` → 128 行（`[selftest][rtl8139] PASS` 开头、`sutureos#` 结尾），串口与屏幕内容一致。
 - **VMware**：新建 *Other 64-bit* 虚拟机 → 内存 ≥256 MB、≥2 核 → 光驱指向 `build/sutureos.iso`（可再加两块 IDE 盘分别挂 fat32.img / ext2.img）→ 启动进终端，`startgui` 进 GUI，`shutdown`/`reboot` 走 ACPI；可加串口重定向到文件抓同样的 `[  OK  ]` 日志。
 - **VMware 自动化（新）**：`powershell -NoProfile -File scripts\vmware_boot.ps1 -SerialLog build\vmware_serial.log -DiskImage build\fat32_ahci.img -WaitSeconds 60`——在 `build\` 里生成一次性 VM（不碰你在 Workstation 里已打开的虚拟机）、ISO 挂光驱、raw 测试镜像当 SATA 盘挂上、串口写文件、跑完自动关机。实测（VMware Workstation 17.5.2 + 虚拟 SATA 盘）：
   ```
