@@ -185,6 +185,10 @@ void vfs_set_cwd(const char *path);
 /* ==================== Legacy xj_vfs API (for compatibility) ==================== */
 #define XJ_VFS_MAX_NAME   64
 #define XJ_VFS_MAX_NODES  64
+/* per-file payload capacity (was a 64-byte uint32_t[16] array, which
+ * silently truncated /etc/motd and could not hold /etc/passwd or
+ * /etc/shadow - the user database needs real files) */
+#define XJ_VFS_MAX_FILE_SIZE 2048
 
 #define XJ_VFS_OK          0
 #define XJ_VFS_ERR        -1
@@ -204,7 +208,7 @@ typedef struct xj_vfs_node {
     char name[XJ_VFS_MAX_NAME];
     xj_vfs_node_type_t type;
     uint32_t size;
-    uint32_t data[16];
+    uint8_t  data[XJ_VFS_MAX_FILE_SIZE];
     struct xj_vfs_node *parent;
     struct xj_vfs_node *children[XJ_VFS_MAX_NODES];
     uint32_t child_count;

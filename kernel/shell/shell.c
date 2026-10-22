@@ -3,6 +3,9 @@
  * Provides Linux-like terminal interface with black background, white text
  */
 #include "shell.h"
+#include "creds.h"
+#include "sudo.h"        /* sudo/su/passwd (kernel/security) */
+#include "userdb.h"
 #include <stitch/types.h>
 #include <stitch/string.h>
 #include <stitch/stdarg.h>
@@ -43,6 +46,9 @@ struct shell_cmd {
     const char *help;
 };
 
+/* defined next to the sudo commands; privileged handlers above use it */
+static int require_root(const char *cmd);
+
 static const struct shell_cmd g_commands[] = {
     {"help",    shell_cmd_help,    "Show this help message"},
     {"clear",   shell_cmd_clear,   "Clear the screen"},
@@ -61,6 +67,11 @@ static const struct shell_cmd g_commands[] = {
     {"ps",      shell_cmd_ps,      "List processes"},
     {"kill",    shell_cmd_kill,    "Kill a process"},
     {"sudo",    shell_cmd_sudo,    "Execute command as root"},
+    {"su",      shell_cmd_su,      "Switch user: su [user] (authenticates against /etc/shadow)"},
+    {"whoami",  shell_cmd_whoami,  "Print the effective user name"},
+    {"id",      shell_cmd_id,      "Print uid/gid/groups of the effective user"},
+    {"passwd",  shell_cmd_passwd,  "Change a password: passwd [user]"},
+    {"sudotest",shell_cmd_sudotest,"Self-test: SHA-256, /etc/shadow, sudoers, ticket, creds"},
     {"mount",   shell_cmd_mount,   "Mount filesystem"},
     {"umount",  shell_cmd_umount,  "Unmount filesystem"},
     {"df",      shell_cmd_df,      "Show disk usage"},
@@ -125,6 +136,62 @@ void shell_scroll_message(const char *msg) {
 }
 
 /* ==================== Shell Core ==================== */
+
+/* ==================== Console input helper ====================
+ * The PS/2 controller has a ONE byte output buffer: if the guest does not read a
+ * byte before the next key arrives, that key is lost. Reading once per idle
+ * iteration was not enough (typing `su user` could arrive as `user`), so a small
+ * ring is filled with a burst of polls and drained by console_getc().
+ * Uses the PS/2 keyboard driver for input. */
+
+#define SHELL_KBD_RING 64
+static char g_kbd_ring[SHELL_KBD_RING];
+static int  g_kbd_head;
+static int  g_kbd_tail;
+
+/* Drain up to `budget` pending scancodes into the ring. */
+static void shell_kbd_fill(int budget)
+{
+    while (budget-- > 0) {
+        const int sc = mbos_kbd_poll();
+        int ch;
+        if (sc < 0) return;
+        ch = mbos_kbd_decode(sc);
+        if (ch <= 0) continue;
+        {
+            const int next = (g_kbd_head + 1) % SHELL_KBD_RING;
+            if (next == g_kbd_tail) return;          /* ring full: leave the rest */
+            g_kbd_ring[g_kbd_head] = (char)ch;
+            g_kbd_head = next;
+        }
+    }
+}
+
+
+int console_getc(void) {
+    if (g_kbd_tail == g_kbd_head) {
+        shell_kbd_fill(16);                 /* refill: one poll is not enough */
+        if (g_kbd_tail == g_kbd_head) return -1;
+    }
+    {
+        const char c = g_kbd_ring[g_kbd_tail];
+        g_kbd_tail = (g_kbd_tail + 1) % SHELL_KBD_RING;
+        return (int)c;
+    }
+}
+
+/* Keep the prompt in sync with the effective identity:
+ *   root       -> "sutureos# "      (historical prompt; docs/tests rely on it)
+ *   other user -> "user@sutureos$ "
+ */
+void shell_refresh_prompt(void) {
+    if (cred_euid() == 0) {
+        strcpy(g_shell.prompt, "sutureos# ");
+    } else {
+        snprintf(g_shell.prompt, sizeof(g_shell.prompt), "%s@sutureos$ ",
+                 cred_username());
+    }
+}
 
 void shell_init(void) {
     memset(&g_shell, 0, sizeof(g_shell));
@@ -211,7 +278,9 @@ int shell_run(void) {
         g_shell.cursor_pos = 0;
         memset(g_shell.cmdline, 0, SHELL_MAX_CMD_LEN);
 
-        /* One prompt per command line. */
+        /* One prompt per command line; refresh it first so `su` / `sudo -i`
+         * show up immediately (root keeps the historical `sutureos# `). */
+        shell_refresh_prompt();
         shell_puts(g_shell.prompt);
 
         /* Read a line. While no key is pending, spin with a bounded pause
@@ -223,6 +292,10 @@ int shell_run(void) {
         for (;;) {
             int c = console_getc();
             if (c < 0) {
+                /* Refill the input ring first: keys must not wait behind the
+                 * SMP/NIC work below, or they are dropped by the 8042. */
+                shell_kbd_fill(8);
+                if (g_kbd_tail != g_kbd_head) continue;
                 /* Nothing to read: the BSP is idle here, so it also drains the
                  * SMP work queue (the APs drain it in their own idle loops).
                  * This is what makes queued kernel work run even when only the
@@ -357,6 +430,7 @@ int shell_cmd_log(int argc, char **argv) {
 }
 
 int shell_cmd_reboot(int argc, char **argv) {
+    if (!require_root("reboot")) return 1;
     (void)argc; (void)argv;
     shell_puts("Rebooting...\n");
     shell_scroll_message("Rebooting system...");
@@ -365,6 +439,7 @@ int shell_cmd_reboot(int argc, char **argv) {
 }
 
 int shell_cmd_shutdown(int argc, char **argv) {
+    if (!require_root("shutdown")) return 1;
     (void)argc; (void)argv;
     shell_puts("Shutting down...\n");
     shell_scroll_message("Shutting down system...");
@@ -587,6 +662,7 @@ int shell_cmd_ps(int argc, char **argv) {
 }
 
 int shell_cmd_kill(int argc, char **argv) {
+    if (!require_root("kill")) return 1;
     if (argc < 2) {
         shell_puts("Usage: kill <tid>\n");
         return -1;
@@ -621,29 +697,84 @@ int shell_cmd_kill(int argc, char **argv) {
     return 0;
 }
 
+/* sudo: forwards to the kernel sudo engine (kernel/security/sudo.c), which
+ * implements Linux sudo's sudoers policy, /etc/shadow password verification, the
+ * timestamp ticket cache and the audit log. */
 int shell_cmd_sudo(int argc, char **argv) {
-    if (argc < 2) {
-        shell_puts("Usage: sudo <command> [args...]\n");
-        return -1;
+    return sudo_main(argc, argv);
+}
+
+/* su [user]: authenticate and adopt that identity for this session. */
+int shell_cmd_su(int argc, char **argv) {
+    return sudo_su(argc, argv);
+}
+
+int shell_cmd_whoami(int argc, char **argv) {
+    (void)argc; (void)argv;
+    shell_printf("%s\n", cred_username());
+    return 0;
+}
+
+int shell_cmd_id(int argc, char **argv) {
+    char buf[192];
+    (void)argc; (void)argv;
+    cred_format_id(buf, sizeof(buf));
+    shell_printf("%s\n", buf);
+    return 0;
+}
+
+/* passwd [user]: two hidden prompts, like Linux. */
+int shell_cmd_passwd(int argc, char **argv) {
+    const char *target;
+    char first[96];
+    char second[96];
+
+    if (argc >= 2) {
+        target = argv[1];
+        if (strcmp(cred_username(), target) != 0 && !cred_is_root()) {
+            shell_printf("passwd: you may not change %s's password\n", target);
+            return 1;
+        }
+    } else {
+        target = cred_username();
     }
-    
-    /* In a real implementation, this would check permissions and escalate privileges */
-    shell_puts("[sudo] Password: ");
-    shell_puts("********\n");  /* Simulated password input */
-    
-    /* Execute command with elevated privileges */
-    /* For now, just run the command normally */
-    char cmdline[SHELL_MAX_CMD_LEN] = {0};
-    for (int i = 1; i < argc; i++) {
-        strcat(cmdline, argv[i]);
-        if (i < argc - 1) strcat(cmdline, " ");
+    if (userdb_by_name(target) == NULL) {
+        shell_printf("passwd: user %s does not exist\n", target);
+        return 1;
     }
-    
-    shell_printf("[sudo] Executing: %s\n", cmdline);
-    return shell_process_line(cmdline);
+    if (sudo_prompt_password("New password: ", first, sizeof(first)) < 0) return 1;
+    if (first[0] == '\0') {
+        shell_puts("passwd: password unchanged\n");
+        return 1;
+    }
+    if (sudo_prompt_password("Retype new password: ", second, sizeof(second)) < 0) return 1;
+    if (strcmp(first, second) != 0) {
+        shell_puts("Sorry, passwords do not match.\n");
+        return 1;
+    }
+    if (userdb_set_password(target, first) != 0) {
+        shell_puts("passwd: could not write /etc/shadow\n");
+        return 1;
+    }
+    shell_printf("passwd: password updated successfully for %s\n", target);
+    return 0;
+}
+
+/* sudotest: automated acceptance for the sudo layer (CI asserts on this). */
+int shell_cmd_sudotest(int argc, char **argv) {
+    (void)argc; (void)argv;
+    return sudo_selftest();
+}
+
+/* Privileged commands check the effective uid and say what to type instead. */
+static int require_root(const char *cmd) {
+    if (cred_is_root()) return 1;
+    shell_printf("%s: permission denied (are you root? try 'sudo %s')\n", cmd, cmd);
+    return 0;
 }
 
 int shell_cmd_mount(int argc, char **argv) {
+    if (!require_root("mount")) return 1;
     if (argc < 4) {
         shell_puts("Usage: mount <type> <device> <mountpoint>\n");
         shell_puts("Types: fat32, ext2, squashfs, ramfs\n");
@@ -676,6 +807,7 @@ int shell_cmd_mount(int argc, char **argv) {
 }
 
 int shell_cmd_umount(int argc, char **argv) {
+    if (!require_root("umount")) return 1;
     if (argc < 2) {
         shell_puts("Usage: umount <mountpoint>\n");
         return -1;
@@ -1295,19 +1427,6 @@ int shell_cmd_kbdstat(int argc, char **argv) {
                  (unsigned)mbos_kbd_dropped_count(),
                  (unsigned)moos_intr_count(0x21));
     return 0;
-}
-
-/* ==================== Console input helper ==================== *//* Uses PS/2 keyboard driver for input */
-int console_getc(void) {
-    /* Poll keyboard for scancode */
-    int scancode = mbos_kbd_poll();
-    if (scancode < 0) return -1;
-    
-    /* Decode scancode to ASCII */
-    int ch = mbos_kbd_decode(scancode);
-    if (ch <= 0) return -1;
-    
-    return ch;
 }
 
 /* ==================== Boot message logging ==================== */

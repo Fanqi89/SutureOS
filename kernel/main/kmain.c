@@ -306,6 +306,22 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
             if (n > 0) vfs_write_file("/etc/motd", motd, (uint32_t)n);
         }
         console_puts("[init] ramfs root mounted, demo files seeded\n");
+
+        /* ==================== users, credentials, sudo ====================
+         * Seeds /etc/passwd + /etc/shadow + /etc/group + /etc/sudoers on first
+         * boot, verifies the SHA-256/HMAC/PBKDF2 known answers, parses the sudo
+         * policy and gives the boot/shell task its root credentials. Must run
+         * after the ramfs is mounted (the policy files live there) and before
+         * the shell task starts (the prompt shows the identity). */
+        {
+            extern int userdb_init(void);
+            extern int sudo_init(void);
+            if (userdb_init() != 0) {
+                console_puts("[  !!  ] users: /etc/passwd unreadable "
+                             "(sudo will deny every request)\n");
+            }
+            (void)sudo_init();
+        }
     }
     /* Auto-mount FAT32 from the first block device that carries a FAT32 volume.
      * Candidate order keeps the historical ATA layout first, then the newer

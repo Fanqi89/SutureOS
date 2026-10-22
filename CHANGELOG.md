@@ -6,6 +6,75 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.7.0-alpha]
+
+First real privilege model: uids/gids, `/etc/passwd` + `/etc/shadow` with hashed
+passwords, a `/etc/sudoers` policy parser, and a `sudo` that behaves like Linux's
+sudo (ticket cache, 3 password tries, NOPASSWD, `-l/-k/-v/-u/-i`, audit log).
+
+### Added
+- **Crypto primitives** (`lib/sha256.c`, `include/stitch/sha256.h`): SHA-256
+  (FIPS 180-4), HMAC-SHA256 (RFC 2104) and PBKDF2-HMAC-SHA256 (RFC 2898), all
+  covered by known-answer self-tests that run at every boot - a broken hash would
+  otherwise let every password through.
+- **User database** (`kernel/security/userdb.c`): parses `/etc/passwd`,
+  `/etc/group` (Linux formats) and `/etc/shadow`, seeding them on first boot with
+  `root`/`root` (uid 0) and `user`/`user` (uid 1000, member of `wheel`). Password
+  hashes are salted PBKDF2-HMAC-SHA256 stored as
+  `$sutureos$pbkdf2-sha256$<iters>$<salt>$<hash>` - deliberately not Linux's
+  crypt format, because it is not one.
+- **Credentials** (`kernel/security/creds.c`): per-task uid/euid/suid/gid/egid
+  (Linux shape). `cred_set_euid(0)` fails for a normal user on purpose; only
+  `cred_escalate_root()` - called by sudo after authentication - may raise it.
+- **sudo** (`kernel/security/sudo.c`, `sudoers.c`): Linux sudo's contract -
+  `sudoers` syntax (`user`/`%group HOST=(RUNAS:GROUP) [NOPASSWD:] CMND`, `Defaults
+  timestamp_timeout`/`passwd_tries`), timestamp ticket cache (15 min, `-k`
+  invalidates, `-v` refreshes), 3 attempts with `Sorry, try again.` and
+  `sudo: 3 incorrect password attempts`, both denial messages, `sudo -l`,
+  `sudo -u`, `sudo -i`, and one audit line per invocation in `/var/log/sudo.log`.
+- **Shell**: `su [user]`, `whoami`, `id`, `passwd [user]` (two hidden prompts),
+  `sudotest` (23-check acceptance), a prompt that shows the identity
+  (`sutureos# ` as root, `user@sutureos$ ` otherwise) and real permission checks
+  on the privileged commands `mount`/`umount`/`shutdown`/`reboot`/`kill`.
+
+### Fixed
+- **ramfs files were capped at 64 bytes** (`uint32_t data[16]`): `/etc/motd` had
+  silently been truncated and `/etc/passwd` could not exist at all. Nodes now
+  carry `XJ_VFS_MAX_FILE_SIZE` (2048) bytes - this is what made the user database
+  possible.
+- **Dropped keystrokes at typing speed**: the 8042 has a one-byte output buffer
+  and the shell read it once per idle iteration, *after* draining the SMP work
+  queue and the NIC ring, so fast input was lost (typing `su user` arrived as
+  `user`). A 64-byte input ring is filled with a burst of polls and drained by
+  `console_getc()`; the keyboard is now serviced before the other idle work.
+- PBKDF2 iterations lowered from 10000 to 2000: 10k cost ~1 s per verification,
+  which stalled the shell (and made the password prompt feel broken).
+
+### Verification
+- `sudotest`: **23/23 PASS** (hashes, accounts, shadow round-trip, policy,
+  ticket, credentials, audit log).
+- Interactive QEMU transcript: `su user` -> `user@sutureos$`; `mount ...` denied
+  with `permission denied (are you root? try 'sudo mount')`; `sudo -l` lists the
+  policy after the password; `sudo mount fat32 0 /mnt/sudomnt` actually mounts and
+  logs `RUN user=user runas=root cmd=mount ...`; a second `sudo` runs without a
+  password (ticket); `sudo -k` forces the prompt again; 3 wrong passwords produce
+  `sudo: 3 incorrect password attempts`; `su root` restores `sutureos#`.
+- Regression: self-tests 13/14, FAT32 write+ops PASS, host verifier 17/17,
+  AP online, RTL8139 ping, PS/2 mouse - unchanged.
+
+### Known limitations (stated, not hidden)
+- This is a **policy layer, not a security boundary**: every task still runs in
+  ring 0 and the shell is the only user, so kernel code can bypass sudo. It
+  becomes a real boundary when ring-3 userland lands; the cred API already has
+  Linux's uid/euid/suid shape so the switch is mechanical.
+- Linux sudo itself is a setuid userspace program built on PAM/crypt(3)/termios.
+  None of those exist here (no libc in the image, 22 syscalls), so the behaviour
+  was ported rather than the binary; password hashing is PBKDF2-HMAC-SHA256
+  instead of yescrypt, and there is no secure RNG yet (salts mix the TSC, a
+  counter and the user name).
+- No `sudoedit`, no PAM modules, no LDAP, no `Defaults` beyond the two above, no
+  per-command argument granularity beyond the command name.
+
 ## [v0.6.2-alpha]
 
 Keyboard fix release. Typing lost characters (the shell's first keystroke after

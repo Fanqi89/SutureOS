@@ -72,6 +72,11 @@ int shell_cmd_cat(int argc, char **argv);
 int shell_cmd_ps(int argc, char **argv);
 int shell_cmd_kill(int argc, char **argv);
 int shell_cmd_sudo(int argc, char **argv);
+int shell_cmd_su(int argc, char **argv);
+int shell_cmd_whoami(int argc, char **argv);
+int shell_cmd_id(int argc, char **argv);
+int shell_cmd_passwd(int argc, char **argv);
+int shell_cmd_sudotest(int argc, char **argv);
 int shell_cmd_mount(int argc, char **argv);
 int shell_cmd_umount(int argc, char **argv);
 int shell_cmd_df(int argc, char **argv);
@@ -91,6 +96,7 @@ int shell_cmd_kbdstat(int argc, char **argv);
 /* Terminal output helpers */
 void shell_putc(char c);
 void shell_puts(const char *s);
+void shell_refresh_prompt(void);  /* root: sutureos# ... non-root: user@sutureos$ */
 void shell_printf(const char *fmt, ...);
 void shell_set_colors(uint32_t fg, uint32_t bg);
 void shell_scroll_message(const char *msg);  /* For boot/shutdown messages */

@@ -301,6 +301,35 @@ py -3 scripts\verify_fat32_write.py build\fat32_virtio.img build\fat32.img
 [fat32] write self-test PASS / [net] selftest ping 10.0.2.2 -> reply in 1293 us
 ```
 
+### 用户与 sudo（v0.7.0-alpha 起）
+
+真正的权限模型，不再是模拟：
+
+- **账号**（`/etc/passwd` + `/etc/shadow`，Linux 格式，首次启动自动播种）：
+
+  | 账号 | 口令 | uid | 说明 |
+  |---|---|---|---|
+  | `root` | `root` | 0 | 管理员，开机即 root 控制台（提示符 `sutureos#`）|
+  | `user` | `user` | 1000 | 普通用户，`wheel` 组成员（提示符 `user@sutureos$`）|
+
+  口令哈希是加盐 **PBKDF2-HMAC-SHA256**（`lib/sha256.c`，每次开机跑 FIPS/RFC 已知答案自检），
+  存成 `$sutureos$pbkdf2-sha256$<迭代>$<盐>$<哈希>`——刻意不用 Linux 的 crypt 格式。
+- **策略** `/etc/sudoers`（Linux sudo 语法子集）：
+  ```
+  Defaults timestamp_timeout=15
+  Defaults passwd_tries=3
+  root   ALL=(ALL:ALL) ALL
+  %wheel ALL=(ALL:ALL) ALL
+  user   ALL=(ALL:ALL) ALL
+  ```
+- **命令**：`sudo [-l|-k|-v|-u user|-i] cmd...`、`su [user]`、`whoami`、`id`、`passwd [user]`、
+  `sudotest`（23 项验收）。票据缓存 15 分钟（`sudo -k` 作废），3 次密码尝试，每次调用写
+  `/var/log/sudo.log` 审计。
+- **权限真正生效**：`mount`/`umount`/`shutdown`/`reboot`/`kill` 非 root 会被拒并提示
+  `try 'sudo mount'`。
+- **边界（明说）**：这是**策略层，不是安全边界**——所有任务仍在 ring 0，内核代码可以绕过；
+  等 ring-3 用户态落地才是硬件边界。也没有 `sudoedit`/PAM/LDAP，盐尚无安全随机数。
+
 ### 版本与发布
 
 - 版本号遵循 **SemVer 2.0.0**，唯一来源是 `include/sutureos/version.h`（内核横幅、
