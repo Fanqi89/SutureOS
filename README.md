@@ -301,6 +301,23 @@ py -3 scripts\verify_fat32_write.py build\fat32_virtio.img build\fat32.img
 [fat32] write self-test PASS / [net] selftest ping 10.0.2.2 -> reply in 1293 us
 ```
 
+### ring 0 能力（v0.8.0-alpha 起）
+
+内核侧（ring 0）已按审计补齐，还差的是用户态（ring 3）：
+
+- **系统调用 56 个**（22 → 56）：stat/fstat/lstat、access、lseek、ioctl、statfs、chdir/getcwd、
+  mkdir/rmdir/unlink/rename、getdents64、fsync/sync/truncate、getpid/gettid/getppid、
+  getuid/…/setgid、uname、gettimeofday/time/clock_gettime/nanosleep/times、kill/wait4、
+  sysinfo/getrlimit/setrlimit/prctl/sched_getaffinity/getcpu、pipe/pipe2。
+  `stat` 用 Linux 逐字节一致的 144 字节结构；`uname` 返回 `sysname=Linux`、`release=6.1.0-sutureos`。
+- **真实时钟**：CMOS RTC（`arch/x86_64/rtc.c`）开机读一次，把 tick 锚到真实时间；
+  `date` 打印真实 UTC。
+- **管道**：`kernel/ipc/pipe.c`，fd 独立号段，EOF/EPIPE/短写/有界等待齐全。
+- **shell 文件管理**：`rm` `mkdir` `rmdir` `touch` `cp` `mv` `date` `uname` `free`。
+- **验收命令**：`systest`（39 项）、`pipetest`（16 项）、`rtctest`（8 项），全部全绿。
+- **仍未做（ring 3）**：`/init` 不执行、无用户态 libc、`dup/dup2/ftruncate/readlink/symlink`
+  返回 `-ENOSYS`；e1000/FAT32 LFN/ext2 写/GUI 拖动缩放未动。
+
 ### 用户与 sudo（v0.7.0-alpha 起）
 
 真正的权限模型，不再是模拟：

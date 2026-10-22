@@ -79,6 +79,7 @@ def main():
         f"-I{ROOT}/kernel/syscall",
         f"-I{ROOT}/kernel/pkg",
         f"-I{ROOT}/kernel/security",   # userdb / creds / sudoers / sudo
+        f"-I{ROOT}/kernel/ipc",        # pipe/fifo
         f"-I{ROOT}/kernel/shell",      # shell_process_line (sudo re-dispatch)
         f"-I{ROOT}/kernel/term",
         "-O2", "-g", "-Wall", "-Wextra"

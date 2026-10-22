@@ -313,6 +313,23 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
          * policy and gives the boot/shell task its root credentials. Must run
          * after the ramfs is mounted (the policy files live there) and before
          * the shell task starts (the prompt shows the identity). */
+        /* ==================== wall clock + the rest of the syscalls ======
+         * The CMOS RTC anchors the monotonic tick counter on real time, and the
+         * second syscall batch (stat/lseek/pipe/getpid/chdir/mkdir/...) is
+         * registered here so the shell's `systest` can exercise it. */
+        {
+            extern int rtc_init(void);
+            extern int syscalls2_register(void);
+            extern int pipe_selftest(void);
+            extern int rtc_selftest(void);
+            (void)rtc_init();
+            console_printf("[  OK  ] syscalls: %d registered "
+                           "(22 base + stat/lseek/pipe/getpid/chdir/mkdir/...)\n",
+                           (int64_t)syscalls2_register());
+            (void)pipe_selftest();
+            (void)rtc_selftest();
+        }
+
         {
             extern int userdb_init(void);
             extern int sudo_init(void);

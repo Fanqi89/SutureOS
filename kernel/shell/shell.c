@@ -4,7 +4,9 @@
  */
 #include "shell.h"
 #include "creds.h"
-#include "sudo.h"        /* sudo/su/passwd (kernel/security) */
+#include "sudo.h"
+#include "syscalls2.h"   /* systest: the new syscalls */
+#include "rtc.h"        /* date */        /* sudo/su/passwd (kernel/security) */
 #include "userdb.h"
 #include <stitch/types.h>
 #include <stitch/string.h>
@@ -72,6 +74,18 @@ static const struct shell_cmd g_commands[] = {
     {"id",      shell_cmd_id,      "Print uid/gid/groups of the effective user"},
     {"passwd",  shell_cmd_passwd,  "Change a password: passwd [user]"},
     {"sudotest",shell_cmd_sudotest,"Self-test: SHA-256, /etc/shadow, sudoers, ticket, creds"},
+    {"rm",      shell_cmd_rm,      "Remove files: rm <path>..."},
+    {"mkdir",   shell_cmd_mkdir,   "Create directories"},
+    {"rmdir",   shell_cmd_rmdir,   "Remove empty directories"},
+    {"touch",   shell_cmd_touch,   "Create empty files"},
+    {"cp",      shell_cmd_cp,      "Copy a file: cp <src> <dst>"},
+    {"mv",      shell_cmd_mv,      "Rename/move inside a directory: mv <src> <dst>"},
+    {"date",    shell_cmd_date,    "Show the wall clock (CMOS RTC)"},
+    {"uname",   shell_cmd_uname,   "System name: uname [-a]"},
+    {"free",    shell_cmd_free,    "Memory usage"},
+    {"systest", shell_cmd_systest, "Self-test: stat/lseek/pipe/getpid/chdir/mkdir/rename/time"},
+    {"pipetest",shell_cmd_pipetest,"Self-test: pipes (create/write/read/EOF/EPIPE)"},
+    {"rtctest", shell_cmd_rtctest, "Self-test: CMOS RTC decoding (BCD/12h/leap/format)"},
     {"mount",   shell_cmd_mount,   "Mount filesystem"},
     {"umount",  shell_cmd_umount,  "Unmount filesystem"},
     {"df",      shell_cmd_df,      "Show disk usage"},
@@ -764,6 +778,204 @@ int shell_cmd_passwd(int argc, char **argv) {
 int shell_cmd_sudotest(int argc, char **argv) {
     (void)argc; (void)argv;
     return sudo_selftest();
+}
+
+/* ==================== file management (ring-0 shell) ====================
+ * These used to be missing entirely, so a user could not create or delete a file
+ * even though the VFS has supported it for a while. Each one calls the syscall
+ * layer (syscall_invoke) instead of the VFS directly, which also exercises the
+ * syscalls a user program will use. */
+static int sh_syscall5(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3,
+                       uint64_t a4)
+{
+    extern uint64_t syscall_invoke(uint64_t, uint64_t, uint64_t, uint64_t,
+                                   uint64_t, uint64_t, uint64_t);
+    return (int)syscall_invoke(nr, a1, a2, a3, a4, 0, 0);
+}
+
+int shell_cmd_rm(int argc, char **argv) {
+    int rc = 0;
+    if (argc < 2) {
+        shell_puts("usage: rm <path>...\n");
+        return 1;
+    }
+    for (int i = 1; i < argc; i++) {
+        const int r = sh_syscall5(SYS_UNLINK, (uint64_t)(uintptr_t)argv[i], 0, 0, 0);
+        if (r != 0) {
+            shell_printf("rm: %s: %s\n", argv[i],
+                         (r == -2) ? "no such file or directory"
+                                   : ((r == -21) ? "is a directory (use rmdir)" : "failed"));
+            rc = 1;
+        }
+    }
+    return rc;
+}
+
+int shell_cmd_mkdir(int argc, char **argv) {
+    int rc = 0;
+    if (argc < 2) {
+        shell_puts("usage: mkdir <dir>...\n");
+        return 1;
+    }
+    for (int i = 1; i < argc; i++) {
+        const int r = sh_syscall5(SYS_MKDIR, (uint64_t)(uintptr_t)argv[i], 0755, 0, 0);
+        if (r != 0) {
+            shell_printf("mkdir: %s: %s\n", argv[i],
+                         (r == -17) ? "file exists" : "cannot create");
+            rc = 1;
+        }
+    }
+    return rc;
+}
+
+int shell_cmd_rmdir(int argc, char **argv) {
+    int rc = 0;
+    if (argc < 2) {
+        shell_puts("usage: rmdir <dir>...\n");
+        return 1;
+    }
+    for (int i = 1; i < argc; i++) {
+        const int r = sh_syscall5(SYS_RMDIR, (uint64_t)(uintptr_t)argv[i], 0, 0, 0);
+        if (r != 0) {
+            shell_printf("rmdir: %s: cannot remove\n", argv[i]);
+            rc = 1;
+        }
+    }
+    return rc;
+}
+
+int shell_cmd_touch(int argc, char **argv) {
+    extern int vfs_write_file(const char *, const void *, uint32_t);
+    int rc = 0;
+    if (argc < 2) {
+        shell_puts("usage: touch <file>...\n");
+        return 1;
+    }
+    for (int i = 1; i < argc; i++) {
+        /* create without truncating if it already exists */
+        {
+            extern int vfs_stat(const char *, vfs_stat_t *);
+            vfs_stat_t st;
+            if (vfs_stat(argv[i], &st) == VFS_OK) continue;
+        }
+        if (vfs_write_file(argv[i], "", 0) != VFS_OK) {
+            shell_printf("touch: %s: cannot create\n", argv[i]);
+            rc = 1;
+        }
+    }
+    return rc;
+}
+
+/* read a whole file into a heap buffer (NUL terminated) */
+static char *sh_read_file(const char *path, size_t *len) {
+    extern void *vfs_read_file(const char *, size_t *);
+    return (char *)vfs_read_file(path, len);
+}
+
+int shell_cmd_cp(int argc, char **argv) {
+    extern int vfs_write_file(const char *, const void *, uint32_t);
+    size_t len = 0;
+    char *data;
+    if (argc < 3) {
+        shell_puts("usage: cp <source> <dest>\n");
+        return 1;
+    }
+    data = sh_read_file(argv[1], &len);
+    if (data == NULL) {
+        shell_printf("cp: %s: no such file\n", argv[1]);
+        return 1;
+    }
+    if (vfs_write_file(argv[2], data, (uint32_t)len) != VFS_OK) {
+        shell_printf("cp: %s: cannot write\n", argv[2]);
+        free(data);
+        return 1;
+    }
+    free(data);
+    shell_printf("cp: %s -> %s (%u bytes)\n", argv[1], argv[2], (unsigned)len);
+    return 0;
+}
+
+int shell_cmd_mv(int argc, char **argv) {
+    if (argc < 3) {
+        shell_puts("usage: mv <source> <dest>\n");
+        return 1;
+    }
+    {
+        const int r = sh_syscall5(SYS_RENAME, (uint64_t)(uintptr_t)argv[1],
+                                  (uint64_t)(uintptr_t)argv[2], 0, 0);
+        if (r != 0) {
+            shell_printf("mv: %s -> %s: failed (%d)\n", argv[1], argv[2], r);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int shell_cmd_date(int argc, char **argv) {
+    extern uint64_t rtc_now_epoch(void);
+    extern void rtc_format_epoch(uint64_t, char *, size_t);
+    extern int rtc_have_hardware_clock(void);
+    char stamp[40];
+    (void)argc; (void)argv;
+    rtc_format_epoch(rtc_now_epoch(), stamp, sizeof(stamp));
+    shell_printf("%s%s\n", stamp,
+                 rtc_have_hardware_clock() ? "" : "  (uptime clock: no RTC)");
+    return 0;
+}
+
+int shell_cmd_uname(int argc, char **argv) {
+    extern uint64_t syscall_invoke(uint64_t, uint64_t, uint64_t, uint64_t,
+                                   uint64_t, uint64_t, uint64_t);
+    struct linux_utsname uts;
+    int all = (argc >= 2 && strcmp(argv[1], "-a") == 0);
+
+    memset(&uts, 0, sizeof(uts));
+    if ((int)syscall_invoke(SYS_UNAME, (uint64_t)(uintptr_t)&uts, 0, 0, 0, 0, 0) != 0) {
+        shell_puts("uname: failed\n");
+        return 1;
+    }
+    if (all) {
+        shell_printf("%s %s %s %s %s %s\n", uts.sysname, uts.nodename,
+                     uts.release, uts.version, uts.machine, uts.domainname);
+    } else {
+        shell_printf("%s\n", uts.sysname);
+    }
+    return 0;
+}
+
+int shell_cmd_free(int argc, char **argv) {
+    extern uint64_t moe_pmm_free_count(void);
+    extern uint64_t moe_pmm_total(void);
+    extern uintptr_t lemis_heap_free_space(void);
+    const uint64_t free_pages = moe_pmm_free_count();
+    const uint64_t total_pages = moe_pmm_total();
+    (void)argc; (void)argv;
+    shell_printf("              total        used        free\n");
+    shell_printf("Mem:    %8u KiB %8u KiB %8u KiB\n",
+                 (unsigned)(total_pages * 4),
+                 (unsigned)((total_pages - free_pages) * 4),
+                 (unsigned)(free_pages * 4));
+    shell_printf("Heap:   %8u KiB free\n", (unsigned)(lemis_heap_free_space() / 1024));
+    return 0;
+}
+
+/* systest: acceptance for the whole new syscall batch. */
+int shell_cmd_systest(int argc, char **argv) {
+    extern int syscalls2_selftest(void);
+    (void)argc; (void)argv;
+    return syscalls2_selftest();
+}
+
+int shell_cmd_pipetest(int argc, char **argv) {
+    extern int pipe_selftest(void);
+    (void)argc; (void)argv;
+    return pipe_selftest();
+}
+
+int shell_cmd_rtctest(int argc, char **argv) {
+    extern int rtc_selftest(void);
+    (void)argc; (void)argv;
+    return rtc_selftest();
 }
 
 /* Privileged commands check the effective uid and say what to type instead. */

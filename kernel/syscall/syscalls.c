@@ -5,6 +5,7 @@
 #include <stitch/string.h>
 #include "task.h"
 #include "vfs.h"
+#include "pipe.h"        /* pipe fds are not VFS fds (kernel/ipc) */
 #include "el0_validate.h"
 #include "mmu.h"
 #include "heap.h"
@@ -42,6 +43,12 @@ uint64_t sys_read(uint64_t fd, uint64_t buf, uint64_t len,
     (void)a4; (void)a5; (void)a6;
     extern sched_cpu_t sched_cpu;
     int tid = sched_cpu.current;
+    /* pipes live in their own fd space (kernel/ipc/pipe.c) */
+    if (pipe_is_fd((int)fd)) {
+        EL0_CHECK(buf, len);
+        return (uint64_t)(int64_t)pipe_read_fd((int)fd, (void *)(uintptr_t)buf,
+                                              (uint32_t)len);
+    }
     if (fd >= MAX_FDS) return (uint64_t)-1;
     struct fd_entry *f = &fd_tables[tid][fd];
     if (f->vfs_fd < 0) return (uint64_t)-1;
@@ -56,6 +63,11 @@ uint64_t sys_write(uint64_t fd, uint64_t buf, uint64_t len,
     (void)a4; (void)a5; (void)a6;
     extern sched_cpu_t sched_cpu;
     int tid = sched_cpu.current;
+    if (pipe_is_fd((int)fd)) {
+        EL0_CHECK(buf, len);
+        return (uint64_t)(int64_t)pipe_write_fd((int)fd, (const void *)(uintptr_t)buf,
+                                               (uint32_t)len);
+    }
     if (fd >= MAX_FDS) return (uint64_t)-1;
     struct fd_entry *f = &fd_tables[tid][fd];
     if (f->vfs_fd < 0) {
@@ -110,6 +122,7 @@ uint64_t sys_close(uint64_t fd, uint64_t a2, uint64_t a3,
     (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
     extern sched_cpu_t sched_cpu;
     int tid = sched_cpu.current;
+    if (pipe_is_fd((int)fd)) return (uint64_t)(int64_t)pipe_close_fd((int)fd);
     if (fd >= MAX_FDS) return (uint64_t)-1;
     if (fd_tables[tid][fd].vfs_fd < 0) return (uint64_t)-1;
     int ret = vfs_close(fd_tables[tid][fd].vfs_fd);

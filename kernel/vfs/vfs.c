@@ -784,8 +784,39 @@ static int xj_vfs_driver_unlink(void *fs_data, const char *path) {
 }
 
 static int xj_vfs_driver_rename(void *fs_data, const char *oldpath, const char *newpath) {
-    (void)fs_data; (void)oldpath; (void)newpath;
-    return VFS_EPERM;
+    xj_vfs_node_t *node;
+    xj_vfs_node_t *parent;
+    xj_vfs_node_t *target_parent;
+    const char *slash;
+    (void)fs_data;
+
+    if (oldpath == NULL || newpath == NULL) return VFS_EINVAL;
+    node = xj_vfs_lookup(oldpath);
+    if (node == NULL) return VFS_ENOTFOUND;
+    if (node == xj_root) return VFS_EINVAL;          /* cannot rename "/" */
+
+    /* SutureOS' ramfs only supports renaming inside one directory (the parents
+     * must match), and only to a name that is free. */
+    parent = node->parent;
+    slash = strrchr(newpath, '/');
+    target_parent = (slash != NULL) ? xj_vfs_lookup((slash == newpath) ? "/"
+                                                    : ({ static char dir[VFS_MAX_PATH];
+                                                         size_t n = (size_t)(slash - newpath);
+                                                         if (n >= sizeof(dir)) n = sizeof(dir) - 1;
+                                                         memcpy(dir, newpath, n);
+                                                         dir[n] = '\0';
+                                                         dir; }))
+                                    : parent;
+    if (target_parent == NULL || parent != target_parent) return VFS_EXDEV;
+    if (xj_vfs_lookup(newpath) != NULL) return VFS_ECONFLICT;
+    {
+        const char *name = (slash != NULL) ? slash + 1 : newpath;
+        if (name[0] == '\0') return VFS_EINVAL;
+        if (strlen(name) >= XJ_VFS_MAX_NAME) return VFS_EINVAL;
+        strncpy(node->name, name, XJ_VFS_MAX_NAME - 1);
+        node->name[XJ_VFS_MAX_NAME - 1] = '\0';
+    }
+    return VFS_OK;
 }
 
 static int xj_vfs_driver_sync(void *fs_data) {

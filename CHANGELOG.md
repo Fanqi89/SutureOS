@@ -6,6 +6,65 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.8.0-alpha]
+
+The ring-0 half of the audit's "unfinished" list: the syscall surface a libc
+needs, a real wall clock, pipes, file-management commands, and signal delivery
+wired into the one return path this kernel has.
+
+### Added
+- **56 syscalls registered** (was 22). New: `stat`/`fstat`/`lstat`, `access`,
+  `lseek`, `ioctl`, `dup`/`dup2`, `fsync`/`fdatasync`/`sync`, `truncate`,
+  `statfs`, `chdir`/`getcwd`, `mkdir`/`rmdir`/`unlink`/`rename`, `getdents64`,
+  `chmod`/`umask`, `getpid`/`gettid`/`getppid`, `getuid`/`geteuid`/`getgid`/
+  `getegid`/`setuid`/`setgid`, `uname`, `gettimeofday`/`time`/`clock_gettime`
+  (now the real clock)/`nanosleep`/`times`, `kill`/`wait4`/`exit_group`,
+  `sysinfo`/`getrlimit`/`setrlimit`/`prctl`/`sched_getaffinity`/`getcpu`,
+  `pipe`/`pipe2`. Relative paths resolve against the cwd, `stat` fills Linux's
+  byte-exact 144-byte `struct stat`, and `uname` reports `sysname = "Linux"` with
+  release `6.1.0-sutureos` so a libc's checks pass.
+- **CMOS RTC driver** (`arch/x86_64/rtc.c`): the wall clock was faked (a constant
+  1234567890); it now reads the RTC once at boot (BCD/binary, 12h/24h, century
+  register) and anchors the tick counter on it. `date` prints real UTC.
+- **Pipes** (`kernel/ipc/pipe.c`): pipe fds live in their own number space and
+  `read`/`write`/`close` route to them; EOF when writers close, `-EPIPE` with no
+  readers, short writes when full, bounded wait when empty.
+- **Shell**: `rm`, `mkdir`, `rmdir`, `touch`, `cp`, `mv`, `date`, `uname`, `free`,
+  and three acceptance commands `systest` / `pipetest` / `rtctest`.
+- **Signal delivery**: `sig_check_pending()` is called on the syscall return path
+  for user tasks (it had no call site at all), and `kill(2)` delivers into it.
+
+### Fixed
+- **ramfs `rename` was a stub** returning `VFS_EPERM`: implemented as a
+  same-directory rename (what `mv a b` in one directory needs) with EEXIST/EXDEV
+  checks, which is what made `systest`'s rename check fail at first.
+- **RTC 12-hour decoding**: the PM flag (bit 7) was still present when the hour
+  was converted, so "1 PM" became 141 instead of 13. Strip it before converting.
+- RTC init decoded the year twice (BCD-decoding an already-binary year), which
+  made every read look implausible and left `date` at 1970-01-01.
+- `date` padding: this kernel's `snprintf` has no `0` flag, so the formatter now
+  pads manually (`2026-10-22 23:04:11 UTC`, not `2026-10- 1  1: 4:11`).
+- The self tests used `%-43s`, which `console_printf` prints literally (its
+  formatter has no `-` flag) - replaced with plain `%s`.
+
+### Verification
+- `systest`: **39/39 PASS** (stat/lseek/read/write/fstat, mkdir/getdents64/
+  unlink/rmdir, rename, chdir/getcwd, getpid/getuid/geteuid, uname, real
+  clock_gettime/gettimeofday/time, pipe over the syscall path, sysinfo,
+  getrlimit, sync, and the honest -ENOSYS/-ENOTTY answers).
+- `pipetest`: **16/16 PASS**; `rtctest`: **8/8 PASS** (BCD/binary/12h/leap/format).
+- Interactive: `date` -> `2026-10-22 23:06:17 UTC`; `mkdir /demo`, `touch`,
+  `cp /etc/motd /demo/b.txt` (92 bytes), `ls` (a.txt, b.txt), `mv` (c.txt),
+  `rm`, `rmdir`, `free`, `uname -a` all worked.
+- Regression unchanged: self-tests 13/14, FAT32 write+ops PASS, host 17/17,
+  AP 1 online, RTL8139 ping, PS/2 mouse, sudo 23/23.
+
+### Still open (the ring-3 half, next batch)
+- No userland yet: `/init` is never executed, `dynlink.c` is unreferenced, and
+  `dup`/`dup2`/`ftruncate`/`readlink`/`symlink` answer `-ENOSYS` because the fd
+  table has no dup API and the VFS has no symlinks. e1000 (VMware networking),
+  FAT32 LFN, ext2 write and the GUI work are untouched.
+
 ## [v0.7.0-alpha]
 
 First real privilege model: uids/gids, `/etc/passwd` + `/etc/shadow` with hashed

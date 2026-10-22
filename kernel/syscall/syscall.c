@@ -10,12 +10,28 @@ static syscall_fn_t syscall_table[SYSCALL_MAX];
 uint64_t syscall_dispatch_c(user_context_t *ctx)
 {
     uint64_t nr = ctx->rax;
+    uint64_t ret;
+
     if (nr >= SYSCALL_MAX || syscall_table[nr] == NULL) {
         console_printf("[syscall] bad nr=%lu\n", nr);
         return (uint64_t)-1;
     }
-    return syscall_table[nr](ctx->rdi, ctx->rsi, ctx->rdx,
-                             ctx->r10, ctx->r8, ctx->r9);
+    ret = syscall_table[nr](ctx->rdi, ctx->rsi, ctx->rdx,
+                            ctx->r10, ctx->r8, ctx->r9);
+
+    /* Signal delivery point: Linux delivers pending signals when returning to
+     * user mode, and a syscall exit is the only place this kernel has that. The
+     * handler rewrites ctx->rip/rsp, so it must run after the return value is
+     * fixed up (rax) and only for user tasks (cs != kernel code segment). */
+    {
+        extern void sig_check_pending(void *uctx);
+        if (ctx->cs == 0x23) {              /* user code segment: ring 3 */
+            ctx->rax = ret;
+            sig_check_pending(ctx);
+            return ctx->rax;
+        }
+    }
+    return ret;
 }
 
 void syscall_register(uint64_t nr, syscall_fn_t fn)
