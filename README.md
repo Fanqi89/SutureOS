@@ -312,6 +312,11 @@ py -3 scripts\verify_fat32_write.py build\fat32_virtio.img build\fat32.img
 - 一键发布：`powershell -NoProfile -File scripts\release.ps1 -Message "feat: ..." -NotesFile <说明文件>`
   （已提交过则用 `-PushOnly`）。脚本从 `version.h` 读版本、自动打附注标签、经系统代理
   推送 `main` + `tags`。
+- 标签与 Release 的内容规范写在 [`docs/RELEASING.md`](docs/RELEASING.md)：版本号（SemVer 唯一来源）、
+  附注标签的固定结构（关键修复 / 新增 / 验证 / **产物（ISO 文件名、大小、sha256）** / 已知限制）、
+  Release 标题与正文格式。
+- 每个 Release 都上传 **`sutureos.iso`** 附件（历史版本各自保留各自的镜像）：
+  <https://github.com/Fanqi89/SutureOS/releases> —— 一键上传用 `scripts\publish_release.ps1`。
 - 当前标签：`v0.1.0-alpha`（初始提交）→ `v0.5.0-alpha`（GUI/TCP-IP/多文件系统的第一个大版本）
   → `v0.6.0-alpha`（VMware 兼容修复、TCP listen/accept、套接字 ABI、SquashFS、启动呈现、
   日志环、PS/2 鼠标 + 开始菜单）。
