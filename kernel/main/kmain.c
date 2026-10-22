@@ -15,6 +15,7 @@
 #include "vfs.h"
 #include "block.h"
 #include "ahci.h"    /* blk_ahci_device_count() (block.h only has init/probe) */
+#include "sutureos/version.h"   /* SUTUREOS_VERSION */
 #include "nvme.h"    /* blk_nvme_present()/mmio_base()/version() diagnostics */
 
 /* Module self-test declarations */
@@ -295,9 +296,15 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
         vfs_write_file("/hello.txt",
                        "Hello from SutureOS ramfs!\n"
                        "This file is real VFS content (driver: xj_vfs).\n", 91);
-        vfs_write_file("/etc/motd",
-                       "Welcome to SutureOS v0.5.0-alpha.\n"
-                       "Try: ls /, cat /hello.txt, df, ps, mount fat32 0 /mnt/fat\n", 126);
+        {
+            char motd[192];
+            int n = snprintf(motd, sizeof(motd),
+                             "Welcome to SutureOS v%s.\n"
+                             "Try: ls /, cat /hello.txt, df, ps, "
+                             "mount fat32 0 /mnt/fat\n",
+                             SUTUREOS_VERSION);
+            if (n > 0) vfs_write_file("/etc/motd", motd, (uint32_t)n);
+        }
         console_puts("[init] ramfs root mounted, demo files seeded\n");
     }
     /* Auto-mount FAT32 from the first block device that carries a FAT32 volume.

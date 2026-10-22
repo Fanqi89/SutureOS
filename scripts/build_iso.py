@@ -6,7 +6,25 @@ import subprocess
 import sys
 import shutil
 import json
+import re
 from pathlib import Path
+
+def _sutureos_version():
+    """Read the version out of include/sutureos/version.h (single source)."""
+    hdr = ROOT / "include" / "sutureos" / "version.h"
+    try:
+        text = hdr.read_text(encoding="utf-8")
+    except OSError:
+        return "0.0.0-unknown"
+    def num(key):
+        m = re.search(r"#define\s+SUTUREOS_VERSION_%s\s+(\d+)" % key, text)
+        return m.group(1) if m else "0"
+    m = re.search(r'#define\s+SUTUREOS_VERSION_PRE\s+"([^"]+)"', text)
+    pre = m.group(1) if m else ""
+    v = "%s.%s.%s" % (num("MAJOR"), num("MINOR"), num("PATCH"))
+    return v + ("-" + pre if pre else "")
+
+
 
 ROOT = Path(r"C:\Users\fanqi\Desktop\SutureOS")
 BUILD = ROOT / "build"
@@ -188,7 +206,7 @@ menuentry "SutureOS (Limine)" {
     manifest = ISO_DIR / "system" / "manifest.json"
     manifest.write_text(json.dumps({
         "name": "SutureOS",
-        "version": "0.1.0",
+        "version": _sutureos_version(),
         "kernel": "kernel.elf",
         "arch": "x86_64",
         "license": "GPL-3.0",

@@ -19,6 +19,7 @@
 #include <stitch/string.h>
 #include <stitch/console.h>
 
+#include "sutureos/version.h"
 #include "term.h"
 #include "boot_banner.h"
 
@@ -57,7 +58,8 @@ void boot_banner_draw(void)
     console_puts("\n");
     banner_rule();
     console_puts("        SutureOS  -  a stitched-together hobby OS kernel\n");
-    console_puts("                    version 0.5.0-alpha  (GPL-3.0)\n");
+    console_printf("                    version %s  (GPL-3.0)\n",
+                   SUTUREOS_VERSION);
     banner_rule();
     console_puts("\n");
     console_puts("  All kernel subsystems reported [  OK  ] above.\n");
