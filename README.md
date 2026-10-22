@@ -315,6 +315,11 @@ py -3 scripts\verify_fat32_write.py build\fat32_virtio.img build\fat32.img
 - 标签与 Release 的内容规范写在 [`docs/RELEASING.md`](docs/RELEASING.md)：版本号（SemVer 唯一来源）、
   附注标签的固定结构（关键修复 / 新增 / 验证 / **产物（ISO 文件名、大小、sha256）** / 已知限制）、
   Release 标题与正文格式。
+- **一键发布**：`scripts\publish_all.ps1`（快照旧 Release → 提交 + 附注标签 + 推送 → 建/更新
+  Release 并上传 ISO → 自动跑 `scripts\verify_release.ps1`，任一步失败即中止）。
+- **发布自证**：`scripts\verify_release.ps1` 会证明「版本串真的进了 ISO（且旧串已消失）」、
+  「附件 size+digest 与本地一致（按附件名匹配）」、「旧 Release 未被踩掉」、「git 侧同步且干净」。
+  这不是可选项——`publish_all.ps1` 把它作为发布的最后一步，失败就不算发布。
 - 每个 Release 都上传 **`sutureos.iso`** 附件（历史版本各自保留各自的镜像）：
   <https://github.com/Fanqi89/SutureOS/releases> —— 一键上传用 `scripts\publish_release.ps1`。
 - 当前标签：`v0.1.0-alpha`（初始提交）→ `v0.5.0-alpha`（GUI/TCP-IP/多文件系统的第一个大版本）
