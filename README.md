@@ -301,6 +301,23 @@ py -3 scripts\verify_fat32_write.py build\fat32_virtio.img build\fat32.img
 [fat32] write self-test PASS / [net] selftest ping 10.0.2.2 -> reply in 1293 us
 ```
 
+### 版本与发布
+
+- 版本号遵循 **SemVer 2.0.0**，唯一来源是 `include/sutureos/version.h`（内核横幅、
+  shell 欢迎语、`/etc/motd`、ISO `manifest.json` 都从这里取，`scripts/build_iso.py`
+  直接解析该头文件）。发版只改这一处。
+- 每次改动都会提交到 `main` 并推送到 <https://github.com/Fanqi89/SutureOS>，同时打一个
+  **附注标签** `v<版本号>`，标签说明写清这个版本做了什么；**旧标签不移动、不删除**，
+  所以新旧版本在仓库里共存。`CHANGELOG.md` 同步记录。
+- 一键发布：`powershell -NoProfile -File scripts\release.ps1 -Message "feat: ..." -NotesFile <说明文件>`
+  （已提交过则用 `-PushOnly`）。脚本从 `version.h` 读版本、自动打附注标签、经系统代理
+  推送 `main` + `tags`。
+- 当前标签：`v0.1.0-alpha`（初始提交）→ `v0.5.0-alpha`（GUI/TCP-IP/多文件系统的第一个大版本）
+  → `v0.6.0-alpha`（VMware 兼容修复、TCP listen/accept、套接字 ABI、SquashFS、启动呈现、
+  日志环、PS/2 鼠标 + 开始菜单）。
+- 本机推 GitHub 必须走 HTTP 代理（直连 TLS 会被重置）：脚本读 Windows 系统代理
+  （`HKCU\...\Internet Settings` 的 `ProxyServer`），可用 `-Proxy` 覆盖。
+
 ### 本机测试（QEMU / VMware）
 ```powershell
 & "C:\Program Files\qemu\qemu-system-x86_64.exe" -machine pc -m 256 -vga std `
