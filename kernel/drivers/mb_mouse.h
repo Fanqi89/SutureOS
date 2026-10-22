@@ -12,6 +12,11 @@ int mbos_mouse_present(void);
 /* Drain pending packets; call once per GUI frame (cheap when idle). */
 void mbos_mouse_poll(void);
 
+/* Hand one raw aux-port byte to the packet decoder. Used by the keyboard
+ * poller: the 8042 output buffer is shared, so whoever drains it must forward
+ * mouse bytes here instead of leaving them to block the keyboard. */
+void mbos_mouse_feed_byte(uint8_t b);
+
 /* Current cursor position in pixels and button mask (bit0 left, bit1 right,
  * bit2 middle). */
 int mbos_mouse_x(void);

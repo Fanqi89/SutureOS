@@ -18,9 +18,11 @@
  *   - keymaps copied verbatim from the source, only made const.
  */
 #include "mb_kbd.h"
+#include "mb_mouse.h"   /* mbos_mouse_feed_byte() */
 
 #include <stitch/io.h>
 #include <stitch/selftest.h>
+#include <stitch/console.h>   /* console_printf (key diagnostics) */
 
 /* ---- decoder state ---- */
 static uint32_t kb_mode;      /* SHIFT | CTRL | ALT | E0ESC (MandelbrotOS) */
@@ -251,17 +253,47 @@ int mbos_kbd_poll(void)
     /* Single consumer of 0x60 for the KEYBOARD: the polling path (see the IRQ1
      * comment above - the handler must not read the port, it only counts).
      *
-     * The 8042 output buffer is shared with the PS/2 mouse: status bit 5 says
-     * the byte came from the aux port. Those bytes are left in the buffer for
-     * mbos_mouse_poll() - reading them here would hand the shell mouse packets
-     * as if they were scancodes. */
-    const uint8_t st = inb(MBOS_KBD_STAT);
-    if ((st & MBOS_KBD_STAT_OBF) == 0)
-        return -1;                      /* nothing to read */
-    if ((st & 0x20u) != 0)
-        return -1;                      /* mouse byte: not ours */
-    return (int)inb(MBOS_KBD_DATA);
+     * The 8042 output buffer is SHARED with the PS/2 mouse: status bit 5 says
+     * the byte came from the aux port. Such a byte must still be READ here and
+     * handed to the mouse driver - if it is left in the buffer the buffer stays
+     * full forever, the keyboard byte behind it can never be read and typing
+     * dies (observed: the first character after boot was swallowed, and typing
+     * only recovered when an IRQ1 handler happened to read the aux byte as if it
+     * were a scancode). So: drain aux bytes into the mouse, return only
+     * scancodes. */
+    for (int guard = 0; guard < 16; guard++) {
+        const uint8_t st = inb(MBOS_KBD_STAT);
+        if ((st & MBOS_KBD_STAT_OBF) == 0)
+            return -1;                  /* nothing to read */
+        if ((st & 0x20u) != 0) {
+            /* aux (mouse) byte: consume it so the buffer drains, and let the
+             * mouse driver decode it out of band */
+            mbos_mouse_feed_byte(inb(MBOS_KBD_DATA));
+            continue;
+        }
+        return (int)inb(MBOS_KBD_DATA);
+    }
+    return -1;                          /* pathological flood: nothing for us */
 }
+
+/* ---- key-delivery diagnostics ----
+ * "the GUI ignores my keys" has two very different causes: the byte never
+ * reaches the poller, or it is decoded to 0 and dropped. Logging the first few
+ * (raw scancode, decoded char) pairs tells them apart from the serial log. */
+static uint32_t g_key_log_count;
+
+void mbos_kbd_key_log_note(int sc, int ch)
+{
+    if (g_key_log_count >= 12) {
+        return;
+    }
+    g_key_log_count++;
+    console_printf("[kbd] key #%u sc=0x%x ch=0x%x\n",
+                   (uint64_t)g_key_log_count, (uint64_t)(uint32_t)sc,
+                   (uint64_t)(uint32_t)ch);
+}
+
+uint32_t mbos_kbd_key_log_count(void) { return g_key_log_count; }
 
 uint32_t mbos_kbd_fallback_count(void) { return g_kbd_drops; }
 int      mbos_kbd_irq_active(void)     { return g_kbd_irq_on; }

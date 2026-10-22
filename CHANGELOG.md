@@ -6,6 +6,40 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.6.2-alpha]
+
+Keyboard fix release. Typing lost characters (the shell's first keystroke after
+boot, and whole words depending on mouse traffic) and the desktop froze a few
+seconds after `startgui`, which also made it look like "the keyboard does not
+work". Both root causes are documented below.
+
+### Fixed
+- **Keyboard starvation (characters/words swallowed)**: the 8042 output buffer
+  is shared by keyboard and mouse, and `mbos_kbd_poll()` returned `-1` on an aux
+  (mouse) byte *without reading it*. The buffer therefore stayed full and the
+  keyboard byte behind it was never read, so typing died until an IRQ1 handler
+  happened to consume the aux byte as a scancode. Reproduced on the released
+  v0.6.1-alpha: typing `startgui` at the prompt produced no input at all.
+  `mbos_kbd_poll()` now drains aux bytes into the mouse decoder
+  (`mbos_mouse_feed_byte()`) and returns only scancodes.
+- **GUI froze ~4 s after startgui** (frames stopped while `g_tick_count` kept
+  advancing, so the desktop looked dead and ignored the keyboard): the frame
+  loop called `sched_yield()`, which switches to a stale EEVDF context that
+  never comes back. Removed; `gui_pace()` already blocks for one tick.
+- **Mouse was initialised twice** (once at boot, again on GUI entry): the second
+  `0x20` config-byte read returned a pending data byte (observed `0x9e`) and its
+  `0xF6` went unanswered. GUI entry now only queries `mbos_mouse_present()`.
+- **`scripts/build.py` / `build_iso.py` hardcoded ROOT** to the main checkout, so
+  building from a git worktree silently compiled the wrong sources into the main
+  `build/` dir and left stale objects that got linked into a later build (which
+  surfaced as an intermittent "hangs after `[SMP] starting AP 1`"). ROOT now
+  follows the script location, with `SUTUREOS_ROOT` as an override.
+
+### Added
+- `[kbd] key #n sc=.. ch=..` diagnostics (first 12 keys) and a `[gui] frame=..`
+  heartbeat every 1000 frames: they separate "the byte never arrived" from "it
+  decoded to 0" and "the loop died" from "the timer died" in serial-only runs.
+
 ## [v0.6.1-alpha]
 
 Fixup release: the About window was still printing a hardcoded `v0.5.0-alpha`,

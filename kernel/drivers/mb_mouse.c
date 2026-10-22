@@ -240,6 +240,25 @@ static void mouse_handle_packet(const uint8_t* p)
     g_packets++;
 }
 
+/* Hand one raw aux-port byte to the packet decoder.
+ *
+ * The 8042 output buffer is shared between the keyboard and the mouse. The
+ * keyboard poller reads whatever is pending; when the byte is an aux byte it
+ * MUST consume it (otherwise the buffer stays full and the keyboard starves -
+ * typing died on the first character after boot) and pass it here. */
+void mbos_mouse_feed_byte(uint8_t b)
+{
+    if (!g_present) {
+        return;                         /* no mouse: drop it, keep the keyboard alive */
+    }
+    g_packet[g_packet_len++] = b;
+    if (g_packet_len < 3) {
+        return;
+    }
+    g_packet_len = 0;
+    mouse_handle_packet(g_packet);
+}
+
 /* Self-test hook: feed a synthetic packet through the real decoder. */
 void mbos_mouse_inject_packet(const uint8_t* p)
 {

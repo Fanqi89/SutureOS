@@ -45,6 +45,10 @@ int mbos_kbd_decode(uint8_t scancode);
  * Self test never calls it - it injects synthetic codes into the decoder. */
 int mbos_kbd_poll(void);
 
+/* first-N-keys diagnostics (serial log) */
+void mbos_kbd_key_log_note(int sc, int ch);
+uint32_t mbos_kbd_key_log_count(void);
+
 /* IRQ1 path: the handler drains 0x60 into a 64-byte scancode ring (so a burst
  * injected faster than the shell polls is no longer lost) and mbos_kbd_poll()
  * pops from it. Register with moos_irq_register(0x21, ...) and call

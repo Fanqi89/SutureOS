@@ -5,7 +5,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-ROOT = Path(r"C:\Users\fanqi\Desktop\SutureOS")
+# ROOT follows the script, so a git worktree / CI checkout builds its own
+# sources into its own build/ dir. SUTUREOS_ROOT overrides it explicitly.
+_here = Path(__file__).resolve().parent.parent
+ROOT = Path(os.environ.get("SUTUREOS_ROOT", _here))
 CC = Path(r"C:\msys64\mingw64\bin\clang.exe")
 OBJCOPY = Path(r"C:\msys64\mingw64\bin\objcopy.exe")
 NASM = Path(r"C:\msys64\usr\bin\nasm.exe")

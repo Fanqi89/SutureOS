@@ -13,6 +13,7 @@
 #include <stitch/init.h>      /* limine_fb_* : real framebuffer discovery (same as kmain/fbcon) */
 #include "heap.h"
 #include "task.h"             /* sched_yield */
+#include <stitch/io.h>     /* inb() for the 8042 status heartbeat */
 #include "mb_kbd.h"           /* mbos_kbd_poll / mbos_kbd_decode (same pattern as shell.c) */
 #include "power.h"            /* power_reset / power_off (ACPI S5 + reset register) */
 #include "font.h"             /* font8x16: ASCII 32..126 bitmap font (fbcon's font asset) */
@@ -634,6 +635,12 @@ static bool gui_handle_keys(void) {
         int sc = mbos_kbd_poll();
         if (sc < 0) break;
         int ch = mbos_kbd_decode((uint8_t)sc);
+        /* first few keys: prove delivery+decode reach this loop (serial-only) */
+        {
+            extern uint32_t mbos_kbd_key_log_count(void);
+            extern void mbos_kbd_key_log_note(int sc, int ch);
+            mbos_kbd_key_log_note(sc, ch);
+        }
 
         /* Arrow keys: scancode set-1 make codes. mbos_kbd_decode() maps the
          * arrows to 0 (unmapped), so match the RAW scancode; break codes
@@ -864,15 +871,15 @@ int gui_run(void) {
                    (unsigned)limine_fb_width, (unsigned)limine_fb_height,
                    (unsigned)limine_fb_pitch, (unsigned)limine_fb_bpp);
 
-    /* pointer bring-up: the GUI used to be keyboard-only, so the PS/2 mouse is
-     * initialised here (before the terminal renderer is suspended, so the
-     * [mouse] line still reaches the visible console and the serial log). */
+    /* pointer bring-up. The mouse is initialised ONCE at boot (kmain): doing it
+     * again here re-sends 0xA8/0xAE/0x20/0xF6/0xF4 while the device is already
+     * streaming, and the config-byte read then returns a pending DATA byte
+     * instead (observed 0x9e) with 0xF6 unanswered - corrupting the packet
+     * stream. So only query the state and place the pointer here. */
     {
-        extern int mbos_mouse_init(void);
         extern int mbos_mouse_present(void);
         extern void mbos_mouse_move_to(int x, int y);
-        const int present = mbos_mouse_init();
-        if (present) {
+        if (mbos_mouse_present()) {
             mbos_mouse_move_to(g_gui_screen_w / 2, g_gui_screen_h / 2);
             console_printf("[gui] pointer: PS/2 mouse at %dx%d\n",
                            (int64_t)g_gui_screen_w, (int64_t)g_gui_screen_h);
@@ -938,7 +945,26 @@ int gui_run(void) {
         busy_tsc += gui_rdtsc() - t0;
         frames++;
 
-        sched_yield();                            /* keep shell/system running */
+        /* heartbeat every 1000 frames (~10 s) - monotonic because `frames` is
+         * reset once per second by the fps block. It is the only way to tell
+         * "the loop died" from "the timer died" in a serial-only test. */
+        static uint32_t g_frames_total;
+        g_frames_total++;
+        if ((g_frames_total % 1000) == 0) {
+            console_printf("[gui] frame=%u tick=%llu ps2stat=0x%x\n",
+                           (unsigned)g_frames_total,
+                           (unsigned long long)g_tick_count,
+                           (unsigned long long)inb(0x64));
+        }
+
+        /* NO sched_yield() here. task.c keeps a cooperative round-robin and an
+         * EEVDF scheduler over the same context storage; yielding from the GUI
+         * lets the CPU switch to a stale EEVDF context and the desktop is never
+         * scheduled again - measured as "frames freeze after ~4 s, ticks keep
+         * running, keyboard goes dead" (the frame heartbeat and the 1 s
+         * telemetry both stop while g_tick_count keeps advancing).
+         * gui_pace() already blocks for one tick, which is all the pacing this
+         * foreground loop needs. */
         gui_pace();                               /* ~1 tick (<=100 fps) per frame */
 
         const uint64_t now = g_tick_count;
