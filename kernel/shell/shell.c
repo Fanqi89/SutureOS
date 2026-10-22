@@ -48,6 +48,7 @@ static const struct shell_cmd g_commands[] = {
     {"clear",   shell_cmd_clear,   "Clear the screen"},
     {"log",     shell_cmd_log,     "Show the captured console log: log [lines] (auto-scrolls to the tail)"},
     {"dmesg",   shell_cmd_log,     "Alias for log"},
+    {"mouseinfo", shell_cmd_mouseinfo, "PS/2 mouse diagnostics (8042 status, config, device id)"},
     {"echo",    shell_cmd_echo,    "Print arguments"},
     {"exit",    shell_cmd_exit,    "Exit shell"},
     {"reboot",  shell_cmd_reboot,  "Reboot the system"},
@@ -309,6 +310,21 @@ int shell_cmd_exit(int argc, char **argv) {
 /* Defined further down; the log command needs it before that point. */
 static int shell_atoi(const char *s);
 
+/* mouseinfo: PS/2 mouse / 8042 diagnostics. */
+int shell_cmd_mouseinfo(int argc, char **argv) {
+    extern void mbos_mouse_diagnose(void);
+    extern int  mbos_mouse_present(void);
+    extern void mbos_mouse_poll(void);
+    (void)argc; (void)argv;
+
+    if (!mbos_mouse_present()) {
+        shell_puts("mouseinfo: no PS/2 mouse was detected at boot\n");
+    }
+    mbos_mouse_poll();          /* pick up anything queued */
+    mbos_mouse_diagnose();
+    return 0;
+}
+
 /* log / dmesg: review the captured console log.
  *
  * "Auto-scroll" here means the tail: the last `n` lines are printed through the
@@ -358,7 +374,13 @@ int shell_cmd_shutdown(int argc, char **argv) {
 
 int shell_cmd_startgui(int argc, char **argv) {
     (void)argc; (void)argv;
-    shell_puts("Starting GUI interface...\n");
+    if (argc > 1 && argv[1] != NULL && strcmp(argv[1], "test") == 0) {
+        extern void gui_arm_pointer_selftest(void);
+        gui_arm_pointer_selftest();
+        shell_puts("Starting GUI interface (pointer self-test armed)...\n");
+    } else {
+        shell_puts("Starting GUI interface...\n");
+    }
     shell_scroll_message("Initializing GUI...");
     
     /* Try to initialize GUI */

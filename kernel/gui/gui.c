@@ -1,4 +1,4 @@
-/* SutureOS module: GUI framework - 移植自 VimtuOS gui64
+/* SutureOS module: GUI framework - ported from VimtuOS gui64
  * Source: C:\Users\fanqi\Desktop\自研操作系统\VimtuOS\kernel\gui64.h/cpp
  * Original license: GPL-3.0
  * Changes: Adapted to SutureOS; prefix gui_; window bookkeeping kept from the
@@ -178,13 +178,407 @@ static const char* gui_fb_setup(void) {
 
 /* ==================== focus / keyboard helpers ==================== */
 
-/* window that keyboard actions target: active one, else topmost visible */
 static struct gui_window* gui_focused(void) {
     for (struct gui_window* w = g_z; w; w = w->next)
         if (w->visible && !w->minimized && w->active) return w;
     for (struct gui_window* w = g_z; w; w = w->next)
         if (w->visible && !w->minimized) return w;
     return NULL;
+}
+
+/* Defined later in this file, used by the pointer/menu code below.
+ * (gui_dirty() is already declared by gui.h.) */
+static void gui_activate_app(int app_id);
+
+/* ==================== pointer + start menu ====================
+ * The GUI started out keyboard-only, so there was no pointer on screen and the
+ * taskbar name was decoration. The PS/2 driver (kernel/drivers/mb_mouse.c) now
+ * supplies a real pointer, so:
+ *   - an arrow is composited on top of every frame,
+ *   - the bottom-left "SutureOS" name is a start button; clicking it pops a
+ *     menu UPWARDS out of the taskbar (as requested),
+ *   - clicking a menu entry launches/focuses that application.
+ */
+#define START_BTN_X      4
+#define START_BTN_W      96
+#define START_MENU_W     212
+#define START_MENU_ITEM_H 24
+#define START_MENU_PAD   6
+
+/* Items in the start menu. NULL = separator line. */
+enum { START_KIND_SEP = -1, START_KIND_EXIT = -2 };
+static const struct {
+    const char* label;
+    int         app_id;      /* APP_ID_* or START_KIND_* */
+} g_start_items[] = {
+    { "Task Manager",   APP_ID_TMGR     },
+    { "Calculator",     APP_ID_CALC     },
+    { "About SutureOS", APP_ID_SETTINGS },
+    { NULL,             START_KIND_SEP  },
+    { "Exit to terminal", START_KIND_EXIT },
+};
+#define START_ITEM_COUNT ((int)(sizeof(g_start_items) / sizeof(g_start_items[0])))
+
+static int g_mx, g_my;                  /* pointer position (clamped)      */
+static int g_mprev_x, g_mprev_y, g_mprev_w, g_mprev_h;   /* last drawn rect  */
+static int g_start_open;
+static int g_gui_exit;                  /* set by the start menu           */
+static int g_pointer_selftest;          /* armed by `startgui test`        */
+static int start_menu_height(void);   /* defined below */
+
+void gui_arm_pointer_selftest(void) { g_pointer_selftest = 1; }
+
+/* Pointer self-test: feed synthetic 3-byte packets through the REAL PS/2
+ * decoder (mbos_mouse_inject_packet) and let the normal input path react.
+ * QEMU cannot inject PS/2 pointer events without a display backend, so this is
+ * what proves "decode -> cursor -> click -> start menu" end to end; the wire
+ * path is proven separately by reading the aux device id (`mouseinfo`).
+ *
+ * A PS/2 packet carries only +/-127 px, so movement happens in small steps,
+ * exactly like a real mouse: one packet per frame until the target is reached.
+ * Packet layout: byte0 = 0x08 | sign bits | buttons, then dx, dy. */
+static int selftest_move_towards(int tx, int ty)
+{
+    extern void mbos_mouse_inject_packet(const uint8_t* p);
+    uint8_t pkt[3];
+    int dx = tx - g_mx;
+    int dy = ty - g_my;
+    int pdy;
+
+    if (dx == 0 && dy == 0) {
+        return 1;                          /* arrived */
+    }
+    if (dx > 60) dx = 60;
+    if (dx < -60) dx = -60;
+    if (dy > 60) dy = 60;
+    if (dy < -60) dy = -60;
+    pdy = -dy;                             /* PS/2 Y is inverted vs the screen */
+    pkt[0] = (uint8_t)(0x08u | ((dx < 0) ? 0x10u : 0u) |
+                       ((pdy < 0) ? 0x20u : 0u));
+    pkt[1] = (uint8_t)(dx & 0xFF);
+    pkt[2] = (uint8_t)(pdy & 0xFF);
+    mbos_mouse_inject_packet(pkt);
+    return 0;
+}
+
+static void selftest_click(void)
+{
+    extern void mbos_mouse_inject_packet(const uint8_t* p);
+    uint8_t press[3]   = { 0x09u, 0, 0 };  /* bit3 + left button down */
+    uint8_t release[3] = { 0x08u, 0, 0 };
+    mbos_mouse_inject_packet(press);
+    mbos_mouse_inject_packet(release);
+}
+
+/* One frame of the self-test; runs only when armed with `startgui test`. */
+static void gui_selftest_frame(void)
+{
+    enum { ST_MOVE_START, ST_CLICK_START, ST_WAIT_MENU,
+           ST_MOVE_ITEM, ST_CLICK_ITEM, ST_DONE };
+    static int st = ST_MOVE_START;
+    static uint64_t wait_until;
+    const int btn_x = START_BTN_X + 8;
+    const int btn_y = g_gui_screen_h - GUI_TASKBAR_H + 8;
+
+    switch (st) {
+    case ST_MOVE_START:
+        if (selftest_move_towards(btn_x, btn_y)) {
+            console_printf("[gui] pointer selftest: on the start button (%d,%d)\n",
+                           (int64_t)g_mx, (int64_t)g_my);
+            st = ST_CLICK_START;
+        }
+        break;
+    case ST_CLICK_START:
+        selftest_click();
+        /* hold the menu open for ~3 s so a screenshot can capture it */
+        wait_until = g_tick_count + 1000;
+        st = ST_WAIT_MENU;
+        break;
+    case ST_WAIT_MENU:
+        if (g_tick_count >= wait_until) {
+            console_printf("[gui] pointer selftest: after the click the menu is %s\n",
+                           g_start_open ? "OPEN" : "closed");
+            st = g_start_open ? ST_MOVE_ITEM : ST_DONE;
+        }
+        break;
+    case ST_MOVE_ITEM: {
+        const int item_y = g_gui_screen_h - GUI_TASKBAR_H - start_menu_height() -
+                           2 + START_MENU_PAD + START_MENU_ITEM_H / 2;
+        if (selftest_move_towards(START_BTN_X + 14, item_y)) {
+            st = ST_CLICK_ITEM;
+        }
+        break;
+    }
+    case ST_CLICK_ITEM:
+        selftest_click();
+        wait_until = g_tick_count + 100;
+        st = ST_DONE;
+        break;
+    case ST_DONE:
+    default:
+        if (wait_until != 0 && g_tick_count >= wait_until) {
+            console_printf("[gui] pointer selftest: finished (menu=%s, focus='%s')\n",
+                           g_start_open ? "open" : "closed",
+                           gui_focused() ? gui_focused()->title : "-");
+            g_pointer_selftest = 0;        /* one shot */
+        }
+        break;
+    }
+}
+static int start_menu_height(void)
+{
+    return START_ITEM_COUNT * START_MENU_ITEM_H + START_MENU_PAD * 2;
+}
+
+static void start_menu_rect(int* mx, int* my, int* mw, int* mh)
+{
+    const int y0 = g_gui_screen_h - GUI_TASKBAR_H;
+    const int h = start_menu_height();
+    *mx = START_BTN_X;
+    *my = y0 - h - 2;                   /* grows UPWARDS from the taskbar   */
+    if (*my < 2) *my = 2;
+    *mw = START_MENU_W;
+    *mh = h;
+}
+
+/* 12x19 classic arrow: '#' outline, '.' fill, ' ' transparent. */
+static const char* const g_arrow[19] = {
+    "#           ",
+    "##          ",
+    "#.#         ",
+    "#..#        ",
+    "#...#       ",
+    "#....#      ",
+    "#.....#     ",
+    "#......#    ",
+    "#.......#   ",
+    "#........#  ",
+    "#.....##### ",
+    "#..#..#     ",
+    "#.# #..#    ",
+    "##  #..#    ",
+    "#    #..#   ",
+    "     #..#   ",
+    "      #..#  ",
+    "      #..#  ",
+    "       ##   ",
+};
+
+static void gui_draw_pointer(void)
+{
+    const int aw = 12, ah = 19;
+
+    for (int y = 0; y < ah; y++) {
+        const int py = g_my + y;
+        if (py < g_clip_y0 || py >= g_clip_y1) continue;
+        for (int x = 0; x < aw; x++) {
+            const int px = g_mx + x;
+            const char c = g_arrow[y][x];
+            if (c == ' ') continue;
+            if (px < g_clip_x0 || px >= g_clip_x1) continue;
+            gui_fill(px, py, 1, 1, (c == '#') ? 0x000000u : 0xFFFFFFu);
+        }
+    }
+    g_mprev_x = g_mx;
+    g_mprev_y = g_my;
+    g_mprev_w = aw;
+    g_mprev_h = ah;
+}
+
+static void gui_draw_start_button(void)
+{
+    const int y0 = g_gui_screen_h - GUI_TASKBAR_H;
+    const int hover = (g_my >= y0 && g_my < g_gui_screen_h &&
+                       g_mx >= START_BTN_X && g_mx < START_BTN_X + START_BTN_W);
+    const uint32_t bg = g_start_open ? 0x2E5A9Eu
+                     : (hover ? 0x24293Au : 0x1B1E28u);
+    gui_fill(START_BTN_X, y0 + 4, START_BTN_W - 8, GUI_TASKBAR_H - 8, bg);
+    const int ty = y0 + (GUI_TASKBAR_H - 16) / 2;
+    gui_draw_text(START_BTN_X + 8, ty, "SutureOS", 0xE8ECF4u);
+}
+
+static void gui_draw_start_menu(void)
+{
+    int mx, my, mw, mh;
+    if (!g_start_open) return;
+    start_menu_rect(&mx, &my, &mw, &mh);
+
+    gui_fill(mx, my, mw, mh, 0x1E2230u);
+    gui_rect(mx, my, mw, mh, 0x5A6B86u);
+
+    int y = my + START_MENU_PAD;
+    for (int i = 0; i < START_ITEM_COUNT; i++) {
+        if (g_start_items[i].app_id == START_KIND_SEP) {
+            gui_fill(mx + 8, y + START_MENU_ITEM_H / 2, mw - 16, 1, 0x3A4356u);
+        } else {
+            const int hover = (g_my >= y && g_my < y + START_MENU_ITEM_H &&
+                               g_mx >= mx && g_mx < mx + mw);
+            if (hover)
+                gui_fill(mx + 2, y, mw - 4, START_MENU_ITEM_H, 0x2E5A9Eu);
+            gui_draw_text(mx + 12, y + (START_MENU_ITEM_H - 16) / 2,
+                          g_start_items[i].label, 0xE8ECF4u);
+        }
+        y += START_MENU_ITEM_H;
+    }
+}
+
+/* ==================== mouse input ====================
+ * Polled once per frame (IRQ12 delivery is unreliable on this machine, exactly
+ * like IRQ1). Moving the pointer dirties both the old and the new arrow rect so
+ * the compositor repaints exactly the pixels that changed.
+ */
+static void gui_pointer_moved(int nx, int ny)
+{
+    if (nx == g_mx && ny == g_my) return;
+    if (g_mprev_w > 0)
+        gui_dirty(g_mprev_x, g_mprev_y, g_mprev_w, g_mprev_h);
+    g_mx = nx;
+    g_my = ny;
+    gui_dirty(g_mx, g_my, 12, 19);        /* arrow size */
+    if (g_start_open) gui_invalidate();   /* hover highlight in the menu */
+}
+
+static void gui_clamp_pointer(void)
+{
+    if (g_mx < 0) g_mx = 0;
+    if (g_my < 0) g_my = 0;
+    if (g_mx > g_gui_screen_w - 1) g_mx = g_gui_screen_w - 1;
+    if (g_my > g_gui_screen_h - 1) g_my = g_gui_screen_h - 1;
+}
+
+/* Handle a left click at (cx,cy). Returns nothing; the next frame repaints. */
+static void gui_click_at(int cx, int cy, int button)
+{
+    if (g_mx != cx || g_my != cy) gui_pointer_moved(cx, cy);
+
+    /* The open start menu is modal: it eats the click. */
+    if (g_start_open) {
+        int mx, my, mw, mh;
+        start_menu_rect(&mx, &my, &mw, &mh);
+        if (cx >= mx && cx < mx + mw && cy >= my && cy < my + mh) {
+            const int idx = (cy - my - START_MENU_PAD) / START_MENU_ITEM_H;
+            if (idx >= 0 && idx < START_ITEM_COUNT) {
+                const int kind = g_start_items[idx].app_id;
+                console_printf("[gui] start menu: '%s' (click %d,%d)\n",
+                               g_start_items[idx].label ? g_start_items[idx].label : "-",
+                               (int64_t)cx, (int64_t)cy);
+                if (kind == START_KIND_EXIT) {
+                    g_gui_exit = 1;
+                } else if (kind != START_KIND_SEP) {
+                    gui_activate_app(kind);
+                }
+            }
+            g_start_open = 0;
+            gui_invalidate();
+            return;
+        }
+        /* click outside closes the menu and falls through to normal handling */
+        g_start_open = 0;
+        console_puts("[gui] start menu: closed\n");
+        gui_invalidate();
+    }
+
+    /* taskbar: the name on the left is the start button */
+    const int tb_y0 = g_gui_screen_h - GUI_TASKBAR_H;
+    if (cy >= tb_y0) {
+        if (cx >= START_BTN_X && cx < START_BTN_X + START_BTN_W) {
+            g_start_open = !g_start_open;
+            console_printf("[gui] start menu: %s (click %d,%d)\n",
+                           g_start_open ? "opened" : "closed",
+                           (int64_t)cx, (int64_t)cy);
+            gui_invalidate();
+        }
+        return;
+    }
+
+    /* topmost window under the pointer */
+    struct gui_window* hit = NULL;
+    for (struct gui_window* w = g_z; w; w = w->next) {
+        if (!w->visible || w->minimized) continue;
+        if (cx >= w->x && cx < w->x + w->w && cy >= w->y && cy < w->y + w->h) {
+            hit = w;
+            break;
+        }
+    }
+    if (hit == NULL) return;
+
+    gui_set_active(hit);                  /* raise + focus                   */
+
+    /* title bar: the three buttons on the right (close / max / min) */
+    if (cy < hit->y + GUI_BORDER + GUI_TITLE_H) {
+        const int bx = hit->x + hit->w - GUI_BORDER - GUI_BTN_W * 3;
+        if (cx >= bx + 3 && cx < bx + 3 + GUI_BTN_W * 3) {
+            const int b = (cx - (bx + 3)) / GUI_BTN_W;
+            if (b == 2) {                 /* close */
+                console_printf("[gui] click: close '%s'\n", hit->title);
+                if (hit->on_close) hit->on_close(hit);
+                hit->visible = false;
+                gui_invalidate();
+            } else if (b == 1) {          /* maximize / restore */
+                gui_flip_window(hit);
+            } else {                      /* minimize */
+                console_printf("[gui] click: minimize '%s'\n", hit->title);
+                hit->minimized = true;
+                gui_invalidate();
+            }
+            return;
+        }
+        return;                           /* title bar drag not implemented */
+    }
+
+    /* client area -> the app's on_click with client-relative coordinates */
+    if (hit->on_click) {
+        hit->on_click(hit, cx - hit->client_x, cy - hit->client_y);
+    } else if (hit->on_click2) {
+        hit->on_click2(hit, cx - hit->client_x, cy - hit->client_y, button);
+    }
+    gui_invalidate();
+}
+
+static void gui_handle_mouse(void)
+{
+    extern void mbos_mouse_poll(void);
+    extern int  mbos_mouse_x(void), mbos_mouse_y(void);
+    extern int  mbos_mouse_take_click(int*, int*, int*);
+
+    mbos_mouse_poll();
+
+    int nx = mbos_mouse_x();
+    int ny = mbos_mouse_y();
+    if (nx < 0) nx = 0;
+    if (ny < 0) ny = 0;
+    if (nx > g_gui_screen_w - 1) nx = g_gui_screen_w - 1;
+    if (ny > g_gui_screen_h - 1) ny = g_gui_screen_h - 1;
+    gui_pointer_moved(nx, ny);
+    gui_clamp_pointer();
+
+    int cx, cy, btn;
+    while (mbos_mouse_take_click(&cx, &cy, &btn)) {
+        if (cx < 0) cx = 0;
+        if (cy < 0) cy = 0;
+        if (cx > g_gui_screen_w - 1) cx = g_gui_screen_w - 1;
+        if (cy > g_gui_screen_h - 1) cy = g_gui_screen_h - 1;
+        gui_click_at(cx, cy, btn);
+    }
+}
+
+/* First visible window owned by `app_id` (used by the start menu). */
+static struct gui_window* gui_find_app_window(int app_id)
+{
+    for (struct gui_window* w = g_z; w; w = w->next)
+        if (w->app_id == (uint8_t)app_id) return w;
+    return NULL;
+}
+
+/* Bring the window of `app_id` to the front (restoring it if minimized). */
+static void gui_activate_app(int app_id)
+{
+    struct gui_window* w = gui_find_app_window(app_id);
+    if (w != NULL) {
+        gui_set_active(w);               /* raises + marks active          */
+        w->minimized = false;
+        gui_invalidate();
+    }
 }
 
 /* Tab: cyclic focus over visible windows, WITHOUT reordering z (reordering
@@ -294,9 +688,12 @@ static void gui_draw_taskbar(void) {
     gui_fill(0, y0, w, GUI_TASKBAR_H, 0x16181Eu);
     gui_fill(0, y0, w, 1, 0x3C4454u);                    /* highlight edge */
     const int ty = y0 + (GUI_TASKBAR_H - 16) / 2;
-    gui_draw_text(8, ty, "SutureOS", 0xE8ECF4u);
-    gui_draw_text(8 + 9 * 8, ty,
-                  " | arrows:move Tab:focus r:repaint q/ESC:quit",
+
+    /* the system name is the start button (click = menu opens upwards) */
+    gui_draw_start_button();
+
+    gui_draw_text(START_BTN_X + START_BTN_W + 8, ty,
+                  "click name for menu | Tab:focus r:repaint q/ESC:quit",
                   0x9FB2CCu);
     /* right side: measured fps */
     char d[12];
@@ -403,6 +800,10 @@ static void gui_render(void) {
         gui_draw_window(w);
     }
 
+    /* the start menu pops over the windows; the pointer is always on top */
+    gui_draw_start_menu();
+    gui_draw_pointer();
+
     gui_clip_full();
     g_dirty_any = false;              /* clear AFTER commit (gui64.cpp lesson) */
 }
@@ -462,8 +863,27 @@ int gui_run(void) {
     console_printf("[gui] framebuffer %ux%u pitch=%u bpp=%u\n",
                    (unsigned)limine_fb_width, (unsigned)limine_fb_height,
                    (unsigned)limine_fb_pitch, (unsigned)limine_fb_bpp);
+
+    /* pointer bring-up: the GUI used to be keyboard-only, so the PS/2 mouse is
+     * initialised here (before the terminal renderer is suspended, so the
+     * [mouse] line still reaches the visible console and the serial log). */
+    {
+        extern int mbos_mouse_init(void);
+        extern int mbos_mouse_present(void);
+        extern void mbos_mouse_move_to(int x, int y);
+        const int present = mbos_mouse_init();
+        if (present) {
+            mbos_mouse_move_to(g_gui_screen_w / 2, g_gui_screen_h / 2);
+            console_printf("[gui] pointer: PS/2 mouse at %dx%d\n",
+                           (int64_t)g_gui_screen_w, (int64_t)g_gui_screen_h);
+        } else {
+            console_puts("[gui] pointer: no PS/2 mouse, keyboard only\n");
+        }
+    }
+
     console_puts("[gui] main loop start\n");
     console_puts("[gui] keys: arrows=move Tab=focus r=repaint q/ESC=exit\n");
+    console_puts("[gui] mouse: click the SutureOS name (bottom left) for the menu\n");
 
     /* The GUI owns the framebuffer from here on: suspend the terminal renderer so
      * kernel log lines (still written to COM1) cannot paint over the desktop.
@@ -499,6 +919,16 @@ int gui_run(void) {
 
         if (gui_handle_keys()) break;             /* q / ESC -> exit loop */
 
+        /* pointer: poll the PS/2 mouse, move the arrow, dispatch clicks */
+        gui_handle_mouse();
+        if (g_gui_exit) break;                    /* start menu "Exit to terminal" */
+
+        /* armed pointer self-test (`startgui test`): inject pointer packets
+         * through the real decoder, then let the normal path react. */
+        if (g_pointer_selftest) {
+            gui_selftest_frame();
+        }
+
         /* application tick callbacks (timer app etc.) */
         for (struct gui_window* w = g_z; w; w = w->next)
             if (w->visible && !w->minimized && w->on_tick) w->on_tick(w);
@@ -524,6 +954,25 @@ int gui_run(void) {
             busy_tsc = 0;
             sec_tick = now;
             sec_tsc = gui_rdtsc();
+
+            /* Pointer telemetry (serial only - the screen belongs to the GUI).
+             * It is what the acceptance runs assert on: packets > 0 proves the
+             * PS/2 data path works, and x/y prove the cursor really moved. */
+            {
+                extern uint32_t mbos_mouse_packets(void);
+                extern uint32_t mbos_mouse_dropped(void);
+                extern int mbos_mouse_buttons(void);
+                extern uint32_t mbos_mouse_obf_seen(void);
+                extern uint32_t mbos_mouse_aux_seen(void);
+                console_printf("[gui] pointer x=%d y=%d buttons=%d pkts=%u drop=%u "
+                               "obf=%u aux=%u\n",
+                               (int64_t)g_mx, (int64_t)g_my,
+                               (int64_t)mbos_mouse_buttons(),
+                               (uint64_t)mbos_mouse_packets(),
+                               (uint64_t)mbos_mouse_dropped(),
+                               (uint64_t)mbos_mouse_obf_seen(),
+                               (uint64_t)mbos_mouse_aux_seen());
+            }
         }
     }
 
@@ -584,8 +1033,8 @@ struct gui_window* gui_create_window(const char* title, int x, int y, int w, int
                 win->title[i] = 0;
             }
             
-            // 简单的客户区计算
-            win->client_x = win->x + 1;
+            // 简单的客户区绘制
+    win->client_x = win->x + 1;
             win->client_y = win->y + GUI_TITLE_H + GUI_BORDER;
             win->client_w = win->w - GUI_BORDER * 2;
             win->client_h = win->h - GUI_TITLE_H - GUI_BORDER * 2;
@@ -627,7 +1076,7 @@ void gui_set_active(struct gui_window* w) {
     w->active = true;
     w->minimized = false;
     gui_dirty(w->x, w->y, w->w, w->h);
-    // 移到 z 序头部
+    // 绉诲埌 z 搴忓ご閮?
     struct gui_window** pp = &g_z;
     while (*pp) {
         if (*pp == w) {
@@ -875,3 +1324,4 @@ int gui_selftest(void) {
                    (uint64_t)g_gui_screen_w, (uint64_t)g_gui_screen_h);
     return 0;
 }
+

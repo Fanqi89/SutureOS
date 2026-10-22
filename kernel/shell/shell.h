@@ -59,6 +59,7 @@ int shell_process_line(const char *line);
 int shell_cmd_help(int argc, char **argv);
 int shell_cmd_clear(int argc, char **argv);
 int shell_cmd_log(int argc, char **argv);
+int shell_cmd_mouseinfo(int argc, char **argv);
 int shell_cmd_echo(int argc, char **argv);
 int shell_cmd_exit(int argc, char **argv);
 int shell_cmd_reboot(int argc, char **argv);

@@ -516,6 +516,22 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
         }
     }
 
+    /* ==================== PS/2 mouse (8042 aux port) ====================
+     * Initialised at boot, not on GUI entry: the shell's `mouseinfo` needs the
+     * device already brought up, and the controller configuration byte must be
+     * fixed (aux clock + aux IRQ) early - at boot it comes up as 0x61, i.e.
+     * with the aux clock DISABLED, which silently blocks every movement packet. */
+    {
+        extern int mbos_mouse_init(void);
+        extern int mbos_mouse_present(void);
+        if (mbos_mouse_init() && mbos_mouse_present()) {
+            console_puts("[  OK  ] PS/2 mouse: aux port enabled "
+                         "(pointer available in the GUI)\n");
+        } else {
+            console_puts("[init] no PS/2 mouse: the GUI runs keyboard-only\n");
+        }
+    }
+
     /* ==================== Network (RTL8139 + IPv4/ARP/ICMP/UDP) ============
      * Polling mode on purpose: the IDT only has gates for 0-47 + 0x80 and the
      * kernel runs the legacy PIC, so the driver's IRQ is not used; the shell's

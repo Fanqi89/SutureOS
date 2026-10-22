@@ -321,6 +321,12 @@ py -3 scripts\verify_fat32_write.py build\fat32_virtio.img build\fat32.img
 - **终端/日志自动滚动**：内核控制台每写一行都会进一个 **128 行的环形缓冲**（`kernel/term/log_ring.c`，捕获点在 `console_putc()` 最前面，屏幕或串口坏了也不丢日志），屏幕输出本身始终跟随最新一行（flanterm 滚屏）。
   - 新命令 `log [行数]`（别名 `dmesg`）：打印最近 N 行（缺省 = 一屏少 4 行），**自动滚到日志尾部**，提示符紧跟最后一行——`log 200` 会打印环里全部 128 行并停在最新行。
   - 实测：`log` → 44 行；`log 200` → 128 行（`[selftest][rtl8139] PASS` 开头、`sutureos#` 结尾），串口与屏幕内容一致。
+- **GUI 鼠标 + 开始菜单**：启动 GUI 后屏幕上就有白色箭头光标（PS/2 鼠标，轮询）；**点击左下角的 “SutureOS” 名字会向上弹出开始菜单**（Task Manager / Calculator / About SutureOS / 分隔线 / Exit to terminal），点菜单项会把对应应用拉到最前、点窗口标题栏的三个按钮可最小化/最大化/关闭。
+  - 驱动：`kernel/drivers/mb_mouse.c`（8042 aux 端）2 开机时就初始化（`kmain`，不是进 GUI 才初始化），循环里逐帧轮询；启动时 8042 配置字节常常是 `0x61`（**aux 时钟关着**），所以初始化里强制清 bit5（开时钟）、置 bit1（aux 中断）并补发 `0xA8`/`0xAE`（开端口 + 开设备）、`0xF6`/`0xF4`（缺省 + 开数据上报）。鼠标字节与键盘共用 8042 输出缓冲，所以 `mbos_kbd_poll()` 不再吃掉 bit5 置位的鼠标字节（否则会当扫描码处理）。
+  - 诊断：`mouseinfo`（shell）打印 8042 状态、配置字节、设备 ID（0 = 标准三字节鼠标）与包计数；GUI 里每秒打一行 `[gui] pointer x=.. y=.. buttons=.. pkts=.. obf=.. aux=..` 到串口。
+  - 验收：`startgui test` 会把**人工构造的 PS/2 包送进真实解码器**（QEMU 无显示后端时不能注入真实指针事件），逐步移动光标→点开始按钮→菜单弹出→点第一项，串口依次打出
+    `pointer selftest: on the start button (12,736)` → `start menu: opened (click 12,736)` → `after the click the menu is OPEN` → `start menu: 'Task Manager' (click 18,612)` → `finished (menu=closed, focus='Task Manager')`，截图里能看到菜单从左下角向上弹出。
+  - **未验证**：真实鼠标的移动包路径（自动化环境里 QEMU `mouse_move`/QMP `input-send-event` 与 VMware VNC 的指针事件都到不了客机；但 8042 aux 数据通路本身已由 `mouseinfo` 读到设备 ID 证实）——请在自己的 VM 里移动真鼠标确认，如果不动就跑 `mouseinfo`，看 `packets/obf/aux` 哪一步是 0。
 - **VMware**：新建 *Other 64-bit* 虚拟机 → 内存 ≥256 MB、≥2 核 → 光驱指向 `build/sutureos.iso`（可再加两块 IDE 盘分别挂 fat32.img / ext2.img）→ 启动进终端，`startgui` 进 GUI，`shutdown`/`reboot` 走 ACPI；可加串口重定向到文件抓同样的 `[  OK  ]` 日志。
 - **VMware 自动化（新）**：`powershell -NoProfile -File scripts\vmware_boot.ps1 -SerialLog build\vmware_serial.log -DiskImage build\fat32_ahci.img -WaitSeconds 60`——在 `build\` 里生成一次性 VM（不碰你在 Workstation 里已打开的虚拟机）、ISO 挂光驱、raw 测试镜像当 SATA 盘挂上、串口写文件、跑完自动关机。实测（VMware Workstation 17.5.2 + 虚拟 SATA 盘）：
   ```

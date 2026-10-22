@@ -248,10 +248,18 @@ void mbos_kbd_enable_irq(void)
 
 int mbos_kbd_poll(void)
 {
-    /* Single consumer of 0x60: the polling path (see the IRQ1 comment above -
-     * the handler must not read the port, it only counts). */
-    if ((inb(MBOS_KBD_STAT) & MBOS_KBD_STAT_OBF) == 0)
+    /* Single consumer of 0x60 for the KEYBOARD: the polling path (see the IRQ1
+     * comment above - the handler must not read the port, it only counts).
+     *
+     * The 8042 output buffer is shared with the PS/2 mouse: status bit 5 says
+     * the byte came from the aux port. Those bytes are left in the buffer for
+     * mbos_mouse_poll() - reading them here would hand the shell mouse packets
+     * as if they were scancodes. */
+    const uint8_t st = inb(MBOS_KBD_STAT);
+    if ((st & MBOS_KBD_STAT_OBF) == 0)
         return -1;                      /* nothing to read */
+    if ((st & 0x20u) != 0)
+        return -1;                      /* mouse byte: not ours */
     return (int)inb(MBOS_KBD_DATA);
 }
 
