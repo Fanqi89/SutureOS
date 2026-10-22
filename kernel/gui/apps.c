@@ -13,6 +13,7 @@
  * the callback to the window's client rectangle, so apps draw with absolute
  * screen coordinates starting at w->client_x / w->client_y.
  */
+#include "sutureos/version.h"
 #include "gui.h"
 #include <stitch/types.h>
 #include <stitch/string.h>
@@ -199,8 +200,15 @@ static void calc_draw(struct gui_window* w) {
 static void about_draw(struct gui_window* w) {
     const int x = w->client_x + 10;
     int y = w->client_y + 8;
+    /* the version comes from include/sutureos/version.h so a release bump can
+     * never leave a stale string baked into the ISO */
+    static char about_ver[64];
+    if (about_ver[0] == 0) {
+        int n = snprintf(about_ver, sizeof(about_ver), "SutureOS v%s",
+                         SUTUREOS_VERSION);
+        if (n <= 0) about_ver[0] = 0;
+    }
     static const char* lines[] = {
-        "SutureOS v0.5.0-alpha",
         "a stitched-together x86_64 kernel",
         "",
         "14 upstream hobby OS projects:",
@@ -212,6 +220,8 @@ static void about_draw(struct gui_window* w) {
         "Terminal: flanterm (BSD-2-Clause)",
         "License: GPL-3.0 (upstreams respected)",
     };
+    gui_draw_str(x, y, about_ver, 0x1B3A6Bu);
+    y += 16;
     for (unsigned i = 0; i < sizeof(lines) / sizeof(lines[0]); i++) {
         gui_draw_str(x, y + (int)i * 16, lines[i], i == 0 ? 0x143C8Cu : 0x1A1A1Au);
     }

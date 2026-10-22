@@ -6,6 +6,25 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.6.1-alpha]
+
+Fixup release: the About window was still printing a hardcoded `v0.5.0-alpha`,
+so a stale version string was baked into the ISO. Found by the new release
+verification, which now also proves the version string is inside the artifact.
+
+### Fixed
+- GUI "About SutureOS" reads the version from `include/sutureos/version.h`
+  instead of a literal, so the ISO can no longer ship an old version string.
+
+### Added
+- `scripts/verify_release.ps1`: proves a release is real - version string inside
+  the ISO (and the previous version gone), asset `size`/`digest` read back from
+  the API by asset NAME, optional byte-range download-back, every OLD release
+  compared against a pre-publish snapshot, and the git side in sync.
+- `scripts/publish_all.ps1`: the whole release in one command (snapshot ->
+  commit/tag/push -> GitHub Release + ISO -> verification).
+- `docs/RELEASING.md` documents the sequence and the checks.
+
 ## [v0.6.0-alpha] - unreleased
 
 Kernel hardening on real hypervisors, a much more complete network stack, the

@@ -91,7 +91,24 @@ powershell -NoProfile -File scripts\publish_release.ps1 `
 - 从 Windows 系统代理取代理（本机直连 GitHub 的 TLS 会被重置，必须走代理）；
 - 幂等：标签已存在就不动它，Release 已存在就更新标题/正文，同名附件先删再传。
 
-## 5. 备份与历史 Release
+## 5. 发布自证（每个版本都必须过）
+
+上传成功 ≠ 发布正确。`scripts/verify_release.ps1` 会逐项证明：
+
+1. **版本串真的进了产物**：在 ISO 里数 `version.h` 的版本号（命中数必须 > 0），
+   并数**上一个版本号**（必须 = 0）。这条曾抓到 About 窗口写死 `v0.5.0-alpha` 的 bug。
+2. 记录本地 ISO 的 `size` + `sha256`。
+3. 回读 Release 附件：`size` 与 `digest` 必须等于本地值，**按附件名匹配**
+   （GitHub API 的附件顺序不稳定，按下标比对会打出假失败）。
+4. `-DownloadBack`：把附件按 256 KB 分块拉回来重算 sha256，形成「本地 == API digest ==
+   下载回读」三向一致（默认关闭：本机代理整包拉 12.5 MB 会超时）。
+5. **旧 Release 全量比对**：发布前 `-SaveBaseline` 快照，发布后逐项比对每个旧 Release 的
+   附件名 / id / size / digest —— 上传踩掉旧版本只有这一步能发现。
+6. git 侧：`HEAD == origin/main`、`origin/main...HEAD` 为 `0 0`、工作树干净、标签在远端。
+
+一键发布已经内置「快照 → 发布 → 自证」三步：`scripts/publish_all.ps1`，任一步失败即中止。
+
+## 6. 备份与历史 Release
 
 - 每个 Release 都留着历史 ISO（GitHub 不会覆盖别版本的文件），所以
   `v0.1.0-alpha`、`v0.5.0-alpha`、`v0.6.0-alpha` 的镜像都能分别下载。
