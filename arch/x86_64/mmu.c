@@ -172,6 +172,21 @@ int mmu_map_user_identity(uint64_t va, uint64_t len, int writable, int executabl
     return 0;
 }
 
+/* Public page-table allocator: the per-process address spaces (userspace.c) need
+ * a zeroed 4 KiB table just like mmu_walk() does internally. */
+void *mmu_alloc_table(void)
+{
+    return mmu_alloc_page();
+}
+
+/* Reload CR3 to flush the TLB after the caller rewrote PTEs. */
+void mmu_flush_tlb(void)
+{
+    uint64_t cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    __asm__ volatile("mov %0, %%cr3" : : "r"(cr3) : "memory");
+}
+
 /* 把用户虚拟区 [va, va+pages*4096) 映射到物理页 pa.. （每页 4 KiB，U/S=1）。
  * 与 mmu_map_user_identity 的区别：VA 不再等于 PA，这是跑"链接在固定地址"的
  * 用户程序所必需的（VimtuOS 的扁平 blob 模型链接在固定 VA）。 */

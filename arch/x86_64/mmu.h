@@ -58,6 +58,12 @@ int mmu_map_user_identity(uint64_t va, uint64_t len, int writable, int executabl
 int mmu_map_user_pages(uint64_t va, uint64_t pa, uint64_t pages,
                        int writable, int executable);
 
+/* Zeroed 4 KiB page-table page from the MMU pool. */
+void *mmu_alloc_table(void);
+
+/* Reload CR3 (flush the TLB) after rewriting PTEs. */
+void mmu_flush_tlb(void);
+
 /* Create the intermediate page tables for a user VA range. */
 int mmu_prepare_user_range(uint64_t va, uint64_t pages);
 

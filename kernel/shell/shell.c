@@ -89,6 +89,7 @@ static const struct shell_cmd g_commands[] = {
     {"ring3",   shell_cmd_ring3,  "Ring-3 status (the boot-time user program)"},
     {"ring3test",shell_cmd_ring3test,"Self-test: U/S page bits, SSE, GS base, exit code"},
     {"run",     shell_cmd_run,     "Run a built-in ring-3 user program: run <name>"},
+    {"ushell",  shell_cmd_ushell,  "Enter the ring-3 user shell (exit comes back here)"},
     {"mount",   shell_cmd_mount,   "Mount filesystem"},
     {"umount",  shell_cmd_umount,  "Unmount filesystem"},
     {"df",      shell_cmd_df,      "Show disk usage"},
@@ -987,6 +988,18 @@ int shell_cmd_ring3(int argc, char **argv) {
         return 0;
     }
     return (ring3_run_init() == 42) ? 0 : 1;
+}
+
+int shell_cmd_ushell(int argc, char **argv) {
+    extern int user_run_builtin(const char *name);
+    const int rc = user_run_builtin("shell");
+    (void)argc; (void)argv;
+    if (rc < 0) {
+        shell_puts("ushell: the ring-3 shell could not start\n");
+        return 1;
+    }
+    shell_printf("ushell: ring-3 shell exited with %d\n", (int64_t)rc);
+    return 0;
 }
 
 int shell_cmd_run(int argc, char **argv) {

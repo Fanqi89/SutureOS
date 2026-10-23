@@ -349,6 +349,10 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
             console_printf("[  OK  ] ring3: first user program ran, exit=%d\n",
                            (int64_t)rc);
             (void)ring3_selftest();
+            {
+                extern int userspace_selftest(void);
+                (void)userspace_selftest();
+            }
 
             /* The ported C userland: VimtuOS' minilibc (printf/malloc/string) in
              * user/lib, talking through the Vimtu64 own-ABI gate at int 0x80. */

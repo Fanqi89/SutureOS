@@ -44,6 +44,7 @@
 #define V64_NR_OPEN     6
 #define V64_NR_READ     7
 #define V64_NR_CLOSE    8
+#define V64_NR_EXEC     9               /* own ABI: execve(path) */
 
 #define V64_WRITE_MAX 1024u
 
@@ -98,6 +99,13 @@ static void int80_handler(struct moos_regs *f)
         const uint64_t fd = frame_get(f, FRAME_RDI), buf = frame_get(f, FRAME_RSI),
                       len = frame_get(f, FRAME_RDX);
         if (!user_ptr_ok((const void *)(uintptr_t)buf, len)) { ret = (uint64_t)-3; break; }
+        if (fd == 0) {
+            /* fd 0 = console: this is what lets a ring-3 shell read commands */
+            extern int user_console_read(char *out, unsigned n);
+            ret = (uint64_t)(int64_t)user_console_read((char *)(uintptr_t)buf,
+                                                       (unsigned)len);
+            break;
+        }
         ret = syscall_invoke(LX_READ, fd, buf, len, 0, 0, 0);
         break;
     }
@@ -131,6 +139,12 @@ static void int80_handler(struct moos_regs *f)
             }
         }
         ret = 0;
+        break;
+    }
+    case V64_NR_EXEC: {
+        const uint64_t path = frame_get(f, FRAME_RDI);
+        extern int user_exec_from_frame(const char *path, void *frame);
+        ret = (uint64_t)(int64_t)user_exec_from_frame((const char *)(uintptr_t)path, f);
         break;
     }
     case V64_NR_EXIT:

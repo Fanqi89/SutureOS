@@ -6,6 +6,64 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.11.0-alpha]
+
+The userspace becomes real: interrupts stay enabled at CPL=3, every program runs in
+its own address space (CR3 switch), `execve` replaces a running program, and there is
+an interactive ring-3 shell.
+
+### Added
+- **Per-process address spaces** (`kernel/syscall/userspace.c`): a real PML4 per
+  program - kernel map shared, the 1 GiB..2 GiB slot (free in the kernel map) gets a
+  private PDPT/PD/PT for the user window at 0x40000000, so two processes can use the
+  same VA and see different pages. CR3 is switched on entry to ring 3 and back on
+  exit. Page-table pages come from the PMM (the static MMU pool ran out after a few
+  runs), and are released on exit.
+- **Ring 3 runs with IF=1**: hardware interrupts are delivered while a program is at
+  CPL=3 (the timer keeps ticking), so userspace is preemptible in principle.
+- **`execve`** as own-ABI `int 0x80` number 9: rebuilds the current address space
+  with another built-in program and rewrites the interrupt frame (rip/rsp/rax) so
+  `iretq` lands at the new entry point. Used by the shell's `hello`/`probe` commands.
+- **Ring-3 interactive shell** (`user/apps/shell.c`, 6889 B): reads commands through
+  `int 0x80` read(fd=0) (the kernel echoes them), and supports help/hello/probe/
+  crash/pid/ticks/exec/exit. The kernel shell enters it with `ushell`.
+- **Console input for ring 3**: `int 0x80` read on fd 0 is routed to the keyboard
+  ring with echo and backspace handling.
+- **`userspace_selftest`** (9 checks) wired into the boot log.
+
+### Fixed
+- **`el0_enter_user_saved` switched CR3 after zeroing the registers**, which cleared
+  `%rdi` (the PML4 argument) - so CR3 was never switched and ring 3 ran on the kernel
+  map where 0x40000000 is unmapped (QEMU: CPL=3 #PF err=0x14 at 0x40000000 forever).
+- **The window is at 1 GiB, i.e. PML4 index 0** (not 1, which starts at 512 GiB), so
+  the private PDPT belongs in `pml4[0]`.
+- **#PF from CPL=3** was handled by the COW path, which ended in
+  `sig_send(current=-1, SIGSEGV)` and re-executed the faulting instruction forever.
+  A user-mode page fault now kills the program (exit 128+14) and the kernel survives:
+  `[ring3] user #PF at 0x100000 (err=0x7) -> killed (exit 142)`.
+- **GS MSRs are saved/restored across ring 3**: a `syscall`-initiated exit
+  (`SYS_EXIT`) long-jumps out of the entry path and skipped the matching `swapgs`,
+  leaving GS swapped for the next entry.
+- Two shell input bugs: the prompt was reprinted on every `-EAGAIN`, and a single
+  keystroke was treated as a command (read(0) returns as soon as one char is
+  available, so the shell accumulates until newline).
+
+### Verification
+- `userspace selftest: RESULT PASS (9/9)`, `ring3 selftest 9/9`,
+  `int80 selftest 2/2`, regression otherwise unchanged (self-tests 13/14, rtc 8/8,
+  pipe 16/16, FAT32 write+ops PASS, host 17/17, AP online, ping, mouse, sudo 23/23).
+- Interactive ring-3 shell transcript: `help`/`ticks`/`pid` work, `hello` execve's the
+  libc program in the same address space, `crash` (write to kernel memory) is killed
+  with exit 142 while the kernel survives, and `ushell` can be re-entered repeatedly.
+
+### Known limitations
+- No `fork`/`wait4`: one process at a time (the scheduler still has the known
+  dual-scheduler problem), so the shell cannot run a program in the background and
+  return to itself - `execve` replaces it.
+- The userspace helpers are in the kernel image (no ELF loader on the boot path yet).
+- Interrupts *during* a syscall stay disabled (the ISR stub frame handling at CPL=3
+  is exercised by the timer, not by nested re-entry).
+
 ## [v0.10.1-alpha]
 
 The ported userland libc runs. v0.10.0 shipped the port with one diagnosed blocker

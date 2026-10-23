@@ -5,6 +5,10 @@
 #include <stitch/string.h>
 #include <stitch/user_context.h>
 #include "el0_validate.h"
+#include "syscall.h"      /* SYS_CLOCK_GETTIME for the tick probe */
+#include "userspace.h"    /* per-process address space */
+#include "el0_switch.h"   /* el0_kernel_state_t + entry/exit primitives */
+#include <stitch/user_context.h>
 #include "mmu.h"
 
 /* The embedded user program: scripts/build.py assembles user/init.S into
@@ -16,7 +20,7 @@ extern const uint8_t _binary_init_bin_size[];
 
 #define USER_CS 0x2B
 #define USER_SS 0x23
-#define RFLAGS_USER 0x2u   /* IF=0 while at CPL=3 (see ring3.h note on interrupts) */
+#define RFLAGS_USER 0x202u /* IF=1 at CPL=3: hardware interrupts are delivered to ring 3 */
 
 /* Per-CPU block the syscall entry expects at %gs:
  *   gs:0 = user rsp (saved on entry)
@@ -39,6 +43,9 @@ static uint64_t g_saved_kernel_rsp;    /* where el0_resume_kernel() returns to *
 static volatile int g_ring3_active;
 static volatile int g_ring3_exit_code = -1;
 static volatile int g_ring3_ran;
+static int g_ring3_ready;                 /* SSE/GS/kstack set up */
+static userspace_t *g_current_us;         /* address space of the running program */
+static el0_kernel_state_t g_kstate;       /* where el0_resume_kernel() returns to */
 
 /* ---- privileged helpers ---- */
 
@@ -100,10 +107,13 @@ void ring3_exit_user(uint64_t code)
 {
     g_ring3_exit_code = (int)code;
     g_ring3_active = 0;
+    /* Restore the GS MSRs: a syscall-initiated exit skips the matching swapgs. */
+    wrmsr(0xC0000101, g_kstate.gs_base);
+    wrmsr(0xC0000102, g_kstate.gs_kernel_base);
     el0_validate_init();
     {
-        extern void el0_resume_kernel(uint64_t saved_rsp, uint64_t value);
-        el0_resume_kernel(g_saved_kernel_rsp, code);   /* does not return */
+        extern void el0_resume_kernel(el0_kernel_state_t *state, uint64_t value);
+        el0_resume_kernel(&g_kstate, code);            /* does not return */
     }
     for (;;) {
         __asm__ volatile("cli; hlt");
@@ -177,10 +187,12 @@ int ring3_run_init(void)
 
     g_ring3_active = 1;
     g_ring3_exit_code = -1;
+    g_kstate.gs_base = rdmsr(0xC0000101);
+    g_kstate.gs_kernel_base = rdmsr(0xC0000102);
     {
-        extern void el0_enter_user_saved(uint64_t entry, uint64_t stack_top,
-                                         uint64_t *slot);
-        el0_enter_user_saved(ctx.rip, ctx.rsp, &g_saved_kernel_rsp);
+        extern void el0_enter_user_saved(uint64_t pml4, uint64_t entry,
+                                         uint64_t stack_top, el0_kernel_state_t *state);
+        el0_enter_user_saved(0 /* keep the kernel map */, ctx.rip, ctx.rsp, &g_kstate);
     }
     g_ring3_active = 0;
 
@@ -196,72 +208,58 @@ int ring3_run_init(void)
 
 int user_run_blob(const char *name, const uint8_t *blob, uint64_t len)
 {
-    extern uintptr_t moe_pmm_alloc(uint32_t n);
-    const uint64_t total_pages = USER_CODE_PAGES + USER_STACK_PAGES;
-    uint64_t pa;
+    static userspace_t us;
 
-    if (blob == NULL || len == 0 || len > (uint64_t)USER_CODE_PAGES * 4096u) {
+    if (!g_ring3_ready) {
+        sse_enable();
+        wrmsr(0xC0000102, (uint64_t)(uintptr_t)&g_ring3_gs);
+        g_ring3_gs.kernel_rsp = (uint64_t)(uintptr_t)&g_ring3_kstack[RING3_KSTACK_BYTES] - 64;
+        g_ring3_ready = 1;
+    }
+
+    if (userspace_create(&us) != 0) {
+        console_printf("[user] '%s': cannot create an address space\n",
+                       (name != NULL) ? name : "?");
+        return -1;
+    }
+    if (userspace_load(&us, blob, len) != 0) {
         console_printf("[user] '%s': blob unusable (len=%llu, limit %u)\n",
                        (name != NULL) ? name : "?", len,
-                       (int64_t)(USER_CODE_PAGES * 4096));
+                       (int64_t)(USERSPACE_CODE_PAGES * 4096));
+        userspace_destroy(&us);
         return -1;
     }
 
-    pa = (uint64_t)moe_pmm_alloc((uint32_t)total_pages);
-    if (pa == 0) {
-        console_printf("[user] '%s': no memory\n", (name != NULL) ? name : "?");
-        return -1;
-    }
-
-    /* Page tables for the user VA window, then map PMM pages into it. */
-    if (mmu_prepare_user_range(USER_VA_BASE, total_pages) != 0) {
-        console_printf("[user] '%s': cannot build page tables\n",
-                       (name != NULL) ? name : "?");
-        return -1;
-    }
-    if (mmu_map_user_pages(USER_VA_BASE, pa, USER_CODE_PAGES, 1, 1) != 0 ||
-        mmu_map_user_pages(USER_VA_BASE + (uint64_t)USER_CODE_PAGES * 4096u,
-                           pa + (uint64_t)USER_CODE_PAGES * 4096u,
-                           USER_STACK_PAGES, 1, 0) != 0) {
-        console_printf("[user] '%s': cannot map user pages\n",
-                       (name != NULL) ? name : "?");
-        return -1;
-    }
-
-    /* zero the whole window (bss + stack), then drop the blob at the base */
-    memset((void *)(uintptr_t)USER_VA_BASE, 0, (size_t)USER_VA_BYTES);
-    memcpy((void *)(uintptr_t)USER_VA_BASE, blob, (size_t)len);
-
-    sse_enable();
-    wrmsr(0xC0000102, (uint64_t)(uintptr_t)&g_ring3_gs);   /* IA32_KERNEL_GS_BASE */
-    g_ring3_gs.kernel_rsp = (uint64_t)(uintptr_t)&g_ring3_kstack[RING3_KSTACK_BYTES] - 64;
-
+    g_current_us = &us;
     el0_validate_init();
-    (void)el0_grant_range(USER_VA_BASE, USER_VA_BYTES);
+    (void)el0_grant_range(USERSPACE_VA, USERSPACE_BYTES);
     el0_set_active(1);
-
     {
         extern void int80_init(void);
-        int80_init();       /* the ported libc talks through int 0x80 */
+        int80_init();
     }
 
-    console_printf("[user] running '%s': va=0x%llx len=%llu stack=0x%llx\n",
-                   (name != NULL) ? name : "?",
-                   USER_VA_BASE, len, USER_VA_BASE + USER_VA_BYTES - 16);
+    console_printf("[user] running '%s': va=0x%llx len=%llu stack=0x%llx pml4=0x%llx\n",
+                   (name != NULL) ? name : "?", USERSPACE_VA, len,
+                   userspace_stack_top(&us), us.pml4);
 
     g_ring3_active = 1;
     g_ring3_exit_code = -1;
+    g_kstate.gs_base = rdmsr(0xC0000101);
+    g_kstate.gs_kernel_base = rdmsr(0xC0000102);
     {
-        extern void el0_enter_user_saved(uint64_t entry, uint64_t stack_top,
-                                         uint64_t *slot);
-        el0_enter_user_saved(USER_VA_BASE, USER_VA_BASE + USER_VA_BYTES - 16,
-                             &g_saved_kernel_rsp);
+        extern void el0_enter_user_saved(uint64_t pml4, uint64_t entry,
+                                         uint64_t stack_top, el0_kernel_state_t *state);
+        el0_enter_user_saved(us.pml4, userspace_entry(&us), userspace_stack_top(&us),
+                             &g_kstate);
     }
     g_ring3_active = 0;
+    g_current_us = NULL;
     __asm__ volatile("sti");
 
     console_printf("[user] '%s' exited with %d\n",
                    (name != NULL) ? name : "?", (int64_t)g_ring3_exit_code);
+    userspace_destroy(&us);
     return g_ring3_exit_code;
 }
 
@@ -273,6 +271,9 @@ extern const uint8_t _binary_hello_bin_size[];
 extern const uint8_t _binary_probe_bin_start[];
 extern const uint8_t _binary_probe_bin_end[];
 extern const uint8_t _binary_probe_bin_size[];
+extern const uint8_t _binary_shell_bin_start[];
+extern const uint8_t _binary_shell_bin_end[];
+extern const uint8_t _binary_shell_bin_size[];
 
 typedef struct {
     const char *name;
@@ -283,7 +284,117 @@ typedef struct {
 static const user_program_t g_programs[] = {
     { "hello", _binary_hello_bin_start, _binary_hello_bin_size },
     { "probe", _binary_probe_bin_start, _binary_probe_bin_size },
+    { "shell", _binary_shell_bin_start, _binary_shell_bin_size },
 };
+
+/* ---- execve support ----
+ * Called from syscall_dispatch_c() for SYS_EXECVE: rebuilds the *current* address
+ * space with the requested built-in program and rewrites the syscall return frame
+ * so iretq lands at the new entry point. Returns 0 or a negative errno. */
+int user_exec_in_place(const char *path, void *ctx_void)
+{
+    user_context_t *ctx = (user_context_t *)ctx_void;
+    const char *name = path;
+    userspace_t *us = g_current_us;
+    const uint8_t *blob = NULL;
+    uint64_t len = 0;
+
+    if (name == NULL || us == NULL || ctx == NULL) return -14;          /* EFAULT */
+    while (*name == '/') name++;
+
+    for (uint64_t i = 0; i < sizeof(g_programs) / sizeof(g_programs[0]); i++) {
+        if (strcmp(g_programs[i].name, name) == 0) {
+            blob = g_programs[i].start;
+            len = (uint64_t)(uintptr_t)g_programs[i].size_ptr;
+            break;
+        }
+    }
+    if (blob == NULL) return -2;                                        /* ENOENT */
+
+    if (userspace_load(us, blob, len) != 0) return -12;                 /* ENOMEM */
+    mmu_flush_tlb();
+
+    ctx->rip = userspace_entry(us);
+    ctx->rsp = userspace_stack_top(us);
+    ctx->rax = 0;
+    console_printf("[user] execve('/%s') -> new image, entry=0x%llx\n",
+                   name, (uint64_t)ctx->rip);
+    return 0;
+}
+
+/* execve through the int 0x80 gate: rebuild the image and rewrite the interrupt
+ * frame so iretq returns into the new program. Frame offsets are the ones the stub
+ * really produces (see kernel/syscall/int80.c). */
+int user_exec_from_frame(const char *path, void *frame_void)
+{
+    uint8_t *f = (uint8_t *)frame_void;
+    userspace_t *us = g_current_us;
+    const char *name = path;
+    char name_copy[32];
+    const uint8_t *blob = NULL;
+    uint64_t len = 0;
+
+    if (name == NULL || us == NULL || f == NULL) return -14;            /* EFAULT */
+    while (*name == '/') name++;
+    /* the path lives in the user window that userspace_load() is about to zero */
+    {
+        size_t n = strlen(name);
+        if (n >= sizeof(name_copy)) n = sizeof(name_copy) - 1;
+        memcpy(name_copy, name, n);
+        name_copy[n] = '\0';
+    }
+
+    for (uint64_t i = 0; i < sizeof(g_programs) / sizeof(g_programs[0]); i++) {
+        if (strcmp(g_programs[i].name, name) == 0) {
+            blob = g_programs[i].start;
+            len = (uint64_t)(uintptr_t)g_programs[i].size_ptr;
+            break;
+        }
+    }
+    if (blob == NULL) return -2;                                        /* ENOENT */
+    if (userspace_load(us, blob, len) != 0) return -12;                 /* ENOMEM */
+    mmu_flush_tlb();
+
+    *(uint64_t *)(void *)(f + 0x88) = userspace_entry(us);              /* rip */
+    *(uint64_t *)(void *)(f + 0xA0) = userspace_stack_top(us);          /* rsp */
+    *(uint64_t *)(void *)(f + 0x70) = 0;                                /* rax = 0 */
+    console_printf("[user] execve('/%s') ok, entry=0x%llx\n",
+                   name_copy, userspace_entry(us));
+    return 0;
+}
+
+/* Console input for ring 3 (`int 0x80` read on fd 0). Returns the number of bytes
+ * placed in buf, 0 on an empty poll, or a negative errno. */
+extern int console_getc(void);
+
+extern void console_putc(char c);
+
+int user_console_read(char *buf, unsigned len)
+{
+    unsigned got = 0;
+    if (buf == NULL || len == 0) return -22;
+    while (got < len) {
+        int c = console_getc();
+        if (c < 0) {
+            if (got == 0) return -11;               /* EAGAIN */
+            break;
+        }
+        if (c == '\r') c = '\n';
+        /* echo: the user program cannot paint the console itself, the kernel does
+         * it here so the ring-3 shell behaves like a real terminal */
+        if (c == 8 || c == 127) {                   /* backspace */
+            if (got > 0) {
+                got--;
+                console_puts("\b \b");
+            }
+            continue;
+        }
+        buf[got++] = (char)c;
+        console_putc((char)c);
+        if (c == '\n') break;
+    }
+    return (int)got;
+}
 
 int user_run_builtin(const char *name)
 {
@@ -298,7 +409,7 @@ int user_run_builtin(const char *name)
     return -1;
 }
 
-const char *user_builtin_list(void) { return "hello probe"; }
+const char *user_builtin_list(void) { return "hello probe shell"; }
 
 /* ---------------- acceptance ---------------- */
 

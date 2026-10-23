@@ -301,6 +301,22 @@ py -3 scripts\verify_fat32_write.py build\fat32_virtio.img build\fat32.img
 [fat32] write self-test PASS / [net] selftest ping 10.0.2.2 -> reply in 1293 us
 ```
 
+### 完整用户态（v0.11.0-alpha 起）
+
+**ring 3 有中断、有地址空间、有 execve、有 shell。**
+
+- **每进程地址空间**：`kernel/syscall/userspace.c` —— 每个程序一个真 PML4（内核映射共享，
+  1 GiB..2 GiB 放私有 PDPT/PD/PT 给 `0x40000000` 窗口），进 ring 3 切 CR3、退出切回；
+  页表页从 PMM 取、退出归还。
+- **IF=1 运行**：程序在 CPL=3 时硬件中断照常投递（系统节拍照走）。
+- **execve**（`int 0x80` 号 9）：重建当前地址空间 + 改写中断帧（rip/rsp/rax）。
+- **ring-3 交互 shell**：`user/apps/shell.c`，`int 0x80` read(fd=0) 读命令（内核回显），
+  内核 shell 用 `ushell` 进入；`help`/`hello`/`probe`/`crash`/`pid`/`ticks`/`exit`。
+- **隔离实测**：`crash` 写内核内存 → `[ring3] user #PF at 0x100000 (err=0x7) -> killed
+  (exit 142)`，内核继续跑。
+- **验收**：`userspace selftest` 9/9、`ring3test` 9/9、`int80 selftest` 2/2。
+- **仍缺**：`fork`/`wait4`（一次一个进程）、启动路径走 ELF 加载器、更多用户程序。
+
 ### 移植的 libc 用户态（v0.10.1-alpha 起）
 
 **C 程序在 ring 3 真的跑起来了**（不是手写汇编）：

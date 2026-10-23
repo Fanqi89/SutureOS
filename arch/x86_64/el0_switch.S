@@ -62,8 +62,10 @@ el0_enter_user:
     iretq
 .size el0_enter_user, .-el0_enter_user
 
-/* void el0_enter_user_saved(uint64_t entry, uint64_t stack_top, uint64_t *slot)
- *   rdi = entry, rsi = user stack top, rdx = where to store the kernel rsp */
+/* void el0_enter_user_saved(uint64_t pml4, uint64_t entry, uint64_t stack_top,
+ *                           uint64_t *slot)
+ *   rdi = process PML4 (0 = keep the current one), rsi = entry,
+ *   rdx = user stack top, rcx = where to store the kernel state (rsp + kernel CR3) */
 .global el0_enter_user_saved
 .type el0_enter_user_saved, @function
 el0_enter_user_saved:
@@ -76,12 +78,22 @@ el0_enter_user_saved:
     pushq   %r13
     pushq   %r14
     pushq   %r15
-    movq    %rsp, (%rdx)               /* remember how to get back */
+    /* [slot] = rsp, [slot+8] = kernel CR3: el0_resume_kernel() needs both. */
+    movq    %rsp, (%rcx)
+    movq    %cr3, %rax
+    movq    %rax, 8(%rcx)
+    /* build the iretq frame: SS, RSP, RFLAGS, CS, RIP */
     pushq   $0x23
-    pushq   %rsi
-    pushq   $0x2                       /* RFLAGS: IF=0 - see ring3.h; bit1 is fixed 1 */
+    pushq   %rdx
+    pushq   $0x202                     /* RFLAGS: IF=1 - interrupts stay enabled at CPL=3 */
     pushq   $0x2B
-    pushq   %rdi
+    pushq   %rsi
+    /* Switch to the process address space now: the zeroing block below clears
+     * %rdi, which still holds the PML4 at this point. 0 = keep the kernel's. */
+    testq   %rdi, %rdi
+    jz      1f
+    movq    %rdi, %cr3
+1:
     /* a fresh user program starts with clean registers */
     xorq    %rax, %rax
     xorq    %rbx, %rbx
@@ -101,12 +113,16 @@ el0_enter_user_saved:
     iretq
 .size el0_enter_user_saved, .-el0_enter_user_saved
 
-/* void el0_resume_kernel(uint64_t saved_rsp, uint64_t value)
- *   rdi = saved kernel rsp, rsi = value to return from el0_enter_user_saved() */
+/* void el0_resume_kernel(saved_state, value)
+ *   rdi = pointer to {kernel rsp, kernel CR3}, rsi = value to return */
 .global el0_resume_kernel
 .type el0_resume_kernel, @function
 el0_resume_kernel:
-    movq    %rdi, %rsp
+    movq    8(%rdi), %rax
+    testq   %rax, %rax
+    jz      1f
+    movq    %rax, %cr3                 /* back to the kernel address space */
+1:  movq    (%rdi), %rsp
     popq    %r15
     popq    %r14
     popq    %r13

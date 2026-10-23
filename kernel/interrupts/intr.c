@@ -55,6 +55,21 @@ void moos_intr_handler(struct moos_regs *frame, uint64_t vec)
     if (vec == 14) {  /* #PF - Page Fault */
         uint64_t fault_addr = 0;
         __asm__ volatile("mov %%cr2, %0" : "=r"(fault_addr));
+
+        /* A fault from CPL=3 is the user program's: no COW exists up there, so
+         * this used to sig_send() to a non-existent task and re-execute the
+         * faulting instruction forever. Kill the program instead. */
+        if (frame != NULL && (frame->cs & 3u) == 3u) {
+            extern int ring3_active(void);
+            extern void ring3_exit_user(uint64_t code);
+            if (ring3_active()) {
+                console_printf("[ring3] user #PF at 0x%llx (err=0x%llx) "
+                               "-> killed (exit %u)\n",
+                               fault_addr, (uint64_t)frame->error_code,
+                               (uint64_t)(128u + 14u));
+                ring3_exit_user(128u + 14u);        /* does not return */
+            }
+        }
         
         uint64_t error_code = frame->error_code;
         bool write = error_code & 0x2;
@@ -76,7 +91,9 @@ void moos_intr_handler(struct moos_regs *frame, uint64_t vec)
         
         // 非 COW 错误或处理失败，发送 SIGSEGV
         extern sched_cpu_t sched_cpu;
-        sig_send(sched_cpu.current, SIGSEGV);
+        if (sched_cpu.current >= 0 && sched_cpu.current < SCHED_MAX_TASKS) {
+            sig_send(sched_cpu.current, SIGSEGV);
+        }
         return;
     }
 
@@ -125,8 +142,7 @@ void moos_intr_handler(struct moos_regs *frame, uint64_t vec)
     /* A fault taken in CPL=3 belongs to the user program, not to the kernel:
      * never panic, never loop - log it once and terminate the program with the
      * Linux convention 128+signal (vector == signal number for 0..31). */
-    if (vec < 32u && vec != 14u && vec != 1u && frame != NULL &&
-        (frame->cs & 3u) == 3u) {
+    if (vec < 32u && frame != NULL && (frame->cs & 3u) == 3u) {
         extern int ring3_active(void);
         extern void ring3_exit_user(uint64_t code);
         if (ring3_active()) {

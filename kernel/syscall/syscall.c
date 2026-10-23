@@ -2,6 +2,7 @@
 #include <stitch/user_context.h>
 #include <stitch/console.h>
 #include <stitch/types.h>
+#include "syscall.h"        /* SYS_* numbers (execve special case) */
 
 #define SYSCALL_MAX 512
 static syscall_fn_t syscall_table[SYSCALL_MAX];
@@ -16,6 +17,17 @@ uint64_t syscall_dispatch_c(user_context_t *ctx)
         console_printf("[syscall] bad nr=%lu\n", nr);
         return (uint64_t)-1;
     }
+    /* execve is special: it replaces the caller's image and rewrites the return
+     * frame, so iretq lands at the new program's entry point. */
+    if (nr == SYS_EXECVE) {
+        extern int user_exec_in_place(const char *path, void *ctx);
+        extern int ring3_active(void);
+        if (ring3_active()) {
+            return (uint64_t)(int64_t)user_exec_in_place(
+                (const char *)(uintptr_t)ctx->rdi, ctx);
+        }
+    }
+
     /* ring-3 trace: the first handful of calls, so a hang can be localised */
     {
         extern int ring3_active(void);

@@ -49,6 +49,16 @@ void ring3_exit_user(uint64_t code) __attribute__((noreturn));
  * status. `name` is only used for log lines. */
 int user_run_blob(const char *name, const uint8_t *blob, uint64_t len);
 
+/* execve from ring 3: rebuild the current address space with a built-in program and
+ * rewrite the syscall frame (ctx) to its entry point. Returns 0 or -errno. */
+int user_exec_in_place(const char *path, void *ctx);
+
+/* execve through the int 0x80 gate: rewrites the interrupt frame. */
+int user_exec_from_frame(const char *path, void *frame);
+
+/* Console input for ring 3 (int 0x80 read on fd 0): bytes read, -EAGAIN, or -errno. */
+int user_console_read(char *buf, unsigned len);
+
 /* Run one of the programs compiled into the kernel (see user/apps/*.c).
  * Returns the exit status, or -1 when the name is unknown. */
 int user_run_builtin(const char *name);
