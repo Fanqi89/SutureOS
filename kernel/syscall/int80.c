@@ -8,12 +8,11 @@
  * moos_intr_handler() -> moos_irq_dispatch(), so all this file has to do is
  * register a handler for it.
  *
- * STATUS: the gate works (the asm probe program calls getpid through it and gets
- * an answer), but for the *ported libc* the call number read from the frame is
- * wrong: `struct moos_regs` declares rax at +0x00 while the shared ISR stub pushes
- * rax first, i.e. it lands at +0x70. The fix is a dedicated int 0x80 stub that
- * passes (nr, a1, a2, a3) to C in registers instead of through that frame; until
- * then user_run_builtin() refuses to start the libc programs.
+ * Frame layout: `struct moos_regs` declares rax at +0x00, but this stub pushes the
+ * GPRs in the order rax, rcx, rdx, rbx, rsi, rdi, rbp, r8..r15, so in memory rax
+ * ends up at +0x70 (the struct's tail - vector/error/rip - is what actually
+ * matches). This file therefore reads the arguments with explicit offsets; that is
+ * the whole reason the ported libc could not see its own call numbers before.
  *
  * Numbers (user/lib/vimtu64.h):
  *   1 write(fd,buf,len)  2 exit(code)      3 getpid()      4 ticks()
@@ -48,6 +47,24 @@
 
 #define V64_WRITE_MAX 1024u
 
+/* Real frame offsets for this stub (see the file header note). The stub pops the
+ * GPRs in reverse before iretq, so writing the return value to FRAME_RAX is what
+ * the user program sees in rax. */
+#define FRAME_RAX 0x70u
+#define FRAME_RDI 0x48u
+#define FRAME_RSI 0x50u
+#define FRAME_RDX 0x60u
+
+static uint64_t frame_get(const struct moos_regs *f, unsigned off)
+{
+    return *(const uint64_t *)(const void *)((const uint8_t *)f + off);
+}
+
+static void frame_set(struct moos_regs *f, unsigned off, uint64_t v)
+{
+    *(uint64_t *)(void *)((uint8_t *)f + off) = v;
+}
+
 static uint32_t g_calls;
 static uint32_t g_denied;
 
@@ -63,33 +80,35 @@ static int user_ptr_ok(const void *p, uint64_t len)
 
 static void int80_handler(struct moos_regs *f)
 {
-    const uint64_t nr = f->rax;
+    const uint64_t nr = frame_get(f, FRAME_RAX);
     uint64_t ret;
 
     g_calls++;
 
     switch (nr) {
     case V64_NR_WRITE: {
-        const uint64_t fd = f->rdi, buf = f->rsi, len = f->rdx;
+        const uint64_t fd = frame_get(f, FRAME_RDI), buf = frame_get(f, FRAME_RSI),
+                      len = frame_get(f, FRAME_RDX);
         if (len > V64_WRITE_MAX) { ret = (uint64_t)-1; break; }
         if (!user_ptr_ok((const void *)(uintptr_t)buf, len)) { ret = (uint64_t)-3; break; }
         ret = syscall_invoke(LX_WRITE, fd, buf, len, 0, 0, 0);
         break;
     }
     case V64_NR_READ: {
-        const uint64_t fd = f->rdi, buf = f->rsi, len = f->rdx;
+        const uint64_t fd = frame_get(f, FRAME_RDI), buf = frame_get(f, FRAME_RSI),
+                      len = frame_get(f, FRAME_RDX);
         if (!user_ptr_ok((const void *)(uintptr_t)buf, len)) { ret = (uint64_t)-3; break; }
         ret = syscall_invoke(LX_READ, fd, buf, len, 0, 0, 0);
         break;
     }
     case V64_NR_OPEN: {
-        const uint64_t path = f->rdi;
+        const uint64_t path = frame_get(f, FRAME_RDI);
         if (!user_ptr_ok((const void *)0, 0) || path == 0) { ret = (uint64_t)-3; break; }
         ret = syscall_invoke(LX_OPEN, path, 0 /* O_RDONLY */, 0, 0, 0, 0);
         break;
     }
     case V64_NR_CLOSE:
-        ret = syscall_invoke(LX_CLOSE, f->rdi, 0, 0, 0, 0, 0);
+        ret = syscall_invoke(LX_CLOSE, frame_get(f, FRAME_RDI), 0, 0, 0, 0, 0);
         break;
     case V64_NR_GETPID:
         ret = syscall_invoke(LX_GETPID, 0, 0, 0, 0, 0, 0);
@@ -98,7 +117,7 @@ static void int80_handler(struct moos_regs *f)
         ret = syscall_invoke(SYS_TIME, 0, 0, 0, 0, 0, 0);   /* epoch seconds */
         break;
     case V64_NR_SLEEP_MS: {
-        const uint64_t ms = f->rdi;
+        const uint64_t ms = frame_get(f, FRAME_RDI);
         if (ms == 0) { ret = 0; break; }
         /* No timer wheel yet: bounded busy wait, the same way nanosleep works. */
         {
@@ -117,7 +136,7 @@ static void int80_handler(struct moos_regs *f)
     case V64_NR_EXIT:
         /* Leave the iretq frame behind and resume the kernel launcher. */
         if (ring3_active()) {
-            ring3_exit_user(f->rdi);        /* does not return */
+            ring3_exit_user(frame_get(f, FRAME_RDI));   /* does not return */
         }
         ret = 0;
         break;
@@ -127,7 +146,7 @@ static void int80_handler(struct moos_regs *f)
         break;
     }
 
-    f->rax = ret;
+    frame_set(f, FRAME_RAX, ret);
 }
 
 int int80_init(void)

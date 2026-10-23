@@ -6,6 +6,45 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.10.1-alpha]
+
+The ported userland libc runs. v0.10.0 shipped the port with one diagnosed blocker
+(the `int 0x80` frame layout); this patch fixes it and enables the programs.
+
+### Fixed
+- **The `int 0x80` frame offsets.** `struct moos_regs` declares `rax` at +0x00, but
+  the shared ISR stub pushes the GPRs as `rax, rcx, rdx, rbx, rsi, rdi, rbp,
+  r8..r15`, so in memory the layout is `r15 ... rcx, rax` - i.e. rax is at **+0x70**
+  (the struct's tail, vector +0x78 / error +0x80 / rip +0x88, is what really
+  matches, which is why every existing handler worked). `kernel/syscall/int80.c`
+  now reads the arguments and writes the result with explicit offsets
+  (`FRAME_RAX/RDI/RSI/RDX`). Before this, the handler saw `nr=0` / `nr=-38` and the
+  libc programs hung in ring 3 with no output.
+
+### Verification: the ported libc runs
+```
+[user] running 'probe': va=0x40000000 len=10249 stack=0x4000fff0
+[probe] 1 int80 write ok
+[probe] 2 puts ok
+[probe] 3 printf ok argc=1 argv0=user64
+[probe] 4 malloc ok len=32 str=abcdefghijklmnopqrstuvwxyzabcdef
+[probe] 5 pid=0 ticks=1792728129
+[probe] 6 exiting with 7
+[user] 'probe' exited with 7
+[user] running 'hello': va=0x40000000 len=5161 stack=0x4000fff0
+hello from Vimtu64 C userland
+[HELLO] argc=1 argv0=user64 pid=0 ticks=1792728129
+[user] 'hello' exited with 0
+int80 selftest: RESULT PASS (2/2)   (14 calls served, 0 -ENOSYS)
+```
+That is: a C program built against the ported libc runs at CPL=3, its `printf`
+reaches the console through `int 0x80` -> `write(2)`, `malloc` and `string.h`
+work, and its exit code comes back to the kernel.
+
+### Regression
+self-tests 13/14, rtc 8/8, pipe 16/16, ring3test 9/9, FAT32 write+ops PASS, host
+17/17, AP 1 online, RTL8139 ping, PS/2 mouse, sudo 23/23 - all unchanged.
+
 ## [v0.10.0-alpha]
 
 Ported a real userland libc from VimtuOS and wired the machinery to run it, which

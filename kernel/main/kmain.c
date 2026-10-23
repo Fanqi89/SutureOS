@@ -350,13 +350,16 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
                            (int64_t)rc);
             (void)ring3_selftest();
 
-            /* The ported C userland (VimtuOS' minilibc in user/) is built and
-             * linked into the kernel, but its int 0x80 calls currently read the
-             * wrong call number (see kernel/syscall/int80.c), so it is not
-             * started at boot. `run` explains the same thing in the shell. */
+            /* The ported C userland: VimtuOS' minilibc (printf/malloc/string) in
+             * user/lib, talking through the Vimtu64 own-ABI gate at int 0x80. */
             {
                 extern int int80_init(void);
+                extern int int80_selftest(void);
+                extern int user_run_builtin(const char *name);
                 int80_init();
+                (void)user_run_builtin("probe");
+                (void)user_run_builtin("hello");
+                (void)int80_selftest();
             }
         }
 

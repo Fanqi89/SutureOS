@@ -301,6 +301,25 @@ py -3 scripts\verify_fat32_write.py build\fat32_virtio.img build\fat32.img
 [fat32] write self-test PASS / [net] selftest ping 10.0.2.2 -> reply in 1293 us
 ```
 
+### 移植的 libc 用户态（v0.10.1-alpha 起）
+
+**C 程序在 ring 3 真的跑起来了**（不是手写汇编）：
+
+- **libc**：`user/lib/`（移植自 VimtuOS，GPL-3.0）—— `string.c`、`stdlib.c`（真
+  `malloc`/`free`）、`stdio.c`（缓冲 `printf`/`puts`）、`crt0.S`（入口 → `main(argc,argv,envp)`
+  → `exit`）、`syscall.c`/`syscall.S`（Vimtu64 自有 ABI）。
+- **程序**：`user/apps/hello.c`、`user/apps/probe.c`（分级验收）；`build.py` 编译 libc 一次、
+  逐程序链接成扁平 blob（VA `0x40000000`）并嵌进内核。
+- **内核侧**：`kernel/syscall/ring3.c`（`user_run_blob()`：PMM 页映射到固定 VA、U/S=1、
+  SSE、GS base、专用 syscall 栈）、`kernel/syscall/int80.c`（`int 0x80` 自有 ABI 门，
+  把 write/read/open/close/getpid/ticks/sleep_ms/exit 转发到 Linux 号系统调用表）、
+  `mmu_map_user_pages()`（VA→PA 映射，含 2 MiB 大页拆分）。
+- **验收**：开机自动跑 `probe`（6 阶段：int80 write → puts → printf → malloc →
+  getpid/ticks → exit 7）与 `hello`；`int80 selftest` 2/2、`ring3test` 9/9；shell 里
+  可 `run hello` / `run probe`。
+- **仍缺**：IF=0（CPL=3 中断返回路径）、每进程地址空间（不能 fork/execve 第二镜像）、
+  ring 3 的 shell/文件工具（`user/apps/` 是扩展点）。
+
 ### 用户态 / ring 3（v0.9.0-alpha 起）
 
 不再"全部在 ring 0"：一个真正的 CPL=3 程序会跑起来。

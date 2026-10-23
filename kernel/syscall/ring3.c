@@ -288,12 +288,7 @@ static const user_program_t g_programs[] = {
 int user_run_builtin(const char *name)
 {
     if (name == NULL) return -1;
-    /* The ported libc programs are built, embedded and loadable, but their
-     * int 0x80 calls read the wrong number (see int80.c). Running one hangs the
-     * machine, so be explicit instead of hanging. */
-    console_puts("[user] the ported libc programs are not runnable yet "
-                 "(int 0x80 frame layout, see kernel/syscall/int80.c)\n");
-    return -2;
+
     for (uint64_t i = 0; i < sizeof(g_programs) / sizeof(g_programs[0]); i++) {
         if (strcmp(g_programs[i].name, name) == 0) {
             const uint64_t len = (uint64_t)(uintptr_t)g_programs[i].size_ptr;
