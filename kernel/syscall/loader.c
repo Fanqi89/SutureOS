@@ -118,6 +118,6 @@ int syscall_execve(uint64_t path_ptr, uint64_t argv_ptr, uint64_t envp_ptr,
     task_set_user_pml4(sched_cpu.current, user_pml4);
 
     el0_set_active(1);
-    el0_enter_user(user_pml4, &uctx);
+    el0_enter_user(&uctx);      /* single address space: U/S bits isolate */
     return 0;
 }

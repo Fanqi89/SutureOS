@@ -107,6 +107,71 @@ int mmu_map_mmio_identity(uint64_t phys, uint64_t bytes)
     return 0;
 }
 
+/* 把一段 identity map 的 4 KiB 页提升到 U/S=1（ring 3 可访问）。
+ * 2 MiB 大页会先被拆成页表，因此只有被点名的那几页对用户开放；
+ * 调用者必须自己拥有这些物理页（来自 moe_pmm_alloc），否则等于把内核内存交给用户态。 */
+int mmu_map_user_identity(uint64_t va, uint64_t len, int writable, int executable)
+{
+    uint64_t *pml4 = (uint64_t *)(uintptr_t)(read_cr3() & ~0xFFFULL);
+    uint64_t first = va & ~(uint64_t)0xFFF;
+    uint64_t last  = (va + len + 0xFFF) & ~(uint64_t)0xFFF;
+
+    for (uint64_t v = first; v < last; v += PAGE_SIZE) {
+        uint64_t *pml4e = &pml4[(v >> 39) & 0x1FF];
+        uint64_t *pdpt;
+        uint64_t *pdpe;
+        uint64_t *pd;
+        uint64_t *pde;
+        uint64_t *pt;
+        uint64_t *pte;
+
+        if ((*pml4e & PTE_P) == 0) return -1;
+        pdpt = (uint64_t *)(uintptr_t)(*pml4e & ~0xFFFULL);
+        pdpe = &pdpt[(v >> 30) & 0x1FF];
+        if ((*pdpe & PTE_P) == 0 || (*pdpe & PTE_PS) != 0) return -1;  /* no 1 GiB split */
+        pd = (uint64_t *)(uintptr_t)(*pdpe & ~0xFFFULL);
+        pde = &pd[(v >> 21) & 0x1FF];
+        if ((*pde & PTE_P) == 0) return -1;
+
+        if ((*pde & PTE_PS) != 0) {
+            /* split this 2 MiB page into 512 identity 4 KiB pages */
+            const uint64_t base = *pde & ~(uint64_t)0x1FFFFF;
+            const uint64_t flags = (*pde & (PTE_P | PTE_W | PTE_PWT | PTE_PCD |
+                                            PTE_A | PTE_D | PTE_G | PTE_NX)) & ~PTE_PS;
+            uint64_t *new_pt = (uint64_t *)mmu_alloc_page();
+            if (new_pt == NULL) return -1;
+            for (int i = 0; i < 512; i++) {
+                new_pt[i] = (base + (uint64_t)i * PAGE_SIZE) | (flags & ~PTE_U);
+            }
+            *pde = (uint64_t)(uintptr_t)new_pt | (flags & ~PTE_PS) | PTE_P | PTE_W;
+            /* the parent tables must allow user access too */
+            *pml4e |= PTE_U;
+            *pdpe  |= PTE_U;
+            *pde   |= PTE_U;
+        } else {
+            *pml4e |= PTE_U;
+            *pdpe  |= PTE_U;
+            *pde   |= PTE_U;
+        }
+
+        pt = (uint64_t *)(uintptr_t)(*pde & ~0xFFFULL);
+        pte = &pt[(v >> 12) & 0x1FF];
+        if ((*pte & PTE_P) == 0) return -1;
+        *pte |= PTE_P | PTE_U;
+        if (writable)   *pte |= PTE_W;
+        if (executable) *pte &= ~PTE_NX;
+        else            *pte |= PTE_NX;
+    }
+
+    /* flush the TLB: reload CR3 */
+    {
+        uint64_t cr3;
+        __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+        __asm__ volatile("mov %0, %%cr3" : : "r"(cr3) : "memory");
+    }
+    return 0;
+}
+
 /* 克隆内核页表到用户 TTBR0：仅提升 [base, base+len) 到 U/S=1 */int mmu_clone_for_el0(uint64_t kernel_pml4, uint64_t *out_user_pml4,
                       uint64_t base, uint64_t len)
 {

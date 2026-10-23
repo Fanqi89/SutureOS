@@ -127,6 +127,13 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
     suture_mem_bringup(mbi, "init");
 
     /* Initialize syscall subsystem */
+    /* The per-task fd table defaults to zeros, which looks like
+     * 'everything is fd 0 open'. It must be initialised once before any
+     * syscall runs (found by the ring-3 write/uname run). */
+    {
+        extern void fd_tables_init(void);
+        fd_tables_init();
+    }
     syscall_init();
 
     /* Phase-2: Hardware initialization */
@@ -328,6 +335,20 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
                            (int64_t)syscalls2_register());
             (void)pipe_selftest();
             (void)rtc_selftest();
+        }
+
+        /* ==================== the first ring-3 program ====================
+         * Everything above runs in ring 0. This is the transition the audit
+         * called out: load the embedded user blob, mark its pages U/S=1, enable
+         * SSE and iretq to CPL=3. The program prints, calls uname/getpid and
+         * exit(42); the kernel gets control back and logs the code. */
+        {
+            extern int ring3_run_init(void);
+            extern int ring3_selftest(void);
+            const int rc = ring3_run_init();
+            console_printf("[  OK  ] ring3: first user program ran, exit=%d\n",
+                           (int64_t)rc);
+            (void)ring3_selftest();
         }
 
         {

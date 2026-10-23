@@ -50,6 +50,7 @@ uint64_t sys_read(uint64_t fd, uint64_t buf, uint64_t len,
                                               (uint32_t)len);
     }
     if (fd >= MAX_FDS) return (uint64_t)-1;
+    if (tid < 0 || tid >= SCHED_MAX_TASKS) return (uint64_t)(int64_t)(-9);
     struct fd_entry *f = &fd_tables[tid][fd];
     if (f->vfs_fd < 0) return (uint64_t)-1;
     EL0_CHECK(buf, len);
@@ -69,10 +70,14 @@ uint64_t sys_write(uint64_t fd, uint64_t buf, uint64_t len,
                                                (uint32_t)len);
     }
     if (fd >= MAX_FDS) return (uint64_t)-1;
-    struct fd_entry *f = &fd_tables[tid][fd];
-    if (f->vfs_fd < 0) {
-        /* fd 1/2 默认 stdout/stderr */
-        if (fd == 1 || fd == 2) {
+    /* fd 1/2 are the console whenever they are not a real opened file. This has
+     * to be decided before indexing the per-task table: the kernel itself makes
+     * syscalls with sched_cpu.current == -1 (e.g. the boot-time ring-3 run), and
+     * fd_tables[-1] used to read out of bounds and swallow the output. */
+    {
+        const int valid_tid = (tid >= 0 && tid < SCHED_MAX_TASKS);
+        if ((fd == 1 || fd == 2) &&
+            (!valid_tid || fd_tables[tid][fd].vfs_fd < 0)) {
             EL0_CHECK(buf, len);
             const char *s = (const char *)(uintptr_t)buf;
             for (uint64_t i = 0; i < len; i++) {
@@ -81,8 +86,10 @@ uint64_t sys_write(uint64_t fd, uint64_t buf, uint64_t len,
             }
             return len;
         }
-        return (uint64_t)-1;
+        if (!valid_tid) return (uint64_t)(int64_t)(-9);      /* -EBADF */
     }
+    struct fd_entry *f = &fd_tables[tid][fd];
+    if (f->vfs_fd < 0) return (uint64_t)-1;
     EL0_CHECK(buf, len);
     int ret = vfs_write(f->vfs_fd, (const void *)(uintptr_t)buf, (uint32_t)len);
     return ret;
@@ -124,6 +131,7 @@ uint64_t sys_close(uint64_t fd, uint64_t a2, uint64_t a3,
     int tid = sched_cpu.current;
     if (pipe_is_fd((int)fd)) return (uint64_t)(int64_t)pipe_close_fd((int)fd);
     if (fd >= MAX_FDS) return (uint64_t)-1;
+    if (tid < 0 || tid >= SCHED_MAX_TASKS) return (uint64_t)(int64_t)(-9);
     if (fd_tables[tid][fd].vfs_fd < 0) return (uint64_t)-1;
     int ret = vfs_close(fd_tables[tid][fd].vfs_fd);
     fd_tables[tid][fd].vfs_fd = -1;
@@ -183,8 +191,15 @@ uint64_t sys_exit(uint64_t code, uint64_t a2, uint64_t a3,
 {
     (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
     extern sched_cpu_t sched_cpu;
+    extern int ring3_active(void);
+    extern void ring3_exit_user(uint64_t code);
     int tid = sched_cpu.current;
     sched_cpu.tasks[tid].state = SCHED_TASK_ZOMBIE;
+    /* A ring-3 program exiting must come back to its kernel launcher, not power
+     * the machine off. */
+    if (ring3_active()) {
+        ring3_exit_user(code);          /* does not return */
+    }
     sched_cpu.shutdown = true;
     return code;
 }

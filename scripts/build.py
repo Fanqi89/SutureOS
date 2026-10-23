@@ -85,6 +85,61 @@ def main():
         "-O2", "-g", "-Wall", "-Wextra"
     ]
     
+    # ---- 1b. Build the ring-3 user program (user/init.S) ----
+    # It is a flat image linked at 0 so it can be copied to any page-aligned
+    # PMM page and entered by el0_enter_user_saved(). No libc, no relocations.
+    user_obj = None
+    user_src = ROOT / "user" / "init.S"
+    if not user_src.exists():
+        print(f"ring-3 user program missing: {user_src}")
+        return 1
+    user_elf = BUILD / "init.elf"
+    user_bin = BUILD / "init.bin"
+    user_c = OBJ / "init.user.o"
+    print(f"Building ring-3 user program: {user_src}")
+    r = subprocess.run([str(CC), "-c", "-target", "x86_64-unknown-none-elf",
+                        "-ffreestanding", "-fno-pic", "-fno-pie",
+                        "-mno-red-zone", "-nostdlib", "-o", str(user_c), str(user_src)])
+    if r.returncode != 0:
+        print("ring-3 user program failed to compile")
+        return 1
+    r = subprocess.run([str(LD), "-Ttext", "0", "-e", "_start", "--oformat", "elf64-x86-64",
+                        "-o", str(user_elf), str(user_c)])
+    if r.returncode != 0:
+        print("ring-3 user program failed to link")
+        return 1
+    r = subprocess.run([str(OBJCOPY), "-O", "binary", str(user_elf), str(user_bin)])
+    if r.returncode != 0:
+        print("ring-3 user program binary extraction failed")
+        return 1
+    print(f"ring-3 user blob: {user_bin} ({user_bin.stat().st_size} bytes)")
+
+    # binary -> object with stable C symbol names
+    import tempfile, shutil
+    tdir = Path(tempfile.gettempdir()) / "sutureos_user"
+    tdir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(str(user_bin), str(tdir / "init.bin"))
+    user_obj = OBJ / "init.bin.o"
+    r = subprocess.run([str(OBJCOPY), "-I", "binary", "-O", "elf64-x86-64",
+                        "-B", "i386:x86-64",
+                        "--rename-section", ".data=.rodata,alloc,load,readonly,data,contents",
+                        "--redefine-sym", "_binary_init_bin_start=init_blob_start",
+                        "--redefine-sym", "_binary_init_bin_end=init_blob_end",
+                        "--redefine-sym", "_binary_init_bin_size=init_blob_size",
+                        "init.bin", "init.bin.o"], cwd=str(tdir))
+    if r.returncode != 0:
+        print("objcopy failed for the ring-3 user blob")
+        return 1
+    shutil.copy2(str(tdir / "init.bin.o"), str(user_obj))
+    r = subprocess.run([str(OBJCOPY),
+                        "--redefine-sym", "init_blob_start=_binary_init_bin_start",
+                        "--redefine-sym", "init_blob_end=_binary_init_bin_end",
+                        "--redefine-sym", "init_blob_size=_binary_init_bin_size",
+                        str(user_obj)])
+    if r.returncode != 0:
+        print("objcopy rename failed for the ring-3 user blob")
+        return 1
+
     # Collect sources
     sources = []
     for pattern in ["boot/*.S", "arch/x86_64/*.c", "arch/x86_64/*.S", 
@@ -203,9 +258,11 @@ def main():
         print(f"{fail} file(s) failed to compile")
         return 1
     
-    # Add trampoline object to link
+    # Add trampoline + ring-3 user blob objects to link
     objs.append(str(trampoline_obj))
-    print(f"Compiled {len(objs)-1} source files + 1 trampoline object")
+    if user_obj is not None:
+        objs.append(str(user_obj))
+    print(f"Compiled {len(objs)-2} source files + trampoline + user blob")
     
     # Link
     elf = BUILD / "kernel.elf"

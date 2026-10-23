@@ -6,6 +6,77 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.9.0-alpha]
+
+**Ring 3 runs.** The audit's biggest gap - "everything is in ring 0, there is no
+userland" - is closed: a real CPL=3 program executes, makes syscalls through the
+`syscall` instruction, gets kernel data copied into its own buffer, and returns
+an exit code to the kernel.
+
+### Added
+- **`user/init.S`**: the first user program (334-byte flat image, no libc). It
+  calls `write(1, ...)`, `uname()`, `getpid()` and `exit(42)`.
+- **`kernel/syscall/ring3.c`**: the ring-3 runtime - PMM-owned user pages mapped
+  with U/S=1, SSE enabled (CR4.OSFXSR|OSXMMEXCPT, CR0.EM/TS clear), GS base set up
+  for the syscall entry, `el0_validate` armed, 16 KiB dedicated syscall stack.
+- **`el0_enter_user_saved()` / `el0_resume_kernel()`**: enter CPL=3 and come back
+  when the program exits (`sys_exit` recognises a ring-3 caller).
+- **Fault isolation**: an exception taken at CPL=3 kills the user program with
+  Linux's `128+signal` convention and the kernel keeps running instead of
+  panicking (or, worse, re-executing the fault forever).
+- **`ring3` / `ring3test`** shell commands + a boot-time run with a 9-check
+  acceptance suite.
+
+### Fixed (each of these blocked ring 3)
+- **`el0_enter_user()` was broken three ways** and had never been called: it
+  pushed/popped its two arguments in the wrong order (CR3 got the *context
+  pointer*), every `user_context_t` offset was wrong (fs_base read from offset
+  112 = rax), and it built an iret frame then executed `sysretq`. Rewritten for a
+  single address space with `iretq`.
+- **`syscall.S` built an incomplete frame** (only the 15 GPRs), so `ctx->cs` /
+  `ctx->rip` were read from stale stack - which is why the signal-delivery hook
+  never fired. It now saves a complete `user_context_t` and returns with `iretq`.
+- **`IA32_EFER.SCE` was never set**, so the very first `syscall` raised #UD
+  (vector 6 at user rip+0x1c). Also fixed `STAR`: the SYSCALL field held 0x10
+  (kernel *data*) instead of 0x08 (kernel *code*), and the SYSRET field was wrong.
+- **`fd_tables_init()` was never called**: the per-task fd table was all zeros,
+  so `write(1)` did not take the stdout path and `open()` from ring 3 would always
+  have failed with EMFILE.
+- **`sched_cpu.current == -1`** while the kernel itself makes syscalls (the
+  boot-time ring-3 run) indexed `fd_tables[-1]` out of bounds and swallowed the
+  program's output. fd 1/2 are now resolved before the table lookup, and every
+  fd syscall validates the task slot.
+- **The ring-3 syscall ran on the launcher's stack**, overwriting the return
+  address that `el0_enter_user_saved()` had saved - so `exit(60)` "returned" into
+  garbage (observed: kernel #UD at rip=0x3). It has a dedicated stack now.
+
+### Verification
+- Boot log with the program running end to end:
+  ```
+  [ring3] entering CPL=3: entry=0x0000000000daa000 ...
+  hello from ring 3
+  uname sysname=Linux
+  pid=0
+  [ring3] the user program returned (exit=42)
+  [  OK  ] ring3: first user program ran, exit=42
+  ```
+- `ring3test`: **9/9 PASS** (blob, user pages, SSE, FPU flags, GS base, program
+  ran, exit code 42, user PTE U=1, kernel text U=0).
+- Regression unchanged: self-tests 13/14, FAT32 write+ops PASS, host 17/17,
+  AP 1 online, RTL8139 ping, PS/2 mouse, rtc 8/8, pipe 16/16, sudo 23/23.
+
+### Known limitations
+- The program runs with **IF=0**: a hardware interrupt taken at CPL=3 does not
+  return correctly yet (the legacy same-CPL ISR stubs assume the kernel frame),
+  so interrupts are re-enabled only after control is back in ring 0. The program
+  needs no timer; a real ring-3 preemptive path is the next step.
+- One shared page table with U/S bits rather than a per-process address space, so
+  no `fork`/`execve` of a second image yet; the ELF loader (`loader.c`) is wired
+  to the new entry but unused by the boot path.
+- Still no libc in ring 3 (the program is hand-written assembly), and
+  `dup`/`ftruncate`/`readlink`/`symlink` remain `-ENOSYS` as documented in
+  v0.8.0-alpha.
+
 ## [v0.8.0-alpha]
 
 The ring-0 half of the audit's "unfinished" list: the syscall surface a libc

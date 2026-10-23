@@ -16,6 +16,12 @@ uint64_t syscall_dispatch_c(user_context_t *ctx)
         console_printf("[syscall] bad nr=%lu\n", nr);
         return (uint64_t)-1;
     }
+    /* ring-3 trace: the first handful of calls, so a hang can be localised */
+    {
+        extern int ring3_active(void);
+        extern void ring3_trace_syscall(uint64_t nr, uint64_t a1, uint64_t a2);
+        if (ring3_active()) ring3_trace_syscall(nr, ctx->rdi, ctx->rsi);
+    }
     ret = syscall_table[nr](ctx->rdi, ctx->rsi, ctx->rdx,
                             ctx->r10, ctx->r8, ctx->r9);
 
@@ -62,9 +68,20 @@ void syscall_init(void)
     extern void syscall_entry(void);
     uint64_t entry = (uint64_t)(uintptr_t)syscall_entry;
 
-    /* STAR: bits 63:48 = sysret CS|3 (用户代码段 0x23)
-     *       bits 47:32 = syscall SS (内核数据段 0x10) */
-    uint64_t star = ((uint64_t)0x23ull << 48) | ((uint64_t)0x10ull << 32);
+    /* IA32_EFER.SCE (bit 0) must be set or the `syscall` instruction raises #UD -
+     * that is exactly what the first ring-3 run hit (vector 6 at user ip+0x1c). */
+    {
+        uint32_t lo, hi;
+        __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0xC0000080));
+        lo |= 1u;                                   /* SCE: syscall/sysret enable */
+        __asm__ volatile("wrmsr" :: "c"(0xC0000080), "a"(lo), "d"(hi));
+    }
+
+    /* STAR: bits 63:48 = SYSRET base (CS = base+16 = 0x2B, SS = base+8 = 0x23)
+     *       bits 47:32 = SYSCALL CS/SS base (CS = 0x08, SS = 0x10)
+     * The previous value put 0x10 in the SYSCALL field (kernel data) and 0x23 in
+     * the SYSRET field (which would have produced CS=0x33). */
+    uint64_t star = ((uint64_t)0x1Bull << 48) | ((uint64_t)0x08ull << 32);
 
     __asm__ volatile("wrmsr" :: "c"(0xC0000082), "a"((uint32_t)entry),
                      "d"(entry >> 32));           /* IA32_LSTAR */

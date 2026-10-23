@@ -301,6 +301,22 @@ py -3 scripts\verify_fat32_write.py build\fat32_virtio.img build\fat32.img
 [fat32] write self-test PASS / [net] selftest ping 10.0.2.2 -> reply in 1293 us
 ```
 
+### 用户态 / ring 3（v0.9.0-alpha 起）
+
+不再"全部在 ring 0"：一个真正的 CPL=3 程序会跑起来。
+
+- **第一个用户程序** `user/init.S`（334 字节扁平镜像，无 libc）：`write(1,...)`、
+  `uname()`、`getpid()`、`exit(42)`。
+- **运行时** `kernel/syscall/ring3.c`：PMM 物理页按 U/S=1 映射、开 SSE、GS base、
+  `el0_validate` 指针校验、16 KiB 专用 syscall 内核栈、`el0_enter_user_saved()` /
+  `el0_resume_kernel()` 进/出 CPL=3。
+- **隔离**：内核页 U=0，用户页 U=1（同一页表，靠 U/S 位）；CPL=3 的异常按 `128+signal`
+  杀程序，内核继续跑。
+- **验收**：开机自动跑 + `ring3` / `ring3test`（9/9 PASS）；
+  `[ring3] entering CPL=3` → `hello from ring 3` → `uname sysname=Linux` → `exit=42`。
+- **仍缺**：IF=0（CPL=3 下中断返回还没修）、无 libc、无 fork/execve 第二镜像、
+  ELF 加载器已接线但启动路径未用。
+
 ### ring 0 能力（v0.8.0-alpha 起）
 
 内核侧（ring 0）已按审计补齐，还差的是用户态（ring 3）：

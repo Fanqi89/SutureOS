@@ -43,6 +43,16 @@ void *loader_alloc_page(void);
  * linear framebuffer at 0xFD000000). Returns 0 on success, -1 on failure. */
 int mmu_map_mmio_identity(uint64_t phys, uint64_t bytes);
 
+/* Expose the identity-mapped range [va, va+len) to ring 3 by setting U/S=1 on
+ * the 4 KiB pages (and on their parent tables). 2 MiB pages are split into a
+ * page table first, so only the requested pages become user accessible - the
+ * caller must own the physical pages (i.e. they came from moe_pmm_alloc()),
+ * otherwise this hands kernel memory to user mode.
+ *
+ * writable != 0 sets PTE_W; executable != 0 clears PTE_NX.
+ * Returns 0 on success, -1 when a parent entry is missing or out of pool. */
+int mmu_map_user_identity(uint64_t va, uint64_t len, int writable, int executable);
+
 /* COW 支持 */
 void mmu_mark_cow(uint64_t *pte);
 bool mmu_is_cow(uint64_t pte);

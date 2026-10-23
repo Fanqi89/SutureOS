@@ -89,6 +89,8 @@ int shell_cmd_free(int argc, char **argv);
 int shell_cmd_systest(int argc, char **argv);
 int shell_cmd_pipetest(int argc, char **argv);
 int shell_cmd_rtctest(int argc, char **argv);
+int shell_cmd_ring3(int argc, char **argv);
+int shell_cmd_ring3test(int argc, char **argv);
 int shell_cmd_mount(int argc, char **argv);
 int shell_cmd_umount(int argc, char **argv);
 int shell_cmd_df(int argc, char **argv);

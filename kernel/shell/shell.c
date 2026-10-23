@@ -86,6 +86,8 @@ static const struct shell_cmd g_commands[] = {
     {"systest", shell_cmd_systest, "Self-test: stat/lseek/pipe/getpid/chdir/mkdir/rename/time"},
     {"pipetest",shell_cmd_pipetest,"Self-test: pipes (create/write/read/EOF/EPIPE)"},
     {"rtctest", shell_cmd_rtctest, "Self-test: CMOS RTC decoding (BCD/12h/leap/format)"},
+    {"ring3",   shell_cmd_ring3,  "Ring-3 status (the boot-time user program)"},
+    {"ring3test",shell_cmd_ring3test,"Self-test: U/S page bits, SSE, GS base, exit code"},
     {"mount",   shell_cmd_mount,   "Mount filesystem"},
     {"umount",  shell_cmd_umount,  "Unmount filesystem"},
     {"df",      shell_cmd_df,      "Show disk usage"},
@@ -970,6 +972,26 @@ int shell_cmd_pipetest(int argc, char **argv) {
     extern int pipe_selftest(void);
     (void)argc; (void)argv;
     return pipe_selftest();
+}
+
+int shell_cmd_ring3(int argc, char **argv) {
+    extern int ring3_ran_ever(void);
+    extern int ring3_last_exit(void);
+    extern int ring3_run_init(void);
+    (void)argc; (void)argv;
+    if (ring3_ran_ever()) {
+        shell_printf("ring3: the first user program already ran (exit=%d)\n",
+                     (int64_t)ring3_last_exit());
+        shell_puts("ring3: it is a boot-time bring-up check, see `ring3test`\n");
+        return 0;
+    }
+    return (ring3_run_init() == 42) ? 0 : 1;
+}
+
+int shell_cmd_ring3test(int argc, char **argv) {
+    extern int ring3_selftest(void);
+    (void)argc; (void)argv;
+    return ring3_selftest();
 }
 
 int shell_cmd_rtctest(int argc, char **argv) {

@@ -122,6 +122,25 @@ void moos_intr_handler(struct moos_regs *frame, uint64_t vec)
         return;
     }
 
+    /* A fault taken in CPL=3 belongs to the user program, not to the kernel:
+     * never panic, never loop - log it once and terminate the program with the
+     * Linux convention 128+signal (vector == signal number for 0..31). */
+    if (vec < 32u && vec != 14u && vec != 1u && frame != NULL &&
+        (frame->cs & 3u) == 3u) {
+        extern int ring3_active(void);
+        extern void ring3_exit_user(uint64_t code);
+        if (ring3_active()) {
+            console_printf("[ring3] user fault: vector=%u err=0x%x rip=0x%x cr2=0x%x "
+                           "-> killed (exit %u)\n",
+                           (uint64_t)vec,
+                           (uint64_t)frame->error_code,
+                           (uint64_t)frame->rip,
+                           ({ uint64_t cr2; __asm__ volatile("mov %%cr2, %0" : "=r"(cr2)); cr2; }),
+                           (uint64_t)(128u + vec));
+            ring3_exit_user(128u + vec);        /* does not return */
+        }
+    }
+
     if (vec < 32u && !vector_expected(vec)) {
         /* MOOS IDT.cs panicked here; bring-up must not die on a stray
          * exception, so only report (numeric args go as uint64_t).
