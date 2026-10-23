@@ -644,6 +644,18 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
     console_puts("\n[stitch] Phase-1 self-tests complete. Starting shell...\n");
 
     /* Create init task that runs the shell */
+    /* Second, late network check: by now the whole machine is up, which is the
+     * state an interactive ping runs in. It is the authoritative e1000 RX verdict
+     * (the early selftest runs before the device model will deliver to the ring). */
+    {
+        extern int net_selftest(void);
+        extern int net_ready(void);
+        if (net_ready()) {
+            console_puts("[net] late selftest (interactive-equivalent path)\n");
+            (void)net_selftest();
+        }
+    }
+
     extern int shell_run(void);
     int shell_tid = sched_eevdf_create((void (*)(void *))(uintptr_t)shell_run, NULL, 0);
     if (shell_tid < 0) {

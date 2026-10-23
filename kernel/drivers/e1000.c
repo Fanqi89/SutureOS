@@ -316,6 +316,12 @@ int e1000_receive(void (*fn)(const uint8_t *frame, uint32_t len))
      * our descriptor ring. Without this read a polled driver never sees a frame. */
     (void)reg_read(E1000_RDH);
 
+    /* Nothing pending? Re-assert the tail pointer: harmless on real hardware and
+     * it is what makes the QEMU model retry a queued packet. */
+    if ((g_rx_desc[g_rx_cur].status & RX_STATUS_DD) == 0) {
+        reg_write(E1000_RDT, (g_rx_cur == 0u) ? (E1000_RX_DESCS - 1u) : (g_rx_cur - 1u));
+    }
+
     for (;;) {
         e1000_rx_desc_t *d = &g_rx_desc[g_rx_cur];
         uint32_t len;

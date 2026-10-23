@@ -6,6 +6,44 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.13.0-alpha]
+
+e1000 finished: it is the **preferred** NIC now, because receive works. The v0.12.0
+"RX does not deliver" verdict was wrong - the driver was fine, the *test* was not.
+
+### Fixed
+- **e1000 RX was never broken.** `ping 10.0.2.2` over `-device e1000` answers
+  **3/3** (1852/38/165 us). What failed was the boot-time net selftest, for two
+  reasons: (a) it ran with interrupts masked, so the poll loop could not `hlt` and
+  QEMU's device model never DMA'd the reply into the ring; (b) it gave the ping only
+  **1000 us**, while one `hlt` costs up to a full 10 ms tick. `ll_yield_once()` now
+  does `sti;hlt;cli` when IF=0 (net_poll is never called from an ISR) and the boot
+  budget is 200 ms.
+- `e1000_receive()` re-asserts the current RDT while idle: QEMU retries a queued
+  receive packet from the descriptor-tail write handler, and an already-armed ring
+  otherwise never writes it.
+- The NIC banner printed RTL8139's I/O base and IRQ even when e1000 was the active
+  driver ("rtl8139 found at 0x0"); it now names the real driver and address.
+
+### Changed
+- **NIC preference is e1000 first**, RTL8139 as the fallback (both directions are now
+  proven, so VMware and `-device e1000` get the better path).
+- Added a **late network selftest** right before the shell starts (the
+  interactive-equivalent state). The log now carries an authoritative RX verdict on
+  every platform without typing anything: `[net] selftest ping 10.0.2.2 -> reply in
+  927 us` on RTL8139, and the same line on e1000 setups.
+
+### Verification
+- QEMU `-device e1000`: `[net] e1000 at 0xfebc0000 mac=52:54:00:12:34:56`,
+  boot selftest + late selftest, interactive `ping` **3/3 replies**.
+- Full regression on the RTL8139 fallback path: `[net] rtl8139 at 0xc000 irq=11`,
+  early selftest reply 38789 us, **late selftest reply 927 us**, self-tests 13/14,
+  FAT32 write+ops PASS, host verifier 17/17, `ring3 selftest 9/9`,
+  `userspace selftest 9/9`, AP online.
+- VMware: e1000 detected (`0:16.0 dev=0x100f`, MAC `00:0c:29:65:01:af`). Note VMware
+  NAT uses a 192.168.x subnet, so the hard-coded 10.0.2.x slirp addresses cannot
+  produce a reply there - that check needs DHCP (future work).
+
 ## [v0.12.0-alpha]
 
 Stitching other operating systems' strengths: the first port that does not come from

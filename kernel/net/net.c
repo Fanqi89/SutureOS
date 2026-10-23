@@ -926,6 +926,13 @@ static void ll_yield_once(void)
     __asm__ volatile("pushfq; popq %0" : "=r"(flags));
     if ((flags & 0x200u) != 0) {
         __asm__ volatile("hlt");
+    } else {
+        /* The boot-time net selftest runs with interrupts masked. Without a yield
+         * QEMU's device main loop never runs and the e1000 reply is never DMA'd
+         * into the ring (that is what made the boot selftest time out while an
+         * interactive ping worked). net_poll() is never called from an ISR, so
+         * opening the window here for one tick is safe and IF is restored. */
+        __asm__ volatile("sti; hlt; cli");
     }
 }
 
@@ -965,33 +972,35 @@ int net_init(void)
     g_clock_last = mbos_pit_counter();
     net_stats_reset();
 
-    /* RTL8139 first (QEMU's default NIC, fully working), e1000 second (VMware's
-     * virtual NIC: detection/MAC/TX verified, RX delivery still being debugged). */
-    r = rtl8139_init();
-    if (r == RTL8139_ERR_NONE) {
-        g_ll = LL_RTL8139;
-        strncpy(g_ll_name, "rtl8139", sizeof(g_ll_name) - 1);
-        if (rtl8139_get_mac(net_local_mac) != 0) {
-            console_puts("[net] rtl8139: MAC read failed\n");
-            return -1;
-        }
-    } else if (e1000_init() == E1000_ERR_NONE) {
+    /* Prefer e1000 (VMware's virtual NIC and QEMU -device e1000; TX and RX both
+     * verified), fall back to RTL8139 (QEMU's default NIC). */
+    if (e1000_init() == E1000_ERR_NONE) {
         g_ll = LL_E1000;
         strncpy(g_ll_name, "e1000", sizeof(g_ll_name) - 1);
         (void)e1000_get_mac(net_local_mac);
-        console_puts("[net] using e1000 (RX delivery: see release notes)\n");
     } else {
-        console_puts("[net] no supported NIC (rtl8139 or e1000)\n");
-        return -1;
+        r = rtl8139_init();
+        if (r == RTL8139_ERR_NONE) {
+            g_ll = LL_RTL8139;
+            strncpy(g_ll_name, "rtl8139", sizeof(g_ll_name) - 1);
+            if (rtl8139_get_mac(net_local_mac) != 0) {
+                console_puts("[net] rtl8139: MAC read failed\n");
+                return -1;
+            }
+        } else {
+            console_puts("[net] no supported NIC (e1000 or rtl8139)\n");
+            return -1;
+        }
     }
 
     g_initialized = 1;
     net_hw_initialized = 1;
 
     /* The two acceptance-critical log lines. */
-    console_printf("[net] rtl8139 found at 0x%llx, irq=%llu, mac=%02llx:%02llx:%02llx:%02llx:%02llx:%02llx\n",
-                   (uint64_t)rtl8139_io_base(),
-                   (uint64_t)rtl8139_irq(),
+    console_printf("[net] %s at 0x%llx irq=%llu mac=%02llx:%02llx:%02llx:%02llx:%02llx:%02llx\n",
+                     g_ll_name,
+                     (uint64_t)((g_ll == LL_RTL8139) ? rtl8139_io_base() : e1000_bar0()),
+                     (uint64_t)((g_ll == LL_RTL8139) ? rtl8139_irq() : 0u),
                    (uint64_t)net_local_mac[0], (uint64_t)net_local_mac[1],
                    (uint64_t)net_local_mac[2], (uint64_t)net_local_mac[3],
                    (uint64_t)net_local_mac[4], (uint64_t)net_local_mac[5]);
@@ -1227,7 +1236,7 @@ int net_selftest(void)
         }
     }
 
-    r = net_ping(net_gateway_ip, 1000, &rtt);
+    r = net_ping(net_gateway_ip, 200000, &rtt);   /* a few hlt yields */
     if (r == 0) {
         console_printf("[net] selftest ping 10.0.2.2 -> reply in %llu us\n",
                        (uint64_t)net_ping_us(rtt));
