@@ -32,6 +32,11 @@ void sig_init_task(int tid);
 void sig_init_all(void);
 void sig_send(int tid, int sig);
 void sig_check_pending(void *uctx);
+
+/* fork(): the child inherits the parent's handlers and blocked mask (the slot is
+ * the process's own row, see process.h PROC_SLOT_BASE); pending signals are not
+ * inherited. */
+void sig_slot_clone(int from, int to);
 uint64_t sys_rt_sigaction(uint64_t signum, uint64_t act_ptr, uint64_t oldact_ptr,
                           uint64_t sigsetsize, uint64_t a5, uint64_t a6);
 void sig_send(int tid, int sig);

@@ -6,6 +6,46 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.11.4-alpha]
+
+**真正的多进程**：fork（写时复制）+ wait4 回收 + getppid，ring-3 shell 也能 fork/wait。
+启动呈现与 GUI 外观零变化。
+
+### Added
+- **进程表与协作式进程调度**（`kernel/syscall/process.c/.h`）：每个进程 =
+  {userspace_t + 16 KiB PMM 内核栈 + 预构建 user_context_t}；切换是
+  push rbx/rbp/r12-r15 -> swap rsp -> pop -> ret，再切 CR3 与 `%gs:8`。
+  子进程以 RUNNABLE 状态挂在一个手工构造的帧上，`ret` 落到 `proc_child_start` -> iretq
+  且 `rax=0`。
+- **fork + COW**（`userspace.c`）：PTE 软件位 9 = `PTE_COW`，父子共享同一批物理页并
+  置只读；缺页时按 160 项"物理帧 -> 引用计数"表决定"复制"还是"仅恢复写权限"。
+  CPL=3 与 CPL=0 两种缺页都先走 COW 再考虑信号。
+- **wait4（61）/ getppid（110）/ getpid** 真实现：子进程退出成僵尸，父进程 wait4 拿
+  `status = sig<<8 | code` 并回收槽位、地址空间与 fd；无子进程返回 `-ECHILD`，
+  `WNOHANG` 支持。fd 表与 signal 槽位随 fork 克隆。
+- **forktest**（`user/apps/forktest.c`）ring-3 验收程序；ring-3 shell 新增 `fork` 命令。
+  另注册 clone(56)/vfork(58)/setpgid(109)/getpgrp(111)/getsid(124) -> **81 个系统调用**。
+
+### Fixed
+- **子进程经 int 0x80 退出会把 GS MSR 对留在"用户侧"**（该门不做 swapgs），父进程恢复后
+  的 swapgs 反转了这对 MSR，下一次 syscall 从线性地址 8 取内核栈（RSP=0xf000ff53f000e2c3）
+  导致整机停止打印；现在每次进程切换都把 GS_BASE/KERNEL_GS_BASE 归一化到内核侧。
+- 删除 mmu.c 里从静态 MMU 池复制且无引用计数的 COW 辅助函数（双重释放风险）。
+
+### Verification
+- 干净重建 build=0、ISO 生成；启动日志 **265 行 == 基线**、`syscalls: 81 registered`、
+  自检 13/14、`ring3 9/9`、`userspace 9/9`、FAT32 写+ops PASS、无 PANIC。
+- `run forktest`：父 pid=1/子 pid=2、子写 'C' 后父仍读到 'Q'（COW 成立）、
+  `wait4 -> pid=2 status=0x2a (code=42)`、无子进程时 `-ECHILD`、第二个子进程 status 0x7，
+  `RESULT PASS`，退出 0；ring-3 shell `fork` 同样 PASS；`run sigtest` 回归 PASS。
+
+### Limits
+- 协作式调度（fork 返回 / wait4 阻塞 / yield / exit 才是切换点），无抢占；自旋子进程会
+  饿死兄弟。
+- 一次只有一个会话，root 退出会销毁存活子进程；fork 只复制 16 页用户窗口（mmap/brk 区
+  不继承）；clone(CLONE_VM)/线程返回 `-EINVAL`，vfork == fork。
+- wait4 status 编码是 `sig<<8|code`（不是 Linux 的 `(code&0xff)<<8`）。
+
 ## [v0.11.3-alpha]
 
 补完第 4、5 项：socket 系统调用 + DHCP/DNS 客户端 + 真正的 signal 语义（sigframe +

@@ -40,9 +40,13 @@ int           vimtu64_sleep_ms(unsigned ms);   /* 自有 ABI 5 */
 
 /* ---- ★ A4-5：fork/wait4（信号演示与 ring3 shell 的 run 用；Linux 号段 57/61，返回 -errno）---- */
 int     fork(void);
-/* wait4 的 status 是 Linux 编码：WEXITSTATUS(status) = (status>>8)&0xFF —— 被信号打死的进程
- * 退出码是 128+sig（本内核的如实实现，见 kernel/proc64.cpp 的 wait4 注释）。 */
+/* wait4 的 status 由内核按 **sig<<8 | code** 填写（见 kernel/syscall/process.c 的
+ * proc_wait4）：正常退出时 sig=0，退出码就在低字节 —— `status & 0xFF`。
+ * 被信号打死时高字节是信号号、低字节是内核记录的 128+sig（见 signal.c 的 SIG_DFL 路径）。
+ * 这里**不是** Linux 的 (code&0xff)<<8 编码，所以不能用 WEXITSTATUS 宏去取。 */
 int     wait4(int pid, int* status, int options, void* rusage);
+/* getppid（Linux 号段 110）：fork 记录的真实父进程 pid，0 表示由内核启动。 */
+int     getppid(void);
 /* ---- 内存映射（Linux 号段 9）：编辑器用它拿大块文本缓冲（user/lib 的堆只有 4 KiB）。
  *      prot: 1=READ 2=WRITE；flags: 0x22 = MAP_PRIVATE|MAP_ANONYMOUS（本内核只认 len/prot/flags）---- */
 void*   mmap(void* addr, size_t len, int prot, int flags, int fd, long off);

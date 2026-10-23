@@ -42,6 +42,7 @@
 #include <stitch/string.h>
 #include <stitch/console.h>
 #include "task.h"
+#include "process.h"    /* PROC_SLOT_BASE: process rows of the signal tables */
 #include <stitch/user_context.h>
 #include "el0_validate.h"
 #include "signal.h"
@@ -78,6 +79,35 @@ uint64_t sig_pending[SCHED_MAX_TASKS] = {0};
 /* Bits that can never be blocked (Linux: SIGKILL / SIGSTOP). */
 #define UNBLOCKABLE ((1ull << (NSIG_KILL - 1)) | (1ull << (NSIG_STOP - 1)))
 
+/* Which row of sig_table/sig_masks/sig_pending describes the caller.
+ *
+ * Same split as the fd table (kernel/syscall/syscalls.c fd_slot()): the processes
+ * of a ring-3 session get their own slots above the kernel task range, so a forked
+ * child inherits a *copy* of the handlers instead of sharing them, and kill(pid)
+ * reaches that process's pending word. */
+static int sig_slot(void)
+{
+    extern sched_cpu_t sched_cpu;
+    extern int proc_current_slot(void);
+    const int slot = proc_current_slot();
+
+    if (slot >= 0 && slot < SCHED_MAX_TASKS) return slot;
+    return sched_cpu.current;
+}
+
+/* fork(): a child inherits the handlers and the blocked mask, but not the pending
+ * signals (nothing was delivered to it). */
+void sig_slot_clone(int from, int to)
+{
+    int i;
+
+    if (from < 0 || from >= SCHED_MAX_TASKS) return;
+    if (to < 0 || to >= SCHED_MAX_TASKS) return;
+    for (i = 0; i < NSIG; i++) sig_table[to][i] = sig_table[from][i];
+    sig_masks[to] = sig_masks[from];
+    sig_pending[to] = 0;
+}
+
 void sig_init_task(int tid) {
     for (int i = 0; i < NSIG; i++) {
         sig_table[tid][i].sa.sa_handler = SIG_DFL;
@@ -97,8 +127,7 @@ uint64_t sys_rt_sigaction(uint64_t signum, uint64_t act_ptr, uint64_t oldact_ptr
                           uint64_t sigsetsize, uint64_t a5, uint64_t a6)
 {
     (void)sigsetsize; (void)a5; (void)a6;
-    extern sched_cpu_t sched_cpu;
-    const int tid = sched_cpu.current;
+    const int tid = sig_slot();
 
     if (signum == 0 || signum >= NSIG) return (uint64_t)(int64_t)(-22); /* -EINVAL */
     if (signum == NSIG_KILL || signum == NSIG_STOP)
@@ -126,8 +155,7 @@ uint64_t sys_rt_sigprocmask(uint64_t how, uint64_t set_va, uint64_t oldset_va,
                             uint64_t sigsetsize, uint64_t a5, uint64_t a6)
 {
     (void)a5; (void)a6;
-    extern sched_cpu_t sched_cpu;
-    const int tid = sched_cpu.current;
+    const int tid = sig_slot();
 
     if (tid < 0 || tid >= SCHED_MAX_TASKS) return (uint64_t)(int64_t)(-3); /* -ESRCH */
     /* Linux requires exactly sizeof(sigset_t) == 8 and rejects anything else. */
@@ -159,10 +187,14 @@ void sig_send(int tid, int sig) {
     if (sig >= NSIG || sig < 1) return;
     if (tid < 0 || tid >= SCHED_MAX_TASKS) return;
     sig_pending[tid] |= (1ULL << (sig - 1));
-    /* 如果目标在休眠，唤醒 */
-    extern sched_cpu_t sched_cpu;
-    if (sched_cpu.tasks[tid].state == SCHED_TASK_ZOMBIE) return;
-    sched_cpu.tasks[tid].state = SCHED_TASK_RUNNABLE;
+    /* 如果目标在休眠，唤醒。Only a *kernel task* slot has a sched task to wake:
+     * the process slots above PROC_SLOT_BASE (process.h) do not index
+     * sched_cpu.tasks, and waking one of those would resurrect a stale context. */
+    if (tid < PROC_SLOT_BASE) {
+        extern sched_cpu_t sched_cpu;
+        if (sched_cpu.tasks[tid].state == SCHED_TASK_ZOMBIE) return;
+        sched_cpu.tasks[tid].state = SCHED_TASK_RUNNABLE;
+    }
 }
 
 /* 检查并分发待处理信号 (在 syscall 返回时调用) */
@@ -177,7 +209,7 @@ void sig_check_pending(void *uctx_void) {
     struct sigaction *sa;
 
     if (uctx == NULL) return;
-    tid = sched_cpu.current;
+    tid = sig_slot();
     if (tid < 0 || tid >= SCHED_MAX_TASKS) return;
 
     pending = sig_pending[tid] & ~sig_masks[tid];
@@ -242,7 +274,7 @@ uint64_t sys_rt_sigreturn(uint64_t a1, uint64_t a2, uint64_t a3,
     extern user_context_t *syscall_current_ctx(void);
     user_context_t *uctx = syscall_current_ctx();
     sigframe_t frame;
-    const int tid = sched_cpu.current;
+    const int tid = sig_slot();
     (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
 
     /* Only a syscall-instruction return has a live user_context_t to restore. */

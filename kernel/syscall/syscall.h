@@ -25,6 +25,13 @@ int fd_vfs_fd(int fd);                 /* VFS fd behind fd, or -1 */
 int fd_sock_fd(int fd);                /* kernel/net socket behind fd, or -1 */
 int fd_install_socket(int sock);       /* give a net socket its lowest free fd */
 
+/* fork()/exit() need the whole table, not one descriptor: a child inherits every
+ * open file (one more reference each, exactly like dup()), and a reaped process
+ * drops every descriptor it still held. The slot is an index into the same array
+ * (process slots live above the kernel task slots, see process.h PROC_SLOT_BASE). */
+int  fd_table_clone(int from_slot, int to_slot);   /* 0, or -1 on a full table */
+void fd_table_release(int slot);                   /* close every open descriptor */
+
 /* syscall numbers - Linux/x86_64 兼容 */
 #define SYS_READ            0
 #define SYS_WRITE           1

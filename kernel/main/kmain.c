@@ -364,6 +364,13 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
                 (void)user_run_builtin("probe");
                 (void)user_run_builtin("hello");
                 (void)int80_selftest();
+                /* Multi-process acceptance (fork returns twice, COW divergence,
+                 * wait4 status, getppid). Silent on success: it only prints
+                 * "fork selftest: ... FAIL" lines when a check breaks. */
+                {
+                    extern int proc_selftest(void);
+                    (void)proc_selftest();
+                }
             }
         }
 

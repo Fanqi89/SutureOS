@@ -69,6 +69,18 @@ const char *user_builtin_list(void);
 /* 1 while the ring-3 program is executing. */
 int ring3_active(void);
 
+/* The per-CPU block the `syscall` entry finds at %gs (arch/x86_64/syscall.S):
+ * gs:0 = saved user rsp, gs:8 = kernel rsp for the running process. The process
+ * layer re-points gs:8 at every context switch (kernel/syscall/process.c). */
+uint64_t ring3_gs_block(void);
+void ring3_set_kernel_rsp(uint64_t rsp);
+
+/* Leave a ring-3 session and resume the kernel caller that entered it: restore the
+ * launcher's GS MSRs and address space and longjmp out of el0_enter_user_saved()
+ * with `code`. Used by the root process's exit, and as the last resort when a child
+ * exits and nothing else can run. Never returns. */
+void ring3_resume_kernel_root(uint64_t code) __attribute__((noreturn));
+
 /* Last exit code (for the shell's `ring3` command and the boot log). */
 int ring3_last_exit(void);
 

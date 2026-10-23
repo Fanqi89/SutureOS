@@ -20,9 +20,11 @@
 #define PTE_G           (1ULL << 8)
 #define PTE_NX          (1ULL << 63)  /* No-execute */
 
-/* COW 支持 */
-#define PTE_COW         (1ULL << 9)   /* Copy-on-Write 标记 */
-#define PTE_COW_MASK    (PTE_COW | PTE_W)  /* COW 页面的写保护掩码 */
+/* COW 支持：PTE 位定义见 mmu.h（PTE_COW = bit 9，x86_64 的软件可用位）。
+ * fork/缺页的真正实现在 kernel/syscall/userspace.c —— 那里才有窗口的每页物理帧
+ * 映射和引用计数，见该文件的说明。这里原先的 mmu_handle_cow/mmu_fork_copy 用
+ * 静态 MMU 池当页拷贝来源、且完全没有引用计数（父子两个地址空间各自销毁时会
+ * 双重释放同一段 16 页窗口），已删除。 */
 
 #define PML4_ENTRIES    512
 #define PDP_ENTRIES     512
@@ -269,84 +271,3 @@ int mmu_prepare_user_range(uint64_t va, uint64_t pages)
 
 /* 释放用户页表（简化：不释放，实际应递归释放） */
 void mmu_free_user_pml4(uint64_t user_pml4) { (void)user_pml4; }
-
-/* COW 支持函数 */
-void mmu_mark_cow(uint64_t *pte) {
-    if (!pte) return;
-    *pte |= PTE_COW;
-    *pte &= ~PTE_W;  /* 移除写权限，触发 #PF */
-}
-
-bool mmu_is_cow(uint64_t pte) {
-    return (pte & PTE_COW) != 0;
-}
-
-/* 处理 COW 缺页 */
-int mmu_handle_cow(uint64_t *pml4, uint64_t fault_addr) {
-    if (!pml4) return -1;
-    
-    uint64_t *pte = mmu_walk((uint64_t *)pml4, 0, fault_addr, 0);
-    if (!pte || !mmu_is_cow(*pte)) return -1;
-    
-    uint64_t old_pfn = (*pte & ~0xFFF) >> 12;
-    
-    // 简化：不做引用计数，直接复制页面
-    void *new_page = mmu_alloc_page();
-    if (!new_page) return -1;
-    
-    memcpy(new_page, (void *)(old_pfn << 12), PAGE_SIZE);
-    
-    uint64_t new_pfn = ((uint64_t)(uintptr_t)new_page) >> 12;
-    *pte = (new_pfn << 12) | (((*pte & 0xFFF) & ~PTE_COW) | PTE_W);
-    
-    // 刷新 TLB
-    __asm__ volatile("invlpg %0" :: "m"(*(volatile char *)fault_addr) : "memory");
-    
-    return 0;
-}
-
-/* fork 时标记所有用户页面为 COW */
-int mmu_mark_user_pages_cow(uint64_t pml4) {
-    for (uint64_t v = 0x40000000; v < 0x80000000; v += PAGE_SIZE) {  /* 用户空间 1GB-2GB */
-        uint64_t *pte = mmu_walk((uint64_t *)pml4, 0, v, 0);
-        if (pte && (*pte & PTE_P) && (*pte & PTE_U)) {
-            if (!mmu_is_cow(*pte) && (*pte & PTE_W)) {
-                uint64_t *pte_w = mmu_walk((uint64_t *)pml4, 0, v, 1);
-                if (pte_w) {
-                    *pte_w |= PTE_COW;
-                    *pte_w &= ~PTE_W;
-                }
-            }
-        }
-    }
-    return 0;
-}
-
-/* 复制页表用于 fork（建立 COW 映射） */
-int mmu_fork_copy(uint64_t parent_pml4_val, uint64_t *out_child_pml4) {
-    uint64_t *child_pml4 = mmu_alloc_page();
-    if (!child_pml4) return -1;
-    
-    /* 复制高半部分（内核空间共享） */
-    uint64_t *parent_pml4 = (uint64_t *)read_cr3();
-    memcpy(child_pml4 + 256, (void *)(uintptr_t)((uint64_t)parent_pml4 + 256 * 8), 256 * 8);
-    memset(child_pml4, 0, 256 * 8);
-    
-    /* 复制用户空间页表，建立 COW 映射 */
-    for (uint64_t v = 0x40000000; v < 0x80000000; v += PAGE_SIZE) {  /* 用户空间 1GB-2GB */
-        uint64_t *parent_pte = mmu_walk((uint64_t *)read_cr3(), 0, v, 0);
-        if (parent_pte && (*parent_pte & PTE_P) && (*parent_pte & PTE_U)) {
-            uint64_t *child_pte = mmu_walk(child_pml4, 0, v, 1);
-            if (!child_pte) continue;
-            
-            if (*parent_pte & PTE_P) {
-                /* 标记为 COW */
-                *child_pte = *parent_pte | PTE_COW;
-                *child_pte &= ~PTE_W;  /* 移除写权限 */
-            }
-        }
-    }
-    
-    *out_child_pml4 = (uint64_t)(uintptr_t)child_pml4;
-    return 0;
-}

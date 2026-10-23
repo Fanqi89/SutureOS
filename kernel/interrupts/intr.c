@@ -56,9 +56,25 @@ void moos_intr_handler(struct moos_regs *frame, uint64_t vec)
         uint64_t fault_addr = 0;
         __asm__ volatile("mov %%cr2, %0" : "=r"(fault_addr));
 
-        /* A fault from CPL=3 is the user program's: no COW exists up there, so
-         * this used to sig_send() to a non-existent task and re-execute the
-         * faulting instruction forever. Kill the program instead. */
+        /* Copy-on-write FIRST, for both CPLs.
+         *
+         * fork() leaves the parent's and the child's window pages present but
+         * read-only with the software bit PTE_COW set (kernel/syscall/userspace.c).
+         * The first write from either process must be resolved here and the
+         * faulting instruction retried - and it is always a CPL=3 write, because
+         * user pages are only written by user code. The previous order (kill the
+         * user program before ever looking at the PTE) is exactly why fork could
+         * not work at all. */
+        if (frame != NULL && (frame->error_code & 0x2u) != 0) {
+            extern int proc_cow_fault_for_current(uint64_t fault_va);
+            if (proc_cow_fault_for_current(fault_addr) == 0) {
+                return;     /* mapping is private + writable now: retry the store */
+            }
+        }
+
+        /* A fault from CPL=3 is the user program's: no COW was resolvable above, so
+         * this is a real fault. Kill the program instead of sig_send()ing to a
+         * non-existent task and re-executing the faulting instruction forever. */
         if (frame != NULL && (frame->cs & 3u) == 3u) {
             extern int ring3_active(void);
             extern void ring3_exit_user(uint64_t code);
@@ -70,29 +86,24 @@ void moos_intr_handler(struct moos_regs *frame, uint64_t vec)
                 ring3_exit_user(128u + 14u);        /* does not return */
             }
         }
-        
-        uint64_t error_code = frame->error_code;
-        bool write = error_code & 0x2;
-        bool user = error_code & 0x4;
-        bool present = error_code & 0x1;
-        
-        // 获取当前进程的页表
-        uint64_t current_pml4 = read_cr3();
-        
-        // 查找故障地址对应的 PTE
-        uint64_t *pte = mmu_walk((uint64_t *)current_pml4, 0, fault_addr, 0);
-        
-        if (pte && (*pte & PTE_P) && mmu_is_cow(*pte)) {
-            // COW 处理
-            if (mmu_handle_cow((uint64_t *)((uint64_t)current_pml4), fault_addr) == 0) {
-                return;  // COW 处理成功，返回继续执行
-            }
-        }
-        
+
         // 非 COW 错误或处理失败，发送 SIGSEGV
         extern sched_cpu_t sched_cpu;
         if (sched_cpu.current >= 0 && sched_cpu.current < SCHED_MAX_TASKS) {
             sig_send(sched_cpu.current, SIGSEGV);
+        }
+        /* A fault taken at CPL=0 has no signal to deliver: the handler returns and
+         * the CPU retries the same instruction, so without this line the machine
+         * just stops printing. Report the first few and stay silent afterwards (a
+         * fault loop must not flood the serial log). */
+        if (frame != NULL && (frame->cs & 3u) == 0u) {
+            static int kernel_pf_reports;
+            if (kernel_pf_reports < 4) {
+                kernel_pf_reports++;
+                console_printf("[mmu] kernel #PF rip=0x%llx cr2=0x%llx err=0x%llx\n",
+                               (uint64_t)frame->rip, fault_addr,
+                               (uint64_t)frame->error_code);
+            }
         }
         return;
     }

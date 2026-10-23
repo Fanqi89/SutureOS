@@ -56,8 +56,9 @@ int main(int argc, char **argv)
 {
     char line[128];
 
-    printf("SutureOS ring-3 shell (pid=%d, argc=%d)\n", getpid(), argc);
-    printf("commands: help hello probe crash pid ticks root exec exit\n");
+    printf("SutureOS ring-3 shell (pid=%d, ppid=%d, argc=%d)\n",
+           getpid(), getppid(), argc);
+    printf("commands: help hello probe fork crash pid ticks root exec exit\n");
 
     for (;;) {
         printf("user$ ");
@@ -73,12 +74,35 @@ int main(int argc, char **argv)
             puts("help   - this list");
             puts("hello  - execve the libc hello program");
             puts("probe  - execve the staged acceptance program");
+            puts("fork   - fork a second process and wait4() for it");
             puts("crash  - write to kernel memory (must kill only this process)");
-            puts("pid    - getpid()");
+            puts("pid    - getpid()/getppid()");
             puts("ticks  - uptime ticks");
             puts("root   - write to kernel memory (same as crash)");
             puts("exec   - execve the ring-3 shell again");
             puts("exit   - leave the shell");
+            continue;
+        }
+        if (strcmp(line, "fork") == 0) {
+            const int cpid = fork();
+            if (cpid == 0) {
+                /* The child is a real second process: its own address space (COW
+                 * from here), its own pid, this shell as its parent. It must leave
+                 * immediately, otherwise two shells would read the console. */
+                printf("[shell] child: pid=%d ppid=%d, exiting with 7\n",
+                       getpid(), getppid());
+                _exit(7);
+            }
+            if (cpid < 0) {
+                printf("fork failed: %d\n", cpid);
+                continue;
+            }
+            {
+                int st = -1;
+                const int w = wait4(cpid, &st, 0, 0);
+                printf("[shell] waited: wait4=%d status=0x%x (exit code %d)\n",
+                       w, st, st & 0xFF);
+            }
             continue;
         }
         if (strcmp(line, "hello") == 0) { do_exec("hello"); continue; }
@@ -88,7 +112,7 @@ int main(int argc, char **argv)
             continue;
         }
         if (strcmp(line, "pid") == 0) {
-            printf("pid=%d\n", getpid());
+            printf("pid=%d ppid=%d\n", getpid(), getppid());
             continue;
         }
         if (strcmp(line, "ticks") == 0) {

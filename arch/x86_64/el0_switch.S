@@ -133,4 +133,54 @@ el0_resume_kernel:
     ret
 .size el0_resume_kernel, .-el0_resume_kernel
 
+/* ---------------- kernel-stack context switch (fork/wait4 scheduler) ----------------
+ *
+ * void proc_ctx_switch(uint64_t *from_ksp, uint64_t *to_ksp)   [rdi, rsi]
+ *
+ * Every ring-3 process owns a kernel stack (kernel/syscall/process.c). Switching
+ * processes is therefore a kernel stack switch: save the callee-saved registers
+ * the SysV ABI requires to survive a call, store rsp in *from_ksp, load *to_ksp,
+ * restore the registers and `ret` - which returns into the *other* process's
+ * suspended proc_ctx_switch() call. A process that has never run has a hand-built
+ * frame here whose `ret` target is proc_child_start below.
+ *
+ * Why this is enough: the whole kernel map is shared by every process address
+ * space (userspace.c copies the kernel PML4), so a kernel stack is mapped
+ * everywhere and the caller may (and does) switch CR3 before switching stacks.
+ * Interrupts are off here (both gates enter with IF=0), so the stack swap is not
+ * preemptible. */
+.global proc_ctx_switch
+.type proc_ctx_switch, @function
+proc_ctx_switch:
+    pushq   %rbx
+    pushq   %rbp
+    pushq   %r12
+    pushq   %r13
+    pushq   %r14
+    pushq   %r15
+    movq    %rsp, (%rdi)               /* from->ksp = current rsp */
+    movq    (%rsi), %rsp               /* rsp = to->ksp          */
+    popq    %r15
+    popq    %r14
+    popq    %r13
+    popq    %r12
+    popq    %rbp
+    popq    %rbx
+    ret
+.size proc_ctx_switch, .-proc_ctx_switch
+
+/* First instruction of a forked process: proc_ctx_switch() has just "returned"
+ * here with a 16-byte aligned rsp (so a call pushes 8 and the C callee sees the
+ * usual rsp % 16 == 8). proc_enter_user_first() switches to the child address
+ * space and iretqs with the context fork prepared - it never returns; the ud2 is
+ * only there so a bug is a fault instead of a wild jump. */
+.global proc_child_start
+.type proc_child_start, @function
+proc_child_start:
+    call    proc_enter_user_first
+    ud2
+.size proc_child_start, .-proc_child_start
+
+.extern proc_enter_user_first
+
 .section .note.GNU-stack,"",@progbits

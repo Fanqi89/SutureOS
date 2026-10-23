@@ -7,6 +7,7 @@
 #include "el0_validate.h"
 #include "syscall.h"      /* SYS_CLOCK_GETTIME for the tick probe */
 #include "userspace.h"    /* per-process address space */
+#include "process.h"      /* fork/wait4 processes of the current session */
 #include "el0_switch.h"   /* el0_kernel_state_t + entry/exit primitives */
 #include <stitch/user_context.h>
 #include "mmu.h"
@@ -44,7 +45,6 @@ static volatile int g_ring3_active;
 static volatile int g_ring3_exit_code = -1;
 static volatile int g_ring3_ran;
 static int g_ring3_ready;                 /* SSE/GS/kstack set up */
-static userspace_t *g_current_us;         /* address space of the running program */
 static el0_kernel_state_t g_kstate;       /* where el0_resume_kernel() returns to */
 
 /* ---- privileged helpers ---- */
@@ -90,6 +90,12 @@ static uint64_t rdmsr(uint32_t msr)
 
 int ring3_active(void) { return g_ring3_active; }
 
+/* The process layer (kernel/syscall/process.c) owns the switchable part of this
+ * state: every process syscall must start on its own kernel stack, so %gs:8 is
+ * re-pointed on every context switch. */
+uint64_t ring3_gs_block(void) { return (uint64_t)(uintptr_t)&g_ring3_gs; }
+void ring3_set_kernel_rsp(uint64_t rsp) { g_ring3_gs.kernel_rsp = rsp; }
+
 static int g_trace_budget = 0;   /* set to 8 to trace the first ring-3 syscalls */
 
 /* Localises a hang: shows the syscall number and the first two arguments. */
@@ -102,8 +108,9 @@ void ring3_trace_syscall(uint64_t nr, uint64_t a1, uint64_t a2)
 int ring3_last_exit(void) { return g_ring3_exit_code; }
 int ring3_ran_ever(void) { return g_ring3_ran; }
 
-/* Called from sys_exit() while the user program is running. */
-void ring3_exit_user(uint64_t code)
+/* Leave the ring-3 session: restore the launcher's GS MSRs and address space and
+ * longjmp out of el0_enter_user_saved() with `code`. */
+void ring3_resume_kernel_root(uint64_t code)
 {
     g_ring3_exit_code = (int)code;
     g_ring3_active = 0;
@@ -118,6 +125,24 @@ void ring3_exit_user(uint64_t code)
     for (;;) {
         __asm__ volatile("cli; hlt");
     }
+}
+
+/* Called from sys_exit()/exit_group()/SIG_DFL while a user program is running.
+ *
+ * The root process of a session is the one the kernel entered, so its exit goes
+ * back to the kernel launcher. A *child* has no kernel caller to return to: it
+ * becomes a zombie, wakes its parent and schedules away (process.c), so the
+ * syscall frame it is standing on is simply abandoned. */
+void ring3_exit_user(uint64_t code)
+{
+    extern int  proc_current_pid(void);
+    extern int  proc_current_is_root(void);
+    extern void proc_exit_current(int, int) __attribute__((noreturn));
+
+    if (proc_current_pid() >= 0 && !proc_current_is_root())
+        proc_exit_current((int)code, 0);      /* does not return */
+
+    ring3_resume_kernel_root(code);           /* does not return */
 }
 
 int ring3_run_init(void)
@@ -206,9 +231,12 @@ int ring3_run_init(void)
 
 /* ---------------- general blob runner (ported libc programs) --------------- */
 
+/* Run one program as the root of a fresh process session. The program may fork()
+ * children and wait4() for them; they are all destroyed when the root exits. */
 int user_run_blob(const char *name, const uint8_t *blob, uint64_t len)
 {
-    static userspace_t us;
+    userspace_t *us;
+    int code;
 
     if (!g_ring3_ready) {
         sse_enable();
@@ -223,22 +251,34 @@ int user_run_blob(const char *name, const uint8_t *blob, uint64_t len)
      * (0xf000ff53...) the signal self test hit. Every program that used only
      * int 0x80 never noticed. */
     wrmsr(0xC0000102, (uint64_t)(uintptr_t)&g_ring3_gs);
-    g_ring3_gs.kernel_rsp = (uint64_t)(uintptr_t)&g_ring3_kstack[RING3_KSTACK_BYTES] - 64;
 
-    if (userspace_create(&us) != 0) {
-        console_printf("[user] '%s': cannot create an address space\n",
-                       (name != NULL) ? name : "?");
-        return -1;
-    }
-    if (userspace_load(&us, blob, len) != 0) {
+    if (len == 0 || len > (uint64_t)USERSPACE_CODE_PAGES * 4096u) {
         console_printf("[user] '%s': blob unusable (len=%llu, limit %u)\n",
                        (name != NULL) ? name : "?", len,
                        (int64_t)(USERSPACE_CODE_PAGES * 4096));
-        userspace_destroy(&us);
         return -1;
     }
 
-    g_current_us = &us;
+    /* One session at a time: the processes of a session share the user VA window
+     * and the single `syscall` gate state. */
+    if (proc_session_begin() != 0) {
+        console_printf("[user] '%s': a ring-3 session is already running\n",
+                       (name != NULL) ? name : "?");
+        return -1;
+    }
+    if (proc_root_create(name, blob, len) != 0) {
+        console_printf("[user] '%s': cannot create an address space\n",
+                       (name != NULL) ? name : "?");
+        proc_session_end();
+        return -1;
+    }
+    us = proc_root_us();
+    if (us == NULL) {
+        proc_session_end();
+        return -1;
+    }
+
+    g_ring3_gs.kernel_rsp = proc_current_kstack_top() - 64;
     el0_validate_init();
     (void)el0_grant_range(USERSPACE_VA, USERSPACE_BYTES);
     el0_set_active(1);
@@ -249,7 +289,7 @@ int user_run_blob(const char *name, const uint8_t *blob, uint64_t len)
 
     console_printf("[user] running '%s': va=0x%llx len=%llu stack=0x%llx pml4=0x%llx\n",
                    (name != NULL) ? name : "?", USERSPACE_VA, len,
-                   userspace_stack_top(&us), us.pml4);
+                   userspace_stack_top(us), us->pml4);
 
     g_ring3_active = 1;
     g_ring3_exit_code = -1;
@@ -258,17 +298,20 @@ int user_run_blob(const char *name, const uint8_t *blob, uint64_t len)
     {
         extern void el0_enter_user_saved(uint64_t pml4, uint64_t entry,
                                          uint64_t stack_top, el0_kernel_state_t *state);
-        el0_enter_user_saved(us.pml4, userspace_entry(&us), userspace_stack_top(&us),
+        el0_enter_user_saved(us->pml4, userspace_entry(us), userspace_stack_top(us),
                              &g_kstate);
     }
     g_ring3_active = 0;
-    g_current_us = NULL;
     __asm__ volatile("sti");
 
+    code = g_ring3_exit_code;
     console_printf("[user] '%s' exited with %d\n",
-                   (name != NULL) ? name : "?", (int64_t)g_ring3_exit_code);
-    userspace_destroy(&us);
-    return g_ring3_exit_code;
+                   (name != NULL) ? name : "?", (int64_t)code);
+    /* The session is over: every child the program may have left behind is
+     * destroyed here (nothing is running any more, so their kernel stacks can be
+     * handed back to the PMM). */
+    proc_session_end();
+    return code;
 }
 
 /* ---------------- built-in program registry ---------------- */
@@ -286,6 +329,10 @@ extern const uint8_t _binary_shell_bin_size[];
 extern const uint8_t _binary_sigtest_bin_start[];
 extern const uint8_t _binary_sigtest_bin_end[];
 extern const uint8_t _binary_sigtest_bin_size[];
+/* Multi-process acceptance: fork + COW + wait4 + getppid (user/apps/forktest.c). */
+extern const uint8_t _binary_forktest_bin_start[];
+extern const uint8_t _binary_forktest_bin_end[];
+extern const uint8_t _binary_forktest_bin_size[];
 
 typedef struct {
     const char *name;
@@ -301,6 +348,9 @@ static const user_program_t g_programs[] = {
      * `run sigtest` from the shell is the acceptance path, so the frozen boot
      * log gains nothing. */
     { "sigtest", _binary_sigtest_bin_start, _binary_sigtest_bin_size },
+    /* Multi-process acceptance: `run forktest`. Also not auto-run - the boot log
+     * must stay byte-for-byte the same shape. */
+    { "forktest", _binary_forktest_bin_start, _binary_forktest_bin_size },
 };
 
 /* ---- execve support ----
@@ -311,7 +361,7 @@ int user_exec_in_place(const char *path, void *ctx_void)
 {
     user_context_t *ctx = (user_context_t *)ctx_void;
     const char *name = path;
-    userspace_t *us = g_current_us;
+    userspace_t *us = proc_current_us();      /* the *calling* process's window */
     const uint8_t *blob = NULL;
     uint64_t len = 0;
 
@@ -344,7 +394,7 @@ int user_exec_in_place(const char *path, void *ctx_void)
 int user_exec_from_frame(const char *path, void *frame_void)
 {
     uint8_t *f = (uint8_t *)frame_void;
-    userspace_t *us = g_current_us;
+    userspace_t *us = proc_current_us();      /* the *calling* process's window */
     const char *name = path;
     char name_copy[32];
     const uint8_t *blob = NULL;
@@ -425,7 +475,7 @@ int user_run_builtin(const char *name)
     return -1;
 }
 
-const char *user_builtin_list(void) { return "hello probe shell sigtest"; }
+const char *user_builtin_list(void) { return "hello probe shell sigtest forktest"; }
 
 /* ---------------- acceptance ---------------- */
 

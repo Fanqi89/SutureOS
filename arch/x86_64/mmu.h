@@ -34,6 +34,15 @@ static inline uint64_t read_cr3(void) {
 #define PTE_G           (1ULL << 8)
 #define PTE_NX          (1ULL << 63)  /* No-execute */
 
+/* Copy-on-write marker. x86_64 leaves bits 9..11 available to software, so the
+ * flag lives in PTE bit 9 and the hardware ignores it. A COW page is always
+ * present, read-only and mapped in two (or more) address spaces; the #PF handler
+ * in kernel/interrupts/intr.c resolves it through kernel/syscall/userspace.c.
+ * Both the PTE and the frame reference map are owned by userspace.c - the old
+ * half-finished helpers in this file copied pages out of the static MMU pool and
+ * had no reference counting, so they could double-free a 16-page window. */
+#define PTE_COW         (1ULL << 9)
+
 /* 页表遍历/分配 */
 uint64_t *mmu_walk(uint64_t *table, int level, uint64_t vaddr, int create);
 void *loader_alloc_page(void);
@@ -67,11 +76,9 @@ void mmu_flush_tlb(void);
 /* Create the intermediate page tables for a user VA range. */
 int mmu_prepare_user_range(uint64_t va, uint64_t pages);
 
-/* COW 支持 */
-void mmu_mark_cow(uint64_t *pte);
-bool mmu_is_cow(uint64_t pte);
-int mmu_handle_cow(uint64_t *pte, uint64_t fault_addr);
-int mmu_mark_user_pages_cow(uint64_t pml4);
-int mmu_fork_copy(uint64_t parent_pml4, uint64_t *out_child_pml4);
+/* Copy-on-write: fork and the #PF resolution live in kernel/syscall/userspace.c
+ * (userspace_fork_create / userspace_cow_fault) because they need the window's
+ * per-page frame map and the frame reference counts, which only that module
+ * keeps. PTE_COW above is the software bit they share with this header. */
 
 #endif

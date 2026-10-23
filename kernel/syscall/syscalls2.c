@@ -368,15 +368,21 @@ static uint64_t sys2_ioctl(uint64_t fd, uint64_t request, uint64_t arg,
 static uint64_t sys2_getpid(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
                             uint64_t a5, uint64_t a6)
 {
+    extern int proc_getpid(void);
     (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
-    return (uint64_t)sched_cpu.current;
+    /* Inside a ring-3 process this is the process's pid (kernel/syscall/process.c);
+     * outside one it stays the kernel task slot, which is what the shell prints. */
+    return (uint64_t)(int64_t)proc_getpid();
 }
 
 static uint64_t sys2_getppid(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
                              uint64_t a5, uint64_t a6)
 {
+    extern int proc_getppid(void);
     (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
-    return 0;                            /* no parent/child bookkeeping yet */
+    /* The real parent: fork() records it, so a child sees the pid the parent was
+     * given by getpid(). 0 means "the kernel started it". */
+    return (uint64_t)(int64_t)proc_getppid();
 }
 
 static uint64_t sys2_getuid(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
@@ -854,6 +860,16 @@ static uint64_t sys2_kill(uint64_t pid, uint64_t sig, uint64_t a3, uint64_t a4,
 
     if (sig == 0) return 0;                       /* existence probe */
     if (sig >= 32) return err(EINVAL_);
+    /* A ring-3 process has its own signal slot (process.h PROC_SLOT_BASE); the
+     * plain task slots below it stay valid for the kernel's own tasks. */
+    {
+        extern int proc_slot_for_pid(int pid);
+        const int slot = proc_slot_for_pid((int)pid);
+        if (slot >= 0) {
+            sig_send(slot, (int)sig);
+            return 0;
+        }
+    }
     if ((int)pid < 0 || (int)pid >= SCHED_MAX_TASKS) return err(EINVAL_);
     if (sched_cpu.tasks[pid].state == SCHED_TASK_UNUSED) return err(ECHILD_);
     sig_send((int)pid, (int)sig);
@@ -863,12 +879,13 @@ static uint64_t sys2_kill(uint64_t pid, uint64_t sig, uint64_t a3, uint64_t a4,
 static uint64_t sys2_wait4(uint64_t pid, uint64_t status_va, uint64_t options,
                            uint64_t rusage_va, uint64_t a5, uint64_t a6)
 {
-    (void)pid; (void)options; (void)rusage_va; (void)a5; (void)a6;
-    /* No parent/child bookkeeping yet: every task is a child of the kernel. */
-    if (status_va != 0 && ptr_ok(status_va, 4)) {
-        *(int32_t *)(uintptr_t)status_va = 0;
-    }
-    return err(ECHILD_);
+    extern int proc_wait4(int pid, uint64_t status_va, int options);
+    (void)rusage_va; (void)a5; (void)a6;
+    /* Real wait4: reap a zombie child of the calling process (process.c). The
+     * status word is sig<<8 | code, so a normal exit leaves the code in the low
+     * byte and a signal death in the high byte. WNOHANG (1) returns 0 instead of
+     * blocking; no matching child at all is -ECHILD. */
+    return (uint64_t)(int64_t)proc_wait4((int)pid, status_va, (int)options);
 }
 
 static uint64_t sys2_exit_group(uint64_t code, uint64_t a2, uint64_t a3,
@@ -876,6 +893,69 @@ static uint64_t sys2_exit_group(uint64_t code, uint64_t a2, uint64_t a3,
 {
     (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
     return syscall_invoke(SYS_EXIT, code, 0, 0, 0, 0, 0);
+}
+
+/* clone(2). SutureOS has no threads: the only clone shape it can honour is the
+ * fork-shaped one (CLONE_VM clear). A CLONE_VM request is refused with -EINVAL
+ * instead of quietly handing back a fork(), because the caller would then believe
+ * that both "threads" share memory and that shared writes are visible - with COW
+ * windows they are not. */
+#define CLONE_VM_ 0x00000100u
+
+static uint64_t sys2_clone(uint64_t flags, uint64_t child_stack, uint64_t ptid,
+                           uint64_t ctid, uint64_t tls, uint64_t a6)
+{
+    (void)child_stack; (void)ptid; (void)ctid; (void)tls; (void)a6;
+    if ((flags & (uint64_t)CLONE_VM_) != 0) return err(EINVAL_);
+    return syscall_invoke(SYS_FORK, 0, 0, 0, 0, 0, 0);
+}
+
+/* vfork(2): this kernel has no address-space sharing, so vfork is fork. The child
+ * gets a COW copy and the parent keeps running until it waits - documented, not
+ * pretended: vfork's "parent is suspended" guarantee is NOT provided. */
+static uint64_t sys2_vfork(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+                           uint64_t a5, uint64_t a6)
+{
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    return syscall_invoke(SYS_FORK, 0, 0, 0, 0, 0, 0);
+}
+
+/* setpgid/getpgrp/getsid: one session per ring-3 program, led by its root process
+ * (pid 1), and every process is its own process group leader. setpgid() therefore
+ * only accepts what is already true (pgid == 0 or == pid) instead of storing a
+ * number the scheduler would ignore. */
+static uint64_t sys2_setpgid(uint64_t pid, uint64_t pgid, uint64_t a3, uint64_t a4,
+                             uint64_t a5, uint64_t a6)
+{
+    extern int proc_getpid(void);
+    extern int proc_slot_for_pid(int pid);
+    const int self = proc_getpid();
+    (void)a3; (void)a4; (void)a5; (void)a6;
+
+    if (self < 0) return err(EINVAL_);
+    if ((int)pid != 0 && (int)pid != self) {
+        if (proc_slot_for_pid((int)pid) < 0) return err(ECHILD_);
+        return err(EPERM_);                 /* only your own group is settable */
+    }
+    if ((int)pgid != 0 && (int)pgid != self) return err(EPERM_);
+    return 0;
+}
+
+static uint64_t sys2_getpgrp(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+                             uint64_t a5, uint64_t a6)
+{
+    extern int proc_getpid(void);
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    return (uint64_t)(int64_t)proc_getpid();   /* every process leads its own group */
+}
+
+static uint64_t sys2_getsid(uint64_t pid, uint64_t a2, uint64_t a3, uint64_t a4,
+                            uint64_t a5, uint64_t a6)
+{
+    extern int proc_slot_for_pid(int pid);
+    (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    if ((int)pid != 0 && proc_slot_for_pid((int)pid) < 0) return err(ECHILD_);
+    return 1;                                  /* the session leader is the root */
 }
 
 /* ============================ system information ============================ */
@@ -1111,6 +1191,14 @@ int syscalls2_register(void)
     reg(SYS_KILL, sys2_kill);
     reg(SYS_WAIT4, sys2_wait4);
     reg(SYS_EXIT_GROUP, sys2_exit_group);
+    /* The rest of the process surface: clone/vfork are fork-shaped (no threads),
+     * setpgid/getpgrp/getsid describe the one session a ring-3 program owns. See
+     * the comments above each handler for what is and is not guaranteed. */
+    reg(SYS_CLONE, sys2_clone);
+    reg(SYS_VFORK, sys2_vfork);
+    reg(SYS_SETPGID, sys2_setpgid);
+    reg(SYS_GETPGRP, sys2_getpgrp);
+    reg(SYS_GETSID, sys2_getsid);
 
     /* system info */
     reg(SYS_SYSINFO, sys2_sysinfo);

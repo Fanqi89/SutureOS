@@ -252,13 +252,18 @@ int fork(void) {
     const long r = __v64_syscall(57, 0, 0, 0, 0, 0);
     return (r < 0) ? v64_errno_lx(r) : (int)r;
 }
-/* wait4 的 status 是 Linux 编码：正常退出 = (code & 0xFF) << 8；被信号打死 = 低 7 位放信号号
- * （本内核如实实现的是"退出码 = 128+sig"，所以 WEXITSTATUS(status) 就是 128+sig —— 见
- *  kernel/proc64.cpp 的 wait4 注释）。 */
+/* wait4 的 status 由内核按 sig<<8 | code 填写（kernel/syscall/process.c 的
+ * proc_wait4）：正常退出时 sig=0，所以退出码就是 status & 0xFF —— 不是 Linux 的
+ * (code&0xff)<<8 编码，别用 WEXITSTATUS。 */
 int wait4(int pid, int* status, int options, void* rusage) {
     const long r = __v64_syscall(61, (long)pid, (long)(uintptr_t)status, (long)options,
                                 (long)(uintptr_t)rusage, 0);
     return (r < 0) ? v64_errno_lx(r) : (int)r;
+}
+/* getppid（110）：fork 记录的真实父进程；0 = 由内核启动（会话的根进程）。 */
+int getppid(void) {
+    const long r = __v64_syscall(110, 0, 0, 0, 0, 0);
+    return (r < 0) ? 0 : (int)r;
 }
 /* ---- ★ A4-5：mmap（9）—— 编辑器用它拿大块文本缓冲（1 MiB 文件不能用 4KB 的堆）---- */
 void* mmap(void* addr, size_t len, int prot, int flags, int fd, long off) {
