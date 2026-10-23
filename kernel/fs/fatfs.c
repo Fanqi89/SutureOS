@@ -31,6 +31,25 @@
 #define MAX_FILES        8
 #define MAX_DIRS         8
 
+#define ATTR_ARCH        0x20
+#define ATTR_LFN_EXACT   0x0Fu   /* an LFN entry's attribute byte is exactly this */
+#define LFN_MAX_CHARS    255u
+#define LFN_MAX_ORD      20u
+
+/* VFAT long-name entry: 13 UTF-16 code units at these byte offsets. */
+static const uint8_t g_lfn_ofs[13] = { 1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30 };
+
+/* Accumulator for one LFN chain.  Entries are stored physically in reverse logical
+ * order: the first physical entry carries ord = N | 0x40 (the LAST 13 chars) and the
+ * entry right before the short name carries ord = 1 (the FIRST 13 chars), so we
+ * index every chunk by (ord - 1) * 13. */
+struct lfn_acc {
+    uint16_t name[LFN_MAX_CHARS + 1];
+    uint8_t  max_ord;
+    uint8_t  sum;
+    uint8_t  active;
+};
+
 /* ==================== volume state ==================== */
 
 struct fat32_vol {
@@ -60,6 +79,7 @@ struct fatfs_dir {
     int      used;
     uint32_t cluster;
     uint32_t entry;
+    struct lfn_acc lfn;          /* pending LFN chain for the resumable readdir() */
     char     path[64];
 };
 
@@ -308,6 +328,151 @@ static void raw_to_name(const char raw[11], char *out, uint32_t cap) {
     out[o] = '\0';
 }
 
+struct dir_slot {
+    uint32_t lba;
+    uint32_t offset;
+    int      valid;
+};
+
+/* ---- VFAT long file names ----
+ * Checksum over the 11 short-name bytes; every entry of one chain carries it and it
+ * must match the short entry that follows, otherwise the chain is stale (that check
+ * is exactly what the SpiritFoxOS ancestor was missing). */
+static uint8_t lfn_checksum(const uint8_t raw[11]) {
+    uint8_t sum = 0;
+    for (int i = 0; i < 11; i++) {
+        sum = (uint8_t)((sum >> 1) + (sum << 7) + raw[i]);
+    }
+    return sum;
+}
+
+static int lfn_is_entry(const uint8_t *ent) {
+    return ent[11] == ATTR_LFN_EXACT && ent[12] == 0 && ent[26] == 0 && ent[27] == 0;
+}
+
+static void lfn_reset(struct lfn_acc *a) {
+    a->max_ord = 0;
+    a->sum = 0;
+    a->active = 0;
+    memset(a->name, 0, sizeof(a->name));
+}
+
+/* Feed one 32-byte directory entry. */
+static void lfn_feed(struct lfn_acc *a, const uint8_t *ent) {
+    uint8_t ord = (uint8_t)(ent[0] & 0x3Fu);
+    if (ord == 0 || ord > LFN_MAX_ORD) {
+        lfn_reset(a);
+        return;
+    }
+    if (ent[0] & 0x40u) {
+        lfn_reset(a);                      /* last logical part: a new chain starts */
+    }
+    a->active = 1;
+    a->sum = ent[13];
+    if (ord > a->max_ord) a->max_ord = ord;
+    for (uint32_t k = 0; k < 13u; k++) {
+        const uint32_t idx = (uint32_t)(ord - 1u) * 13u + k;
+        if (idx < LFN_MAX_CHARS) {
+            a->name[idx] = (uint16_t)((uint16_t)ent[g_lfn_ofs[k]] |
+                                      ((uint16_t)ent[g_lfn_ofs[k] + 1u] << 8));
+        }
+    }
+}
+
+/* Assemble the pending chain into `out` (ASCII only; anything above 0x7F becomes
+ * '_' because this driver has no codepage). Returns 1 when a name was produced. */
+static int lfn_assemble(const struct lfn_acc *a, const uint8_t sfn[11],
+                        char *out, uint32_t cap) {
+    uint32_t n = 0;
+    if (!a->active || a->max_ord == 0) return 0;
+    if (lfn_checksum(sfn) != a->sum) return 0;         /* stale chain: ignore it */
+    for (uint32_t i = 0; i < LFN_MAX_CHARS; i++) {
+        uint16_t c = a->name[i];
+        if (c == 0x0000u || c == 0xFFFFu) break;
+        if (n + 1u >= cap) break;
+        out[n++] = (c >= 0x20u && c < 0x7Fu) ? (char)c : '_';
+    }
+    out[n] = '\0';
+    return n > 0;
+}
+
+static int name_eq_ci(const char *a, const char *b) {
+    while (*a && *b) {
+        char x = *a, y = *b;
+        if (x >= 'a' && x <= 'z') x = (char)(x - 'a' + 'A');
+        if (y >= 'a' && y <= 'z') y = (char)(y - 'a' + 'A');
+        if (x != y) return 0;
+        a++; b++;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+/* Find an entry whose VFAT long name matches `want` (case-insensitive). On success
+ * the short entry is copied to out_ent and its 11 raw name bytes to out_raw, so the
+ * caller can keep using the 8.3 machinery for everything else. */
+static int dir_find_lfn(uint32_t dir_cl, const char *want, uint8_t *s,
+                        struct dir_slot *out, uint8_t *out_ent, char out_raw[11]) {
+    struct lfn_acc acc;
+    uint32_t cl = dir_cl;
+    lfn_reset(&acc);
+    while (cl >= 2 && cl < FAT32_EOC) {
+        for (uint32_t k = 0; k < g_vol.spc; k++) {
+            uint32_t lba = cluster_lba(cl) + k;
+            int r = sec_read(lba, s);
+            if (r != FATFS_OK) return r;
+            for (uint32_t e = 0; e < ENTRIES_PER_SEC; e++) {
+                uint8_t *ent = s + e * DIR_ENTRY_SIZE;
+                char longname[LFN_MAX_CHARS + 1];
+                if (ent[0] == 0x00) return FATFS_ENOENT;
+                if (ent[0] == 0xE5) { lfn_reset(&acc); continue; }
+                if (lfn_is_entry(ent)) { lfn_feed(&acc, ent); continue; }
+                if (ent[11] & ATTR_VOL) { lfn_reset(&acc); continue; }
+                if (lfn_assemble(&acc, ent, longname, sizeof(longname)) &&
+                    name_eq_ci(longname, want)) {
+                    out->lba = lba;
+                    out->offset = e * DIR_ENTRY_SIZE;
+                    out->valid = 1;
+                    if (out_ent) memcpy(out_ent, ent, DIR_ENTRY_SIZE);
+                    memcpy(out_raw, ent, 11);
+                    return FATFS_OK;
+                }
+                lfn_reset(&acc);
+            }
+        }
+        uint32_t next;
+        int r = fat_get(cl, s, &next);
+        if (r != FATFS_OK) return r;
+        cl = next;
+    }
+    return FATFS_ENOENT;
+}
+
+/* Mark the LFN entries that precede the short entry at (lba, off) as deleted, so a
+ * remove/rename does not orphan them. Walks backwards, crossing sector boundaries
+ * inside the cluster; stops at the first non-LFN entry. */
+static void dir_mark_lfn_chain(uint32_t lba, uint32_t off, uint8_t *s) {
+    uint32_t cur_lba = lba;
+    uint32_t cur_off = off;
+    for (int guard = 0; guard <= (int)LFN_MAX_ORD; guard++) {
+        if (cur_off >= DIR_ENTRY_SIZE) {
+            cur_off -= DIR_ENTRY_SIZE;
+        } else {
+            if (cur_lba == 0) return;
+            cur_lba--;
+            cur_off = 512u - DIR_ENTRY_SIZE;
+        }
+        if (sec_read(cur_lba, s) != FATFS_OK) return;
+        if (!lfn_is_entry(s + cur_off)) return;
+        s[cur_off] = 0xE5;
+        {
+            uint8_t *v = lemis_heap_alloc(512);
+            if (!v) return;
+            (void)sec_write_checked(cur_lba, s, v, "lfn delete", cur_off);
+            lemis_heap_free(v);
+        }
+    }
+}
+
 static int raw_equal(const char a[11], const char b[11]) {
     return memcmp(a, b, 11) == 0;
 }
@@ -325,12 +490,6 @@ static int make_raw(const char *name, char raw[11]) {
 
 /* ==================== directory entries ==================== */
 
-struct dir_slot {
-    uint32_t lba;
-    uint32_t offset;
-    int      valid;
-};
-
 static int dir_find(uint32_t dir_cl, const char raw[11], uint8_t *s,
                     struct dir_slot *out, uint8_t *out_ent) {
     uint32_t cl = dir_cl;
@@ -343,7 +502,7 @@ static int dir_find(uint32_t dir_cl, const char raw[11], uint8_t *s,
                 uint8_t *ent = s + e * DIR_ENTRY_SIZE;
                 if (ent[0] == 0x00) return FATFS_ENOENT;
                 if (ent[0] == 0xE5) continue;
-                if ((ent[11] & ATTR_LFN) == ATTR_LFN) continue;
+                if (ent[11] == ATTR_LFN_EXACT) continue;
                 if (ent[11] & ATTR_VOL) continue;
                 if (raw_equal((const char *)ent, raw)) {
                     out->lba = lba;
@@ -972,15 +1131,19 @@ int fatfs_readdir(fatfs_dir_t *d, char *name, uint32_t name_cap,
         d->entry = idx;
 
         if (ent[0] == 0x00) { r = FATFS_ENOTFOUND; goto out; }
-        if (ent[0] == 0xE5) { r = FATFS_OK; continue; }
-        if ((ent[11] & ATTR_LFN) == ATTR_LFN) { r = FATFS_OK; continue; }
-        if (ent[11] & ATTR_VOL) { r = FATFS_OK; continue; }
+        if (ent[0] == 0xE5) { lfn_reset(&d->lfn); r = FATFS_OK; continue; }
+        if (ent[11] == ATTR_LFN_EXACT) { lfn_feed(&d->lfn, ent); r = FATFS_OK; continue; }
+        if (ent[11] & ATTR_VOL) { lfn_reset(&d->lfn); r = FATFS_OK; continue; }
         if (ent[0] == '.' && (ent[1] == ' ' || (ent[1] == '.' && ent[2] == ' '))) {
+            lfn_reset(&d->lfn);
             r = FATFS_OK;
             continue;
         }
 
-        raw_to_name((const char *)ent, name, name_cap);
+        if (!lfn_assemble(&d->lfn, ent, name, name_cap)) {
+                raw_to_name((const char *)ent, name, name_cap);
+            }
+            lfn_reset(&d->lfn);
         if (size) {
             uint32_t sz;
             memcpy(&sz, ent + 28, 4);
@@ -1114,7 +1277,7 @@ int fatfs_rmdir(const char *path) {
             idx++;
             if (e2[0] == 0x00) break;
             if (e2[0] == 0xE5) continue;
-            if ((e2[11] & ATTR_LFN) == ATTR_LFN) continue;
+            if (e2[11] == ATTR_LFN_EXACT) continue;
             if (e2[0] == '.' && (e2[1] == ' ' || (e2[1] == '.' && e2[2] == ' '))) continue;
             r = FATFS_ENOTEMPTY;
             break;

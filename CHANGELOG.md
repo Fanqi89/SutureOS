@@ -6,6 +6,57 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.14.0-alpha]
+
+FAT32 gets **VFAT long file names** (read side), stitched from PlantOS (ChaN FatFs) and
+SpiritFoxOS rather than Cinux.
+
+### Added
+- **VFAT long-name reader** in `kernel/fs/fatfs.c`: the LFN entry state machine
+  (attribute byte exactly 0x0F, ord chain with 0x40 on the physically first entry,
+  13 UTF-16 code units at offsets 1/3/5/7/9/14/16/18/20/22/24/28/30, SFN checksum
+  verification, 0x0000/0xFFFF terminators, 0xE5 deleted / 0x00 end-of-directory).
+  Implementation notes taken from PlantOS `src/fs/fatfs/ff.c` (the only sibling repo
+  with a full LFN read+write) and SpiritFoxOS `kernel/src/fs/fat32.c` (the ancestor of
+  this driver) - with the checksum validation the ancestor is missing.
+- **`ls` prints long names**; `path_resolve` falls back to a long-name directory scan
+  when a component does not fit 8.3, so stat/open/cat/unlink/rmdir accept long names
+  while the rest of the driver stays 8.3-based.
+- **unlink/rmdir mark the whole preceding LFN chain 0xE5** instead of orphaning it
+  (that would leave invisible stale entries that some OSes still hide behind).
+- **Test fixture + host verifier**: `scripts/mkfat32_testimg.py` now writes a real LFN
+  chain (long name `Long file name test.txt`, short alias `LFNTRAN.TXT`, checksum and
+  reverse ordering included); `scripts/verify_fat32_write.py` skips LFN/volume
+  entries when enumerating the root (it parsed them as files with cluster 0 and
+  walked off the volume).
+
+### Fixed
+- New files were created with attribute 0x01 (read-only); they are 0x20 (archive).
+- The LFN/volume test used `(attr & 0x0F) == 0x0F`, which also matches 0x1F/0x2F/0x4F
+  (directories with the archive bit set) - a long name could be built for a
+  directory. It is now an exact `attr == 0x0F` test.
+
+### Verification
+- Guest: `ls /mnt/fat` prints `Long file name test.txt` from the fixture's chain.
+- Guest regression unchanged: `[fat32] write self-test PASS`,
+  `[fat32] ops self-test PASS (mkdir/rmdir, rename, unlink: 3/3)`, self-tests 13/14,
+  `ring3 selftest 9/9`, `userspace selftest 9/9`.
+- Host: `py -3 scripts/verify_fat32_write.py build/fat32_ata.img build/fat32.img`
+  -> **checks=17 ok=17 fail=0**.
+
+### Notes on the "port everything" line
+- **Cinux has no FAT driver at all** (only ext2 plus a TODO document), so the LFN
+  source is PlantOS/SpiritFoxOS, not Cinux.
+- **MOOS's FAT is stock ChaN FatFs R0.13 vendored inside a managed C# kernel** and is
+  dead code there (`//new FATFS();`); it is not a port source. Useful algorithms are
+  now on the list instead: SFN `~N` alias generation, LFN **write**, NTres lowercase
+  preservation, and the FSInfo trust protocol.
+
+### Not done yet
+- LFN **write** (creating a long name from this OS; needs the multi-slot directory
+  allocator and the `~N` short-name generator).
+- HanOS scheduler port / `fork`+`wait4`.
+
 ## [v0.13.0-alpha]
 
 e1000 finished: it is the **preferred** NIC now, because receive works. The v0.12.0
