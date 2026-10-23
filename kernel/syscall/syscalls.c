@@ -194,7 +194,9 @@ uint64_t sys_exit(uint64_t code, uint64_t a2, uint64_t a3,
     extern int ring3_active(void);
     extern void ring3_exit_user(uint64_t code);
     int tid = sched_cpu.current;
-    sched_cpu.tasks[tid].state = SCHED_TASK_ZOMBIE;
+    if (tid >= 0 && tid < SCHED_MAX_TASKS) {
+        sched_cpu.tasks[tid].state = SCHED_TASK_ZOMBIE;
+    }
     /* A ring-3 program exiting must come back to its kernel launcher, not power
      * the machine off. */
     if (ring3_active()) {

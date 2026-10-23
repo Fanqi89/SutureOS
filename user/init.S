@@ -27,6 +27,29 @@ _start:
     movq    $msg_hello_len, %rdx
     syscall
 
+    /* Probe the Vimtu64 own-ABI gate (int 0x80, eax = call number). */
+    movq    $3, %rax                    /* V64_NR_GETPID */
+    int     $0x80
+    movq    %rax, int80_pid(%rip)
+    movq    $SYS_write, %rax
+    movq    $1, %rdi
+    leaq    msg_int80(%rip), %rsi
+    movq    $msg_int80_len, %rdx
+    syscall
+    movq    int80_pid(%rip), %rax
+    addb    $'0', %al
+    movb    %al, int80_digit(%rip)
+    movq    $SYS_write, %rax
+    movq    $1, %rdi
+    leaq    int80_digit(%rip), %rsi
+    movq    $1, %rdx
+    syscall
+    movq    $SYS_write, %rax
+    movq    $1, %rdi
+    leaq    msg_nl(%rip), %rsi
+    movq    $1, %rdx
+    syscall
+
     /* uname(&uts): proves a kernel -> user buffer copy works */
     movq    $SYS_uname, %rax
     leaq    uts_buf(%rip), %rdi
@@ -99,6 +122,9 @@ msg_sysname:
 msg_pid:
     .ascii "pid="
     .set msg_pid_len, . - msg_pid
+msg_int80:
+    .ascii "int80 getpid="
+    .set msg_int80_len, . - msg_int80
 msg_nl:
     .ascii "\n"
 
@@ -109,6 +135,10 @@ uts_buf:
 pid_result:
     .space 8
 pid_digit:
+    .space 8
+int80_pid:
+    .space 8
+int80_digit:
     .space 8
 
     .section .note.GNU-stack,"",@progbits

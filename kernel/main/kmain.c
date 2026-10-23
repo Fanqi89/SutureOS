@@ -349,6 +349,15 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
             console_printf("[  OK  ] ring3: first user program ran, exit=%d\n",
                            (int64_t)rc);
             (void)ring3_selftest();
+
+            /* The ported C userland (VimtuOS' minilibc in user/) is built and
+             * linked into the kernel, but its int 0x80 calls currently read the
+             * wrong call number (see kernel/syscall/int80.c), so it is not
+             * started at boot. `run` explains the same thing in the shell. */
+            {
+                extern int int80_init(void);
+                int80_init();
+            }
         }
 
         {

@@ -67,6 +67,15 @@ el0_enter_user:
 .global el0_enter_user_saved
 .type el0_enter_user_saved, @function
 el0_enter_user_saved:
+    /* Save the callee-saved registers first: coming back through
+     * el0_resume_kernel() must restore them or the C caller's locals (which live
+     * in rbx/rbp/r12-r15) are whatever the user program left behind. */
+    pushq   %rbx
+    pushq   %rbp
+    pushq   %r12
+    pushq   %r13
+    pushq   %r14
+    pushq   %r15
     movq    %rsp, (%rdx)               /* remember how to get back */
     pushq   $0x23
     pushq   %rsi
@@ -98,6 +107,12 @@ el0_enter_user_saved:
 .type el0_resume_kernel, @function
 el0_resume_kernel:
     movq    %rdi, %rsp
+    popq    %r15
+    popq    %r14
+    popq    %r13
+    popq    %r12
+    popq    %rbp
+    popq    %rbx
     movq    %rsi, %rax
     ret
 .size el0_resume_kernel, .-el0_resume_kernel

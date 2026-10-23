@@ -56,6 +56,16 @@ static void sse_enable(void)
     cr4 |= (1ULL << 9);                 /* OSFXSR: SSE state is saved/restored */
     cr4 |= (1ULL << 10);                /* OSXMMEXCPT: unmasked SIMD exceptions */
     __asm__ volatile("mov %0, %%cr4" : : "r"(cr4));
+
+    /* IA32_EFER.NXE: without it the PTE bit 63 that mmu_map_user_pages() uses to
+     * make the user stack non-executable is a *reserved* bit, so every stack access
+     * took a reserved-bit #PF (and the machine looked dead). */
+    {
+        uint32_t lo, hi;
+        __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0xC0000080));
+        lo |= (1u << 11);               /* NXE */
+        __asm__ volatile("wrmsr" :: "c"(0xC0000080), "a"(lo), "d"(hi));
+    }
 }
 
 static void wrmsr(uint32_t msr, uint64_t value)
@@ -181,6 +191,119 @@ int ring3_run_init(void)
     (void)rdmsr(0xC0000102);
     return g_ring3_exit_code;
 }
+
+/* ---------------- general blob runner (ported libc programs) --------------- */
+
+int user_run_blob(const char *name, const uint8_t *blob, uint64_t len)
+{
+    extern uintptr_t moe_pmm_alloc(uint32_t n);
+    const uint64_t total_pages = USER_CODE_PAGES + USER_STACK_PAGES;
+    uint64_t pa;
+
+    if (blob == NULL || len == 0 || len > (uint64_t)USER_CODE_PAGES * 4096u) {
+        console_printf("[user] '%s': blob unusable (len=%llu, limit %u)\n",
+                       (name != NULL) ? name : "?", len,
+                       (int64_t)(USER_CODE_PAGES * 4096));
+        return -1;
+    }
+
+    pa = (uint64_t)moe_pmm_alloc((uint32_t)total_pages);
+    if (pa == 0) {
+        console_printf("[user] '%s': no memory\n", (name != NULL) ? name : "?");
+        return -1;
+    }
+
+    /* Page tables for the user VA window, then map PMM pages into it. */
+    if (mmu_prepare_user_range(USER_VA_BASE, total_pages) != 0) {
+        console_printf("[user] '%s': cannot build page tables\n",
+                       (name != NULL) ? name : "?");
+        return -1;
+    }
+    if (mmu_map_user_pages(USER_VA_BASE, pa, USER_CODE_PAGES, 1, 1) != 0 ||
+        mmu_map_user_pages(USER_VA_BASE + (uint64_t)USER_CODE_PAGES * 4096u,
+                           pa + (uint64_t)USER_CODE_PAGES * 4096u,
+                           USER_STACK_PAGES, 1, 0) != 0) {
+        console_printf("[user] '%s': cannot map user pages\n",
+                       (name != NULL) ? name : "?");
+        return -1;
+    }
+
+    /* zero the whole window (bss + stack), then drop the blob at the base */
+    memset((void *)(uintptr_t)USER_VA_BASE, 0, (size_t)USER_VA_BYTES);
+    memcpy((void *)(uintptr_t)USER_VA_BASE, blob, (size_t)len);
+
+    sse_enable();
+    wrmsr(0xC0000102, (uint64_t)(uintptr_t)&g_ring3_gs);   /* IA32_KERNEL_GS_BASE */
+    g_ring3_gs.kernel_rsp = (uint64_t)(uintptr_t)&g_ring3_kstack[RING3_KSTACK_BYTES] - 64;
+
+    el0_validate_init();
+    (void)el0_grant_range(USER_VA_BASE, USER_VA_BYTES);
+    el0_set_active(1);
+
+    {
+        extern void int80_init(void);
+        int80_init();       /* the ported libc talks through int 0x80 */
+    }
+
+    console_printf("[user] running '%s': va=0x%llx len=%llu stack=0x%llx\n",
+                   (name != NULL) ? name : "?",
+                   USER_VA_BASE, len, USER_VA_BASE + USER_VA_BYTES - 16);
+
+    g_ring3_active = 1;
+    g_ring3_exit_code = -1;
+    {
+        extern void el0_enter_user_saved(uint64_t entry, uint64_t stack_top,
+                                         uint64_t *slot);
+        el0_enter_user_saved(USER_VA_BASE, USER_VA_BASE + USER_VA_BYTES - 16,
+                             &g_saved_kernel_rsp);
+    }
+    g_ring3_active = 0;
+    __asm__ volatile("sti");
+
+    console_printf("[user] '%s' exited with %d\n",
+                   (name != NULL) ? name : "?", (int64_t)g_ring3_exit_code);
+    return g_ring3_exit_code;
+}
+
+/* ---------------- built-in program registry ---------------- */
+
+extern const uint8_t _binary_hello_bin_start[];
+extern const uint8_t _binary_hello_bin_end[];
+extern const uint8_t _binary_hello_bin_size[];
+extern const uint8_t _binary_probe_bin_start[];
+extern const uint8_t _binary_probe_bin_end[];
+extern const uint8_t _binary_probe_bin_size[];
+
+typedef struct {
+    const char *name;
+    const uint8_t *start;
+    const uint8_t *size_ptr;
+} user_program_t;
+
+static const user_program_t g_programs[] = {
+    { "hello", _binary_hello_bin_start, _binary_hello_bin_size },
+    { "probe", _binary_probe_bin_start, _binary_probe_bin_size },
+};
+
+int user_run_builtin(const char *name)
+{
+    if (name == NULL) return -1;
+    /* The ported libc programs are built, embedded and loadable, but their
+     * int 0x80 calls read the wrong number (see int80.c). Running one hangs the
+     * machine, so be explicit instead of hanging. */
+    console_puts("[user] the ported libc programs are not runnable yet "
+                 "(int 0x80 frame layout, see kernel/syscall/int80.c)\n");
+    return -2;
+    for (uint64_t i = 0; i < sizeof(g_programs) / sizeof(g_programs[0]); i++) {
+        if (strcmp(g_programs[i].name, name) == 0) {
+            const uint64_t len = (uint64_t)(uintptr_t)g_programs[i].size_ptr;
+            return user_run_blob(g_programs[i].name, g_programs[i].start, len);
+        }
+    }
+    return -1;
+}
+
+const char *user_builtin_list(void) { return "hello probe"; }
 
 /* ---------------- acceptance ---------------- */
 

@@ -88,6 +88,7 @@ static const struct shell_cmd g_commands[] = {
     {"rtctest", shell_cmd_rtctest, "Self-test: CMOS RTC decoding (BCD/12h/leap/format)"},
     {"ring3",   shell_cmd_ring3,  "Ring-3 status (the boot-time user program)"},
     {"ring3test",shell_cmd_ring3test,"Self-test: U/S page bits, SSE, GS base, exit code"},
+    {"run",     shell_cmd_run,     "Run a built-in ring-3 user program: run <name>"},
     {"mount",   shell_cmd_mount,   "Mount filesystem"},
     {"umount",  shell_cmd_umount,  "Unmount filesystem"},
     {"df",      shell_cmd_df,      "Show disk usage"},
@@ -986,6 +987,25 @@ int shell_cmd_ring3(int argc, char **argv) {
         return 0;
     }
     return (ring3_run_init() == 42) ? 0 : 1;
+}
+
+int shell_cmd_run(int argc, char **argv) {
+    extern int user_run_builtin(const char *name);
+    extern const char *user_builtin_list(void);
+    int rc;
+    if (argc < 2) {
+        shell_printf("built-in user programs: %s\n", user_builtin_list());
+        shell_puts("usage: run <name>\n");
+        return 1;
+    }
+    rc = user_run_builtin(argv[1]);
+    if (rc < 0) {
+        shell_printf("run: %s: no such built-in program (%s)\n", argv[1],
+                     user_builtin_list());
+        return 1;
+    }
+    shell_printf("run: %s exited with %d\n", argv[1], (int64_t)rc);
+    return 0;
 }
 
 int shell_cmd_ring3test(int argc, char **argv) {

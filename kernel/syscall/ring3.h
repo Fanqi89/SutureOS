@@ -39,6 +39,23 @@ int ring3_run_init(void);
  * (it abandons the syscall frame and resumes ring3_run_init). */
 void ring3_exit_user(uint64_t code) __attribute__((noreturn));
 
+/* Fixed virtual address the ported userland is linked at (user/lib/user.ld). */
+#define USER_VA_BASE        0x40000000ull
+#define USER_CODE_PAGES     8
+#define USER_STACK_PAGES    8
+#define USER_VA_BYTES       ((USER_CODE_PAGES + USER_STACK_PAGES) * 4096ull)
+
+/* Run a flat user blob (linked at USER_VA_BASE) in ring 3 and return its exit
+ * status. `name` is only used for log lines. */
+int user_run_blob(const char *name, const uint8_t *blob, uint64_t len);
+
+/* Run one of the programs compiled into the kernel (see user/apps/*.c).
+ * Returns the exit status, or -1 when the name is unknown. */
+int user_run_builtin(const char *name);
+
+/* Names of the built-in programs, space separated (for `run` with no argument). */
+const char *user_builtin_list(void);
+
 /* 1 while the ring-3 program is executing. */
 int ring3_active(void);
 

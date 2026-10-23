@@ -172,6 +172,62 @@ int mmu_map_user_identity(uint64_t va, uint64_t len, int writable, int executabl
     return 0;
 }
 
+/* 把用户虚拟区 [va, va+pages*4096) 映射到物理页 pa.. （每页 4 KiB，U/S=1）。
+ * 与 mmu_map_user_identity 的区别：VA 不再等于 PA，这是跑"链接在固定地址"的
+ * 用户程序所必需的（VimtuOS 的扁平 blob 模型链接在固定 VA）。 */
+int mmu_map_user_pages(uint64_t va, uint64_t pa, uint64_t pages,
+                       int writable, int executable)
+{
+    uint64_t *pml4 = (uint64_t *)(uintptr_t)(read_cr3() & ~0xFFFULL);
+
+    for (uint64_t i = 0; i < pages; i++) {
+        const uint64_t v = va + i * PAGE_SIZE;
+        uint64_t *pml4e = &pml4[(v >> 39) & 0x1FF];
+        uint64_t *pdpt;
+        uint64_t *pdpe;
+        uint64_t *pd;
+        uint64_t *pde;
+        uint64_t *pt;
+        uint64_t *pte;
+
+        if ((*pml4e & PTE_P) == 0) return -1;
+        pdpt = (uint64_t *)(uintptr_t)(*pml4e & ~0xFFFULL);
+        pdpe = &pdpt[(v >> 30) & 0x1FF];
+        if ((*pdpe & PTE_P) == 0) return -1;          /* caller must pre-map the PDPT */
+        if (*pdpe & PTE_PS) return -1;                 /* 1 GiB page: not supported */
+        pd = (uint64_t *)(uintptr_t)(*pdpe & ~0xFFFULL);
+        pde = &pd[(v >> 21) & 0x1FF];
+        if ((*pde & PTE_P) == 0 || (*pde & PTE_PS) != 0) return -1;
+
+        *pml4e |= PTE_U;
+        *pdpe  |= PTE_U;
+        *pde   |= PTE_U;
+        pt = (uint64_t *)(uintptr_t)(*pde & ~0xFFFULL);
+        pte = &pt[(v >> 12) & 0x1FF];
+        *pte = (pa + i * PAGE_SIZE) | PTE_P | PTE_U;
+        if (writable)   *pte |= PTE_W;
+        if (executable) *pte &= ~PTE_NX;
+        else            *pte |= PTE_NX;
+    }
+
+    {
+        uint64_t cr3;
+        __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+        __asm__ volatile("mov %0, %%cr3" : : "r"(cr3) : "memory");
+    }
+    return 0;
+}
+
+/* 为 mmu_map_user_pages 准备 VA 区间的页表（PML4/PDPT/PD/PT 全部就位）。 */
+int mmu_prepare_user_range(uint64_t va, uint64_t pages)
+{
+    uint64_t *pml4 = (uint64_t *)(uintptr_t)(read_cr3() & ~0xFFFULL);
+    for (uint64_t i = 0; i < pages; i++) {
+        if (mmu_walk(pml4, 0, va + i * PAGE_SIZE, 1) == NULL) return -1;
+    }
+    return 0;
+}
+
 /* 克隆内核页表到用户 TTBR0：仅提升 [base, base+len) 到 U/S=1 */int mmu_clone_for_el0(uint64_t kernel_pml4, uint64_t *out_user_pml4,
                       uint64_t base, uint64_t len)
 {

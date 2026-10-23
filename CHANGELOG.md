@@ -6,6 +6,70 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.10.0-alpha]
+
+Ported a real userland libc from VimtuOS and wired the machinery to run it, which
+uncovered and fixed three genuine kernel bugs. The ported programs themselves are
+**not runnable yet** - the `int 0x80` own-ABI gate reads the wrong call number
+(diagnosed below) - so this release ships the infrastructure and the kernel fixes,
+not the milestone.
+
+### Added
+- **`user/lib/`** - VimtuOS' minimal libc, ported nearly verbatim (GPL-3.0, same
+  project family): `string.c`, `stdlib.c` (real `malloc`/`free` free-list arena),
+  `stdio.c` (buffered `printf`/`puts`), `syscall.c`/`syscall.S` (own ABI +
+  Linux-number fallbacks), `crt0.S` (entry, `main(argc,argv,envp)`, `exit`), and
+  its headers (`stdio.h`, `stdlib.h`, `string.h`, `unistd.h`, `errno.h`,
+  `unistd.h`, `vimtu64.h`, `sys/types.h`, `sys/stat.h`, ...).
+- **`user/lib/user.ld`** - flat-blob linker script at VA `0x40000000` (VimtuOS used
+  4 GiB); `.text.start` first, `.l*` sections for `-mcmodel=large`, `.image_end`
+  sentinel so the `.bss` tail is part of the blob.
+- **`user/apps/hello.c`** and **`user/apps/probe.c`** (staged acceptance program:
+  int-0x80 write -> puts -> printf -> malloc -> getpid/ticks -> exit(7)).
+- **Build integration**: `scripts/build.py` compiles the libc once, links each app
+  with the flat-blob script and embeds the blob in the kernel image
+  (`_binary_<name>_bin_start/end/size`), 32 KiB load-window limit enforced.
+- **`kernel/syscall/int80.c`** - the Vimtu64 own-ABI gate on vector 0x80 (DPL=3):
+  write/read/open/close/getpid/ticks/sleep_ms/exit forwarded onto the Linux-numbered
+  syscall table; everything else answers -ENOSYS.
+- **`mmu_map_user_pages()` / `mmu_prepare_user_range()`** - map a fixed user VA
+  window onto PMM pages (U/S=1, W for data, NX for stack), which is what a program
+  linked at an absolute address needs.
+- **`user_run_blob()` / `user_run_builtin()` / shell `run`** - the general ring-3
+  program launcher (the v0.9.0 runtime only knew the one embedded asm blob).
+
+### Fixed (all three found by this work)
+- **`IA32_EFER.NXE` was never set.** `mmu_map_user_pages()` marks the user stack
+  non-executable with PTE bit 63; with NXE off that bit is *reserved*, so every
+  stack access raised a reserved-bit #PF. Symptom: the machine stopped silently
+  right after "zeroed page 7" (QEMU `-d int` showed `v=0e CR2=0x0`).
+- **`el0_resume_kernel()` violated the C ABI** (SysV): it restored only `rsp` and
+  returned, leaving `rbx`/`rbp`/`r12-r15` holding whatever the user program left
+  in them, so the caller's locals were garbage (`console_printf("%s", name)` with
+  name == -38 -> #PF inside `console_printf`, CR2=0xffffffffffffffda). It now
+  saves those registers in `el0_enter_user_saved()` and pops them on the way back.
+- **`sys_exit()` indexed `sched_cpu.tasks[tid]` with `tid == -1`** when the kernel
+  itself is the caller (the ring-3 programs run from kmain), writing out of bounds
+  and corrupting kernel state. Guarded like the fd syscalls.
+
+### Known blocker (why the ported programs do not run yet)
+`int 0x80` *works* - the asm probe program calls `getpid` through it and gets an
+answer - but for the libc programs the handler reads the wrong call number
+(`nr=0` / `nr=-38` in the log). The reason: `struct moos_regs` declares `rax` at
+offset +0x00, while the shared ISR stub pushes `rax` first, so it lands at +0x70.
+The proper fix is a dedicated `int 0x80` stub that passes `(nr, a1, a2, a3)` to C
+in registers instead of through that frame. Until then `user_run_builtin()`
+refuses to start the libc programs (running one hangs the machine) and says so.
+
+### Verification
+- Regression unchanged and green: self-tests 13/14, FAT32 write+ops PASS, host
+  17/17, AP 1 online, RTL8139 ping, PS/2 mouse, rtc 8/8, pipe 16/16, sudo 23/23,
+  `ring3test` 9/9, and the asm ring-3 program still prints
+  `hello from ring 3` / `int80 getpid=3` / `uname sysname=Linux` and exits 42.
+- `hello` (5161 B) and `probe` (10249 B) build and link at 0x40000000 and are
+  embedded in the kernel; the loader maps them, copies them and enters ring 3
+  (QEMU `-d int` shows the calls), but the own-ABI frame bug stops them there.
+
 ## [v0.9.0-alpha]
 
 **Ring 3 runs.** The audit's biggest gap - "everything is in ring 0, there is no

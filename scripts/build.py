@@ -140,6 +140,85 @@ def main():
         print("objcopy rename failed for the ring-3 user blob")
         return 1
 
+    # ---- 1c. Ported ring-3 userland (user/lib + user/apps) ----
+    # VimtuOS' minimal libc, ported nearly verbatim: real printf/malloc/string
+    # over the int 0x80 own ABI (kernel/syscall/int80.c). Programs are linked at
+    # USER_VA_BASE (user/lib/user.ld) into flat blobs like the AP trampoline.
+    user_embed_objs = []
+    import tempfile, shutil
+    USER_VA_BASE = 0x40000000
+    uflags = ["--target=x86_64-unknown-none-elf", "-nostdinc", f"-I{ROOT / 'user' / 'lib'}",
+              "-ffreestanding", "-nostdlib", "-fno-builtin", "-mcmodel=large",
+              "-fno-pic", "-fno-pie", "-fno-stack-protector", "-mno-red-zone",
+              "-mno-sse", "-mno-sse2", "-mno-mmx", "-mno-avx", "-O2", "-std=c11",
+              "-Wall", "-Wextra", "-ffunction-sections", "-fdata-sections"]
+    ulib_srcs = ["string.c", "stdlib.c", "stdio.c", "syscall.c"]
+    ulib_objs = []
+    for src in ulib_srcs:
+        obj = OBJ / f"userlib_{src}.o"
+        r = subprocess.run([str(CC), "-c"] + uflags + ["-o", str(obj),
+                             str(ROOT / "user" / "lib" / src)])
+        if r.returncode != 0:
+            print(f"userland libc failed to compile: {src}")
+            return 1
+        ulib_objs.append(str(obj))
+    for src in ["crt0.S", "syscall.S"]:
+        obj = OBJ / f"userlib_{src}.o"
+        r = subprocess.run([str(CC), "-c"] + uflags + ["-o", str(obj),
+                             str(ROOT / "user" / "lib" / src)])
+        if r.returncode != 0:
+            print(f"userland runtime failed to compile: {src}")
+            return 1
+        ulib_objs.append(str(obj))
+
+    render = OBJ / "user_render.ld"
+    shutil.copy2(str(ROOT / "user" / "lib" / "user.ld"), str(render))
+
+    apps = sorted((ROOT / "user" / "apps").glob("*.c"))
+    if not apps:
+        print("no ring-3 user programs in user/apps")
+        return 1
+    tdir = Path(tempfile.gettempdir()) / "sutureos_userprog"
+    tdir.mkdir(parents=True, exist_ok=True)
+    for app in apps:
+        name = app.stem
+        aobj = OBJ / f"userapp_{name}.o"
+        r = subprocess.run([str(CC), "-c"] + uflags + ["-o", str(aobj), str(app)])
+        if r.returncode != 0:
+            print(f"user program failed to compile: {name}")
+            return 1
+        elf = BUILD / f"user_{name}.elf"
+        binf = BUILD / f"user_{name}.bin"
+        # GNU ld: lld in MSYS2 does not accept -T here
+        r = subprocess.run([str(LD), "-T", str(render), "--gc-sections",
+                            "-o", str(elf)] + ulib_objs + [str(aobj)])
+        if r.returncode != 0:
+            print(f"user program failed to link: {name}")
+            return 1
+        r = subprocess.run([str(OBJCOPY), "-O", "binary", str(elf), str(binf)])
+        if r.returncode != 0:
+            print(f"user program blob extraction failed: {name}")
+            return 1
+        size = binf.stat().st_size
+        print(f"ring-3 program '{name}': {size} bytes (limit 32768)")
+        if size > 8 * 4096:
+            print(f"user program '{name}' is too large for the 8-page load window")
+            return 1
+        shutil.copy2(str(binf), str(tdir / "prog.bin"))
+        eobj = OBJ / f"userblob_{name}.o"
+        r = subprocess.run([str(OBJCOPY), "-I", "binary", "-O", "elf64-x86-64",
+                            "-B", "i386:x86-64",
+                            "--rename-section", ".data=.rodata,alloc,load,readonly,data,contents",
+                            f"--redefine-sym", f"_binary_prog_bin_start=_binary_{name}_bin_start",
+                            f"--redefine-sym", f"_binary_prog_bin_end=_binary_{name}_bin_end",
+                            f"--redefine-sym", f"_binary_prog_bin_size=_binary_{name}_bin_size",
+                            "prog.bin", "prog.bin.o"], cwd=str(tdir))
+        if r.returncode != 0:
+            print(f"objcopy failed for user program: {name}")
+            return 1
+        shutil.copy2(str(tdir / "prog.bin.o"), str(eobj))
+        user_embed_objs.append(str(eobj))
+
     # Collect sources
     sources = []
     for pattern in ["boot/*.S", "arch/x86_64/*.c", "arch/x86_64/*.S", 
@@ -262,6 +341,7 @@ def main():
     objs.append(str(trampoline_obj))
     if user_obj is not None:
         objs.append(str(user_obj))
+    objs.extend(user_embed_objs)
     print(f"Compiled {len(objs)-2} source files + trampoline + user blob")
     
     # Link

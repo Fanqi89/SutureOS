@@ -53,6 +53,14 @@ int mmu_map_mmio_identity(uint64_t phys, uint64_t bytes);
  * Returns 0 on success, -1 when a parent entry is missing or out of pool. */
 int mmu_map_user_identity(uint64_t va, uint64_t len, int writable, int executable);
 
+/* Map [va, va+pages*4KiB) to the physical pages starting at pa, with U/S=1.
+ * Used to run a program that was linked at a fixed VA. */
+int mmu_map_user_pages(uint64_t va, uint64_t pa, uint64_t pages,
+                       int writable, int executable);
+
+/* Create the intermediate page tables for a user VA range. */
+int mmu_prepare_user_range(uint64_t va, uint64_t pages);
+
 /* COW 支持 */
 void mmu_mark_cow(uint64_t *pte);
 bool mmu_is_cow(uint64_t pte);
