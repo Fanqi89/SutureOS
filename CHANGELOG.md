@@ -6,6 +6,37 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.11.2-alpha]
+
+补完 5 项未完成系统调用中的前 3 项（dup/*at/ioctl+tty）。**启动呈现与 GUI 外观零变化。**
+
+### Added
+- **`dup`/`dup2`/`dup3`（32/33/292）**：fd 表新增"复制条目"能力；`dup` 取最小空闲 fd，
+  `dup2` 指定目标 fd（已打开先关闭），管道端点复制会正确增加读写引用计数以保持
+  EOF 语义；不再返回 `-ENOSYS`。
+- **`creat`（85）**：等价 `open(path, O_CREAT|O_WRONLY|O_TRUNC)`。
+- **`openat`/`mkdirat`/`unlinkat`/`renameat`/`fstatat`（257/258/263/264/262）**：
+  `AT_FDCWD` 走当前 cwd，真实 dirfd 经 fd 表解析后拼接相对路径，再复用非 `*at` 版本
+  的 VFS 实现。
+- **`statx`（332）**：填充 `struct statx` 基础统计（mask=STATX_BASIC_STATS），
+  时间戳按秒/纳秒给出。
+- **最小 tty 层（`kernel/vfs/tty.c`/`.h`）**：fd 0/1/2 视为控制台 tty，
+  `ioctl` 支持 `TCGETS/TCSETS/TCSETSW/TCSETSF`（termios 存取）、`TIOCGWINSZ`
+  （返回控制台行列数）、`TCFLSH`；其它请求仍返回 `-ENOTTY`。原来所有 `ioctl`
+  都是 `-ENOTTY`。
+
+### Verification
+- 启动日志：`syscalls: 62 registered`（v0.11.1 为 56，新增 6 个）。
+- 回归不变：自检 13/14（`moos_intr` 既有判定）、`ring3 selftest 9/9`、
+  `userspace selftest 9/9`、无 PANIC。
+- 新增自检（**成功不打印**，失败才打印）：dup 双写同一文件、dup2 到固定 fd、
+  `openat(AT_FDCWD,..)` 与非 at 版本一致、`statx` 返回 size>0、`ioctl(TCGETS)`/`TIOCGWINSZ` 成功。
+
+### Not in this release
+- **socket 家族（41-50）与 DHCP/DNS**：未做（下一批）
+- **signal 真语义（sigframe + `rt_sigreturn`）**：未做（下一批）；当前 `SIG_DFL` 只杀进程、
+  handler 仍只改 rip
+
 ## [v0.11.1-alpha]
 
 补完三项"未完成/坏了"的部分，**启动呈现与 GUI 外观零变化**（见验证）。

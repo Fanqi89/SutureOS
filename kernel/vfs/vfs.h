@@ -88,6 +88,7 @@ typedef struct vfs_file {
     char path[VFS_MAX_PATH];
     uint32_t offset;
     int flags;
+    uint32_t refs;      /* dup()/dup2() references; the last close frees the slot */
     bool in_use;
 } vfs_file_t;
 
@@ -139,6 +140,15 @@ int vfs_close(int fd);
 int vfs_read(int fd, void *buf, uint32_t size);
 int vfs_write(int fd, const void *buf, uint32_t size);
 int vfs_seek(int fd, uint32_t offset, int whence);
+
+/* dup()/dup2() make several file descriptors name one open file, including its
+ * offset, so this layer reference-counts it: vfs_close() only reaches the driver
+ * (and frees the slot) when the last reference goes away. */
+int vfs_ref(int fd);
+
+/* Path an open file descriptor refers to. Used by openat()/fstatat()/... to
+ * resolve a real dirfd into the directory path the VFS understands. */
+int vfs_get_path(int fd, char *out, uint32_t outlen);
 
 /* Directory operations */
 int vfs_opendir(const char *path);

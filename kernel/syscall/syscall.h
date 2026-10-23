@@ -13,6 +13,16 @@ uint64_t syscall_invoke(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3,
                         uint64_t a4, uint64_t a5, uint64_t a6);
 int syscall_is_registered(uint64_t nr);
 
+/* ==================== per-task fd table primitives ====================
+ * The table itself lives in syscalls.c next to read/write/open/close. dup(),
+ * dup2() and dup3() operate on it, and the *at family needs to tell a VFS fd
+ * from a pipe end and to learn which VFS fd a duck-typed fd stands for. */
+int fd_dup_lowest(int oldfd);          /* new lowest free fd, or -errno */
+int fd_dup_to(int oldfd, int newfd);   /* install the duplicate at newfd, or -errno */
+int fd_pipe_end(int fd);               /* pipe end behind fd, or -1 */
+int fd_is_open(int fd);                /* 1 when fd names a file or a pipe end */
+int fd_vfs_fd(int fd);                 /* VFS fd behind fd, or -1 */
+
 /* syscall numbers - Linux/x86_64 兼容 */
 #define SYS_READ            0
 #define SYS_WRITE           1
@@ -248,7 +258,14 @@ int syscall_is_registered(uint64_t nr);
 #define SYS_EXIT_GROUP     231
 #define SYS_EPOLL_PWAIT    232
 #define SYS_EPOLL_CREATE1  233
-#define SYS_DUP3           243
+/* *at family (Linux x86-64): 234..256 are unused numbers there, the directory
+ * variants start at 257. SYS_FSTATAT is Linux' newfstatat. */
+#define SYS_OPENAT         257
+#define SYS_MKDIRAT        258
+#define SYS_FSTATAT        262
+#define SYS_UNLINKAT       263
+#define SYS_RENAMEAT       264
+#define SYS_DUP3           292     /* was 243, which is not dup3 on Linux x86-64 */
 #define SYS_PIPE2          293
 #define SYS_INOTIFY_INIT1  294
 #define SYS_PREADV         295

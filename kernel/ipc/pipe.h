@@ -34,6 +34,11 @@ int pipe_read_fd(int fd, void *buf, uint32_t len);
 int pipe_write_fd(int fd, const void *buf, uint32_t len);
 int pipe_close_fd(int fd);
 
+/* Take one more reference on an existing pipe end. dup()/dup2() call this so the
+ * reader/writer counts stay right: with a duplicated write end the read side
+ * must not see EOF just because the original descriptor was closed. */
+int pipe_ref_fd(int fd);
+
 /* Number of live pipes (diagnostics / self test). */
 uint32_t pipe_count(void);
 

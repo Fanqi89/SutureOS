@@ -120,6 +120,22 @@ int pipe_write_fd(int fd, const void *buf, uint32_t len)
     return (int)put;                            /* short write when full */
 }
 
+int pipe_ref_fd(int fd)
+{
+    int slot, end;
+    pipe_t *p;
+
+    if (!pipe_is_fd(fd)) return -EINVAL_;
+    PIPE_DECODE(fd, slot, end);
+    p = &g_pipes[slot];
+    if (end == 0) {
+        p->readers++;
+    } else {
+        p->writers++;
+    }
+    return 0;
+}
+
 int pipe_close_fd(int fd)
 {
     int slot, end;

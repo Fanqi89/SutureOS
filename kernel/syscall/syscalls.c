@@ -10,10 +10,16 @@
 #include "mmu.h"
 #include "heap.h"
 
-/* 文件描述符表 (每任务静态) - 存储 VFS fd */
+/* 文件描述符表 (每任务静态) - 存储 VFS fd
+ *
+ * A slot names either a VFS open file (vfs_fd) or a pipe end (pipe_fd). Pipes
+ * normally live in their own encoded number space (kernel/ipc/pipe.c, fds >=
+ * PIPE_FD_BASE), but dup()/dup2() have to hand out ordinary low descriptor
+ * numbers, so a slot can also hold one of those encoded pipe fds. */
 #define MAX_FDS 32
 struct fd_entry {
-    int vfs_fd;  /* VFS layer file descriptor */
+    int vfs_fd;   /* VFS layer file descriptor, -1 when unused */
+    int pipe_fd;  /* pipe end behind this slot (dup of a pipe), -1 otherwise */
     uint32_t flags;  /* O_RDONLY=0, O_WRONLY=1, O_RDWR=2 */
 };
 
@@ -24,6 +30,7 @@ void fd_tables_init(void) {
     for (int i = 0; i < SCHED_MAX_TASKS; i++) {
         for (int j = 0; j < MAX_FDS; j++) {
             fd_tables[i][j].vfs_fd = -1;
+            fd_tables[i][j].pipe_fd = -1;
             fd_tables[i][j].flags = 0;
         }
     }
@@ -31,10 +38,122 @@ void fd_tables_init(void) {
 
 /* 分配空闲 fd */
 static int fd_alloc(int tid) {
+    if (tid < 0 || tid >= SCHED_MAX_TASKS) return -1;
     for (int i = 0; i < MAX_FDS; i++) {
-        if (fd_tables[tid][i].vfs_fd < 0) return i;
+        if (fd_tables[tid][i].vfs_fd < 0 && fd_tables[tid][i].pipe_fd < 0) return i;
     }
     return -1;
+}
+
+/* ---------------- fd table primitives shared with syscalls2.c ---------------- */
+
+/* Pipe end behind `fd`: an encoded pipe fd (>= PIPE_FD_BASE) is returned as it
+ * is, an ordinary slot holding a duplicated pipe end resolves through the
+ * table. -1 when `fd` is neither. */
+int fd_pipe_end(int fd)
+{
+    extern sched_cpu_t sched_cpu;
+    const int tid = sched_cpu.current;
+
+    if (pipe_is_fd(fd)) return fd;
+    if (fd < 0 || fd >= MAX_FDS) return -1;
+    if (tid < 0 || tid >= SCHED_MAX_TASKS) return -1;
+    if (fd_tables[tid][fd].pipe_fd < 0) return -1;
+    return fd_tables[tid][fd].pipe_fd;
+}
+
+/* VFS fd behind a descriptor slot, or -1 (pipe ends have none). */
+int fd_vfs_fd(int fd)
+{
+    extern sched_cpu_t sched_cpu;
+    const int tid = sched_cpu.current;
+
+    if (fd < 0 || fd >= MAX_FDS) return -1;
+    if (tid < 0 || tid >= SCHED_MAX_TASKS) return -1;
+    return fd_tables[tid][fd].vfs_fd;
+}
+
+int fd_is_open(int fd)
+{
+    if (fd_pipe_end(fd) >= 0) return 1;
+    return fd_vfs_fd(fd) >= 0;
+}
+
+/* Drop whatever a slot holds (used by dup2() before it overwrites it). */
+static void fd_close_slot(int tid, int fd)
+{
+    if (tid < 0 || tid >= SCHED_MAX_TASKS) return;
+    if (fd < 0 || fd >= MAX_FDS) return;
+    if (fd_tables[tid][fd].pipe_fd >= 0) {
+        (void)pipe_close_fd(fd_tables[tid][fd].pipe_fd);
+    } else if (fd_tables[tid][fd].vfs_fd >= 0) {
+        (void)vfs_close(fd_tables[tid][fd].vfs_fd);
+    }
+    fd_tables[tid][fd].vfs_fd = -1;
+    fd_tables[tid][fd].pipe_fd = -1;
+    fd_tables[tid][fd].flags = 0;
+}
+
+/* dup(): the lowest free descriptor naming the same open file (same offset) or
+ * the same pipe end. Returns the new fd or -errno. */
+int fd_dup_lowest(int oldfd)
+{
+    extern sched_cpu_t sched_cpu;
+    const int tid = sched_cpu.current;
+    int pfd, newfd;
+
+    if (tid < 0 || tid >= SCHED_MAX_TASKS) return -9;       /* -EBADF */
+    pfd = fd_pipe_end(oldfd);
+    if (pfd >= 0) {
+        newfd = fd_alloc(tid);
+        if (newfd < 0) return -24;                          /* -EMFILE */
+        if (pipe_ref_fd(pfd) != 0) return -9;
+        fd_tables[tid][newfd].vfs_fd = -1;
+        fd_tables[tid][newfd].pipe_fd = pfd;
+        fd_tables[tid][newfd].flags = 0;
+        return newfd;
+    }
+    if (oldfd < 0 || oldfd >= MAX_FDS) return -9;
+    if (fd_tables[tid][oldfd].vfs_fd < 0) return -9;
+    newfd = fd_alloc(tid);
+    if (newfd < 0) return -24;
+    if (vfs_ref(fd_tables[tid][oldfd].vfs_fd) != VFS_OK) return -5;  /* -EIO */
+    fd_tables[tid][newfd].vfs_fd = fd_tables[tid][oldfd].vfs_fd;
+    fd_tables[tid][newfd].pipe_fd = -1;
+    fd_tables[tid][newfd].flags = fd_tables[tid][oldfd].flags;
+    return newfd;
+}
+
+/* dup2()/dup3(): close newfd when open, then make it a duplicate of oldfd.
+ * newfd must be an ordinary descriptor slot: the encoded pipe numbers are a
+ * fixed function of (pipe slot, end), so they cannot be remapped to a requested
+ * number. Returns newfd or -errno. */
+int fd_dup_to(int oldfd, int newfd)
+{
+    extern sched_cpu_t sched_cpu;
+    const int tid = sched_cpu.current;
+    int pfd;
+
+    if (tid < 0 || tid >= SCHED_MAX_TASKS) return -9;       /* -EBADF */
+    if (newfd < 0 || newfd >= MAX_FDS) return -9;
+    if (oldfd == newfd) return fd_is_open(oldfd) ? newfd : -9;
+    pfd = fd_pipe_end(oldfd);
+    if (pfd >= 0) {
+        fd_close_slot(tid, newfd);
+        if (pipe_ref_fd(pfd) != 0) return -9;
+        fd_tables[tid][newfd].vfs_fd = -1;
+        fd_tables[tid][newfd].pipe_fd = pfd;
+        fd_tables[tid][newfd].flags = 0;
+        return newfd;
+    }
+    if (oldfd < 0 || oldfd >= MAX_FDS) return -9;
+    if (fd_tables[tid][oldfd].vfs_fd < 0) return -9;
+    fd_close_slot(tid, newfd);
+    if (vfs_ref(fd_tables[tid][oldfd].vfs_fd) != VFS_OK) return -5;
+    fd_tables[tid][newfd].vfs_fd = fd_tables[tid][oldfd].vfs_fd;
+    fd_tables[tid][newfd].pipe_fd = -1;
+    fd_tables[tid][newfd].flags = fd_tables[tid][oldfd].flags;
+    return newfd;
 }
 
 uint64_t sys_read(uint64_t fd, uint64_t buf, uint64_t len,
@@ -43,11 +162,15 @@ uint64_t sys_read(uint64_t fd, uint64_t buf, uint64_t len,
     (void)a4; (void)a5; (void)a6;
     extern sched_cpu_t sched_cpu;
     int tid = sched_cpu.current;
-    /* pipes live in their own fd space (kernel/ipc/pipe.c) */
-    if (pipe_is_fd((int)fd)) {
-        EL0_CHECK(buf, len);
-        return (uint64_t)(int64_t)pipe_read_fd((int)fd, (void *)(uintptr_t)buf,
-                                              (uint32_t)len);
+    /* pipes live in their own fd space (kernel/ipc/pipe.c), and dup()/dup2() can
+     * also park a pipe end in an ordinary descriptor slot */
+    {
+        const int pfd = fd_pipe_end((int)fd);
+        if (pfd >= 0) {
+            EL0_CHECK(buf, len);
+            return (uint64_t)(int64_t)pipe_read_fd(pfd, (void *)(uintptr_t)buf,
+                                                  (uint32_t)len);
+        }
     }
     if (fd >= MAX_FDS) return (uint64_t)-1;
     if (tid < 0 || tid >= SCHED_MAX_TASKS) return (uint64_t)(int64_t)(-9);
@@ -64,20 +187,26 @@ uint64_t sys_write(uint64_t fd, uint64_t buf, uint64_t len,
     (void)a4; (void)a5; (void)a6;
     extern sched_cpu_t sched_cpu;
     int tid = sched_cpu.current;
-    if (pipe_is_fd((int)fd)) {
-        EL0_CHECK(buf, len);
-        return (uint64_t)(int64_t)pipe_write_fd((int)fd, (const void *)(uintptr_t)buf,
-                                               (uint32_t)len);
+    {
+        const int pfd = fd_pipe_end((int)fd);
+        if (pfd >= 0) {
+            EL0_CHECK(buf, len);
+            return (uint64_t)(int64_t)pipe_write_fd(pfd, (const void *)(uintptr_t)buf,
+                                                   (uint32_t)len);
+        }
     }
     if (fd >= MAX_FDS) return (uint64_t)-1;
-    /* fd 1/2 are the console whenever they are not a real opened file. This has
-     * to be decided before indexing the per-task table: the kernel itself makes
-     * syscalls with sched_cpu.current == -1 (e.g. the boot-time ring-3 run), and
-     * fd_tables[-1] used to read out of bounds and swallow the output. */
+    /* fd 1/2 are the console whenever they are not a real opened file (or a
+     * dup'ed pipe end, which has to win: `dup2(pipe_write, 1)` is redirection).
+     * This has to be decided before indexing the per-task table: the kernel
+     * itself makes syscalls with sched_cpu.current == -1 (e.g. the boot-time
+     * ring-3 run), and fd_tables[-1] used to read out of bounds and swallow the
+     * output. */
     {
         const int valid_tid = (tid >= 0 && tid < SCHED_MAX_TASKS);
         if ((fd == 1 || fd == 2) &&
-            (!valid_tid || fd_tables[tid][fd].vfs_fd < 0)) {
+            (!valid_tid ||
+             (fd_tables[tid][fd].vfs_fd < 0 && fd_tables[tid][fd].pipe_fd < 0))) {
             EL0_CHECK(buf, len);
             const char *s = (const char *)(uintptr_t)buf;
             for (uint64_t i = 0; i < len; i++) {
@@ -119,6 +248,7 @@ uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode,
         return (uint64_t)-1;  /* EMFILE */
     }
     fd_tables[tid][fd].vfs_fd = vfs_fd;
+    fd_tables[tid][fd].pipe_fd = -1;
     fd_tables[tid][fd].flags = flags & 3;
     return fd;
 }
@@ -129,12 +259,26 @@ uint64_t sys_close(uint64_t fd, uint64_t a2, uint64_t a3,
     (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
     extern sched_cpu_t sched_cpu;
     int tid = sched_cpu.current;
-    if (pipe_is_fd((int)fd)) return (uint64_t)(int64_t)pipe_close_fd((int)fd);
+    {
+        const int pfd = fd_pipe_end((int)fd);
+        if (pfd >= 0) {
+            const int r = pipe_close_fd(pfd);
+            /* a slot-held pipe end (dup of a pipe) also frees its descriptor */
+            if (fd < MAX_FDS && !pipe_is_fd((int)fd) &&
+                tid >= 0 && tid < SCHED_MAX_TASKS) {
+                fd_tables[tid][fd].vfs_fd = -1;
+                fd_tables[tid][fd].pipe_fd = -1;
+                fd_tables[tid][fd].flags = 0;
+            }
+            return (uint64_t)(int64_t)r;
+        }
+    }
     if (fd >= MAX_FDS) return (uint64_t)-1;
     if (tid < 0 || tid >= SCHED_MAX_TASKS) return (uint64_t)(int64_t)(-9);
     if (fd_tables[tid][fd].vfs_fd < 0) return (uint64_t)-1;
     int ret = vfs_close(fd_tables[tid][fd].vfs_fd);
     fd_tables[tid][fd].vfs_fd = -1;
+    fd_tables[tid][fd].pipe_fd = -1;
     fd_tables[tid][fd].flags = 0;
     return ret;
 }

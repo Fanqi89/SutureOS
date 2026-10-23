@@ -197,6 +197,7 @@ int vfs_open(const char *path, int flags) {
     strncpy(file->path, path, VFS_MAX_PATH - 1);
     file->offset = 0;
     file->flags = flags;
+    file->refs = 1;
     file->in_use = true;
     
     return fd;
@@ -208,9 +209,32 @@ int vfs_close(int fd) {
     vfs_file_t *file = &g_open_files[fd];
     if (!file->in_use) return VFS_EINVAL;
     
+    /* dup()/dup2() can point several descriptors at this one open file; only the
+     * final close may reach the driver and recycle the slot. */
+    if (file->refs > 1) {
+        file->refs--;
+        return VFS_OK;
+    }
+    
     int ret = file->driver->close(file->file_handle);
     memset(file, 0, sizeof(vfs_file_t));
     return ret;
+}
+
+int vfs_ref(int fd) {
+    if (fd < 0 || fd >= VFS_MAX_OPEN_FILES) return VFS_EINVAL;
+    if (!g_open_files[fd].in_use) return VFS_EINVAL;
+    g_open_files[fd].refs++;
+    return VFS_OK;
+}
+
+int vfs_get_path(int fd, char *out, uint32_t outlen) {
+    if (fd < 0 || fd >= VFS_MAX_OPEN_FILES) return VFS_EINVAL;
+    if (out == NULL || outlen == 0) return VFS_EINVAL;
+    if (!g_open_files[fd].in_use) return VFS_EINVAL;
+    strncpy(out, g_open_files[fd].path, outlen - 1);
+    out[outlen - 1] = '\0';
+    return VFS_OK;
 }
 
 int vfs_read(int fd, void *buf, uint32_t size) {

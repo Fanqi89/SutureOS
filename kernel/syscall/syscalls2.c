@@ -12,8 +12,15 @@
 #include "signal.h"
 #include "syscall.h"
 #include "task.h"
+#include "tty.h"
 #include "userdb.h"
 #include "vfs.h"
+
+/* These layouts are ABI, not style: a libc indexes statx/termios/winsize by byte
+ * offset, so a silent padding change would be a real bug. */
+_Static_assert(sizeof(struct linux_statx) == 256, "statx must keep its Linux x86-64 size");
+_Static_assert(sizeof(struct termios) == 60, "termios must keep its Linux x86-64 size");
+_Static_assert(sizeof(struct winsize) == 8, "winsize must keep its Linux x86-64 size");
 
 /* errno values (Linux numbering, which the compat layer shares) */
 #define EPERM_   1
@@ -37,6 +44,11 @@
 
 #define AT_FDCWD_        (-100)
 #define O_ACCMODE_       3
+#define O_WRONLY_        1
+#define O_RDWR_          2
+#define O_CREAT_         0x40
+#define O_TRUNC_         0x200
+#define O_CLOEXEC_       0x80000
 #define SEEK_SET_ 0
 #define SEEK_CUR_ 1
 #define SEEK_END_ 2
@@ -89,6 +101,47 @@ static void resolve_path(const char *in, char *out, size_t outlen)
     }
 }
 
+/* Resolve the (dirfd, path) pair of the *at family. AT_FDCWD is the cwd the rest
+ * of this file already uses; a real dirfd is looked up in the task fd table and
+ * turned into its VFS path, then joined. Returns 0 or a negative errno.
+ *
+ * Honest limit: SutureOS' VFS has no way to open a directory as a file
+ * (vfs_open() answers VFS_EISDIR and there is no O_DIRECTORY), so a *directory*
+ * fd can never be obtained by a user program today. The dirfd branch therefore
+ * only ever sees a regular file fd and correctly answers ENOTDIR; AT_FDCWD (and
+ * absolute paths) is the path that is actually usable. */
+static int resolve_path_at(int64_t dirfd, const char *in, char *out, size_t outlen)
+{
+    if (in == NULL) return -EFAULT_;
+    if (in[0] == '/') {
+        snprintf(out, outlen, "%s", in);
+        return 0;
+    }
+    if (dirfd == AT_FDCWD_) {
+        resolve_path(in, out, outlen);
+        return 0;
+    }
+    {
+        char base[VFS_MAX_PATH];
+        vfs_stat_t st;
+        int vfd;
+
+        if (dirfd < 0 || dirfd > 0x7fffffff) return -EBADF_;
+        if (fd_pipe_end((int)dirfd) >= 0) return -ENOTDIR_;
+        vfd = fd_vfs_fd((int)dirfd);
+        if (vfd < 0) return -EBADF_;
+        if (vfs_get_path(vfd, base, sizeof(base)) != VFS_OK) return -EBADF_;
+        if (vfs_stat(base, &st) != VFS_OK) return -EBADF_;
+        if (st.type != VFS_NODE_DIR) return -ENOTDIR_;
+        if (strcmp(base, "/") == 0) {
+            snprintf(out, outlen, "/%s", in);
+        } else {
+            snprintf(out, outlen, "%s/%s", base, in);
+        }
+        return 0;
+    }
+}
+
 static void fill_linux_stat(const vfs_stat_t *st, struct linux_stat *out)
 {
     memset(out, 0, sizeof(*out));
@@ -111,23 +164,56 @@ static void fill_linux_stat(const vfs_stat_t *st, struct linux_stat *out)
     out->st_ctime = (int64_t)st->ctime;
 }
 
+/* Linux x86-64 struct statx from the VFS stat. Only STATX_BASIC_STATS fields
+ * are filled; everything else (including the birth time, which no driver here
+ * records) stays zero. */
+static void fill_linux_statx(const vfs_stat_t *st, struct linux_statx *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->stx_mask = STATX_BASIC_STATS;
+    out->stx_blksize = 4096;
+    out->stx_nlink = (st->type == VFS_NODE_DIR) ? 2 : 1;
+    out->stx_uid = st->uid;
+    out->stx_gid = st->gid;
+    switch (st->type) {
+    case VFS_NODE_DIR:     out->stx_mode = S_IFDIR_ | 0755; break;
+    case VFS_NODE_SYMLINK: out->stx_mode = S_IFLNK_ | 0777; break;
+    default:               out->stx_mode = S_IFREG_ | (st->mode & 0777); break;
+    }
+    out->stx_ino = 1;
+    out->stx_size = st->size;
+    out->stx_blocks = (st->size + 511) / 512;
+    out->stx_atime.tv_sec = (int64_t)st->atime;
+    out->stx_ctime.tv_sec = (int64_t)st->ctime;
+    out->stx_mtime.tv_sec = (int64_t)st->mtime;
+    out->stx_dev_major = 0;
+    out->stx_dev_minor = 1;
+}
+
 /* ============================ file status ============================ */
+
+/* stat one already-resolved absolute path into a caller struct. */
+static uint64_t stat_path(const char *abs, uint64_t st_va)
+{
+    struct linux_stat *out = (struct linux_stat *)(uintptr_t)st_va;
+    vfs_stat_t st;
+
+    if (out == NULL) return err(EFAULT_);
+    if (!ptr_ok(st_va, sizeof(*out))) return err(EFAULT_);
+    if (vfs_stat(abs, &st) != VFS_OK) return err(ENOENT_);
+    fill_linux_stat(&st, out);
+    return 0;
+}
 
 static uint64_t do_stat(uint64_t path_va, uint64_t st_va, int follow_links)
 {
     const char *path = str_arg(path_va);
-    struct linux_stat *out = (struct linux_stat *)(uintptr_t)st_va;
-    vfs_stat_t st;
     char abs[VFS_MAX_PATH];
 
     (void)follow_links;                 /* the VFS has no symlink resolution yet */
-    if (path == NULL || out == NULL) return err(EFAULT_);
-    if (!ptr_ok(st_va, sizeof(*out))) return err(EFAULT_);
-
+    if (path == NULL) return err(EFAULT_);
     resolve_path(path, abs, sizeof(abs));
-    if (vfs_stat(abs, &st) != VFS_OK) return err(ENOENT_);
-    fill_linux_stat(&st, out);
-    return 0;
+    return stat_path(abs, st_va);
 }
 
 static uint64_t sys2_stat(uint64_t path, uint64_t st, uint64_t a3, uint64_t a4,
@@ -144,6 +230,18 @@ static uint64_t sys2_lstat(uint64_t path, uint64_t st, uint64_t a3, uint64_t a4,
     return do_stat(path, st, 0);
 }
 
+/* The descriptor a syscall receives is a *task-table* fd (sys_open() allocated
+ * it), while the VFS speaks its own numbers. lseek/fstat below used to pass the
+ * syscall fd straight to the VFS, which only worked while the two tables lined
+ * up - and after dup() they no longer do (two task fds share one VFS fd). Resolve
+ * through the table first and fall back to the raw value so kernel-internal
+ * callers that really do pass a VFS fd (the `systest` harness) keep working. */
+static int vfs_fd_of(uint64_t fd)
+{
+    const int v = fd_vfs_fd((int)fd);
+    return (v >= 0) ? v : (int)fd;
+}
+
 static uint64_t sys2_fstat(uint64_t fd, uint64_t st_va, uint64_t a3, uint64_t a4,
                            uint64_t a5, uint64_t a6)
 {
@@ -151,7 +249,7 @@ static uint64_t sys2_fstat(uint64_t fd, uint64_t st_va, uint64_t a3, uint64_t a4
     (void)a3; (void)a4; (void)a5; (void)a6;
 
     if (out == NULL || !ptr_ok(st_va, sizeof(*out))) return err(EFAULT_);
-    if (pipe_is_fd((int)fd)) {
+    if (fd_pipe_end((int)fd) >= 0) {
         /* a pipe has no on-disk identity: report a FIFO, size 0 */
         memset(out, 0, sizeof(*out));
         out->st_mode = 0010000 | 0600;      /* S_IFIFO */
@@ -163,13 +261,14 @@ static uint64_t sys2_fstat(uint64_t fd, uint64_t st_va, uint64_t a3, uint64_t a4
      * not possible either, so report the fd as a character-ish object with the
      * size the fd reports via seek(END). */
     {
-        const int end = vfs_seek((int)fd, 0, SEEK_END_);
+        const int vfd = vfs_fd_of(fd);
+        const int end = vfs_seek(vfd, 0, SEEK_END_);
         memset(out, 0, sizeof(*out));
         out->st_mode = S_IFREG_ | 0644;
         out->st_nlink = 1;
         out->st_size = (end > 0) ? end : 0;
         out->st_blksize = 4096;
-        (void)vfs_seek((int)fd, 0, SEEK_SET_);
+        (void)vfs_seek(vfd, 0, SEEK_SET_);
         return 0;
     }
 }
@@ -192,37 +291,76 @@ static uint64_t sys2_access(uint64_t path_va, uint64_t mode, uint64_t a3,
 static uint64_t sys2_lseek(uint64_t fd, uint64_t offset, uint64_t whence,
                            uint64_t a4, uint64_t a5, uint64_t a6)
 {
+    const int vfd = vfs_fd_of(fd);
     (void)a4; (void)a5; (void)a6;
-    if (pipe_is_fd((int)fd)) return err(ESPIPE_);
-    if (vfs_seek((int)fd, (uint32_t)offset, (int)whence) < 0) return err(EINVAL_);
-    return vfs_seek((int)fd, 0, SEEK_CUR_);
+    if (fd_pipe_end((int)fd) >= 0) return err(ESPIPE_);
+    if (vfs_seek(vfd, (uint32_t)offset, (int)whence) < 0) return err(EINVAL_);
+    return vfs_seek(vfd, 0, SEEK_CUR_);
 }
 
+/* dup(): lowest free descriptor naming the same open file (so both share the
+ * file offset, exactly like Linux) or the same pipe end. The fd table and the
+ * VFS reference count live in syscalls.c / vfs.c, next to the objects they
+ * protect; this is only the syscall-shaped wrapper. */
 static uint64_t sys2_dup(uint64_t fd, uint64_t a2, uint64_t a3, uint64_t a4,
                          uint64_t a5, uint64_t a6)
 {
     (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
-    if (pipe_is_fd((int)fd)) {
-        /* duplicate a pipe end: bump the reader/writer count */
-        int fds[2];
-        (void)fds;
-        return err(ENOSYS_);            /* pipe duplication needs both ends */
-    }
-    return err(ENOSYS_);                /* see note in the release notes */
+    return ok(fd_dup_lowest((int)fd));
 }
 
+/* dup2(oldfd, newfd): close newfd when it is open, then make it a duplicate.
+ * Works for files and for pipes (a pipe end parked in a low descriptor is what
+ * makes `dup2(pipe_write, 1)` real stdout redirection in this kernel). */
 static uint64_t sys2_dup2(uint64_t oldfd, uint64_t newfd, uint64_t a3,
                           uint64_t a4, uint64_t a5, uint64_t a6)
 {
-    (void)oldfd; (void)newfd; (void)a3; (void)a4; (void)a5; (void)a6;
-    return err(ENOSYS_);                /* fd table has no free-list API yet */
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    if (oldfd == newfd) {
+        return fd_is_open((int)oldfd) ? ok((int)newfd) : err(EBADF_);
+    }
+    return ok(fd_dup_to((int)oldfd, (int)newfd));
 }
 
+/* dup3(oldfd, newfd, flags): dup2 with the extra rule that oldfd == newfd is
+ * EINVAL and that only O_CLOEXEC may be passed. */
+static uint64_t sys2_dup3(uint64_t oldfd, uint64_t newfd, uint64_t flags,
+                          uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a4; (void)a5; (void)a6;
+    if ((flags & ~(uint64_t)O_CLOEXEC_) != 0) return err(EINVAL_);
+    if (oldfd == newfd) return err(EINVAL_);
+    if (flags & O_CLOEXEC_) {
+        /* Accepted and deliberately not recorded: SutureOS keeps no per-fd
+         * descriptor flags and its execve() path (kernel/syscall/ring3.c) does
+         * not close descriptors, so pretending to store FD_CLOEXEC here would be
+         * a lie. Fixing that needs a flags field in the fd table plus an execve
+         * close-on-exec pass; until then the call itself behaves like dup2. */
+    }
+    return ok(fd_dup_to((int)oldfd, (int)newfd));
+}
+
+/* ioctl(): fds 0/1/2 are the console and get the minimal tty surface in
+ * kernel/vfs/tty.c (TCGETS/TCSETS/TCSETSW/TCSETSF, TIOCGWINSZ, TCFLSH). Pipes,
+ * regular files and directories have no tty to configure and keep answering
+ * -ENOTTY. */
 static uint64_t sys2_ioctl(uint64_t fd, uint64_t request, uint64_t arg,
                            uint64_t a4, uint64_t a5, uint64_t a6)
 {
-    (void)fd; (void)request; (void)arg; (void)a4; (void)a5; (void)a6;
-    return err(ENOTTY_);                /* no tty driver: nothing to configure */
+    (void)a4; (void)a5; (void)a6;
+    if ((int64_t)fd < 0) return err(EBADF_);
+    if (fd < 3) {
+        size_t need = 0;
+        if (request == TCGETS || request == TCSETS ||
+            request == TCSETSW || request == TCSETSF) {
+            need = sizeof(struct termios);
+        } else if (request == TIOCGWINSZ) {
+            need = sizeof(struct winsize);
+        }
+        if (need != 0 && (arg == 0 || !ptr_ok(arg, need))) return err(EFAULT_);
+        return ok(tty_ioctl((int)fd, request, (void *)(uintptr_t)arg));
+    }
+    return err(ENOTTY_);
 }
 
 /* ============================ identity ============================ */
@@ -394,6 +532,152 @@ static uint64_t sys2_rename(uint64_t old_va, uint64_t new_va, uint64_t a3,
     resolve_path(oldp, a, sizeof(a));
     resolve_path(newp, b, sizeof(b));
     return (vfs_rename(a, b) == VFS_OK) ? 0 : err(EPERM_);
+}
+
+/* ---- creat / the *at family / statx ---------------------------------------- */
+
+/* creat(path, mode) is exactly open(path, O_CREAT|O_WRONLY|O_TRUNC, mode): this
+ * reuses the existing open path (fd table + VFS), and the mode is still not
+ * enforced by the ramfs (files report 0644), same as open(). */
+static uint64_t sys2_creat(uint64_t path_va, uint64_t mode, uint64_t a3,
+                           uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    const char *path = str_arg(path_va);
+    char abs[VFS_MAX_PATH];
+    (void)a3; (void)a4; (void)a5; (void)a6;
+
+    if (path == NULL) return err(EFAULT_);
+    resolve_path(path, abs, sizeof(abs));
+    return syscall_invoke(SYS_OPEN, (uint64_t)(uintptr_t)abs,
+                          (uint64_t)(O_CREAT_ | O_WRONLY_ | O_TRUNC_), mode, 0, 0, 0);
+}
+
+static uint64_t sys2_openat(uint64_t dirfd, uint64_t path_va, uint64_t flags,
+                            uint64_t mode, uint64_t a5, uint64_t a6)
+{
+    const char *path = str_arg(path_va);
+    char abs[VFS_MAX_PATH];
+    int r;
+    (void)a5; (void)a6;
+
+    if (path == NULL) return err(EFAULT_);
+    r = resolve_path_at((int64_t)dirfd, path, abs, sizeof(abs));
+    if (r < 0) return ok(r);
+    return syscall_invoke(SYS_OPEN, (uint64_t)(uintptr_t)abs, flags, mode, 0, 0, 0);
+}
+
+static uint64_t sys2_mkdirat(uint64_t dirfd, uint64_t path_va, uint64_t mode,
+                             uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    const char *path = str_arg(path_va);
+    char abs[VFS_MAX_PATH];
+    int r;
+    (void)mode; (void)a4; (void)a5; (void)a6;   /* ramfs directories are 0755 */
+
+    if (path == NULL) return err(EFAULT_);
+    r = resolve_path_at((int64_t)dirfd, path, abs, sizeof(abs));
+    if (r < 0) return ok(r);
+    {
+        vfs_stat_t st;
+        if (vfs_stat(abs, &st) == VFS_OK) return err(EEXIST_);
+    }
+    return (vfs_mkdir(abs, 0755) == VFS_OK) ? 0 : err(EIO_);
+}
+
+static uint64_t sys2_unlinkat(uint64_t dirfd, uint64_t path_va, uint64_t flags,
+                              uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    const char *path = str_arg(path_va);
+    char abs[VFS_MAX_PATH];
+    int r;
+    (void)a4; (void)a5; (void)a6;
+
+    if (path == NULL) return err(EFAULT_);
+    if (flags & ~(uint64_t)AT_REMOVEDIR) return err(EINVAL_);
+    r = resolve_path_at((int64_t)dirfd, path, abs, sizeof(abs));
+    if (r < 0) return ok(r);
+    if (flags & AT_REMOVEDIR) {
+        return (vfs_rmdir(abs) == VFS_OK) ? 0 : err(ENOENT_);
+    }
+    return (vfs_unlink(abs) == VFS_OK) ? 0 : err(ENOENT_);
+}
+
+static uint64_t sys2_renameat(uint64_t olddirfd, uint64_t old_va, uint64_t newdirfd,
+                              uint64_t new_va, uint64_t a5, uint64_t a6)
+{
+    const char *oldp = str_arg(old_va);
+    const char *newp = str_arg(new_va);
+    char a[VFS_MAX_PATH], b[VFS_MAX_PATH];
+    int r;
+    (void)a5; (void)a6;
+
+    if (oldp == NULL || newp == NULL) return err(EFAULT_);
+    r = resolve_path_at((int64_t)olddirfd, oldp, a, sizeof(a));
+    if (r < 0) return ok(r);
+    r = resolve_path_at((int64_t)newdirfd, newp, b, sizeof(b));
+    if (r < 0) return ok(r);
+    return (vfs_rename(a, b) == VFS_OK) ? 0 : err(EPERM_);
+}
+
+static uint64_t sys2_fstatat(uint64_t dirfd, uint64_t path_va, uint64_t st_va,
+                             uint64_t flags, uint64_t a5, uint64_t a6)
+{
+    const char *path = str_arg(path_va);
+    char abs[VFS_MAX_PATH];
+    int r;
+    (void)a5; (void)a6;
+
+    if (path == NULL) return err(EFAULT_);
+    if (flags & AT_EMPTY_PATH) return err(EINVAL_);   /* no fd-only stat variant */
+    /* AT_SYMLINK_NOFOLLOW is accepted and has no effect: no VFS driver resolves
+     * symlinks, so lstat and stat are the same operation here (as in do_stat). */
+    r = resolve_path_at((int64_t)dirfd, path, abs, sizeof(abs));
+    if (r < 0) return ok(r);
+    return stat_path(abs, st_va);
+}
+
+/* statx(dirfd, path, flags, mask, buf): the BASIC_STATS subset of the Linux
+ * structure. The `mask` argument is advisory (Linux may return more than was
+ * asked for and always sets stx_mask to what it filled); this kernel always
+ * fills exactly STATX_BASIC_STATS. */
+static uint64_t sys2_statx(uint64_t dirfd, uint64_t path_va, uint64_t flags,
+                           uint64_t mask, uint64_t buf_va, uint64_t a6)
+{
+    const char *path = str_arg(path_va);
+    struct linux_statx *out = (struct linux_statx *)(uintptr_t)buf_va;
+    char abs[VFS_MAX_PATH];
+    vfs_stat_t st;
+    int r;
+    (void)mask; (void)a6;
+
+    if (path == NULL || out == NULL) return err(EFAULT_);
+    if (!ptr_ok(buf_va, sizeof(*out))) return err(EFAULT_);
+    if (flags & AT_EMPTY_PATH) return err(EINVAL_);
+    r = resolve_path_at((int64_t)dirfd, path, abs, sizeof(abs));
+    if (r < 0) return ok(r);
+    if (vfs_stat(abs, &st) != VFS_OK) return err(ENOENT_);
+    fill_linux_statx(&st, out);
+    return 0;
+}
+
+/* readlink(): POSIX says -EINVAL when the path is not a symlink, and no VFS
+ * driver here can create one (see the registration comments for link/symlink).
+ * The one case that cannot be served is a node a future driver *reports* as a
+ * symlink: no driver stores a link target, so that answers -ENOSYS instead of
+ * copying garbage. */
+static uint64_t sys2_readlink(uint64_t path_va, uint64_t buf_va, uint64_t bufsiz,
+                              uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    const char *path = str_arg(path_va);
+    char abs[VFS_MAX_PATH];
+    vfs_stat_t st;
+    (void)buf_va; (void)bufsiz; (void)a4; (void)a5; (void)a6;
+
+    if (path == NULL) return err(EFAULT_);
+    resolve_path(path, abs, sizeof(abs));
+    if (vfs_stat(abs, &st) != VFS_OK) return err(ENOENT_);
+    if (st.type != VFS_NODE_SYMLINK) return err(EINVAL_);
+    return err(ENOSYS_);
 }
 
 static uint64_t sys2_getdents64(uint64_t fd, uint64_t buf_va, uint64_t len,
@@ -763,7 +1047,7 @@ int syscalls2_register(void)
     reg(SYS_IOCTL, sys2_ioctl);
     reg(SYS_DUP, sys2_dup);
     reg(SYS_DUP2, sys2_dup2);
-    reg(SYS_DUP3, sys2_dup2);
+    reg(SYS_DUP3, sys2_dup3);           /* Linux number 292 (was registered as 243) */
     reg(SYS_FSYNC, sys2_fsync);
     reg(SYS_FDATASYNC, sys2_fsync);
     reg(SYS_SYNC, sys2_sync);
@@ -780,13 +1064,29 @@ int syscalls2_register(void)
     reg(SYS_UNLINK, sys2_unlink);
     reg(SYS_RENAME, sys2_rename);
     reg(SYS_GETDENTS64, sys2_getdents64);
-    reg(SYS_CREAT, sys2_enosys);        /* open(O_CREAT) is the supported path */
+    reg(SYS_CREAT, sys2_creat);         /* open(O_CREAT|O_WRONLY|O_TRUNC) */
     reg(SYS_CHMOD, sys2_chmod);
     reg(SYS_FCHMOD, sys2_chmod);
     reg(SYS_UMASK, sys2_umask);
+    /* Hard links and symlinks are NOT stubs by omission: the VFS driver
+     * interface (kernel/vfs/vfs.h) has no link()/symlink() hook, every node
+     * model is path-keyed with a single parent (ramfs: xj_vfs_node_t.children +
+     * parent; FAT32: one 8.3 directory entry per file; ext2/squashfs are
+     * read-only), and no node stores a link target. A hard link would need
+     * inode-style link counts shared by several names, a symlink needs a target
+     * string per node, and both would have to be implemented in each driver
+     * plus the VFS. Until that exists these two keep answering -ENOSYS. */
     reg(SYS_LINK, sys2_enosys);
     reg(SYS_SYMLINK, sys2_enosys);
-    reg(SYS_READLINK, sys2_enosys);
+    reg(SYS_READLINK, sys2_readlink);   /* real: -EINVAL for a non-symlink */
+
+    /* the *at family: same VFS operations as above, with dirfd resolution */
+    reg(SYS_OPENAT, sys2_openat);
+    reg(SYS_MKDIRAT, sys2_mkdirat);
+    reg(SYS_FSTATAT, sys2_fstatat);
+    reg(SYS_UNLINKAT, sys2_unlinkat);
+    reg(SYS_RENAMEAT, sys2_renameat);
+    reg(SYS_STATX, sys2_statx);
 
     /* identity */
     reg(SYS_GETPID, sys2_getpid);
@@ -838,6 +1138,327 @@ static void st_report(const char *what, int ok, const char *detail)
     if (!ok) g_failed++;
     console_printf("systest: %s ... %s%s%s\n", what, ok ? "PASS" : "FAIL",
                    (detail != NULL) ? "  " : "", (detail != NULL) ? detail : "");
+}
+
+/* ==================== acceptance: the new syscall surface ====================
+ * Exercises dup/dup2/dup3, creat, the *at family, statx and the tty ioctl
+ * surface through syscall_invoke() - the same dispatch path a ring-3 program
+ * takes. Silent on success by design: the boot log must stay identical, so
+ * failures are collected and printed (as `[sys2] new syscalls FAIL ...`) only
+ * after every descriptor the test touched has been closed. That ordering also
+ * means a half-finished test can never leave stdout redirected into a pipe. */
+
+#define NEW_FAIL_MAX 16
+
+static const char *g_new_fail[NEW_FAIL_MAX];
+static uint32_t g_new_fail_n;
+
+static void new_fail(const char *what)
+{
+    if (g_new_fail_n < NEW_FAIL_MAX) g_new_fail[g_new_fail_n] = what;
+    g_new_fail_n++;
+}
+
+static int new_close(int fd)
+{
+    if (fd >= 0) (void)syscall_invoke(SYS_CLOSE, (uint64_t)fd, 0, 0, 0, 0, 0);
+    return -1;
+}
+
+/* Drop a descriptor the test installed in a low slot, but only when it was free
+ * before the test ran (so a real caller's descriptor is never stolen). */
+static void new_restore_fd(int fd, int was_open)
+{
+    if (!was_open && fd_is_open(fd)) new_close(fd);
+}
+
+static int file_equals(const char *path, const char *want, size_t len)
+{
+    size_t got = 0;
+    void *p = vfs_read_file(path, &got);
+    const int same = (p != NULL && got == len && memcmp(p, want, len) == 0);
+    if (p != NULL) lemis_heap_free(p);
+    return same;
+}
+
+static int new_surface_selftest(void)
+{
+    char saved_cwd[VFS_MAX_PATH];
+    int fd = -1, dup_fd = -1, fd2 = -1;
+    int pipefd[2] = { -1, -1 };
+    int pipe_dup = -1;
+    int was_open[32];
+    uint32_t i;
+
+    g_new_fail_n = 0;
+    snprintf(saved_cwd, sizeof(saved_cwd), "%s", vfs_get_cwd());
+    vfs_set_cwd("/");
+    for (i = 0; i < 32; i++) was_open[i] = fd_is_open((int)i);
+
+    /* ---- dup(): a second descriptor on the same open file ---- */
+    (void)syscall_invoke(SYS_UNLINK, (uint64_t)(uintptr_t)"/sys2dup.txt", 0, 0, 0, 0, 0);
+    fd = (int)syscall_invoke(SYS_OPEN, (uint64_t)(uintptr_t)"/sys2dup.txt",
+                             (uint64_t)(O_RDWR_ | O_CREAT_ | O_TRUNC_), 0644, 0, 0, 0);
+    if (fd < 0) {
+        new_fail("dup: open /sys2dup.txt");
+    } else {
+        if ((int)syscall_invoke(SYS_WRITE, (uint64_t)fd,
+                                (uint64_t)(uintptr_t)"AAAA", 4, 0, 0, 0) != 4)
+            new_fail("dup: write through the original fd");
+        dup_fd = (int)syscall_invoke(SYS_DUP, (uint64_t)fd, 0, 0, 0, 0, 0);
+        if (dup_fd < 0) {
+            new_fail("dup: dup() answered an error");
+        } else if (dup_fd == fd) {
+            new_fail("dup: dup() returned the same descriptor");
+            dup_fd = new_close(dup_fd);
+        } else {
+            /* the duplicate shares the file offset, so this lands after "AAAA" */
+            if ((int)syscall_invoke(SYS_WRITE, (uint64_t)dup_fd,
+                                    (uint64_t)(uintptr_t)"BBBB", 4, 0, 0, 0) != 4)
+                new_fail("dup: write through the duplicate fd");
+            /* closing one descriptor must not close the shared open file either */
+            fd = new_close(fd);
+            if (!file_equals("/sys2dup.txt", "AAAABBBB", 8))
+                new_fail("dup: one open file, shared offset, refcounted close");
+            /* and the duplicate is a full descriptor on that open file: it can
+             * seek and read the shared content back */
+            if ((int)syscall_invoke(SYS_LSEEK, (uint64_t)dup_fd, 0, SEEK_SET_,
+                                    0, 0, 0) != 0) {
+                new_fail("dup: lseek on the duplicate fd");
+            } else {
+                char rb[9];
+                memset(rb, 0, sizeof(rb));
+                if ((int)syscall_invoke(SYS_READ, (uint64_t)dup_fd,
+                                        (uint64_t)(uintptr_t)rb, 8, 0, 0, 0) != 8 ||
+                    memcmp(rb, "AAAABBBB", 8) != 0)
+                    new_fail("dup: read the shared file through the duplicate");
+            }
+            dup_fd = new_close(dup_fd);
+        }
+    }
+    fd = new_close(fd);
+    (void)syscall_invoke(SYS_UNLINK, (uint64_t)(uintptr_t)"/sys2dup.txt", 0, 0, 0, 0, 0);
+    if ((int)syscall_invoke(SYS_DUP, 77, 0, 0, 0, 0, 0) != -EBADF_)
+        new_fail("dup: a closed descriptor answers -EBADF");
+
+    /* ---- dup2() to a fixed descriptor ---- */
+    (void)syscall_invoke(SYS_UNLINK, (uint64_t)(uintptr_t)"/sys2dup2.txt", 0, 0, 0, 0, 0);
+    fd = (int)syscall_invoke(SYS_OPEN, (uint64_t)(uintptr_t)"/sys2dup2.txt",
+                             (uint64_t)(O_RDWR_ | O_CREAT_ | O_TRUNC_), 0644, 0, 0, 0);
+    if (fd < 0) {
+        new_fail("dup2: open /sys2dup2.txt");
+    } else {
+        if ((int)syscall_invoke(SYS_DUP2, (uint64_t)fd, 20, 0, 0, 0, 0) != 20) {
+            new_fail("dup2: did not land on the requested descriptor");
+        } else {
+            if ((int)syscall_invoke(SYS_WRITE, 20, (uint64_t)(uintptr_t)"CCCC",
+                                    4, 0, 0, 0) != 4)
+                new_fail("dup2: write through the fixed descriptor");
+            new_close(20);
+        }
+        fd = new_close(fd);
+        if (!file_equals("/sys2dup2.txt", "CCCC", 4))
+            new_fail("dup2: content written through the duplicate");
+
+        /* ---- dup3(): O_CLOEXEC accepted, bad flags / equal fds are EINVAL ---- */
+        fd = (int)syscall_invoke(SYS_OPEN, (uint64_t)(uintptr_t)"/sys2dup2.txt",
+                                 (uint64_t)O_RDWR_, 0, 0, 0, 0);
+        if (fd < 0) {
+            new_fail("dup3: reopen /sys2dup2.txt");
+        } else {
+            if ((int)syscall_invoke(SYS_DUP3, (uint64_t)fd, 21,
+                                    (uint64_t)O_CLOEXEC_, 0, 0, 0) != 21)
+                new_fail("dup3: O_CLOEXEC duplicate to a fixed descriptor");
+            new_close(21);
+            if ((int)syscall_invoke(SYS_DUP3, (uint64_t)fd, 22, 0x1234, 0, 0, 0) != -EINVAL_)
+                new_fail("dup3: unknown flags -> -EINVAL");
+            if ((int)syscall_invoke(SYS_DUP3, (uint64_t)fd, (uint64_t)fd,
+                                    0, 0, 0, 0) != -EINVAL_)
+                new_fail("dup3: oldfd == newfd -> -EINVAL");
+            fd = new_close(fd);
+        }
+    }
+    fd = new_close(fd);
+    (void)syscall_invoke(SYS_UNLINK, (uint64_t)(uintptr_t)"/sys2dup2.txt", 0, 0, 0, 0, 0);
+
+    /* ---- openat(AT_FDCWD, ...) behaves like open(...) ---- */
+    fd = (int)syscall_invoke(SYS_OPEN, (uint64_t)(uintptr_t)"/etc/motd", 0, 0, 0, 0, 0);
+    fd2 = (int)syscall_invoke(SYS_OPENAT, (uint64_t)(int64_t)AT_FDCWD_,
+                              (uint64_t)(uintptr_t)"/etc/motd", 0, 0, 0, 0);
+    if (fd < 0 || fd2 < 0) {
+        new_fail("openat(AT_FDCWD, \"/etc/motd\") == open(\"/etc/motd\")");
+    } else {
+        char a = 0, b = 0;
+        const int na = (int)syscall_invoke(SYS_READ, (uint64_t)fd,
+                                           (uint64_t)(uintptr_t)&a, 1, 0, 0, 0);
+        const int nb = (int)syscall_invoke(SYS_READ, (uint64_t)fd2,
+                                           (uint64_t)(uintptr_t)&b, 1, 0, 0, 0);
+        if (na != 1 || nb != 1 || a != b)
+            new_fail("openat(AT_FDCWD): same bytes as open()");
+    }
+    fd = new_close(fd);
+    fd2 = new_close(fd2);
+    /* relative to the cwd (open() itself does not resolve, openat() does) */
+    vfs_set_cwd("/etc");
+    fd = (int)syscall_invoke(SYS_OPENAT, (uint64_t)(int64_t)AT_FDCWD_,
+                             (uint64_t)(uintptr_t)"motd", 0, 0, 0, 0);
+    if (fd < 0) new_fail("openat: relative path resolved against the cwd");
+    fd = new_close(fd);
+    vfs_set_cwd("/");
+
+    /* ---- fstatat / statx on the same file ---- */
+    {
+        struct linux_stat st;
+        struct linux_statx sx;
+        memset(&st, 0, sizeof(st));
+        memset(&sx, 0, sizeof(sx));
+        if ((int)syscall_invoke(SYS_FSTATAT, (uint64_t)(int64_t)AT_FDCWD_,
+                                (uint64_t)(uintptr_t)"/etc/motd",
+                                (uint64_t)(uintptr_t)&st, 0, 0, 0) != 0 ||
+            (st.st_mode & S_IFMT_) != S_IFREG_ || st.st_size <= 0)
+            new_fail("fstatat(AT_FDCWD): a regular file with size > 0");
+        if ((int)syscall_invoke(SYS_STATX, (uint64_t)(int64_t)AT_FDCWD_,
+                                (uint64_t)(uintptr_t)"/etc/motd", 0,
+                                (uint64_t)STATX_BASIC_STATS,
+                                (uint64_t)(uintptr_t)&sx, 0) != 0 ||
+            (sx.stx_mask & STATX_BASIC_STATS) != STATX_BASIC_STATS ||
+            sx.stx_size == 0 || (sx.stx_mode & S_IFMT_) != S_IFREG_)
+            new_fail("statx(AT_FDCWD, \"/etc/motd\"): BASIC_STATS with size > 0");
+    }
+
+    /* ---- creat / mkdirat / renameat / unlinkat ---- */
+    fd = (int)syscall_invoke(SYS_CREAT, (uint64_t)(uintptr_t)"/sys2creat.txt",
+                             0644, 0, 0, 0, 0);
+    if (fd < 0) {
+        new_fail("creat: create /sys2creat.txt");
+    } else {
+        if ((int)syscall_invoke(SYS_WRITE, (uint64_t)fd,
+                                (uint64_t)(uintptr_t)"X", 1, 0, 0, 0) != 1)
+            new_fail("creat: write through the new descriptor");
+        fd = new_close(fd);
+        if (!file_equals("/sys2creat.txt", "X", 1))
+            new_fail("creat: O_CREAT|O_WRONLY|O_TRUNC through the open path");
+    }
+    fd = new_close(fd);
+    (void)syscall_invoke(SYS_UNLINK, (uint64_t)(uintptr_t)"/sys2creat.txt", 0, 0, 0, 0, 0);
+
+    if ((int)syscall_invoke(SYS_MKDIRAT, (uint64_t)(int64_t)AT_FDCWD_,
+                            (uint64_t)(uintptr_t)"/sys2at_dir", 0755, 0, 0, 0) != 0) {
+        new_fail("mkdirat(AT_FDCWD)");
+    } else if ((int)syscall_invoke(SYS_RENAMEAT, (uint64_t)(int64_t)AT_FDCWD_,
+                                   (uint64_t)(uintptr_t)"/sys2at_dir",
+                                   (uint64_t)(int64_t)AT_FDCWD_,
+                                   (uint64_t)(uintptr_t)"/sys2at_dir2", 0, 0) != 0) {
+        new_fail("renameat(AT_FDCWD, AT_FDCWD)");
+    } else if ((int)syscall_invoke(SYS_UNLINKAT, (uint64_t)(int64_t)AT_FDCWD_,
+                                   (uint64_t)(uintptr_t)"/sys2at_dir2",
+                                   (uint64_t)AT_REMOVEDIR, 0, 0, 0) != 0) {
+        new_fail("unlinkat(AT_FDCWD, AT_REMOVEDIR)");
+    }
+    (void)syscall_invoke(SYS_UNLINKAT, (uint64_t)(int64_t)AT_FDCWD_,
+                         (uint64_t)(uintptr_t)"/sys2at_dir", (uint64_t)AT_REMOVEDIR,
+                         0, 0, 0);
+    (void)syscall_invoke(SYS_UNLINKAT, (uint64_t)(int64_t)AT_FDCWD_,
+                         (uint64_t)(uintptr_t)"/sys2at_dir2", (uint64_t)AT_REMOVEDIR,
+                         0, 0, 0);
+
+    /* ---- the console tty ioctl surface on fd 1 ---- */
+    {
+        struct termios tio, back, set;
+        struct winsize ws;
+        memset(&tio, 0, sizeof(tio));
+        memset(&back, 0, sizeof(back));
+        memset(&ws, 0, sizeof(ws));
+        if ((int)syscall_invoke(SYS_IOCTL, 1, (uint64_t)TCGETS,
+                                (uint64_t)(uintptr_t)&tio, 0, 0, 0) != 0) {
+            new_fail("ioctl(1, TCGETS)");
+        } else {
+            set = tio;
+            set.c_lflag ^= TTY_LFLAG_ECHO;      /* make the round trip visible */
+            if ((int)syscall_invoke(SYS_IOCTL, 1, (uint64_t)TCSETS,
+                                    (uint64_t)(uintptr_t)&set, 0, 0, 0) != 0) {
+                new_fail("ioctl(1, TCSETS)");
+            } else if ((int)syscall_invoke(SYS_IOCTL, 1, (uint64_t)TCGETS,
+                                           (uint64_t)(uintptr_t)&back, 0, 0, 0) != 0 ||
+                       back.c_lflag != set.c_lflag) {
+                new_fail("ioctl: termios round trip (TCSETS then TCGETS)");
+            }
+            (void)syscall_invoke(SYS_IOCTL, 1, (uint64_t)TCSETS,
+                                 (uint64_t)(uintptr_t)&tio, 0, 0, 0);
+        }
+        if ((int)syscall_invoke(SYS_IOCTL, 1, (uint64_t)TIOCGWINSZ,
+                                (uint64_t)(uintptr_t)&ws, 0, 0, 0) != 0 ||
+            ws.ws_row == 0 || ws.ws_col == 0)
+            new_fail("ioctl(1, TIOCGWINSZ) reports non-zero rows/cols");
+        if ((int)syscall_invoke(SYS_IOCTL, 1, 0x1234, 0, 0, 0, 0) != -ENOTTY_)
+            new_fail("ioctl: an unknown request still answers -ENOTTY");
+    }
+
+    /* ---- a duplicated pipe end keeps EOF semantics right ---- */
+    if ((int)syscall_invoke(SYS_PIPE, (uint64_t)(uintptr_t)pipefd, 0, 0, 0, 0, 0) != 0) {
+        new_fail("dup: pipe()");
+    } else {
+        pipe_dup = (int)syscall_invoke(SYS_DUP, (uint64_t)pipefd[1], 0, 0, 0, 0, 0);
+        if (pipe_dup < 0) {
+            new_fail("dup: duplicate a pipe write end");
+        } else {
+            /* closing the original write end must not produce EOF: one writer
+             * (the duplicate) is still open */
+            pipefd[1] = new_close(pipefd[1]);
+            if ((int)syscall_invoke(SYS_WRITE, (uint64_t)pipe_dup,
+                                    (uint64_t)(uintptr_t)"Z", 1, 0, 0, 0) != 1)
+                new_fail("dup: write through the duplicated pipe end");
+            {
+                char c = 0;
+                if ((int)syscall_invoke(SYS_READ, (uint64_t)pipefd[0],
+                                        (uint64_t)(uintptr_t)&c, 1, 0, 0, 0) != 1 ||
+                    c != 'Z')
+                    new_fail("dup: read the byte back from the pipe");
+            }
+            pipe_dup = new_close(pipe_dup);
+            {
+                char c = 0;
+                if ((int)syscall_invoke(SYS_READ, (uint64_t)pipefd[0],
+                                        (uint64_t)(uintptr_t)&c, 1, 0, 0, 0) != 0)
+                    new_fail("dup: EOF once the last write end closed");
+            }
+        }
+    }
+
+    /* ---- leave nothing behind, then report ---- */
+    fd = new_close(fd);
+    fd2 = new_close(fd2);
+    dup_fd = new_close(dup_fd);
+    pipe_dup = new_close(pipe_dup);
+    pipefd[0] = new_close(pipefd[0]);
+    pipefd[1] = new_close(pipefd[1]);
+    for (i = 0; i < 32; i++) new_restore_fd((int)i, was_open[i]);
+    (void)syscall_invoke(SYS_UNLINK, (uint64_t)(uintptr_t)"/sys2dup.txt", 0, 0, 0, 0, 0);
+    (void)syscall_invoke(SYS_UNLINK, (uint64_t)(uintptr_t)"/sys2dup2.txt", 0, 0, 0, 0, 0);
+    (void)syscall_invoke(SYS_UNLINK, (uint64_t)(uintptr_t)"/sys2creat.txt", 0, 0, 0, 0, 0);
+    (void)syscall_invoke(SYS_UNLINKAT, (uint64_t)(int64_t)AT_FDCWD_,
+                         (uint64_t)(uintptr_t)"/sys2at_dir", (uint64_t)AT_REMOVEDIR,
+                         0, 0, 0);
+    (void)syscall_invoke(SYS_UNLINKAT, (uint64_t)(int64_t)AT_FDCWD_,
+                         (uint64_t)(uintptr_t)"/sys2at_dir2", (uint64_t)AT_REMOVEDIR,
+                         0, 0, 0);
+    vfs_set_cwd(saved_cwd);
+
+    for (i = 0; i < g_new_fail_n && i < NEW_FAIL_MAX; i++) {
+        console_printf("[sys2] new syscalls FAIL: %s\n", g_new_fail[i]);
+    }
+    if (g_new_fail_n > NEW_FAIL_MAX) {
+        console_printf("[sys2] new syscalls FAIL: %u more\n",
+                       (uint64_t)(g_new_fail_n - NEW_FAIL_MAX));
+    }
+    return (int)g_new_fail_n;
+}
+
+/* Boot-time entry point: silent when everything works, so the serial log keeps
+ * exactly the lines the frozen boot presentation has always printed. */
+int syscalls2_boot_selftest(void)
+{
+    return new_surface_selftest();
 }
 
 int syscalls2_selftest(void)
@@ -1020,6 +1641,12 @@ int syscalls2_selftest(void)
         st_report("filesystem is synced", (int)syscall_invoke(SYS_SYNC, 0, 0, 0, 0, 0, 0) == 0,
                   NULL);
     }
+
+    /* --- batch 3: dup/dup2/dup3, the *at family, statx, the tty ioctl surface.
+     * Silent on success like at boot; a failure prints `[sys2] ... FAIL` lines
+     * from the check itself, so this one line is just the tally. --- */
+    st_report("dup/dup2/dup3, *at, statx, tty ioctl",
+              new_surface_selftest() == 0, NULL);
 
     /* --- explicit ENOSYS answers are honest, not silent --- */
     st_report("symlink() answers -ENOSYS",

@@ -670,6 +670,17 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
         }
     }
 
+    /* The second batch of "unfinished syscalls": dup/dup2/dup3, the *at family,
+     * creat/readlink, statx and the tty ioctl surface. Silent on success - the
+     * boot log must keep exactly its old lines - and it prints `[sys2] new
+     * syscalls FAIL ...` only when something is actually broken. It runs here
+     * because the fd table is per task and the idle task now owns a valid slot
+     * (dup/dup2 need one); the VFS, /etc/motd and the terminal are all up. */
+    {
+        extern int syscalls2_boot_selftest(void);
+        (void)syscalls2_boot_selftest();
+    }
+
     extern int shell_run(void);
     int shell_tid = sched_eevdf_create((void (*)(void *))(uintptr_t)shell_run, NULL, 0);
     if (shell_tid < 0) {
