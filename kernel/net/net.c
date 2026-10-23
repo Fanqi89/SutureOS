@@ -27,6 +27,7 @@
 #include "net.h"
 #include "tcp.h"                 /* kernel/net/tcp.c: TCP protocol module     */
 #include "rtl8139.h"
+#include "e1000.h"        /* second link layer: Intel 8254x (VMware/QEMU) */
 
 #include <stitch/types.h>
 #include <stitch/string.h>
@@ -77,6 +78,9 @@ static void udp_rx(const ipv4_header_t *ip, const uint8_t *payload,
                    uint32_t len, uint32_t src);
 static int  net_ip_tx(uint32_t dst_ip, uint8_t proto, uint32_t payload_len);
 static void net_spin_poll(uint32_t budget);
+/* Link-layer dispatch (implemented next to net_init; used by the TX/RX paths). */
+static int  ll_send(const void *frame, uint32_t len);
+static void ll_poll_rx(void (*fn)(const uint8_t *frame, uint32_t len));
 
 /* ===================== configuration (slirp defaults) ===================== */
 uint32_t net_local_ip     = 0x0A00020Fu;   /* 10.0.2.15 */
@@ -319,7 +323,7 @@ static int arp_send_request(uint32_t target_ip)
     memset(arp->tha, 0, 6);
     ip_store(target_ip, (uint8_t *)&arp->tpa);
 
-    if (rtl8139_send_frame(g_arp_frame, NET_ETH_HDR_LEN + sizeof(arp_packet_t)) != 0)
+    if (ll_send(g_arp_frame, NET_ETH_HDR_LEN + sizeof(arp_packet_t)) != 0)
         return -1;
     g_arp_tx++;
     g_frames_tx++;
@@ -352,7 +356,7 @@ static void arp_send_reply(uint32_t dst_ip, const uint8_t dst_mac[6])
     memcpy(arp->tha, dst_mac, 6);
     ip_store(dst_ip, (uint8_t *)&arp->tpa);
 
-    if (rtl8139_send_frame(g_arp_frame, NET_ETH_HDR_LEN + sizeof(arp_packet_t)) == 0) {
+    if (ll_send(g_arp_frame, NET_ETH_HDR_LEN + sizeof(arp_packet_t)) == 0) {
         g_arp_tx++;
         g_frames_tx++;
     }
@@ -451,7 +455,7 @@ static int net_eth_send_ip(uint32_t dst_ip, uint32_t len)
     memcpy(eth->src_mac, net_local_mac, 6);
     eth->ethertype = htons(ETH_TYPE_IPV4);
 
-    if (rtl8139_send_frame(g_tx_frame, frame_len) != 0) {
+    if (ll_send(g_tx_frame, frame_len) != 0) {
         g_drops++;
         return -1;
     }
@@ -674,7 +678,7 @@ static void icmp_rx(const ipv4_header_t *ip, const uint8_t *payload,
         }
         oip->header_checksum = htons(net_checksum(oip, 20u));
 
-        if (rtl8139_send_frame(g_tx_frame, frame_len) == 0) {
+        if (ll_send(g_tx_frame, frame_len) == 0) {
             g_frames_tx++;
             g_ip_tx++;
             g_icmp_tx++;
@@ -897,6 +901,51 @@ void net_input(const void *frame, uint32_t len)
 }
 
 /* ===================== bring-up / polling ===================== */
+/* ==================== link-layer dispatch ====================
+ * Two drivers can sit under this stack: Intel e1000 (preferred - it is what VMware
+ * and `-device e1000` present) and RTL8139 (the historical path). Everything below
+ * goes through ll_send()/ll_poll_rx(), so the IP stack does not care. */
+typedef enum { LL_NONE = 0, LL_RTL8139 = 1, LL_E1000 = 2 } link_layer_t;
+
+static link_layer_t g_ll = LL_NONE;
+static char g_ll_name[16] = "none";
+
+static int ll_send(const void *frame, uint32_t len)
+{
+    if (g_ll == LL_E1000) return e1000_send_frame(frame, len);
+    if (g_ll == LL_RTL8139) return rtl8139_send_frame(frame, len);
+    return -1;
+}
+
+/* Yield the vCPU for one interrupt so the emulator's device main loop can run and
+ * DMA pending receive packets into the ring. Only when interrupts are enabled;
+ * otherwise this would hang until the next NMI. */
+static void ll_yield_once(void)
+{
+    uint64_t flags;
+    __asm__ volatile("pushfq; popq %0" : "=r"(flags));
+    if ((flags & 0x200u) != 0) {
+        __asm__ volatile("hlt");
+    }
+}
+
+static void ll_poll_rx(void (*fn)(const uint8_t *frame, uint32_t len))
+{
+    if (g_ll == LL_E1000) {
+        if (e1000_receive(fn) == 0) {
+            /* nothing in the ring: let the emulator deliver, then look again */
+            ll_yield_once();
+            (void)e1000_receive(fn);
+        }
+        return;
+    }
+    if (g_ll == LL_RTL8139) {
+        (void)rtl8139_receive(fn);
+    }
+}
+
+const char *net_link_name(void) { return g_ll_name; }
+
 int net_init(void)
 {
     int r;
@@ -916,24 +965,23 @@ int net_init(void)
     g_clock_last = mbos_pit_counter();
     net_stats_reset();
 
+    /* RTL8139 first (QEMU's default NIC, fully working), e1000 second (VMware's
+     * virtual NIC: detection/MAC/TX verified, RX delivery still being debugged). */
     r = rtl8139_init();
-    if (r != RTL8139_ERR_NONE) {
-        const char *why = "unknown";
-        switch (r) {
-        case RTL8139_ERR_NOT_FOUND: why = "rtl8139 not found on PCI"; break;
-        case RTL8139_ERR_BAR:       why = "BAR0 is not an I/O BAR";    break;
-        case RTL8139_ERR_RESET:     why = "reset timeout";             break;
-        case RTL8139_ERR_IO_BASE:   why = "I/O base unusable";         break;
-        case RTL8139_ERR_NO_BUFFERS:why = "DMA buffers above 4 GiB";   break;
-        case RTL8139_ERR_CMD:       why = "Rx/Tx would not enable";    break;
-        default: break;
+    if (r == RTL8139_ERR_NONE) {
+        g_ll = LL_RTL8139;
+        strncpy(g_ll_name, "rtl8139", sizeof(g_ll_name) - 1);
+        if (rtl8139_get_mac(net_local_mac) != 0) {
+            console_puts("[net] rtl8139: MAC read failed\n");
+            return -1;
         }
-        console_printf("[net] init failed: %s\n", why);
-        return -1;
-    }
-
-    if (rtl8139_get_mac(net_local_mac) != 0) {
-        console_printf("[net] init failed: MAC read failed\n");
+    } else if (e1000_init() == E1000_ERR_NONE) {
+        g_ll = LL_E1000;
+        strncpy(g_ll_name, "e1000", sizeof(g_ll_name) - 1);
+        (void)e1000_get_mac(net_local_mac);
+        console_puts("[net] using e1000 (RX delivery: see release notes)\n");
+    } else {
+        console_puts("[net] no supported NIC (rtl8139 or e1000)\n");
         return -1;
     }
 
@@ -977,7 +1025,7 @@ void net_poll(void)
     g_epoch++;
     /* rtl8139_receive() invokes the callback once per complete frame while the
      * frame is still in the ring; net_input() counts it and dispatches it. */
-    (void)rtl8139_receive(net_rx_from_driver);
+    ll_poll_rx(net_rx_from_driver);
     /* TCP retransmission timers / TIME_WAIT expiry ride on the same tick. */
     tcp_poll();
     {

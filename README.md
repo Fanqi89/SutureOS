@@ -301,6 +301,21 @@ py -3 scripts\verify_fat32_write.py build\fat32_virtio.img build\fat32.img
 [fat32] write self-test PASS / [net] selftest ping 10.0.2.2 -> reply in 1293 us
 ```
 
+### 缝合来的子系统（"多家系统的优点"）
+
+| 来源 | 贡献 |
+|---|---|
+| **VimtuOS** | ext2/SquashFS 只读驱动、用户态 libc 与 ring-3 运行时、GDT/TSS/分级中断 |
+| **HanOS** | LAPIC / IOAPIC / MADT（`hanos_*` API） |
+| **Lemis** | 内核堆（`lemis_heap_init`） |
+| **MOOS** | 中断框架（`moos_*`） |
+| **CoolPotOS** | flanterm 终端（黑底白字控制台） |
+| **Cinux** | Intel **e1000** 网卡驱动（v0.12.0-alpha，VMware 虚拟网卡）+ 其 RX/TX 踩坑笔记 |
+
+- **e1000 现状**：VMware 上探测 + MAC + 发送已验证（pcap 有线上证据）；**收包未打通**，
+  所以分发顺序 RTL8139 优先（QEMU 联网不受影响）。
+- 后续候选：Cinux 的 FAT32 LFN、HanOS 的调度器（解 fork/wait4）、MOOS 的 FAT。
+
 ### 完整用户态（v0.11.0-alpha 起）
 
 **ring 3 有中断、有地址空间、有 execve、有 shell。**

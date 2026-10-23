@@ -6,6 +6,47 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.12.0-alpha]
+
+Stitching other operating systems' strengths: the first port that does not come from
+VimtuOS. The **Intel e1000 NIC driver** is ported from **Cinux**, together with a
+link-layer dispatch so the network stack can sit on either NIC.
+
+### Added
+- **e1000 driver** (`kernel/drivers/e1000.c`, ported from Cinux
+  `kernel/drivers/net/e1000.cpp`): PCI probe (8086:100e/100f/10d3), MMIO BAR0
+  mapping, reset, EEPROM MAC read, RAL0/RAH0/MTA filter programming, legacy RX
+  descriptor ring (32 x 2 KiB) and TX ring (8 descriptors, EOP|IFCS|RS), polled
+  send/receive. This is VMware's virtual NIC - the card the OS is actually used on
+  was previously unsupported.
+- **Link-layer dispatch** in `kernel/net/net.c`: `ll_send()` / `ll_poll_rx()` pick
+  RTL8139 (QEMU default, fully working) or e1000 (VMware), so the IPv4/ARP/ICMP/UDP
+  stack is NIC-agnostic. `net_link_name()` reports which one is active.
+- **VMware test VM now has a NIC**: `scripts/vmware_boot.ps1` adds
+  `ethernet0.virtualDev = "e1000"`, so the e1000 path is exercised on the real
+  hypervisor.
+
+### Verification
+- **VMware**: `[e1000] found at 0:16.0 dev=0x100f BAR0=0xfebc0000` +
+  `[  OK  ] e1000: MAC=0:c:29:65:1:af link=1 fd=1 RCTL=0x400800a` +
+  `[net] using e1000`. Full boot otherwise unchanged (AHCI/FAT32, ring3 9/9).
+- **QEMU `-device e1000`**: card detected, MAC read, and **frame transmission
+  verified on the wire** with `-object filter-dump` (pcap shows our ARP requests to
+  ff:ff:ff:ff:ff:ff and slirp's replies to our MAC).
+- **QEMU regression (RTL8139 path)**: unchanged and green - self-tests 13/14,
+  `[net] selftest ping 10.0.2.2 -> reply in 2107 us`, FAT32 write+ops PASS, host
+  verifier 17/17, `ring3 selftest 9/9`, `userspace selftest 9/9`, AP online, mouse.
+
+### Known limitation (stated plainly)
+The e1000 **receive path does not deliver packets yet** on either QEMU or VMware:
+descriptor 0 never gets the DD bit and GPRC stays 0, although TX completes
+(TDH/TDT advance, DD set) and the pcap proves the frames reach the card. Cinux'
+note about the emulator's main loop explains QEMU; it does not explain VMware, so
+there is still a ring-setup difference to find. Because of that the dispatch prefers
+RTL8139 when both are present - existing QEMU networking is not regressed - and the
+e1000 is used only where it is the only NIC (VMware), where it currently gives
+detection, MAC and TX.
+
 ## [v0.11.0-alpha]
 
 The userspace becomes real: interrupts stay enabled at CPL=3, every program runs in
