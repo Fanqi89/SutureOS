@@ -59,8 +59,54 @@ uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
     return vaddr;
 }
 
+/* Reload CR3 to drop stale TLB entries after a PTE edit. */
+static void mem_flush_tlb(void)
+{
+    uint64_t cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    __asm__ volatile("mov %0, %%cr3" : : "r"(cr3) : "memory");
+}
+
+#define PTE_NX_BIT (1ull << 63)
+
+/* mprotect: change the permission bits of an already mapped anonymous range. */
+uint64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot,
+                      uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a4; (void)a5; (void)a6;
+    if ((addr & 0xFFFull) != 0 || len == 0) return (uint64_t)-22;   /* EINVAL */
+    len = (len + 4095) & ~4095ull;
+    if (addr < USER_HEAP_START || addr + len > USER_HEAP_MAX) return (uint64_t)-12;
+    for (uint64_t v = addr; v < addr + len; v += 4096) {
+        uint64_t *pte = mmu_walk((uint64_t*)read_cr3(), 0, v, 0);
+        if (!pte || !(*pte & PTE_P)) return (uint64_t)-12;          /* ENOMEM */
+        if (prot & PROT_WRITE) *pte |= PTE_W; else *pte &= ~PTE_W;
+        if (prot & PROT_EXEC)  *pte &= ~PTE_NX_BIT; else *pte |= PTE_NX_BIT;
+    }
+    mem_flush_tlb();
+    return 0;
+}
+
 uint64_t sys_munmap(uint64_t addr, uint64_t len,
                     uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    /* Unmap the range for real (the old code only returned 0). The frames are not
+     * handed back to the PMM yet - that needs a per-range allocator - but the
+     * mapping is gone, so use-after-unmap faults instead of silently working. */
+    if ((addr & 0xFFFull) != 0 || len == 0) return (uint64_t)-22;
+    len = (len + 4095) & ~4095ull;
+    if (addr < USER_HEAP_START || addr + len > USER_HEAP_MAX) return (uint64_t)-22;
+    for (uint64_t v = addr; v < addr + len; v += 4096) {
+        uint64_t *pte = mmu_walk((uint64_t*)read_cr3(), 0, v, 0);
+        if (pte && (*pte & PTE_P)) *pte = 0;
+    }
+    mem_flush_tlb();
+    return 0;
+}
+
+uint64_t sys_munmap_legacy_unused(uint64_t addr, uint64_t len,
+                                  uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 {
     (void)addr; (void)len; (void)a3; (void)a4; (void)a5; (void)a6;
     /* 简化：不实际释放，仅返回 0 */

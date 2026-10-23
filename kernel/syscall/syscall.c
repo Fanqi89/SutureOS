@@ -138,6 +138,11 @@ void syscall_init(void)
     syscall_register(11, sys_munmap); /* munmap */
     syscall_register(13, sys_rt_sigaction);  /* rt_sigaction */
     syscall_register(15, sys_rt_sigreturn);  /* rt_sigreturn */
+    {
+        extern uint64_t sys_mprotect(uint64_t, uint64_t, uint64_t,
+                                      uint64_t, uint64_t, uint64_t);
+        syscall_register(10, sys_mprotect);   /* mprotect */
+    }
     syscall_register(57, sys_fork);   /* fork */
     syscall_register(59, sys_execve); /* execve */
     syscall_register(60, sys_exit);   /* exit */

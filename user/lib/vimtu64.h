@@ -19,14 +19,16 @@
 #define V64_NR_OPEN        6   /* open(path) 只读        -> fd / -1 */
 #define V64_NR_READ        7   /* read(fd, buf, len)     -> 已读字节数 / -1 */
 #define V64_NR_CLOSE       8   /* close(fd)              -> 0 / -1 */
-#define V64_NR_FB_MAP      9   /* fb_map(&va, &info)     -> 0 / -1..-4（A1） */
-#define V64_NR_FB_FLIP     10  /* fb_flip(x, y, w, h)    -> 0 = 已提交(含夹取) / 1 = 完全越界被拒 */
-#define V64_NR_FB_PRESENT  11  /* fb_present()           -> 0/负 */
+/* 保留号段 0x40..0x45：以下 6 个功能内核尚未实现，调用会返回 -ENOSYS。
+ * 注意不要再用 9/10/11：内核 int80.c 把 9 用作 execve（历史号段冲突）。 */
+#define V64_NR_FB_MAP      0x40   /* fb_map(&va, &info)     -> 0 / -1..-4（A1） */
+#define V64_NR_FB_FLIP     0x41  /* fb_flip(x, y, w, h)    -> 0 = 已提交(含夹取) / 1 = 完全越界被拒 */
+#define V64_NR_FB_PRESENT  0x42  /* fb_present()           -> 0/负 */
 /* ---- ★ A5 前置：用户态输入事件投递 + 共享内存缓冲（内核侧定义见 kernel/input64.h 与
  *      kernel/proc64.h 的 A5 段；改这里必须同步那两份 + docs/应用层与系统调用说明.md） ---- */
-#define V64_NR_INPUT_POLL  12  /* input_poll(Event*, max, flags) -> 事件数 / 待取数(max=0) / 负错误码 */
-#define V64_NR_SHM_CREATE  13  /* shm_create(size)               -> 跨进程共享的对象 id(>=1) / 负错误码 */
-#define V64_NR_SHM_MAP     14  /* shm_map(id, off, len, &va)     -> 0 / 负错误码（第 4 参数走 r10） */
+#define V64_NR_INPUT_POLL  0x43  /* input_poll(Event*, max, flags) -> 事件数 / 待取数(max=0) / 负错误码 */
+#define V64_NR_SHM_CREATE  0x44  /* shm_create(size)               -> 跨进程共享的对象 id(>=1) / 负错误码 */
+#define V64_NR_SHM_MAP     0x45  /* shm_map(id, off, len, &va)     -> 0 / 负错误码（第 4 参数走 r10） */
 
 /* input_poll 的错误码（与 kernel/input64.h 的 EV64_* 一致） */
 #define V64_EV_EPERM    (-1)   /* 没有进程上下文（任务 0 / 共享地址空间模式） */

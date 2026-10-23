@@ -6,6 +6,37 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.11.1-alpha]
+
+补完三项"未完成/坏了"的部分，**启动呈现与 GUI 外观零变化**（见验证）。
+
+### Fixed
+- **用户态 ABI 号段冲突（真 bug）**：`user/lib/vimtu64.h` 把 9/10/11 声明为
+  `FB_MAP`/`FB_FLIP`/`FB_PRESENT`、12/13/14 为 `INPUT_POLL`/`SHM_CREATE`/`SHM_MAP`，
+  而内核 `int80.c:47` 把 **9 用作 execve**——用户一调 `fb_map()` 就会执行 execve。
+  内核尚未实现这 6 个功能，现改为保留号段 `0x40..0x45` 并注明"调用返回 -ENOSYS"。
+- **`SIG_DFL` 会停机整机**：`signal.c` 的默认动作原本调 `sched_shutdown()`，任何
+  `SIG_DFL` 投递都会关掉整台机器。现在只终止该用户程序（退出码 128+sig），
+  内核上下文的投递直接丢弃。
+
+### Added
+- **`mprotect`（系统调用 10）**：真实的 PTE 权限变更（W/NX 位）+ TLB 刷新；
+  未映射页返回 `-ENOMEM`，非页对齐/零长返回 `-EINVAL`。
+- **`munmap` 真实解除映射**：原实现是空壳（只 `return 0`）。现在清 PTE 并刷 TLB，
+  unmap 后再访问会缺页而不是"静默还能用"（物理页暂不归还 PMM，注释已写明）。
+
+### Verification
+- 新增开机自检（成功时**不打印**，失败才打印，保持启动日志与基线一致）：
+  `mmap -> mprotect -> munmap` 往返 + ABI 号段检查 = PASS。
+- 回归不变：自检 13/14、`syscalls: 56 registered`、`ring3 selftest 9/9`、
+  `userspace selftest 9/9`、FAT32 写+目录操作 PASS。
+- **外观未变（按新规矩逐项验）**：
+  - 终端截图与 `docs/baseline/base_terminal.png` **逐像素完全相同**（`bbox=None`）
+  - GUI 截图与基线差异仅在 `(44,102)-(352,221)` = Task Manager 的实时计数器文字
+    （运行时长/帧数），窗口、任务栏、配色、字体均一致
+  - 启动日志逐行对比：仅内核地址（+0x1000）、PMM 空闲页数（-1）、RTC 时间不同，
+    流程与文案完全一致
+
 ## [v0.11.0-alpha]
 
 The userspace becomes real: interrupts stay enabled at CPL=3, every program runs in

@@ -80,10 +80,16 @@ void sig_check_pending(user_context_t *uctx) {
     struct sigaction *sa = &sig_table[sched_cpu.current][sig].sa;
     if ((uintptr_t)sa->sa_handler == (uintptr_t)SIG_IGN) return;
     if ((uintptr_t)sa->sa_handler == (uintptr_t)SIG_DFL) {
-        /* 默认动作：终止 */
-        sched_shutdown();
-        return;
-    }
+          /* Default action: terminate the *process*, never the machine. The old
+           * code called sched_shutdown() here, so any SIG_DFL delivery halted the
+           * whole system; kernel-context deliveries are simply dropped. */
+          extern int ring3_active(void);
+          extern void ring3_exit_user(uint64_t code);
+          if (ring3_active()) {
+              ring3_exit_user((uint64_t)(128u + (uint64_t)sig));
+          }
+          return;
+      }
     /* 保存当前上下文到 signal frame */
     /* 简化：直接修改 uctx->rip 指向 handler */
     uctx->rip = (uint64_t)sa->sa_handler;

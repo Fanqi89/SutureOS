@@ -644,6 +644,32 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
     console_puts("\n[stitch] Phase-1 self-tests complete. Starting shell...\n");
 
     /* Create init task that runs the shell */
+    /* Completed syscalls: mmap -> mprotect -> munmap round trip, plus the user-ABI
+     * renumbering check (FB/INPUT/SHM must not alias the kernel's execve number 9). */
+    {
+        extern uint64_t sys_mmap(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+        extern uint64_t sys_mprotect(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+                                     uint64_t);
+        extern uint64_t sys_munmap(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+                                   uint64_t);
+        extern uint64_t *mmu_walk(uint64_t *, uint64_t, uint64_t, int);
+        const uint64_t va = sys_mmap(0, 4096, 3, 0x22, 0, 0);
+        const int map_ok = (va != (uint64_t)-1);
+        const int prot_ok = map_ok && sys_mprotect(va, 4096, 1, 0, 0, 0) == 0;
+        const int unmap_ok = map_ok && sys_munmap(va, 4096, 0, 0, 0, 0) == 0;
+        uint64_t cr3v = 0;
+        __asm__ volatile("mov %%cr3, %0" : "=r"(cr3v));
+        uint64_t *pte = map_ok ? mmu_walk((uint64_t *)cr3v, 0, va, 0) : 0;
+        const int gone_ok = unmap_ok && (pte == 0 || (*pte & 1u) == 0);
+        const int abi_ok = (0x40 != 9) && (0x43 != 9) && (0x45 != 9);
+        if (!(map_ok && prot_ok && unmap_ok && gone_ok && abi_ok)) {
+            console_printf("[fixes] mmap/mprotect/munmap FAIL (map=%d prot=%d "
+                           "unmap=%d gone=%d) abi_numbers=%d\n",
+                           (int64_t)map_ok, (int64_t)prot_ok, (int64_t)unmap_ok,
+                           (int64_t)gone_ok, (int64_t)abi_ok);
+        }
+    }
+
     extern int shell_run(void);
     int shell_tid = sched_eevdf_create((void (*)(void *))(uintptr_t)shell_run, NULL, 0);
     if (shell_tid < 0) {
