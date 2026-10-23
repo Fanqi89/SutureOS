@@ -20,8 +20,10 @@ int syscall_is_registered(uint64_t nr);
 int fd_dup_lowest(int oldfd);          /* new lowest free fd, or -errno */
 int fd_dup_to(int oldfd, int newfd);   /* install the duplicate at newfd, or -errno */
 int fd_pipe_end(int fd);               /* pipe end behind fd, or -1 */
-int fd_is_open(int fd);                /* 1 when fd names a file or a pipe end */
+int fd_is_open(int fd);                /* 1 when fd names a file, pipe end or socket */
 int fd_vfs_fd(int fd);                 /* VFS fd behind fd, or -1 */
+int fd_sock_fd(int fd);                /* kernel/net socket behind fd, or -1 */
+int fd_install_socket(int sock);       /* give a net socket its lowest free fd */
 
 /* syscall numbers - Linux/x86_64 兼容 */
 #define SYS_READ            0

@@ -1124,6 +1124,42 @@ int syscalls2_register(void)
     reg(SYS_PIPE, sys2_pipe);
     reg(SYS_PIPE2, sys2_pipe2);
 
+    /* sockets: Linux x86-64 numbers 41..55 (no SOCKETPAIR) over the in-kernel
+     * socket ABI in kernel/net/net.c. kernel/syscall/sockets.c is the ABI
+     * boundary: user-pointer validation, sockaddr byte-order conversion and the
+     * socket descriptor kind in the fd table. OFD/socket pairs are not offered. */
+    {
+        extern uint64_t sys_socket(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+        extern uint64_t sys_connect(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+        extern uint64_t sys_accept(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+        extern uint64_t sys_sendto(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+        extern uint64_t sys_recvfrom(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+        extern uint64_t sys_sendmsg(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+        extern uint64_t sys_recvmsg(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+        extern uint64_t sys_sock_shutdown(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+        extern uint64_t sys_bind(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+        extern uint64_t sys_listen(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+        extern uint64_t sys_getsockname(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+        extern uint64_t sys_getpeername(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+        extern uint64_t sys_setsockopt(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+        extern uint64_t sys_getsockopt(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+
+        reg(SYS_SOCKET, sys_socket);
+        reg(SYS_CONNECT, sys_connect);
+        reg(SYS_ACCEPT, sys_accept);
+        reg(SYS_SENDTO, sys_sendto);
+        reg(SYS_RECVFROM, sys_recvfrom);
+        reg(SYS_SENDMSG, sys_sendmsg);
+        reg(SYS_RECVMSG, sys_recvmsg);
+        reg(SYS_SHUTDOWN, sys_sock_shutdown);
+        reg(SYS_BIND, sys_bind);
+        reg(SYS_LISTEN, sys_listen);
+        reg(SYS_GETSOCKNAME, sys_getsockname);
+        reg(SYS_GETPEERNAME, sys_getpeername);
+        reg(SYS_SETSOCKOPT, sys_setsockopt);
+        reg(SYS_GETSOCKOPT, sys_getsockopt);
+    }
+
     return (int)g_registered;
 }
 
@@ -1458,7 +1494,25 @@ static int new_surface_selftest(void)
  * exactly the lines the frozen boot presentation has always printed. */
 int syscalls2_boot_selftest(void)
 {
-    return new_surface_selftest();
+    int fails = new_surface_selftest();
+
+    /* The socket ABI boundary (descriptor kind, bind/getsockname round trip,
+     * getsockopt(SO_TYPE), family/type refusals, close()) plus the pure DNS and
+     * DHCP packet builders. All three are silent on success. The socket part
+     * needs the NIC to be up - net_socket() would otherwise call net_init() and
+     * print lines - so it is skipped (not faked) when the link is down. */
+    {
+        extern int sockets_boot_selftest(void);
+        extern int dns_selftest(void);
+        extern int dhcp_selftest(void);
+        extern int net_ready(void);
+
+        fails += dns_selftest();
+        fails += dhcp_selftest();
+        if (net_ready())
+            fails += sockets_boot_selftest();
+    }
+    return fails;
 }
 
 int syscalls2_selftest(void)

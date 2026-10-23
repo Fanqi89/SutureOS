@@ -58,6 +58,8 @@ typedef _Bool bool;
 #define EPIPE           32
 #define EDOM            33
 #define ERANGE          34
+/* EPROTO: the DNS answer validator's "malformed reply" errno (Linux value). */
+#define EPROTO          71
 #define ENOSYS          38
 #define ENOTEMPTY       39
 #define ELOOP           40

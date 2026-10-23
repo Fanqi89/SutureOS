@@ -446,11 +446,28 @@ int net_setsockopt(int fd, int level, int optname, const void *optval, socklen_t
 int net_getsockopt(int fd, int level, int optname, void *optval, socklen_t *optlen);
 int net_getsockname(int fd, net_sockaddr_t *addr, socklen_t *addrlen);
 int net_getpeername(int fd, net_sockaddr_t *addr, socklen_t *addrlen);
+/* SOCK_STREAM / SOCK_DGRAM of an open socket, or a negative errno. */
+int net_socket_type(int fd);
 int net_sendmsg(int fd, const struct msghdr *msg, int flags);
 int net_recvmsg(int fd, struct msghdr *msg, int flags);
 
 /* Configuration setters kept from the stub API. */
 void net_configure_ip(uint32_t ip, uint32_t gateway, uint32_t netmask);
+/* DHCP/DNS program the resolver address through this setter (there was only a
+ * constant before); 0 clears it, net_dns() then answers 0. */
+void net_set_dns_ip(uint32_t dns);
+/* Source address used by the transmit path (IP header + UDP pseudo-header).
+ * Defaults to net_local_ip. DHCP sets it to 0.0.0.0 for DISCOVER/REQUEST, since
+ * a client without a lease may not claim an address, then clears it. */
+void net_set_tx_src_ip(uint32_t ip);
+void net_clear_tx_src_ip(void);
+/* Port the legacy single UDP handler listens on (0 = accept every port). The
+ * datagram socket path does not need it: a bound SOCK_DGRAM socket stages its
+ * own datagrams by port. */
+uint16_t net_udp_listen_port(void);
+void net_udp_listen_set(uint16_t port);
+/* Datagrams dropped because the target socket still had an unread one. */
+uint64_t net_udp_dgram_drops(void);
 uint32_t net_get_tcp_initial_seq(void);
 port_t net_alloc_port(void);
 

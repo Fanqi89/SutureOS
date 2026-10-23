@@ -60,6 +60,33 @@ syscall_entry:
     call    syscall_dispatch_c         /* returns the syscall result in rax */
 
     movq    %rax, 112(%rsp)            /* ctx->rax = result */
+
+    /* Restore EVERY general-purpose register from the frame, not just the iretq
+     * part. The frame is the kernel's authoritative copy of the interrupted user
+     * state: the signal machinery (kernel/syscall/signal.c) rewrites ctx->rdi to
+     * pass the signal number to a handler and ctx->rip/rsp to enter it, and
+     * rt_sigreturn(15) copies a whole saved user_context_t back over the frame.
+     * Dropping the 15 GPR slots (the old `addq $120,%rsp`) threw those edits away
+     * and returned to user mode with whatever registers the C dispatcher left
+     * behind - which is why a signal handler saw a garbage argument even though
+     * ctx->rdi had been set correctly. It also silently broke the SysV
+     * callee-saved registers rbx/rbp/r12-r15 across a syscall. */
+    movq     0(%rsp), %r15
+    movq     8(%rsp), %r14
+    movq    16(%rsp), %r13
+    movq    24(%rsp), %r12
+    movq    32(%rsp), %r11
+    movq    40(%rsp), %r10
+    movq    48(%rsp), %r9
+    movq    56(%rsp), %r8
+    movq    64(%rsp), %rbp
+    movq    72(%rsp), %rdi
+    movq    80(%rsp), %rsi
+    movq    88(%rsp), %rdx
+    movq    96(%rsp), %rcx
+    movq   104(%rsp), %rbx
+    movq   112(%rsp), %rax
+
     addq    $120, %rsp                 /* drop the 15 GPR slots */
     swapgs                             /* back to the user GS */
     iretq                              /* rip, cs, rflags, rsp, ss */

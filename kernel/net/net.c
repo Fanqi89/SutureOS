@@ -53,6 +53,11 @@
 
 #define NET_ICMP_ID 0xB00Bu          /* our echo identifier ("BooB" style)   */
 
+/* Bounded busy-wait budget for a blocking datagram receive. There is no wait
+ * queue yet, so recvfrom()/recvmsg() spin on net_poll() until this wall-clock
+ * budget expires and then answer -EAGAIN (MSG_DONTWAIT skips the wait). */
+#define NET_DGRAM_RECV_TIMEOUT_MS 3000
+
 static const uint8_t g_bcast_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 /* TX scratch: 14 (eth) + 20 (ip) + payload. Reused by ARP/ICMP/UDP sends. */
@@ -97,6 +102,38 @@ static uint32_t g_icmp_rtt_ticks;
 static int      g_icmp_got_reply;
 static net_udp_handler_t g_udp_handler;
 static uint16_t g_udp_local_port;
+
+/* ===================== datagram socket staging =====================
+ * The stack has no wait queue yet, so an inbound datagram addressed to a bound
+ * SOCK_DGRAM socket is copied into that socket's single staging slot and
+ * net_recvfrom() busy-waits on it with a bounded budget. One slot holds exactly
+ * one datagram: a second datagram arriving before the first is consumed is
+ * dropped (and counted in the [net] "sock dgram drops" line), which is honest
+ * for a polled stack and enough for the request/response protocols it serves
+ * (DNS, DHCP, echo). 8 slots x 1472 bytes of .bss. */
+#define NET_DGRAM_SLOTS 8
+typedef struct {
+    int      sock;                        /* owning net socket, -1 = free     */
+    int      ready;                       /* a datagram is staged             */
+    uint32_t src_ip;                      /* host byte order                  */
+    uint16_t src_port;                    /* host byte order                  */
+    uint32_t len;
+    uint8_t  data[NET_UDP_RX_MAX];
+} net_dgram_slot_t;
+
+static net_dgram_slot_t g_dgram[NET_DGRAM_SLOTS];
+static uint64_t g_dgram_drops;
+static uint64_t g_dgram_rx;
+
+/* The socket table lives here (not next to the socket API further down) because
+ * the UDP receive path has to find the socket a datagram belongs to before the
+ * socket section is reached. */
+static net_socket_t g_sockets[NET_MAX_SOCKETS];
+static int g_socket_used[NET_MAX_SOCKETS];
+static net_dgram_slot_t *dgram_slot_get(int sock, int create);
+static void dgram_slot_release(int sock);
+/* Source address for the transmit path (net_local_ip unless DHCP overrode it). */
+static uint32_t net_tx_src(void);
 
 /* ARP cache */
 typedef struct {
@@ -482,7 +519,7 @@ static int net_ip_tx(uint32_t dst_ip, uint8_t proto, uint32_t payload_len)
     ip->protocol       = proto;
     ip->header_checksum = 0u;
     {
-        uint32_t s = htonl(net_local_ip);
+        uint32_t s = htonl(net_tx_src());
         uint32_t d = htonl(dst_ip);
         memcpy(&ip->src_ip, &s, 4);
         memcpy(&ip->dst_ip, &d, 4);
@@ -784,7 +821,7 @@ int net_udp_send(uint32_t ip, uint16_t sport, uint16_t dport,
     udp->dst_port = htons(dport);
     udp->length   = htons((uint16_t)udp_len);
     udp->checksum = 0u;
-    udp->checksum = htons(udp_checksum(net_local_ip, ip, (const uint8_t *)udp, udp_len));
+    udp->checksum = htons(udp_checksum(net_tx_src(), ip, (const uint8_t *)udp, udp_len));
 
     if (net_ip_tx(ip, IP_PROTO_UDP, udp_len) != 0)
         return -1;
@@ -803,7 +840,6 @@ static void udp_rx(const ipv4_header_t *ip, const uint8_t *payload,
     const udp_header_t *udp = (const udp_header_t *)(const void *)payload;
     uint16_t sport, dport, ulen;
 
-    (void)ip;
     if (len < 8u)
         return;
 
@@ -820,21 +856,58 @@ static void udp_rx(const ipv4_header_t *ip, const uint8_t *payload,
      * datagram therefore evaluates to 0xFFFF (not 0): the field is written as
      * `c` and re-reading it adds `c` back, leaving the carry-folded total at
      * 0xFFFF, whose complement is 0 -- which udp_checksum() substitutes with
-     * 0xFFFF because 0 means "no checksum" on the wire. */
+     * 0xFFFF because 0 means "no checksum" on the wire.
+     *
+     * SutureOS fix: the pseudo-header destination must be the IPv4 destination
+     * of *this* datagram, not net_local_ip. A DHCP ACK/DNS answer sent to the
+     * limited broadcast address (255.255.255.255) is addressed to us by
+     * net_ip_is_ours() but its checksum folds 255.255.255.255, so validating it
+     * against our unicast address failed and every broadcast UDP reply was
+     * counted as a bad checksum and dropped. */
     if (udp->checksum != 0u) {
-        uint32_t sum = udp_checksum(src, net_local_ip, payload, (uint32_t)ulen);
+        const uint32_t dst = (ip != NULL) ? ip_load((const uint8_t *)&ip->dst_ip)
+                                          : net_local_ip;
+        uint32_t sum = udp_checksum(src, dst, payload, (uint32_t)ulen);
         if (sum != 0xFFFFu) {
             g_bad_checksum++;
             return;
         }
     }
-    /* A reply to our request, or any datagram to the port we listen on. */
-    if (dport != g_udp_local_port && g_udp_local_port != 0u) {
-        g_udp_drops++;
-        return;
+
+    /* 1) A bound/connected datagram socket owns this port: stage the payload so
+     *    the (blocking, busy-waiting) recvfrom() can return it. */
+    {
+        int i;
+        for (i = 0; i < NET_MAX_SOCKETS; i++) {
+            net_dgram_slot_t *sl;
+            uint32_t n;
+            if (!g_socket_used[i] || g_sockets[i].type != SOCK_DGRAM)
+                continue;
+            if (g_sockets[i].local_port == 0u || g_sockets[i].local_port != dport)
+                continue;
+            sl = dgram_slot_get(i, 1);
+            if (sl == NULL || sl->ready) {      /* no slot / still unread */
+                g_dgram_drops++;
+                return;
+            }
+            n = (uint32_t)ulen - 8u;
+            if (n > NET_UDP_RX_MAX)
+                n = NET_UDP_RX_MAX;
+            if (n != 0u)
+                memcpy(sl->data, payload + 8u, n);
+            sl->len      = n;
+            sl->src_ip   = src;
+            sl->src_port = sport;
+            sl->ready    = 1;
+            g_dgram_rx++;
+            return;
+        }
     }
 
-    if (g_udp_handler) {
+    /* 2) Legacy single-handler path (a reply to our request, or any datagram to
+     *    the port that handler listens on). */
+    if (g_udp_handler != NULL &&
+        (g_udp_local_port == 0u || dport == g_udp_local_port)) {
         uint32_t n = (uint32_t)ulen - 8u;
         if (n > NET_UDP_RX_MAX)
             n = NET_UDP_RX_MAX;
@@ -842,6 +915,7 @@ static void udp_rx(const ipv4_header_t *ip, const uint8_t *payload,
             memcpy(g_udp_buf, payload + 8u, n);
         g_udp_handler(src, sport, dport, g_udp_buf, n);
     }
+    /* Nobody wants it: dropped silently, exactly like the pre-socket layer. */
 }
 
 /* ===================== ethernet RX dispatch ===================== */
@@ -1259,6 +1333,8 @@ void net_dump_stats(void)
                    (uint64_t)g_icmp_rx, (uint64_t)g_icmp_tx);
     console_printf("[net] udp rx=%llu tx=%llu dropped=%llu\n",
                    (uint64_t)g_stat_udp_rx, (uint64_t)g_stat_udp_tx, (uint64_t)g_udp_drops);
+    console_printf("[net] sock dgram rx=%llu staged_drops=%llu\n",
+                   (uint64_t)g_dgram_rx, (uint64_t)g_dgram_drops);
     console_printf("[net] nic io=0x%llx irq=%llu present=%llu isr=0x%llx ring_drops=%llu\n",
                    (uint64_t)rtl8139_io_base(), (uint64_t)rtl8139_irq(),
                    (uint64_t)(rtl8139_present() ? 1u : 0u),
@@ -1286,9 +1362,53 @@ void net_configure_ip(uint32_t ip, uint32_t gateway, uint32_t netmask)
     memset(g_arp, 0, sizeof(g_arp));
 }
 
+void net_set_dns_ip(uint32_t dns)
+{
+    net_dns_ip = dns;
+}
+
+/* Source-address override for the transmit path.
+ *
+ * DHCP must emit DISCOVER/REQUEST from 0.0.0.0 (the client has no address yet)
+ * while receive filtering keeps using the address we currently believe we have -
+ * so the override belongs to the *transmit* side only, and the IP header and the
+ * UDP pseudo-header both have to see the same value. 0 without the flag means
+ * "no override" because 0.0.0.0 is itself a legal override. */
+static uint32_t g_tx_src_ip;
+static int      g_tx_src_set;
+
+static uint32_t net_tx_src(void)
+{
+    return g_tx_src_set ? g_tx_src_ip : net_local_ip;
+}
+
+void net_set_tx_src_ip(uint32_t ip)
+{
+    g_tx_src_ip = ip;
+    g_tx_src_set = 1;
+}
+
+void net_clear_tx_src_ip(void)
+{
+    g_tx_src_set = 0;
+}
+
+uint16_t net_udp_listen_port(void)
+{
+    return g_udp_local_port;
+}
+
+void net_udp_listen_set(uint16_t port)
+{
+    g_udp_local_port = port;
+}
+
+uint64_t net_udp_dgram_drops(void)
+{
+    return g_dgram_drops;
+}
+
 /* ===================== socket API (stub ABI, datagram subset) ===================== */
-static net_socket_t g_sockets[NET_MAX_SOCKETS];
-static int g_socket_used[NET_MAX_SOCKETS];
 static port_t g_next_port = 49152;
 static uint32_t g_tcp_seq = 0x12345678;
 
@@ -1316,6 +1436,37 @@ int net_socket(int domain, int type, int protocol)
     return -ENFILE;
 }
 
+/* ===================== datagram staging helpers ===================== */
+static net_dgram_slot_t *dgram_slot_get(int sock, int create)
+{
+    int i;
+    net_dgram_slot_t *free_slot = NULL;
+
+    for (i = 0; i < NET_DGRAM_SLOTS; i++) {
+        if (g_dgram[i].sock == sock)
+            return &g_dgram[i];
+        if (free_slot == NULL && g_dgram[i].sock < 0)
+            free_slot = &g_dgram[i];
+    }
+    if (!create || free_slot == NULL)
+        return NULL;
+    memset(free_slot, 0, sizeof(*free_slot));
+    free_slot->sock = sock;
+    return free_slot;
+}
+
+static void dgram_slot_release(int sock)
+{
+    int i;
+
+    for (i = 0; i < NET_DGRAM_SLOTS; i++) {
+        if (g_dgram[i].sock == sock) {
+            memset(&g_dgram[i], 0, sizeof(g_dgram[i]));
+            g_dgram[i].sock = -1;
+        }
+    }
+}
+
 int net_bind(int fd, const net_sockaddr_t *addr, socklen_t addrlen)
 {
     (void)addrlen;
@@ -1323,8 +1474,19 @@ int net_bind(int fd, const net_sockaddr_t *addr, socklen_t addrlen)
         return -EBADF;
     g_sockets[fd].local_ip = addr->sin_addr;
     g_sockets[fd].local_port = ntohs(addr->sin_port);
-    if (g_sockets[fd].local_port != 0u)
+    if (g_sockets[fd].type == SOCK_DGRAM) {
+        /* port 0 means "pick an ephemeral one", like the BSD bind() */
+        if (g_sockets[fd].local_port == 0u) {
+            g_sockets[fd].local_port = net_alloc_port();
+            if (g_sockets[fd].local_port == 0u)
+                return -EADDRINUSE;
+        }
+        if (dgram_slot_get(fd, 1) == NULL)
+            return -ENOMEM;
         g_udp_local_port = g_sockets[fd].local_port;
+    } else if (g_sockets[fd].local_port != 0u) {
+        g_udp_local_port = g_sockets[fd].local_port;
+    }
     return 0;
 }
 
@@ -1454,9 +1616,74 @@ int net_send(int fd, const void *buf, size_t len, int flags)
                         buf, (uint32_t)len) == 0 ? (int)len : -EIO;
 }
 
+/* Receive one datagram into the staging slot of this socket.
+ * BOUNDED BUSY-WAIT: there is no wait queue yet, so this pumps net_poll() and
+ * gives up after `timeout_ms` (a wall-clock budget from the PIT clock). A caller
+ * that wants non-blocking behaviour passes MSG_DONTWAIT, which turns it into a
+ * single poll. Returns the byte count, 0 for a zero-length datagram, or
+ * -EAGAIN when the budget expired with nothing staged. */
+static int net_dgram_recv(int fd, void *buf, size_t len, int flags,
+                          net_sockaddr_t *src_addr, socklen_t *addrlen,
+                          int timeout_ms)
+{
+    net_dgram_slot_t *sl;
+    uint64_t start;
+    uint64_t budget_us;
+
+    if (fd < 0 || fd >= NET_MAX_SOCKETS || !g_socket_used[fd])
+        return -EBADF;
+    if (g_sockets[fd].type != SOCK_DGRAM)
+        return -ENOTSOCK;
+    sl = dgram_slot_get(fd, 1);
+    if (sl == NULL)
+        return -ENOMEM;
+
+    /* An unbound socket still needs a source port: bind() normally did this. */
+    if (g_sockets[fd].local_port == 0u) {
+        g_sockets[fd].local_port = net_alloc_port();
+        if (g_sockets[fd].local_port == 0u)
+            return -EAGAIN;
+    }
+
+    if (timeout_ms < 0)
+        timeout_ms = NET_DGRAM_RECV_TIMEOUT_MS;
+    budget_us = (uint64_t)timeout_ms * 1000ull;
+    start = net_now_us();
+
+    for (;;) {
+        if (sl->ready) {
+            uint32_t n = sl->len;
+            if (n > len)
+                n = (uint32_t)len;
+            if (n != 0u && buf != NULL)
+                memcpy(buf, sl->data, n);
+            if (src_addr != NULL) {
+                memset(src_addr, 0, sizeof(*src_addr));
+                src_addr->sin_family = AF_INET;
+                src_addr->sin_port   = htons(sl->src_port);
+                src_addr->sin_addr   = sl->src_ip;
+            }
+            if (addrlen != NULL)
+                *addrlen = (socklen_t)sizeof(net_sockaddr_t);
+            sl->ready = 0;
+            return (int)n;
+        }
+        if ((flags & MSG_DONTWAIT) != 0)
+            return -EAGAIN;
+        net_poll();
+        if (sl->ready)
+            continue;
+        if ((net_now_us() - start) >= budget_us)
+            return -EAGAIN;
+        {
+            for (volatile int spin = 0; spin < 2000; spin++)
+                __asm__ volatile("pause");
+        }
+    }
+}
+
 int net_recv(int fd, void *buf, size_t len, int flags)
 {
-    (void)flags;
     sock_tcp_init_table();
     if (fd < 0 || fd >= NET_MAX_SOCKETS || !g_socket_used[fd])
         return -EBADF;
@@ -1470,17 +1697,27 @@ int net_recv(int fd, void *buf, size_t len, int flags)
             return 0;                            /* EOF */
         return n > 0 ? n : -EAGAIN;
     }
-    return -EAGAIN;                              /* datagrams need a handler */
+    (void)flags;
+    return net_dgram_recv(fd, buf, len, 0, NULL, NULL, -1);
 }
 
 int net_sendto(int fd, const void *buf, size_t len, int flags,
                const net_sockaddr_t *dest_addr, socklen_t addrlen)
 {
-    (void)fd; (void)flags; (void)addrlen;
+    (void)flags; (void)addrlen;
+    if (fd < 0 || fd >= NET_MAX_SOCKETS || !g_socket_used[fd])
+        return -EBADF;
     if (!dest_addr)
         return -EDESTADDRREQ;
-    return net_udp_send(dest_addr->sin_addr,
-                        g_sockets[fd].local_port ? g_sockets[fd].local_port : 40000u,
+    if (g_sockets[fd].type != SOCK_DGRAM)
+        return -ENOTSOCK;
+    if (g_sockets[fd].local_port == 0u) {
+        g_sockets[fd].local_port = net_alloc_port();
+        if (g_sockets[fd].local_port == 0u)
+            return -EAGAIN;
+    }
+    (void)dgram_slot_get(fd, 1);                 /* make sure replies can land */
+    return net_udp_send(dest_addr->sin_addr, g_sockets[fd].local_port,
                         ntohs(dest_addr->sin_port), buf, (uint32_t)len) == 0
            ? (int)len : -EIO;
 }
@@ -1488,8 +1725,7 @@ int net_sendto(int fd, const void *buf, size_t len, int flags,
 int net_recvfrom(int fd, void *buf, size_t len, int flags,
                  net_sockaddr_t *src_addr, socklen_t *addrlen)
 {
-    (void)fd; (void)buf; (void)len; (void)flags; (void)src_addr; (void)addrlen;
-    return -EAGAIN;
+    return net_dgram_recv(fd, buf, len, flags, src_addr, addrlen, -1);
 }
 
 int net_shutdown(int fd, int how)
@@ -1511,6 +1747,7 @@ int net_close(int fd)
             (void)tcp_close(g_sock_tcp[fd]);     /* listener or connection */
             g_sock_tcp[fd] = -1;
         }
+        dgram_slot_release(fd);
         g_socket_used[fd] = 0;
         memset(&g_sockets[fd], 0, sizeof(net_socket_t));
     }
@@ -1527,6 +1764,14 @@ int net_getsockopt(int fd, int level, int optname, void *optval, socklen_t *optl
 {
     (void)fd; (void)level; (void)optname; (void)optval; (void)optlen;
     return -ENOPROTOOPT;
+}
+
+/* SOCK_STREAM / SOCK_DGRAM of an open net socket, or a negative errno. */
+int net_socket_type(int fd)
+{
+    if (fd < 0 || fd >= NET_MAX_SOCKETS || !g_socket_used[fd])
+        return -EBADF;
+    return g_sockets[fd].type;
 }
 
 int net_getsockname(int fd, net_sockaddr_t *addr, socklen_t *addrlen)
@@ -1575,8 +1820,48 @@ int net_sendmsg(int fd, const struct msghdr *msg, int flags)
 
 int net_recvmsg(int fd, struct msghdr *msg, int flags)
 {
-    (void)fd; (void)msg; (void)flags;
-    return -EAGAIN;
+    net_sockaddr_t from;
+    socklen_t fromlen = 0;
+    uint8_t staged[NET_UDP_RX_MAX];
+    size_t i;
+    uint32_t off;
+    int r;
+
+    if (msg == NULL || msg->msg_iov == NULL || msg->msg_iovlen == 0)
+        return -EINVAL;
+    if (fd < 0 || fd >= NET_MAX_SOCKETS || !g_socket_used[fd])
+        return -EBADF;
+
+    if (g_sockets[fd].type == SOCK_STREAM) {
+        r = net_recv(fd, msg->msg_iov[0].iov_base, msg->msg_iov[0].iov_len, flags);
+        if (r >= 0)
+            msg->msg_namelen = 0;
+        return r;
+    }
+
+    /* Datagram: read once into a staging copy, then scatter it across the
+     * caller's iovecs so msg_iovlen is honoured. No ancillary data is produced
+     * (this stack has none) and msg_flags is left untouched. */
+    r = net_dgram_recv(fd, staged, sizeof(staged), flags, &from, &fromlen, -1);
+    if (r < 0)
+        return r;
+
+    off = 0;
+    for (i = 0; i < msg->msg_iovlen && off < (uint32_t)r; i++) {
+        uint32_t n = (uint32_t)r - off;
+        if (n > msg->msg_iov[i].iov_len)
+            n = (uint32_t)msg->msg_iov[i].iov_len;
+        if (n != 0u && msg->msg_iov[i].iov_base != NULL)
+            memcpy(msg->msg_iov[i].iov_base, staged + off, n);
+        off += n;
+    }
+    if (msg->msg_name != NULL && msg->msg_namelen >= sizeof(net_sockaddr_t)) {
+        memcpy(msg->msg_name, &from, sizeof(net_sockaddr_t));
+        msg->msg_namelen = (socklen_t)sizeof(net_sockaddr_t);
+    } else {
+        msg->msg_namelen = 0;
+    }
+    return (int)((off < (uint32_t)r) ? off : (uint32_t)r);
 }
 
 uint32_t net_get_tcp_initial_seq(void)

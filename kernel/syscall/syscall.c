@@ -7,11 +7,29 @@
 #define SYSCALL_MAX 512
 static syscall_fn_t syscall_table[SYSCALL_MAX];
 
+/* The user_context_t of the syscall currently being dispatched.
+ *
+ * rt_sigreturn(15) has to write back into that frame (it restores every GPR plus
+ * rip/rsp/rflags), but a syscall handler only receives six register arguments -
+ * there is no ctx parameter in syscall_fn_t. The dispatcher therefore publishes
+ * the frame it is working on here for the duration of the call; sigreturn is the
+ * only consumer and it always runs inside dispatch. A ring-3 exit longjmps out of
+ * the dispatcher, so the pointer is re-published on every entry rather than
+ * cleared on exit. */
+static user_context_t *g_dispatch_ctx;
+
+user_context_t *syscall_current_ctx(void)
+{
+    return g_dispatch_ctx;
+}
+
 /* 从汇编调用：rdi 指向 user_context_t（内核栈上） */
 uint64_t syscall_dispatch_c(user_context_t *ctx)
 {
     uint64_t nr = ctx->rax;
     uint64_t ret;
+
+    g_dispatch_ctx = ctx;
 
     if (nr >= SYSCALL_MAX || syscall_table[nr] == NULL) {
         console_printf("[syscall] bad nr=%lu\n", nr);
@@ -40,10 +58,17 @@ uint64_t syscall_dispatch_c(user_context_t *ctx)
     /* Signal delivery point: Linux delivers pending signals when returning to
      * user mode, and a syscall exit is the only place this kernel has that. The
      * handler rewrites ctx->rip/rsp, so it must run after the return value is
-     * fixed up (rax) and only for user tasks (cs != kernel code segment). */
+     * fixed up (rax) and only for user tasks (cs != kernel code segment).
+     *
+     * SutureOS fix: the ring-3 code selector is 0x2B (GDT 64-bit user code;
+     * arch/x86_64/syscall.S pushes exactly that), not 0x23 - 0x23 is the user
+     * *data* selector. The old `ctx->cs == 0x23` test was therefore never true on
+     * the syscall path, so sig_check_pending() was only ever reached from the
+     * fault path and signal delivery never happened at all. The RPL test below
+     * accepts any CPL=3 selector. */
     {
         extern void sig_check_pending(void *uctx);
-        if (ctx->cs == 0x23) {              /* user code segment: ring 3 */
+        if ((ctx->cs & 3u) == 3u) {         /* user code segment: ring 3 */
             ctx->rax = ret;
             sig_check_pending(ctx);
             return ctx->rax;
@@ -137,6 +162,11 @@ void syscall_init(void)
     syscall_register(9, sys_mmap);    /* mmap */
     syscall_register(11, sys_munmap); /* munmap */
     syscall_register(13, sys_rt_sigaction);  /* rt_sigaction */
+    {
+        extern uint64_t sys_rt_sigprocmask(uint64_t, uint64_t, uint64_t,
+                                            uint64_t, uint64_t, uint64_t);
+        syscall_register(14, sys_rt_sigprocmask); /* rt_sigprocmask: real mask */
+    }
     syscall_register(15, sys_rt_sigreturn);  /* rt_sigreturn */
     {
         extern uint64_t sys_mprotect(uint64_t, uint64_t, uint64_t,

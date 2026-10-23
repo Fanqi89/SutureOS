@@ -20,6 +20,8 @@
 #include "syscall.h"
 #include "mb_kbd.h"
 #include "net.h"      /* tcp_header_t / TCP_FLAG_* / htons for the TCP commands */
+#include "dhcp.h"     /* dhcp / nslookup: on-demand lease + resolver */
+#include "dns.h"
 
 /* Declare console_getc for keyboard input */
 extern int console_getc(void);
@@ -96,6 +98,9 @@ static const struct shell_cmd g_commands[] = {
     {"cpus",    shell_cmd_cpus,    "Show per-CPU state (jiffies, IPIs, work done)"},
     {"smptest", shell_cmd_smptest, "Queue work items and report which CPU ran them" },
     {"ping",    shell_cmd_ping,    "Send ICMP echo requests: ping <ipv4>"},
+    {"dhcp",    shell_cmd_dhcp,    "DHCP: acquire a lease, program IP/mask/gateway/DNS: dhcp"},
+    {"nslookup",shell_cmd_nslookup,"Resolve an A record through the configured DNS server: nslookup <name>"},
+    {"socktest",shell_cmd_socktest,"Self-test: socket/bind/getsockname/getsockopt/close ABI"},
     {"netstat", shell_cmd_netstat, "Show network statistics"},
     {"tcpecho", shell_cmd_tcpecho, "TCP round trip: tcpecho <ipv4> <port> <text>"},
     {"tcpsend", shell_cmd_tcpsend, "TCP one-way send: tcpsend <ipv4> <port> <text>"},
@@ -1229,6 +1234,79 @@ int shell_cmd_netstat(int argc, char **argv) {
     (void)argc; (void)argv;
     net_dump_stats();
     return 0;
+}
+
+/* DHCP client: on demand only (never at boot). Acquires a lease and programs the
+ * address/mask/gateway/resolver the stack uses from then on. */
+int shell_cmd_dhcp(int argc, char **argv) {
+    extern int dhcp_client_acquire(dhcp_lease_t *out, int timeout_ms);
+    extern uint32_t net_ip(void), net_gw(void), net_mask(void), net_dns(void);
+    int rc;
+    dhcp_lease_t lease;
+    char ip[16], mask[16], gw[16], dns[16];
+    (void)argc; (void)argv;
+
+    if (!net_ready()) {
+        shell_puts("dhcp: network is not up (no RTL8139 / net_init failed)\n");
+        return -1;
+    }
+    shell_puts("DHCP: sending DISCOVER to 255.255.255.255:67 ...\n");
+    rc = dhcp_client_acquire(&lease, 4000);
+    if (rc != 0) {
+        shell_printf("dhcp: no lease (error %d)%s\n", (int64_t)rc,
+                     (rc == -110) ? " - no reply from a DHCP server" : "");
+        return -1;
+    }
+    net_ip_to_str(net_ip(), ip, sizeof(ip));
+    net_ip_to_str(net_mask(), mask, sizeof(mask));
+    net_ip_to_str(net_gw(), gw, sizeof(gw));
+    net_ip_to_str(net_dns(), dns, sizeof(dns));
+    shell_printf("dhcp: lease %s mask %s gateway %s dns %s (server ",
+                 ip, mask, gw, dns);
+    net_ip_to_str(lease.server_id, ip, sizeof(ip));
+    shell_printf("%s, %u s)\n", ip, (unsigned)lease.lease_secs);
+    return 0;
+}
+
+/* DNS resolver: nslookup <name> (A record only, one query at a time). */
+int shell_cmd_nslookup(int argc, char **argv) {
+    extern int dns_resolve(const char *name, uint32_t *out_ip, int timeout_ms);
+    uint32_t ip = 0;
+    char server[16], answer[16];
+    int rc;
+
+    if (!net_ready()) {
+        shell_puts("nslookup: network is not up (no RTL8139 / net_init failed)\n");
+        return -1;
+    }
+    if (argc < 2) {
+        shell_puts("usage: nslookup <name>    e.g. nslookup example.com\n");
+        return -1;
+    }
+    if (net_dns() == 0u) {
+        shell_puts("nslookup: no DNS server configured (run dhcp first)\n");
+        return -1;
+    }
+    net_ip_to_str(net_dns(), server, sizeof(server));
+    shell_printf("nslookup: querying %s for %s (A)\n", server, argv[1]);
+    rc = dns_resolve(argv[1], &ip, 1000);
+    if (rc != 0) {
+        shell_printf("nslookup: %s: no A record (error %d)\n", argv[1], (int64_t)rc);
+        return -1;
+    }
+    net_ip_to_str(ip, answer, sizeof(answer));
+    shell_printf("%s has address %s\n", argv[1], answer);
+    return 0;
+}
+
+/* Socket ABI acceptance, callable any time (also runs silently at boot). */
+int shell_cmd_socktest(int argc, char **argv) {
+    extern int sockets_boot_selftest(void);
+    const int fails = sockets_boot_selftest();
+    (void)argc; (void)argv;
+    shell_printf("socktest: %s (%d failure(s))\n", (fails == 0) ? "PASS" : "FAIL",
+                 (int64_t)fails);
+    return (fails == 0) ? 0 : 1;
 }
 
 /* ==================== TCP commands (kernel/net/tcp.c) ====================

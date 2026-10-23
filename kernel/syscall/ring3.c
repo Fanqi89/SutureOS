@@ -212,10 +212,18 @@ int user_run_blob(const char *name, const uint8_t *blob, uint64_t len)
 
     if (!g_ring3_ready) {
         sse_enable();
-        wrmsr(0xC0000102, (uint64_t)(uintptr_t)&g_ring3_gs);
-        g_ring3_gs.kernel_rsp = (uint64_t)(uintptr_t)&g_ring3_kstack[RING3_KSTACK_BYTES] - 64;
         g_ring3_ready = 1;
     }
+    /* IA32_KERNEL_GS_BASE must be re-armed for EVERY run, not just the first one:
+     * ring3_exit_user() restores the MSRs it found on entry (so the kernel's own
+     * GS state is intact afterwards), which means the pointer is back to 0 when
+     * the next program starts. With it at 0 the first `syscall` instruction's
+     * swapgs is a no-op and `mov %gs:8,%rsp` loads the kernel stack pointer from
+     * linear address 8 - the real-mode IVT - which is exactly the garbage stack
+     * (0xf000ff53...) the signal self test hit. Every program that used only
+     * int 0x80 never noticed. */
+    wrmsr(0xC0000102, (uint64_t)(uintptr_t)&g_ring3_gs);
+    g_ring3_gs.kernel_rsp = (uint64_t)(uintptr_t)&g_ring3_kstack[RING3_KSTACK_BYTES] - 64;
 
     if (userspace_create(&us) != 0) {
         console_printf("[user] '%s': cannot create an address space\n",
@@ -274,6 +282,10 @@ extern const uint8_t _binary_probe_bin_size[];
 extern const uint8_t _binary_shell_bin_start[];
 extern const uint8_t _binary_shell_bin_end[];
 extern const uint8_t _binary_shell_bin_size[];
+/* ITEM 5 acceptance: the signal-semantics program (user/apps/sigtest.c). */
+extern const uint8_t _binary_sigtest_bin_start[];
+extern const uint8_t _binary_sigtest_bin_end[];
+extern const uint8_t _binary_sigtest_bin_size[];
 
 typedef struct {
     const char *name;
@@ -285,6 +297,10 @@ static const user_program_t g_programs[] = {
     { "hello", _binary_hello_bin_start, _binary_hello_bin_size },
     { "probe", _binary_probe_bin_start, _binary_probe_bin_size },
     { "shell", _binary_shell_bin_start, _binary_shell_bin_size },
+    /* Signal semantics acceptance (ITEM 5). Deliberately NOT auto-run at boot:
+     * `run sigtest` from the shell is the acceptance path, so the frozen boot
+     * log gains nothing. */
+    { "sigtest", _binary_sigtest_bin_start, _binary_sigtest_bin_size },
 };
 
 /* ---- execve support ----
@@ -409,7 +425,7 @@ int user_run_builtin(const char *name)
     return -1;
 }
 
-const char *user_builtin_list(void) { return "hello probe shell"; }
+const char *user_builtin_list(void) { return "hello probe shell sigtest"; }
 
 /* ---------------- acceptance ---------------- */
 

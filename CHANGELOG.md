@@ -6,6 +6,33 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.11.3-alpha]
+
+补完第 4、5 项：socket 系统调用 + DHCP/DNS 客户端 + 真正的 signal 语义（sigframe +
+rt_sigreturn）。启动呈现与 GUI 外观零变化。
+
+### Added
+- **socket 系统调用家族**（`kernel/syscall/sockets.c/.h`）：socket/connect/accept/sendto/
+  recvfrom/sendmsg/recvmsg/shutdown/bind/listen/getsockname/getpeername/setsockopt/
+  getsockopt 注册到内核既有 UDP/TCP 对象上，带用户指针校验；socket fd 进入 fd 表。
+  `syscalls: 76 registered`（v0.11.2 为 62）。
+- **DHCP 客户端**（`kernel/net/dhcp.c/.h`）：DISCOVER/REQUEST over UDP 68->67，解析
+  OFFER/ACK 后写入 IP/掩码/网关/DNS。**只在 shell 命令 `dhcp` 时运行，不在开机阶段发起。**
+- **DNS 解析器**（`kernel/net/dns.c/.h`）：A 查询构造 + 应答解析，`nslookup <name>` 触发。
+- **signal 真语义**（`kernel/syscall/signal.c`）：进入 handler 前在用户栈上构造 sigframe
+  （保存完整上下文 + 返回跳板），`rt_sigreturn` 从 sigframe 恢复全部寄存器与
+  rip/rsp/rflags，handler 返回后精确回到被打断处；`sigaction`/`sigprocmask` 掩码真实
+  生效；`SIG_DFL` 仍是终止该进程（不停机）。
+- **ring-3 验收程序 `user/apps/sigtest.c`**：安装 SIGUSR1 handler -> `kill(getpid())`
+  -> 校验 handler 运行并通过跳板返回 -> 成功退出 0；注册进内建程序表（`run sigtest`）。
+
+### Verification
+- 启动日志：`syscalls: 76 registered`、自检 13/14、`ring3 selftest 9/9`、
+  `userspace selftest 9/9`、`[fat32] write self-test PASS`、无 PANIC；
+  **启动日志行数 265 == 基线 265，零增删行**（只有数据值不同）。
+- 新自检全部"成功不打印、失败才打印"。
+- GUI 目录零改动，启动 print 序列未改动。
+
 ## [v0.11.2-alpha]
 
 补完 5 项未完成系统调用中的前 3 项（dup/*at/ioctl+tty）。**启动呈现与 GUI 外观零变化。**

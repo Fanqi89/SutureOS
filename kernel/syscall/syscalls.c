@@ -12,14 +12,17 @@
 
 /* 文件描述符表 (每任务静态) - 存储 VFS fd
  *
- * A slot names either a VFS open file (vfs_fd) or a pipe end (pipe_fd). Pipes
- * normally live in their own encoded number space (kernel/ipc/pipe.c, fds >=
- * PIPE_FD_BASE), but dup()/dup2() have to hand out ordinary low descriptor
- * numbers, so a slot can also hold one of those encoded pipe fds. */
+ * A slot names either a VFS open file (vfs_fd), a pipe end (pipe_fd) or a
+ * kernel/net socket (sock_fd). Pipes normally live in their own encoded number
+ * space (kernel/ipc/pipe.c, fds >= PIPE_FD_BASE), but dup()/dup2() have to hand
+ * out ordinary low descriptor numbers, so a slot can also hold one of those
+ * encoded pipe fds. A socket slot holds the index of the net socket object
+ * (kernel/net/net.c), which is a different number space from the descriptor. */
 #define MAX_FDS 32
 struct fd_entry {
     int vfs_fd;   /* VFS layer file descriptor, -1 when unused */
     int pipe_fd;  /* pipe end behind this slot (dup of a pipe), -1 otherwise */
+    int sock_fd;  /* kernel/net socket slot behind this fd, -1 otherwise */
     uint32_t flags;  /* O_RDONLY=0, O_WRONLY=1, O_RDWR=2 */
 };
 
@@ -31,6 +34,7 @@ void fd_tables_init(void) {
         for (int j = 0; j < MAX_FDS; j++) {
             fd_tables[i][j].vfs_fd = -1;
             fd_tables[i][j].pipe_fd = -1;
+            fd_tables[i][j].sock_fd = -1;
             fd_tables[i][j].flags = 0;
         }
     }
@@ -40,7 +44,8 @@ void fd_tables_init(void) {
 static int fd_alloc(int tid) {
     if (tid < 0 || tid >= SCHED_MAX_TASKS) return -1;
     for (int i = 0; i < MAX_FDS; i++) {
-        if (fd_tables[tid][i].vfs_fd < 0 && fd_tables[tid][i].pipe_fd < 0) return i;
+        if (fd_tables[tid][i].vfs_fd < 0 && fd_tables[tid][i].pipe_fd < 0 &&
+            fd_tables[tid][i].sock_fd < 0) return i;
     }
     return -1;
 }
@@ -73,24 +78,64 @@ int fd_vfs_fd(int fd)
     return fd_tables[tid][fd].vfs_fd;
 }
 
+/* Kernel/net socket behind a descriptor slot, or -1 (defined below). */
+int fd_sock_fd(int fd);
+
 int fd_is_open(int fd)
 {
     if (fd_pipe_end(fd) >= 0) return 1;
-    return fd_vfs_fd(fd) >= 0;
+    if (fd_vfs_fd(fd) >= 0) return 1;
+    return fd_sock_fd(fd) >= 0;
+}
+
+/* Kernel/net socket behind a descriptor slot, or -1. */
+int fd_sock_fd(int fd)
+{
+    extern sched_cpu_t sched_cpu;
+    const int tid = sched_cpu.current;
+
+    if (fd < 0 || fd >= MAX_FDS) return -1;
+    if (tid < 0 || tid >= SCHED_MAX_TASKS) return -1;
+    return fd_tables[tid][fd].sock_fd;
+}
+
+/* Install a kernel/net socket in the lowest free descriptor slot and return that
+ * descriptor, or -EMFILE when the table is full. The caller owns the net socket;
+ * on failure it must net_close() it. */
+int fd_install_socket(int sock)
+{
+    extern sched_cpu_t sched_cpu;
+    const int tid = sched_cpu.current;
+    int fd;
+
+    if (sock < 0) return -9;                                 /* -EBADF */
+    if (tid < 0 || tid >= SCHED_MAX_TASKS) return -9;
+    fd = fd_alloc(tid);
+    if (fd < 0) return -24;                                  /* -EMFILE */
+    fd_tables[tid][fd].vfs_fd = -1;
+    fd_tables[tid][fd].pipe_fd = -1;
+    fd_tables[tid][fd].sock_fd = sock;
+    fd_tables[tid][fd].flags = 0;
+    return fd;
 }
 
 /* Drop whatever a slot holds (used by dup2() before it overwrites it). */
 static void fd_close_slot(int tid, int fd)
 {
+    extern int net_close(int fd);
+
     if (tid < 0 || tid >= SCHED_MAX_TASKS) return;
     if (fd < 0 || fd >= MAX_FDS) return;
-    if (fd_tables[tid][fd].pipe_fd >= 0) {
+    if (fd_tables[tid][fd].sock_fd >= 0) {
+        (void)net_close(fd_tables[tid][fd].sock_fd);
+    } else if (fd_tables[tid][fd].pipe_fd >= 0) {
         (void)pipe_close_fd(fd_tables[tid][fd].pipe_fd);
     } else if (fd_tables[tid][fd].vfs_fd >= 0) {
         (void)vfs_close(fd_tables[tid][fd].vfs_fd);
     }
     fd_tables[tid][fd].vfs_fd = -1;
     fd_tables[tid][fd].pipe_fd = -1;
+    fd_tables[tid][fd].sock_fd = -1;
     fd_tables[tid][fd].flags = 0;
 }
 
@@ -110,16 +155,30 @@ int fd_dup_lowest(int oldfd)
         if (pipe_ref_fd(pfd) != 0) return -9;
         fd_tables[tid][newfd].vfs_fd = -1;
         fd_tables[tid][newfd].pipe_fd = pfd;
+        fd_tables[tid][newfd].sock_fd = -1;
         fd_tables[tid][newfd].flags = 0;
         return newfd;
     }
     if (oldfd < 0 || oldfd >= MAX_FDS) return -9;
+    if (fd_tables[tid][oldfd].sock_fd >= 0) {
+        /* A socket slot is a plain handle, not a refcounted open file: the
+         * duplicate names the same net socket and the first close() retires it
+         * (a second close then sees a closed slot). Documented, not pretended. */
+        newfd = fd_alloc(tid);
+        if (newfd < 0) return -24;
+        fd_tables[tid][newfd].vfs_fd = -1;
+        fd_tables[tid][newfd].pipe_fd = -1;
+        fd_tables[tid][newfd].sock_fd = fd_tables[tid][oldfd].sock_fd;
+        fd_tables[tid][newfd].flags = 0;
+        return newfd;
+    }
     if (fd_tables[tid][oldfd].vfs_fd < 0) return -9;
     newfd = fd_alloc(tid);
     if (newfd < 0) return -24;
     if (vfs_ref(fd_tables[tid][oldfd].vfs_fd) != VFS_OK) return -5;  /* -EIO */
     fd_tables[tid][newfd].vfs_fd = fd_tables[tid][oldfd].vfs_fd;
     fd_tables[tid][newfd].pipe_fd = -1;
+    fd_tables[tid][newfd].sock_fd = -1;
     fd_tables[tid][newfd].flags = fd_tables[tid][oldfd].flags;
     return newfd;
 }
@@ -143,15 +202,25 @@ int fd_dup_to(int oldfd, int newfd)
         if (pipe_ref_fd(pfd) != 0) return -9;
         fd_tables[tid][newfd].vfs_fd = -1;
         fd_tables[tid][newfd].pipe_fd = pfd;
+        fd_tables[tid][newfd].sock_fd = -1;
         fd_tables[tid][newfd].flags = 0;
         return newfd;
     }
     if (oldfd < 0 || oldfd >= MAX_FDS) return -9;
+    if (fd_tables[tid][oldfd].sock_fd >= 0) {
+        fd_close_slot(tid, newfd);
+        fd_tables[tid][newfd].vfs_fd = -1;
+        fd_tables[tid][newfd].pipe_fd = -1;
+        fd_tables[tid][newfd].sock_fd = fd_tables[tid][oldfd].sock_fd;
+        fd_tables[tid][newfd].flags = 0;
+        return newfd;
+    }
     if (fd_tables[tid][oldfd].vfs_fd < 0) return -9;
     fd_close_slot(tid, newfd);
     if (vfs_ref(fd_tables[tid][oldfd].vfs_fd) != VFS_OK) return -5;
     fd_tables[tid][newfd].vfs_fd = fd_tables[tid][oldfd].vfs_fd;
     fd_tables[tid][newfd].pipe_fd = -1;
+    fd_tables[tid][newfd].sock_fd = -1;
     fd_tables[tid][newfd].flags = fd_tables[tid][oldfd].flags;
     return newfd;
 }
@@ -174,6 +243,13 @@ uint64_t sys_read(uint64_t fd, uint64_t buf, uint64_t len,
     }
     if (fd >= MAX_FDS) return (uint64_t)-1;
     if (tid < 0 || tid >= SCHED_MAX_TASKS) return (uint64_t)(int64_t)(-9);
+    /* A socket descriptor behaves like read(2) on a connected socket. */
+    if (fd_tables[tid][fd].sock_fd >= 0) {
+        extern int net_recv(int, void *, size_t, int);
+        EL0_CHECK(buf, len);
+        return (uint64_t)(int64_t)net_recv(fd_tables[tid][fd].sock_fd,
+                                           (void *)(uintptr_t)buf, (size_t)len, 0);
+    }
     struct fd_entry *f = &fd_tables[tid][fd];
     if (f->vfs_fd < 0) return (uint64_t)-1;
     EL0_CHECK(buf, len);
@@ -217,6 +293,14 @@ uint64_t sys_write(uint64_t fd, uint64_t buf, uint64_t len,
         }
         if (!valid_tid) return (uint64_t)(int64_t)(-9);      /* -EBADF */
     }
+    /* A socket descriptor behaves like write(2) on a connected socket. */
+    if (fd_tables[tid][fd].sock_fd >= 0) {
+        extern int net_send(int, const void *, size_t, int);
+        EL0_CHECK(buf, len);
+        return (uint64_t)(int64_t)net_send(fd_tables[tid][fd].sock_fd,
+                                           (const void *)(uintptr_t)buf,
+                                           (size_t)len, 0);
+    }
     struct fd_entry *f = &fd_tables[tid][fd];
     if (f->vfs_fd < 0) return (uint64_t)-1;
     EL0_CHECK(buf, len);
@@ -249,6 +333,7 @@ uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode,
     }
     fd_tables[tid][fd].vfs_fd = vfs_fd;
     fd_tables[tid][fd].pipe_fd = -1;
+    fd_tables[tid][fd].sock_fd = -1;
     fd_tables[tid][fd].flags = flags & 3;
     return fd;
 }
@@ -268,6 +353,7 @@ uint64_t sys_close(uint64_t fd, uint64_t a2, uint64_t a3,
                 tid >= 0 && tid < SCHED_MAX_TASKS) {
                 fd_tables[tid][fd].vfs_fd = -1;
                 fd_tables[tid][fd].pipe_fd = -1;
+                fd_tables[tid][fd].sock_fd = -1;
                 fd_tables[tid][fd].flags = 0;
             }
             return (uint64_t)(int64_t)r;
@@ -275,10 +361,22 @@ uint64_t sys_close(uint64_t fd, uint64_t a2, uint64_t a3,
     }
     if (fd >= MAX_FDS) return (uint64_t)-1;
     if (tid < 0 || tid >= SCHED_MAX_TASKS) return (uint64_t)(int64_t)(-9);
+    /* close() must retire a socket descriptor too: net_close() shuts the TCP
+     * connection or drops the datagram staging slot, then the descriptor frees. */
+    if (fd_tables[tid][fd].sock_fd >= 0) {
+        extern int net_close(int fd);
+        const int r = net_close(fd_tables[tid][fd].sock_fd);
+        fd_tables[tid][fd].vfs_fd = -1;
+        fd_tables[tid][fd].pipe_fd = -1;
+        fd_tables[tid][fd].sock_fd = -1;
+        fd_tables[tid][fd].flags = 0;
+        return (uint64_t)(int64_t)r;
+    }
     if (fd_tables[tid][fd].vfs_fd < 0) return (uint64_t)-1;
     int ret = vfs_close(fd_tables[tid][fd].vfs_fd);
     fd_tables[tid][fd].vfs_fd = -1;
     fd_tables[tid][fd].pipe_fd = -1;
+    fd_tables[tid][fd].sock_fd = -1;
     fd_tables[tid][fd].flags = 0;
     return ret;
 }

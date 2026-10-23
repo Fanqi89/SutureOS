@@ -99,6 +99,9 @@ int shell_cmd_df(int argc, char **argv);
 int shell_cmd_cpus(int argc, char **argv);
 int shell_cmd_smptest(int argc, char **argv);
 int shell_cmd_ping(int argc, char **argv);
+int shell_cmd_dhcp(int argc, char **argv);
+int shell_cmd_nslookup(int argc, char **argv);
+int shell_cmd_socktest(int argc, char **argv);
 int shell_cmd_netstat(int argc, char **argv);
 /* TCP (kernel/net/tcp.c): connect + send + receive + close, all polled. */
 int shell_cmd_tcpecho(int argc, char **argv);
