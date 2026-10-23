@@ -447,10 +447,225 @@ static void gui_clamp_pointer(void)
     if (g_my > g_gui_screen_h - 1) g_my = g_gui_screen_h - 1;
 }
 
-/* Handle a left click at (cx,cy). Returns nothing; the next frame repaints. */
+/* ==================== interactive window management ====================
+ * Drag (title bar), resize (bottom-right grip) and close (the title bar "x")
+ * are implemented against the EXISTING chrome: no colour, font, metric, widget
+ * or draw order of the frozen baseline (docs/baseline/base_gui.png) changes.
+ *
+ * The only affordance that is not part of the static desktop is the 3-dot
+ * resize grip. It is drawn exclusively while the pointer sits inside the 12x12
+ * grip area (or while a resize is in progress), so a screenshot taken with the
+ * pointer anywhere else stays pixel-identical to the baseline.
+ *
+ * Interaction model (screen coordinates; everything is polled once per frame):
+ *   press in the title bar  -> move drag: the window origin follows the pointer
+ *   press in the grip area  -> resize: the bottom-right corner follows it
+ *   left button released    -> drag ends, no state is left behind
+ * Every geometry change dirties BOTH the old and the new window rect, so the
+ * existing union-rect compositor erases the stale pixels; the pointer is
+ * composited last, so it stays on top while a window is dragged under it.
+ */
+#define GUI_GRIP_SIZE 12
+#define GUI_BTN_LEFT  0x01
+#define GUI_DRAG_NONE 0
+#define GUI_DRAG_MOVE 1
+#define GUI_DRAG_SIZE 2
+
+static int g_drag_kind = GUI_DRAG_NONE;
+static struct gui_window* g_drag_win = NULL;
+static int g_drag_off_x, g_drag_off_y;   /* move: pointer - window origin     */
+static int g_drag_px, g_drag_py;         /* resize: pointer at the grab point */
+static int g_drag_w0, g_drag_h0;         /* resize: window size when grabbed  */
+static struct gui_window* g_grip_win = NULL;   /* grip hover highlight        */
+
+static void gui_dirty_win(struct gui_window* w) {
+    if (w) gui_dirty(w->x, w->y, w->w, w->h);
+}
+
+/* Recompute the client rect exactly the way gui_create_window() does, so a
+ * resized window keeps the same 1px border / GUI_TITLE_H title layout. */
+static void gui_sync_client(struct gui_window* w) {
+    w->client_x = w->x + GUI_BORDER;
+    w->client_y = w->y + GUI_TITLE_H + GUI_BORDER;
+    w->client_w = w->w - GUI_BORDER * 2;
+    w->client_h = w->h - GUI_TITLE_H - GUI_BORDER * 2;
+    if (w->client_w < 1) w->client_w = 1;
+    if (w->client_h < 1) w->client_h = 1;
+}
+
+/* Start moving `w`. The grab offset is taken from the LIVE pointer position
+ * (g_mx,g_my), never from the queued click coordinate: gui_handle_mouse() updates
+ * the pointer from the newest PS/2 bytes and only then drains the click queue, so
+ * any motion delivered in the same frame as the press is already in g_mx but not
+ * in the click record. Deriving the offset from the click made the window leap by
+ * exactly that un-delivered motion on the first drag frame (measured: a press
+ * recorded at x=221 while the pointer was at x=100 threw a window from x=24 to
+ * x=3 with a single +100 packet). Using the live position makes the gesture
+ * start where the pointer actually is, so the window never jumps.
+ * The offset is also clamped into the window so a wildly stale click record can
+ * never place the pointer far outside the frame it is dragging. */
+static void gui_drag_begin_move(struct gui_window* w) {
+    if (!w) return;
+    g_drag_kind = GUI_DRAG_MOVE;
+    g_drag_win = w;
+    g_drag_off_x = g_mx - w->x;
+    g_drag_off_y = g_my - w->y;
+    if (g_drag_off_x < 0) g_drag_off_x = 0;
+    if (g_drag_off_x > w->w) g_drag_off_x = w->w;
+    if (g_drag_off_y < 0) g_drag_off_y = 0;
+    if (g_drag_off_y > GUI_BORDER + GUI_TITLE_H) g_drag_off_y = GUI_BORDER + GUI_TITLE_H;
+    console_printf("[gui] drag: '%s' at %d,%d\n",
+                   w->title, (int64_t)w->x, (int64_t)w->y);
+}
+
+/* Start resizing `w` from its bottom-right corner. Same rule as the move: the
+ * reference point is the live pointer, so the very first resize frame cannot
+ * change the size by the click-record lag. */
+static void gui_drag_begin_resize(struct gui_window* w) {
+    if (!w) return;
+    g_drag_kind = GUI_DRAG_SIZE;
+    g_drag_win = w;
+    g_drag_px = g_mx;
+    g_drag_py = g_my;
+    g_drag_w0 = w->w;
+    g_drag_h0 = w->h;
+    console_printf("[gui] resize: '%s' %dx%d\n",
+                   w->title, (int64_t)w->w, (int64_t)w->h);
+}
+
+/* One frame of drag/resize. Called with the CURRENT pointer position and the
+ * CURRENT button mask, so a fast release can never leave a window glued to the
+ * pointer: the mask simply reads 0 and the gesture ends. */
+static void gui_drag_update(void) {
+    extern int mbos_mouse_buttons(void);
+    struct gui_window* w = g_drag_win;
+
+    if (g_drag_kind == GUI_DRAG_NONE) return;
+    if (w == NULL || !w->visible) {              /* window went away mid-drag */
+        g_drag_kind = GUI_DRAG_NONE;
+        g_drag_win = NULL;
+        return;
+    }
+    if ((mbos_mouse_buttons() & GUI_BTN_LEFT) == 0) {   /* released */
+        g_drag_kind = GUI_DRAG_NONE;
+        g_drag_win = NULL;
+        gui_dirty_win(w);              /* drop the grip highlight / final frame */
+        return;
+    }
+
+    if (g_drag_kind == GUI_DRAG_MOVE) {
+        const int max_x = g_gui_screen_w - w->w;
+        const int max_y = g_gui_screen_h - GUI_TASKBAR_H - w->h;
+        int nx = g_mx - g_drag_off_x;
+        int ny = g_my - g_drag_off_y;
+        if (nx < 0) nx = 0;
+        if (ny < 0) ny = 0;
+        if (max_x > 0 && nx > max_x) nx = max_x;
+        if (max_y > 0 && ny > max_y) ny = max_y;
+        if (nx == w->x && ny == w->y) return;
+        gui_dirty_win(w);              /* old rect */
+        w->x = nx;
+        w->y = ny;
+        gui_sync_client(w);
+        gui_dirty_win(w);              /* new rect */
+        return;
+    }
+
+    /* resize from the bottom-right corner */
+    {
+        int nw = g_drag_w0 + (g_mx - g_drag_px);
+        int nh = g_drag_h0 + (g_my - g_drag_py);
+        const int max_w = g_gui_screen_w - w->x;
+        const int max_h = g_gui_screen_h - GUI_TASKBAR_H - w->y;
+        if (max_w > 0 && nw > max_w) nw = max_w;
+        if (max_h > 0 && nh > max_h) nh = max_h;
+        if (nw < w->min_w) nw = w->min_w;      /* sane minimum (120x80 default) */
+        if (nh < w->min_h) nh = w->min_h;
+        if (nw == w->w && nh == w->h) return;
+        gui_dirty_win(w);              /* old rect */
+        w->w = nw;
+        w->h = nh;
+        w->maximized = false;
+        gui_sync_client(w);
+        gui_dirty_win(w);              /* new rect */
+    }
+}
+
+/* Move keyboard focus to the topmost visible, non-minimized window. Used after
+ * a close / minimize so the disappeared window never keeps the keyboard. */
+static void gui_focus_topmost_visible(void) {
+    for (struct gui_window* w = g_z; w; w = w->next)
+        if (w->active) { w->active = false; gui_dirty_win(w); }
+    for (struct gui_window* w = g_z; w; w = w->next) {
+        if (!w->visible || w->minimized) continue;
+        w->active = true;
+        gui_dirty_win(w);
+        break;
+    }
+}
+
+/* Close = hide, keeping the window slot. gui_destroy_window() would free the
+ * slot and the desktop apps are only created once by gui_apps_init(), so hiding
+ * is the model that matches the existing start menu: gui_activate_app() looks a
+ * window up by APP_ID_* and restores it (minimized / hidden alike). */
+static void gui_hide_window(struct gui_window* w) {
+    if (!w) return;
+    if (w->on_close) w->on_close(w);
+    if (g_drag_win == w) { g_drag_kind = GUI_DRAG_NONE; g_drag_win = NULL; }
+    if (g_grip_win == w) g_grip_win = NULL;
+    gui_dirty_win(w);                  /* repaint where it was */
+    w->visible = false;
+    w->active = false;
+    console_printf("[gui] window closed: '%s' (start menu re-opens it)\n",
+                   w->title);
+    gui_focus_topmost_visible();
+    gui_invalidate();
+}
+
+/* Track which window's resize grip the pointer is over. Only the 12x12 grip
+ * rect is dirtied on a change, so the compositor repaints nothing else. */
+static void gui_update_grip_hover(void) {
+    struct gui_window* hit = NULL;
+    /* the open start menu is modal: nothing under it reacts */
+    if (!g_start_open) {
+        for (struct gui_window* w = g_z; w; w = w->next) {
+            if (!w->visible || w->minimized) continue;
+            if (g_mx >= w->x + w->w - GUI_GRIP_SIZE && g_mx < w->x + w->w &&
+                g_my >= w->y + w->h - GUI_GRIP_SIZE && g_my < w->y + w->h) {
+                hit = w;
+                break;
+            }
+        }
+    }
+    if (hit == g_grip_win) return;
+    if (g_grip_win)
+        gui_dirty(g_grip_win->x + g_grip_win->w - GUI_GRIP_SIZE,
+                  g_grip_win->y + g_grip_win->h - GUI_GRIP_SIZE,
+                  GUI_GRIP_SIZE, GUI_GRIP_SIZE);
+    g_grip_win = hit;
+    if (hit)
+        gui_dirty(hit->x + hit->w - GUI_GRIP_SIZE,
+                  hit->y + hit->h - GUI_GRIP_SIZE,
+                  GUI_GRIP_SIZE, GUI_GRIP_SIZE);
+}
+
+/* Handle a click at (cx,cy). `button` is 0 for the left button, 1 right, 2 middle
+ * (see mb_mouse.c's decoder). Returns nothing; the next frame repaints.
+ *
+ * The window frame (drag / resize / the three title-bar buttons) reacts ONLY to
+ * the LEFT button: this used to ignore `button` completely, so a right-click on a
+ * title bar started a drag and a right-click on the red "x" closed the window.
+ * Client-area clicks keep the full button state - gui_click_is_right() is set for
+ * the legacy query path and on_click2() receives the raw button index. */
 static void gui_click_at(int cx, int cy, int button)
 {
-    if (g_mx != cx || g_my != cy) gui_pointer_moved(cx, cy);
+    /* The pointer is NOT rewound to (cx,cy): it is refreshed from the PS/2 device
+     * at the top of every frame, and moving it back to a click record that can be
+     * one motion burst older made the drawn arrow jump backwards (and fed a stale
+     * position into the drag state machine in the same frame). The hit tests below
+     * use the click position explicitly, so nothing depends on that side effect. */
+    const int left = (button == 0) ? 1 : 0;
+    g_click_right = (button != 0);
 
     /* The open start menu is modal: it eats the click. */
     if (g_start_open) {
@@ -503,28 +718,44 @@ static void gui_click_at(int cx, int cy, int button)
     }
     if (hit == NULL) return;
 
-    gui_set_active(hit);                  /* raise + focus                   */
+    gui_set_active(hit);                  /* raise + focus (drag raises too) */
+
+    /* bottom-right grip: 12x12 corner starts a resize. Checked before the title
+     * bar and the client area because the grip lives inside the client rect and
+     * must win over the app's own on_click. Left button only. */
+    if (left && cx >= hit->x + hit->w - GUI_GRIP_SIZE && cx < hit->x + hit->w &&
+        cy >= hit->y + hit->h - GUI_GRIP_SIZE && cy < hit->y + hit->h) {
+        gui_drag_begin_resize(hit);
+        return;
+    }
 
     /* title bar: the three buttons on the right (close / max / min) */
     if (cy < hit->y + GUI_BORDER + GUI_TITLE_H) {
+        if (!left) return;                /* right/middle click never moves or
+                                           * closes a window */
         const int bx = hit->x + hit->w - GUI_BORDER - GUI_BTN_W * 3;
         if (cx >= bx + 3 && cx < bx + 3 + GUI_BTN_W * 3) {
             const int b = (cx - (bx + 3)) / GUI_BTN_W;
-            if (b == 2) {                 /* close */
-                console_printf("[gui] click: close '%s'\n", hit->title);
-                if (hit->on_close) hit->on_close(hit);
-                hit->visible = false;
-                gui_invalidate();
-            } else if (b == 1) {          /* maximize / restore */
+            if (b == 2) {                 /* close: hide, start menu re-opens */
+                gui_hide_window(hit);
+            } else if (b == 1) {          /* maximize / restore (unchanged) */
                 gui_flip_window(hit);
-            } else {                      /* minimize */
+            } else {                      /* minimize -> start menu restores */
                 console_printf("[gui] click: minimize '%s'\n", hit->title);
+                if (g_drag_win == hit) { g_drag_kind = GUI_DRAG_NONE; g_drag_win = NULL; }
                 hit->minimized = true;
+                hit->active = false;
+                gui_dirty_win(hit);        /* repaint the now-hidden rect */
+                gui_focus_topmost_visible();
                 gui_invalidate();
             }
             return;
         }
-        return;                           /* title bar drag not implemented */
+        /* empty title-bar space: start a move drag. gui_set_active() above has
+         * already raised and focused this window, so dragging an unfocused
+         * window raises it on the same click. */
+        gui_drag_begin_move(hit);
+        return;
     }
 
     /* client area -> the app's on_click with client-relative coordinates */
@@ -561,6 +792,12 @@ static void gui_handle_mouse(void)
         if (cy > g_gui_screen_h - 1) cy = g_gui_screen_h - 1;
         gui_click_at(cx, cy, btn);
     }
+
+    /* drag / resize continuation for this frame (runs after the click drain, so
+     * a press handled above starts the gesture and the very next frame keeps it
+     * alive), then the hover highlight of the resize grip. */
+    gui_drag_update();
+    gui_update_grip_hover();
 }
 
 /* First visible window owned by `app_id` (used by the start menu). */
@@ -571,11 +808,15 @@ static struct gui_window* gui_find_app_window(int app_id)
     return NULL;
 }
 
-/* Bring the window of `app_id` to the front (restoring it if minimized). */
+/* Bring the window of `app_id` to the front (restoring it if minimized, and
+ * re-showing it if the title-bar "x" closed it). The start menu is the existing
+ * re-open affordance: there is no taskbar slot model to click a hidden window
+ * in, and adding slots would restyle the frozen taskbar. */
 static void gui_activate_app(int app_id)
 {
     struct gui_window* w = gui_find_app_window(app_id);
     if (w != NULL) {
+        w->visible = true;               /* re-open after the close button  */
         gui_set_active(w);               /* raises + marks active          */
         w->minimized = false;
         gui_invalidate();
@@ -780,6 +1021,20 @@ static void gui_draw_window(struct gui_window* w) {
 
     /* 4) 1px border (active window gets a brighter frame) */
     gui_rect(w->x, w->y, w->w, w->h, w->active ? 0x8FB4E8u : 0x3C4048u);
+
+    /* 5) resize grip (3 dots, drawn AFTER the app callback so it is never
+     *    overpainted). Only shown while the pointer is over the grip or while
+     *    that window is being resized, which keeps the static desktop
+     *    byte-identical to docs/baseline/base_gui.png. */
+    if (w == g_grip_win ||
+        (g_drag_kind == GUI_DRAG_SIZE && g_drag_win == w)) {
+        const int gx = w->x + w->w - 4;
+        const int gy = w->y + w->h - 4;
+        const uint32_t gc = 0x8A929Cu;             /* neutral window grey */
+        gui_fill(gx - 2, gy - 2, 2, 2, gc);
+        gui_fill(gx - 6, gy - 2, 2, 2, gc);
+        gui_fill(gx - 2, gy - 6, 2, 2, gc);
+    }
 }
 
 /* compose one frame over the dirty union rect, then clear the dirty flag */
@@ -845,6 +1100,10 @@ int gui_init(int screen_w, int screen_h) {
     g_lang_zh = true;
     g_click_right = false;
     g_dirty_any = false;
+    /* no gesture can survive an (re)initialisation of the window table */
+    g_drag_kind = GUI_DRAG_NONE;
+    g_drag_win = NULL;
+    g_grip_win = NULL;
     gui_clip_full();
 
     console_printf("[gui] GUI framework init %dx%d (fb: %s)\n",
@@ -1083,6 +1342,9 @@ void gui_destroy_window(struct gui_window* w) {
     for (int i = 0; i < GUI_MAX_WINDOWS; i++) {
         if (g_used[i] && &g_wins[i] == w) {
             if (w->on_close) w->on_close(w);
+            /* never leave an interaction pointing at a freed slot */
+            if (g_drag_win == w) { g_drag_kind = GUI_DRAG_NONE; g_drag_win = NULL; }
+            if (g_grip_win == w) g_grip_win = NULL;
             gui_dirty(w->x, w->y, w->w, w->h);   /* repaint where it was */
             w->visible = false;
             g_used[i] = false;

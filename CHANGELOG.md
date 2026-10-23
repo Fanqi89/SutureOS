@@ -6,6 +6,31 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.11.5-alpha]
+
+**GUI 窗口可以拖动、缩放、关闭了**（界面外观不变）。
+
+### Fixed
+- **拖动跳跃**：`gui_drag_begin_move/resize` 用"排队的点击坐标"算抓取偏移，而
+  `gui_handle_mouse()` 先刷新实时指针再排空点击队列，同帧内的位移不在点击记录里
+  → 第一帧跳一大截（实测按在 x=221、指针在 x=100，窗口被甩 100px）。改为以**实时指针**
+  为基准并钳进屏幕。
+- **右键误触发**：`gui_click_at()` 完全忽略 button，PS/2 的 bit1（右键）会开始标题栏拖动、
+  在红色 x 上还会**关闭窗口**。现在只认左键，并记录 `g_click_right`。
+- **指针回跳**：`gui_pointer_moved()` 把可见指针倒回排队的点击位置，导致拖动手势拿到旧位置。
+  已删除该回跳。
+
+### Verification
+- 真 QEMU 交互（QMP 注入鼠标 + 截图分析）：拖动 `[gui] drag: 'Task Manager' at 24,24`
+  标题栏像素恰好 +120/+80、旧矩形为纯桌面渐变、全桌面 0 残留像素；缩放
+  `[gui] resize: 'Task Manager' 330x260` 边框恰好 +100/+60、0 残留；关闭
+  `[gui] window closed:` 后矩形变桌面渐变，开始菜单可重新打开。
+- 外观：与 `docs/baseline/base_gui.png` 对比，317 px 差异在动态文字区内，另有 78 px
+  在 2 个簇内且都证实是动态文本（Task Manager 的 PMM 数字、About 的版本号数字——
+  基线是 v0.11.0 截图，当前是 v0.11.4）；默认画面新增像素 = 0。
+- 回归：启动日志 265 行、`syscalls: 81 registered`、自检 13/14、FAT32 ops PASS、
+  无 PANIC。
+
 ## [v0.11.4-alpha]
 
 **真正的多进程**：fork（写时复制）+ wait4 回收 + getppid，ring-3 shell 也能 fork/wait。

@@ -42,6 +42,13 @@ static char* put_str(char* p, const char* s) {
     return p;
 }
 
+/* Resizing can shrink a window down to the 120x80 minimum, so every derived
+ * width used below passes through this clamp: a negative width would be dropped
+ * by the drawing primitives and an unsigned wrap would paint the wrong extent.
+ * Default geometry is untouched - the clamp only engages below the authored
+ * window sizes. */
+static int clamp_min(int v, int lo) { return v < lo ? lo : v; }
+
 /* "label: value" line at (x,y) */
 static void kv_u32(int x, int y, const char* label, uint32_t v, uint32_t rgb) {
     char buf[64];
@@ -103,7 +110,7 @@ static void tmgr_draw(struct gui_window* w) {
     y += 18;
     {
         const uint32_t pct = gui_cpu_busy_pct();
-        const int bar_w = w->client_w - 20;
+        const int bar_w = clamp_min(w->client_w - 20, 8);
         gui_fill_rect(x, y, bar_w, 10, 0xD0D4DAu);
         gui_fill_rect(x, y, (int)((uint32_t)bar_w * pct / 100u), 10, 0x2E8B57u);
         gui_frame_rect(x, y, bar_w, 10, 0x808890u);
@@ -178,13 +185,16 @@ static void calc_key(struct gui_window* w, char ch) {
 static void calc_draw(struct gui_window* w) {
     const int x = w->client_x + 10;
     int y = w->client_y + 10;
+    const int inner_w = clamp_min(w->client_w - 20, 8);   /* resize-safe */
 
     /* display */
-    gui_fill_rect(x, y, w->client_w - 20, 34, 0x101418u);
-    gui_frame_rect(x, y, w->client_w - 20, 34, 0x39424Eu);
+    gui_fill_rect(x, y, inner_w, 34, 0x101418u);
+    gui_frame_rect(x, y, inner_w, 34, 0x39424Eu);
     {
         const int len = (int)strlen(g_calc.line);
-        gui_draw_str(x + (w->client_w - 20) - 8 - len * 8, y + 9, g_calc.line, 0x8CE89Cu);
+        int tx = x + inner_w - 8 - len * 8;
+        if (tx < x) tx = x;                  /* keep the number inside the box */
+        gui_draw_str(tx, y + 9, g_calc.line, 0x8CE89Cu);
     }
     y += 44;
 
