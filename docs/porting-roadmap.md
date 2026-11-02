@@ -63,4 +63,4 @@
 | B9 | v0.27.0-alpha | **Intel HDA 音频**（控制器 + codec 枚举 + BDL 播放） | PlantOS（MIT）hda.c 骨架 | 宿主 WAV 校验 48000 Hz/2ch/16bit/1.002 s/0.5000 FS/440.01 Hz **6/6** | ✅ 本轮完成 |
 | B12 | v0.28.0-alpha（部分） | **`sync` 命令**（多卷挂载表遍历 flush） | SutureOS 自有（GPL-3.0） | 不 umount + 宿主 FAT32 逐字节 **6/6** | ✅ 本轮完成 |
 | B13 | v0.29.0-alpha | **EXT2 多卷**（双卷同挂 + 跨卷写入根因修复） | SutureOS 自有 | 卷 1 写验证器 40/40、卷 2 fixture 35/35、卷 2 变化 48B、卷 1 无卷 2 文本 → **12/12** | ✅ 本轮完成 |
-| B14 | 下一批 | **squashfs 多卷**（照 ext2/FAT32 的模式） | SutureOS 自有 | 双 squashfs 镜像同时挂载 + 各自 ls/cat + 读校验 83/83 不回归 | ⏳ 待做 |
+| B14 | v0.30.0-alpha | **squashfs 多卷** | SutureOS 自有 | 双 squashfs 同挂 + 各自 ls/cat + 宿主两镜像 83/83 → **7/7** | ✅ 本轮完成 |

@@ -6,6 +6,27 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.30.0-alpha]
+
+**SquashFS 支持多卷：FAT32 / ext2 / squashfs 三种真实文件系统全部做到一次启动多卷同时挂载。
+本批收尾跑了全套回归门禁。启动呈现与 GUI 外观未变。**
+
+### Added
+- `kernel/fs/squashfs.c/.h`：`g_squashfs_fs`/`g_squashfs_mount` → `[4]` 数组 + 当前卷指针；
+  `squashfs_select_volume/current_volume/volume_count/unmount_drive`；mount 返回卷槽号；
+  句柄带 `vol`（所有认领点）。
+- `kernel/fs/squashfs_vfs.c`：挂载点表 `g_squash_mnts[4]`，每操作选卷，unmount 按挂载点定位。
+- `scripts/multivol_squashfs_acceptance.py`：双卷 + 宿主双镜像 83/83。
+
+### Verification (full sweep on this ISO)
+- 内核 13/14；FAT32 宿主 21/21 + 四自检；EXT2 多卷 12/12；SquashFS 多卷 7/7；
+  USB 只读 5/5 + 写 8/8；HDA WAV 6/6；终端 CJK 10/10；GUI CJK 4/4；wget 8/8；
+  文本工具 7/7；编辑器 5/5；sync 6/6；GUI 外观门禁 0 像素。
+
+### Limits
+- 卷槽 4、挂载点不可嵌套、句柄表 8+8；squashfs 只读（无 xz/zstd/xattr/>4KiB 块）；
+  第二卷需在 AHCI/NVMe/VirtIO；USB 热插拔/HID 与 virtio-gpu 增强仍待做。
+
 ## [v0.29.0-alpha]
 
 **EXT2 支持多卷（两个卷同时挂载、独立读写）；同时修掉上一轮暴露的跨卷写入 bug：

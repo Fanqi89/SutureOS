@@ -354,7 +354,7 @@ struct squashfs_fs {
     int      mounted;
 };
 
-extern struct squashfs_fs g_squashfs_fs;
+extern struct squashfs_fs *g_squashfs_fs;
 
 /* The legacy global that the ported-from-CoolPotOS stub exposed. Kept so any
  * out-of-tree reference still links; it mirrors the head of g_squashfs_fs. */
@@ -377,7 +377,14 @@ struct squashfs_mount {
     bool mounted;
     uint8_t block_buf[SQUASHFS_METADATA_SIZE];
 };
-extern struct squashfs_mount g_squashfs_mount;
+/* Multi-volume (v0.30.0): one state block per mounted volume + current pointers. */
+#define SQUASHFS_MAX_VOLS 4
+extern struct squashfs_mount *g_squashfs_mount;
+extern struct squashfs_fs *g_squashfs_fs;
+int squashfs_select_volume(int slot);
+int squashfs_current_volume(void);
+int squashfs_volume_count(void);
+int squashfs_unmount_drive(int drive);
 
 /* ==================== stat / handles ==================== */
 
@@ -398,6 +405,7 @@ struct squashfs_stat {
 
 struct squashfs_file {
     int      used;
+    int      vol;        /* volume slot this handle belongs to */
     uint64_t inode_ref;
     uint32_t inode_number;
     uint64_t size;
@@ -411,6 +419,7 @@ struct squashfs_file {
 
 struct squashfs_dir {
     int      used;
+    int      vol;        /* volume slot this handle belongs to */
     uint64_t inode_ref;
     uint32_t size;           /* listing bytes, off-by-3 already removed */
     uint64_t start_block;    /* offset from the directory table start */
@@ -429,6 +438,7 @@ struct squashfs_dir {
 
 /* Mount the SquashFS volume on a block device at start_lba (real partition
  * path). Returns SQUASHFS_OK (0) or a negative squashfs_err_t. */
+/* Returns the volume slot (>= 0) or a negative SQUASHFS_* error. */
 int squashfs_mount(int drive, uint32_t start_lba);
 
 /* Mount the RAM image previously handed to squashfs_register_ramdisk(). */

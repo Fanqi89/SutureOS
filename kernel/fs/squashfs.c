@@ -48,8 +48,30 @@
 
 /* ==================== volume state ==================== */
 
-struct squashfs_fs g_squashfs_fs = {0};
-struct squashfs_mount g_squashfs_mount = {0};
+#define SQUASHFS_MAX_VOLS 4
+static struct squashfs_fs g_squashfs_fss[SQUASHFS_MAX_VOLS];
+static struct squashfs_mount g_squashfs_mounts[SQUASHFS_MAX_VOLS];
+struct squashfs_fs *g_squashfs_fs = &g_squashfs_fss[0];
+struct squashfs_mount *g_squashfs_mount = &g_squashfs_mounts[0];
+static int g_cur_squash_vol;
+
+int squashfs_select_volume(int slot) {
+    if (slot < 0 || slot >= SQUASHFS_MAX_VOLS) return SQUASHFS_EINVAL;
+    if (!g_squashfs_mounts[slot].mounted) return SQUASHFS_EBUSY;
+    g_cur_squash_vol = slot;
+    g_squashfs_fs = &g_squashfs_fss[slot];
+    g_squashfs_mount = &g_squashfs_mounts[slot];
+    return SQUASHFS_OK;
+}
+
+int squashfs_current_volume(void) { return g_cur_squash_vol; }
+
+int squashfs_volume_count(void) {
+    int n = 0;
+    for (int i = 0; i < SQUASHFS_MAX_VOLS; i++)
+        if (g_squashfs_mounts[i].mounted) n++;
+    return n;
+}
 
 /* The registered RAM image survives mount/unmount; it belongs to the caller. */
 static const uint8_t *g_ram_image = NULL;
@@ -145,7 +167,7 @@ uint32_t squashfs_crc32(const void *data, uint32_t len) {
  * therefore needs a bounce buffer or it would overrun the caller's buffer.
  * Every access is bounds-checked against image_size. */
 static int sq_dev_read(uint64_t off, void *buf, uint32_t len) {
-    struct squashfs_fs *fs = &g_squashfs_fs;
+    struct squashfs_fs *fs = g_squashfs_fs;
 
     if (!buf || len == 0) return SQUASHFS_EINVAL;
     if (off > fs->image_size || len > fs->image_size - off) {
@@ -225,7 +247,7 @@ int squashfs_decompress_block(uint16_t algo, int compressed,
  * bits 14:0 == on-disk size. The decompressed block is at most 8192 bytes. */
 static int sq_meta_block_load(struct squashfs_meta_table *t, uint32_t index,
                               uint8_t *dst, uint32_t dst_cap, uint32_t *out_len) {
-    struct squashfs_fs *fs = &g_squashfs_fs;
+    struct squashfs_fs *fs = g_squashfs_fs;
     uint64_t off;
     uint8_t hdr[2];
     uint16_t h;
@@ -285,7 +307,7 @@ static int squashfs_meta_read(struct squashfs_meta_table *t, uint64_t pos,
         int r;
 
         if (index >= t->block_count) return SQUASHFS_ERANGE;
-        r = sq_meta_block_load(t, index, g_squashfs_fs.meta_buf,
+        r = sq_meta_block_load(t, index, g_squashfs_fs->meta_buf,
                                SQUASHFS_METADATA_SIZE, &blen);
         if (r != SQUASHFS_OK) return r;
         if (inner >= blen) {
@@ -294,7 +316,7 @@ static int squashfs_meta_read(struct squashfs_meta_table *t, uint64_t pos,
             return SQUASHFS_ERANGE;
         }
         chunk = sq_min_u32(blen - inner, len - done);
-        memcpy(dst + done, g_squashfs_fs.meta_buf + inner, chunk);
+        memcpy(dst + done, g_squashfs_fs->meta_buf + inner, chunk);
         done += chunk;
         pos += chunk;
     }
@@ -308,7 +330,7 @@ static int squashfs_meta_read(struct squashfs_meta_table *t, uint64_t pos,
  * fragment table and the id table do (see sq_table_lookup). */
 static int sq_table_walk(struct squashfs_meta_table *t, const char *what,
                          uint64_t first_block, uint64_t span_hi) {
-    struct squashfs_fs *fs = &g_squashfs_fs;
+    struct squashfs_fs *fs = g_squashfs_fs;
     uint64_t span, cap;
     uint8_t *raw;
     uint64_t off = first_block;
@@ -391,7 +413,7 @@ static int sq_table_lookup(struct squashfs_meta_table *t, const char *what,
                        (uint64_t)SQUASHFS_MAX_TABLE_BLOCKS);
         return SQUASHFS_ERANGE;
     }
-    if (lookup_at == (uint64_t)-1 || lookup_at + span > g_squashfs_fs.image_size) {
+    if (lookup_at == (uint64_t)-1 || lookup_at + span > g_squashfs_fs->image_size) {
         console_printf("[squashfs] mount failed: %s lookup list is outside the image\n",
                        what);
         return SQUASHFS_ERANGE;
@@ -445,7 +467,7 @@ static void sq_table_free(struct squashfs_meta_table *t) {
  * decompressed block. */
 static int sq_inode_load(uint64_t ref, struct squashfs_base_inode *hdr,
                          uint8_t *buf, uint32_t buf_cap, uint32_t *out_len) {
-    struct squashfs_fs *fs = &g_squashfs_fs;
+    struct squashfs_fs *fs = g_squashfs_fs;
     uint64_t block = ref >> 16;
     uint32_t offset = (uint32_t)(ref & 0xFFFFu);
     uint32_t blen = 0;
@@ -476,7 +498,7 @@ static int sq_inode_load(uint64_t ref, struct squashfs_base_inode *hdr,
 /* `st` is filled from an inode reference. Only the common fields plus the
  * type-specific size are needed; the block list is loaded separately on open. */
 static int sq_inode_stat(uint64_t ref, struct squashfs_stat *st) {
-    struct squashfs_fs *fs = &g_squashfs_fs;
+    struct squashfs_fs *fs = g_squashfs_fs;
     struct squashfs_base_inode hdr;
     uint8_t buf[256];
     uint32_t len = 0;
@@ -598,7 +620,7 @@ static int sq_inode_stat(uint64_t ref, struct squashfs_stat *st) {
 /* Load the data-block list of a regular file (basic or extended inode) into
  * f->block_sizes. Also records blocks_start / fragment info / size. */
 static int sq_file_load_blocks(struct squashfs_file *f) {
-    struct squashfs_fs *fs = &g_squashfs_fs;
+    struct squashfs_fs *fs = g_squashfs_fs;
     struct squashfs_base_inode hdr;
     uint8_t buf[64];
     uint32_t len = 0;
@@ -746,7 +768,7 @@ static int sq_dir_header(struct squashfs_fs *fs, uint64_t pos, uint32_t *out_cou
  * *out_ref is the child's inode reference. */
 static int sq_dir_find(const struct squashfs_dir *dir, const char *name,
                        uint32_t name_len, uint64_t *out_ref) {
-    struct squashfs_fs *fs = &g_squashfs_fs;
+    struct squashfs_fs *fs = g_squashfs_fs;
     /* A directory listing starts at (start_block, offset) inside the directory
      * table's *logical* byte stream: start_block selects the uncompressed
      * metadata block, offset is the byte position within it. */
@@ -795,7 +817,7 @@ static int sq_dir_find(const struct squashfs_dir *dir, const char *name,
 
 static int squashfs_resolve(const char *path, uint64_t *out_ref,
                             struct squashfs_stat *out_stat) {
-    struct squashfs_fs *fs = &g_squashfs_fs;
+    struct squashfs_fs *fs = g_squashfs_fs;
     struct squashfs_stat st;
     uint64_t cur = fs->root_inode_ref;
     const char *p;
@@ -882,7 +904,7 @@ static int squashfs_resolve(const char *path, uint64_t *out_ref,
 /* Decompress data block `index` of `f` into fs->data_buf, setting cached_*.
  * Returns the number of valid bytes in the buffer. */
 static int sq_data_block(struct squashfs_file *f, uint32_t index) {
-    struct squashfs_fs *fs = &g_squashfs_fs;
+    struct squashfs_fs *fs = g_squashfs_fs;
     uint32_t on_disk;
     uint64_t off;
     int compressed, n;
@@ -938,7 +960,7 @@ static int sq_data_block(struct squashfs_file *f, uint32_t index) {
 
 /* Fill one fragment block into fs->frag_buf. Returns the number of valid bytes. */
 static int sq_fragment_block(uint32_t frag_idx) {
-    struct squashfs_fs *fs = &g_squashfs_fs;
+    struct squashfs_fs *fs = g_squashfs_fs;
     struct squashfs_fragment_entry fe;
     uint8_t raw[sizeof(fe)];
     uint32_t on_disk;
@@ -982,7 +1004,7 @@ static int sq_fragment_block(uint32_t frag_idx) {
 
 static int squashfs_read_ref_impl(uint64_t ref, void *buf, uint32_t offset,
                                   uint32_t size) {
-    struct squashfs_fs *fs = &g_squashfs_fs;
+    struct squashfs_fs *fs = g_squashfs_fs;
     struct squashfs_file f;
     uint8_t *dst = (uint8_t *)buf;
     uint32_t done = 0;
@@ -1036,7 +1058,7 @@ static int squashfs_read_ref_impl(uint64_t ref, void *buf, uint32_t offset,
 /* ==================== mount / unmount ==================== */
 
 static void squashfs_teardown(void) {
-    struct squashfs_fs *fs = &g_squashfs_fs;
+    struct squashfs_fs *fs = g_squashfs_fs;
 
     sq_table_free(&fs->inode_table);
     sq_table_free(&fs->dir_table);
@@ -1051,7 +1073,7 @@ static void squashfs_teardown(void) {
     if (fs->sizes)    { lemis_heap_free(fs->sizes);    fs->sizes = NULL; }
     fs->sizes_cap = 0;
     fs->mounted = 0;
-    g_squashfs_mount.mounted = false;
+    g_squashfs_mount->mounted = false;
 }
 
 static int squashfs_mount_fail(const char *reason) {
@@ -1141,22 +1163,48 @@ int squashfs_register_ramdisk(const void *image, uint32_t size) {
 int squashfs_ramdisk_registered(void) { return g_ram_image != NULL; }
 
 int squashfs_mount(int drive, uint32_t start_lba) {
+    int slot = -1;
+    for (int i = 0; i < SQUASHFS_MAX_VOLS; i++) {
+        if (g_squashfs_mounts[i].mounted && g_squashfs_fss[i].drive == drive) {
+            (void)squashfs_select_volume(i);
+            return i;
+        }
+    }
+    for (int i = 0; i < SQUASHFS_MAX_VOLS; i++) {
+        if (!g_squashfs_mounts[i].mounted) { slot = i; break; }
+    }
+    if (slot < 0) return SQUASHFS_EBUSY;
+    g_cur_squash_vol = slot;
+    g_squashfs_fs = &g_squashfs_fss[slot];
+    g_squashfs_mount = &g_squashfs_mounts[slot];
     squashfs_teardown();
-    g_squashfs_fs.drive = drive;
-    g_squashfs_fs.start_lba = start_lba;
-    g_squashfs_fs.ram = NULL;
-    g_squashfs_fs.ram_size = 0;
-    return squashfs_mount_current_device();
+    g_squashfs_fs->drive = drive;
+    g_squashfs_fs->start_lba = start_lba;
+    g_squashfs_fs->ram = NULL;
+    g_squashfs_fs->ram_size = 0;
+    int r = squashfs_mount_current_device();
+    if (r != SQUASHFS_OK) return r;
+    return slot;
 }
 
 int squashfs_mount_ramdisk(void) {
     if (!g_ram_image) return squashfs_mount_fail("no ramdisk registered");
+    int slot = -1;
+    for (int i = 0; i < SQUASHFS_MAX_VOLS; i++) {
+        if (!g_squashfs_mounts[i].mounted) { slot = i; break; }
+    }
+    if (slot < 0) return SQUASHFS_EBUSY;
+    g_cur_squash_vol = slot;
+    g_squashfs_fs = &g_squashfs_fss[slot];
+    g_squashfs_mount = &g_squashfs_mounts[slot];
     squashfs_teardown();
-    g_squashfs_fs.ram = g_ram_image;
-    g_squashfs_fs.ram_size = g_ram_image_size;
-    g_squashfs_fs.drive = -1;
-    g_squashfs_fs.start_lba = 0;
-    return squashfs_mount_current_device();
+    g_squashfs_fs->ram = g_ram_image;
+    g_squashfs_fs->ram_size = g_ram_image_size;
+    g_squashfs_fs->drive = -1;
+    g_squashfs_fs->start_lba = 0;
+    int r = squashfs_mount_current_device();
+    if (r != SQUASHFS_OK) return r;
+    return slot;
 }
 
 int squashfs_unmount(void) {
@@ -1164,13 +1212,35 @@ int squashfs_unmount(void) {
     return SQUASHFS_OK;
 }
 
-int squashfs_is_mounted(void) { return g_squashfs_fs.mounted; }
-uint32_t squashfs_block_size(void) { return g_squashfs_fs.block_size; }
-uint32_t squashfs_compression(void) { return g_squashfs_fs.compression; }
-uint32_t squashfs_entry_count(void) { return g_squashfs_fs.inode_count; }
+/* Unmount the volume mounted from `drive` and clear its slot. */
+int squashfs_unmount_drive(int drive) {
+    for (int i = 0; i < SQUASHFS_MAX_VOLS; i++) {
+        if (g_squashfs_mounts[i].mounted && g_squashfs_fss[i].drive == drive) {
+            (void)squashfs_select_volume(i);
+            squashfs_teardown();
+            for (int k = 0; k < SQUASHFS_MAX_OPEN_FILES; k++)
+                if (g_files[k].used && g_files[k].vol == i) g_files[k].used = 0;
+            for (int k = 0; k < SQUASHFS_MAX_OPEN_DIRS; k++)
+                if (g_dirs[k].used && g_dirs[k].vol == i) g_dirs[k].used = 0;
+            memset(&g_squashfs_mounts[i], 0, sizeof(g_squashfs_mounts[i]));
+            g_squashfs_fs = &g_squashfs_fss[0];
+            g_squashfs_mount = &g_squashfs_mounts[0];
+            g_cur_squash_vol = 0;
+            console_printf("[squashfs] unmounted drive=%d (volumes left=%d)\n",
+                           (int64_t)drive, (int64_t)squashfs_volume_count());
+            return SQUASHFS_OK;
+        }
+    }
+    return SQUASHFS_EBUSY;
+}
+
+int squashfs_is_mounted(void) { return g_squashfs_fs->mounted; }
+uint32_t squashfs_block_size(void) { return g_squashfs_fs->block_size; }
+uint32_t squashfs_compression(void) { return g_squashfs_fs->compression; }
+uint32_t squashfs_entry_count(void) { return g_squashfs_fs->inode_count; }
 
 static int squashfs_mount_current_device(void) {
-    struct squashfs_fs *fs = &g_squashfs_fs;
+    struct squashfs_fs *fs = g_squashfs_fs;
     uint8_t *sb_bytes;
     uint64_t sector_count = 0;
     uint32_t sector_size = 0;
@@ -1381,19 +1451,19 @@ static int squashfs_mount_current_device(void) {
     }
 
     fs->mounted = 1;
-    g_squashfs_mount.drive = fs->drive;
-    g_squashfs_mount.start_lba = fs->start_lba;
-    g_squashfs_mount.block_size = fs->block_size;
-    g_squashfs_mount.block_log = fs->sb.block_log;
-    g_squashfs_mount.inodes = fs->inode_count;
-    g_squashfs_mount.fragments = fs->fragment_count;
-    g_squashfs_mount.compression = fs->compression;
-    g_squashfs_mount.flags = fs->flags;
-    g_squashfs_mount.inode_table_start = (uint32_t)fs->sb.inode_table_start;
-    g_squashfs_mount.directory_table_start = (uint32_t)fs->sb.directory_table_start;
-    g_squashfs_mount.fragment_table_start = (uint32_t)fs->sb.fragment_table_start;
-    g_squashfs_mount.lookup_table_start = (uint32_t)fs->sb.lookup_table_start;
-    g_squashfs_mount.mounted = true;
+    g_squashfs_mount->drive = fs->drive;
+    g_squashfs_mount->start_lba = fs->start_lba;
+    g_squashfs_mount->block_size = fs->block_size;
+    g_squashfs_mount->block_log = fs->sb.block_log;
+    g_squashfs_mount->inodes = fs->inode_count;
+    g_squashfs_mount->fragments = fs->fragment_count;
+    g_squashfs_mount->compression = fs->compression;
+    g_squashfs_mount->flags = fs->flags;
+    g_squashfs_mount->inode_table_start = (uint32_t)fs->sb.inode_table_start;
+    g_squashfs_mount->directory_table_start = (uint32_t)fs->sb.directory_table_start;
+    g_squashfs_mount->fragment_table_start = (uint32_t)fs->sb.fragment_table_start;
+    g_squashfs_mount->lookup_table_start = (uint32_t)fs->sb.lookup_table_start;
+    g_squashfs_mount->mounted = true;
 
     /* THE mount line (exactly one, as specified) */
     console_printf("[squashfs] mount blocksz=%u inodes=%u fragments=%u comp=%u "
@@ -1407,19 +1477,19 @@ static int squashfs_mount_current_device(void) {
 /* ==================== public file API ==================== */
 
 int squashfs_lookup(const char *path, uint64_t *out_ref) {
-    if (!g_squashfs_fs.mounted) return SQUASHFS_EBUSY;
+    if (!g_squashfs_fs->mounted) return SQUASHFS_EBUSY;
     if (!out_ref) return SQUASHFS_EINVAL;
     return squashfs_resolve(path, out_ref, NULL);
 }
 
 int squashfs_stat(const char *path, struct squashfs_stat *out) {
-    if (!g_squashfs_fs.mounted) return SQUASHFS_EBUSY;
+    if (!g_squashfs_fs->mounted) return SQUASHFS_EBUSY;
     if (!out) return SQUASHFS_EINVAL;
     return squashfs_resolve(path, NULL, out);
 }
 
 int squashfs_readlink_ref(uint64_t ref, char *buf, uint32_t cap) {
-    struct squashfs_fs *fs = &g_squashfs_fs;
+    struct squashfs_fs *fs = g_squashfs_fs;
     struct squashfs_base_inode hdr;
     /* SutureOS fix: the extended-symlink inode needs the 16-byte base header
      * plus 8 bytes of payload plus the 256-byte target/offset field (280 in
@@ -1495,7 +1565,7 @@ int squashfs_read_ref(uint64_t ref, void *buf, uint32_t offset, uint32_t size) {
     struct squashfs_stat st;
     int r;
 
-    if (!g_squashfs_fs.mounted) return SQUASHFS_EBUSY;
+    if (!g_squashfs_fs->mounted) return SQUASHFS_EBUSY;
     if (!buf && size != 0) return SQUASHFS_EINVAL;
     r = sq_inode_stat(ref, &st);
     if (r != SQUASHFS_OK) return r;
@@ -1510,7 +1580,7 @@ int squashfs_open(const char *path, struct squashfs_file **out) {
     struct squashfs_file *f = NULL;
     int i, r;
 
-    if (!g_squashfs_fs.mounted) return SQUASHFS_EBUSY;
+    if (!g_squashfs_fs->mounted) return SQUASHFS_EBUSY;
     if (!out) return SQUASHFS_EINVAL;
     r = squashfs_resolve(path, &ref, &st);
     if (r != SQUASHFS_OK) return r;
@@ -1524,9 +1594,10 @@ int squashfs_open(const char *path, struct squashfs_file **out) {
 
     memset(f, 0, sizeof(*f));
     f->used = 1;
+    f->vol = g_cur_squash_vol;
     f->inode_ref = ref;
-    f->block_sizes = g_squashfs_fs.sizes;
-    f->block_sizes_cap = g_squashfs_fs.sizes_cap;
+    f->block_sizes = g_squashfs_fs->sizes;
+    f->block_sizes_cap = g_squashfs_fs->sizes_cap;
     r = sq_file_load_blocks(f);
     if (r != SQUASHFS_OK) {
         memset(f, 0, sizeof(*f));
@@ -1539,7 +1610,7 @@ int squashfs_open(const char *path, struct squashfs_file **out) {
 int squashfs_file_read(struct squashfs_file *f, void *buf, uint32_t size,
                        uint32_t offset) {
     if (!f || !f->used) return SQUASHFS_EINVAL;
-    if (!g_squashfs_fs.mounted) return SQUASHFS_EBUSY;
+    if (!g_squashfs_fs->mounted) return SQUASHFS_EBUSY;
     if ((uint64_t)offset >= f->size) return 0;                 /* EOF */
     if ((uint64_t)size > f->size - (uint64_t)offset) {
         size = (uint32_t)(f->size - (uint64_t)offset);
@@ -1548,6 +1619,7 @@ int squashfs_file_read(struct squashfs_file *f, void *buf, uint32_t size,
 }
 
 int squashfs_close(struct squashfs_file *f) {
+    (void)squashfs_select_volume(f->vol);
     if (!f) return SQUASHFS_EINVAL;
     memset(f, 0, sizeof(*f));
     return SQUASHFS_OK;
@@ -1557,7 +1629,7 @@ int squashfs_close(struct squashfs_file *f) {
 
 /* Fill a directory handle from the directory inode at `ref`. */
 static int sq_dir_open_ref(struct squashfs_dir *d, uint64_t ref) {
-    struct squashfs_fs *fs = &g_squashfs_fs;
+    struct squashfs_fs *fs = g_squashfs_fs;
     struct squashfs_base_inode hdr;
     uint8_t buf[64];
     uint32_t len = 0;
@@ -1587,6 +1659,7 @@ static int sq_dir_open_ref(struct squashfs_dir *d, uint64_t ref) {
         return SQUASHFS_ENOTDIR;
     }
     d->used = 1;
+    d->vol = g_cur_squash_vol;
     d->pos = 0;
     (void)fs;
     return SQUASHFS_OK;
@@ -1598,7 +1671,7 @@ int squashfs_opendir(const char *path, struct squashfs_dir **out) {
     struct squashfs_dir *d = NULL;
     int i, r;
 
-    if (!g_squashfs_fs.mounted) return SQUASHFS_EBUSY;
+    if (!g_squashfs_fs->mounted) return SQUASHFS_EBUSY;
     if (!out) return SQUASHFS_EINVAL;
     r = squashfs_resolve(path, &ref, &st);
     if (r != SQUASHFS_OK) return r;
@@ -1621,7 +1694,8 @@ int squashfs_opendir(const char *path, struct squashfs_dir **out) {
  * "." and ".." are skipped. Names longer than name_cap-1 are truncated. */
 int squashfs_readdir(struct squashfs_dir *d, char *name, uint32_t name_cap,
                      uint32_t *name_len, int *is_dir) {
-    struct squashfs_fs *fs = &g_squashfs_fs;
+    (void)squashfs_select_volume(d->vol);
+    struct squashfs_fs *fs = g_squashfs_fs;
     uint64_t base;
 
     if (!d || !d->used || !name || name_cap == 0) return SQUASHFS_EINVAL;
@@ -1695,6 +1769,7 @@ int squashfs_readdir(struct squashfs_dir *d, char *name, uint32_t name_cap,
 }
 
 int squashfs_closedir(struct squashfs_dir *d) {
+    (void)squashfs_select_volume(d->vol);
     if (!d) return SQUASHFS_EINVAL;
     memset(d, 0, sizeof(*d));
     return SQUASHFS_OK;
@@ -1756,7 +1831,7 @@ static int sq_selftest_fail(const char *reason) {
 
 static int sq_selftest_file(const char *path, int kind, uint32_t expect_size,
                             const char *text, uint8_t *scratch, uint32_t *out_crc) {
-    struct squashfs_fs *fs = &g_squashfs_fs;
+    struct squashfs_fs *fs = g_squashfs_fs;
     struct squashfs_stat st;
     uint32_t offset = 0;
     uint32_t crc = 0xFFFFFFFFu;
@@ -1829,7 +1904,7 @@ static int sq_selftest_readdir(const char *path, const char *const *want,
 }
 
 int squashfs_selftest(void) {
-    struct squashfs_fs *fs = &g_squashfs_fs;
+    struct squashfs_fs *fs = g_squashfs_fs;
     uint8_t *scratch;
     uint32_t crc_hello = 0, crc_large = 0, crc_nested = 0, crc_uncomp = 0, crc_frag = 0;
     int seen[SQ_ST_ROOT_NAME_COUNT];
@@ -2032,9 +2107,9 @@ int squashfs_stat_vfs64(const char *path, struct Vfs64Info64 *out) {
 /* Read one whole metadata block from the image (the legacy API's meaning). */
 int squashfs_read_block(uint32_t block_num, void *buf) {
     if (!buf) return SQUASHFS_EINVAL;
-    if (!g_squashfs_fs.mounted) return SQUASHFS_EBUSY;
-    if (block_num >= g_squashfs_fs.inode_table.block_count) return SQUASHFS_ERANGE;
-    return (sq_meta_block_load(&g_squashfs_fs.inode_table, block_num, (uint8_t *)buf,
+    if (!g_squashfs_fs->mounted) return SQUASHFS_EBUSY;
+    if (block_num >= g_squashfs_fs->inode_table.block_count) return SQUASHFS_ERANGE;
+    return (sq_meta_block_load(&g_squashfs_fs->inode_table, block_num, (uint8_t *)buf,
                                SQUASHFS_METADATA_SIZE, NULL) == SQUASHFS_OK)
            ? SQUASHFS_OK : SQUASHFS_EIO;
 }
@@ -2049,9 +2124,9 @@ int squashfs_write_block(uint32_t block_num, const void *buf) {
  * other value fails honestly instead of returning a wrong inode. */
 int squashfs_read_inode(uint32_t ino, void *inode_buf) {
     if (!inode_buf) return SQUASHFS_EINVAL;
-    if (!g_squashfs_fs.mounted) return SQUASHFS_EBUSY;
+    if (!g_squashfs_fs->mounted) return SQUASHFS_EBUSY;
     if (ino != 2) return SQUASHFS_ENOTSUP;      /* legacy API is root-only */
-    return sq_inode_stat(g_squashfs_fs.root_inode_ref, (struct squashfs_stat *)inode_buf);
+    return sq_inode_stat(g_squashfs_fs->root_inode_ref, (struct squashfs_stat *)inode_buf);
 }
 
 int squashfs_write_inode(uint32_t ino, const void *inode_buf) {
@@ -2060,9 +2135,9 @@ int squashfs_write_inode(uint32_t ino, const void *inode_buf) {
 }
 
 int squashfs_read_file(uint32_t ino, void *buf, uint32_t offset, uint32_t size) {
-    if (!g_squashfs_fs.mounted) return SQUASHFS_EBUSY;
+    if (!g_squashfs_fs->mounted) return SQUASHFS_EBUSY;
     if (ino != 2) return SQUASHFS_ENOTSUP;      /* legacy API is root-only */
-    return squashfs_read_ref(g_squashfs_fs.root_inode_ref, buf, offset, size);
+    return squashfs_read_ref(g_squashfs_fs->root_inode_ref, buf, offset, size);
 }
 
 int squashfs_write_file(uint32_t ino, const void *buf, uint32_t offset, uint32_t size) {

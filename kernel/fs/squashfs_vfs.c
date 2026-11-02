@@ -19,10 +19,31 @@
 /* vfs.h has no EROFS; alias it so the intent is explicit at every call site. */
 #define VFS_EROFS VFS_EPERM
 
-/* ---- single mounted volume ---- */
-static char g_mountpoint[VFS_MAX_PATH] = "";
-static int  g_ram = 0;
+/* ---- mount table: one entry per mounted volume (v0.30.0) ---- */
+#define SQUASHFS_VFS_MAX_MOUNTS 4
+struct squashfs_mnt {
+    int  used;
+    char mp[VFS_MAX_PATH];
+    int  drive;
+    int  ram;
+    int  vol;
+};
+static struct squashfs_mnt g_squash_mnts[SQUASHFS_VFS_MAX_MOUNTS];
 static int  g_ro_logged = 0;
+
+static struct squashfs_mnt *squash_mnt_find_by_point(const char *mountpoint) {
+    if (!mountpoint) return NULL;
+    for (int i = 0; i < SQUASHFS_VFS_MAX_MOUNTS; i++)
+        if (g_squash_mnts[i].used && strcmp(g_squash_mnts[i].mp, mountpoint) == 0)
+            return &g_squash_mnts[i];
+    return NULL;
+}
+
+static struct squashfs_mnt *squash_mnt_first(void) {
+    for (int i = 0; i < SQUASHFS_VFS_MAX_MOUNTS; i++)
+        if (g_squash_mnts[i].used) return &g_squash_mnts[i];
+    return NULL;
+}
 
 static void squashfs_ro_log(const char *what) {
     if (g_ro_logged) return;
@@ -93,13 +114,13 @@ static int parse_device(const char *device, int *out_drive, uint32_t *out_lba,
 }
 
 /* VFS path -> volume-relative path ("/HELLO.TXT"), stripping the mountpoint. */
-static int vol_path(const char *path, char *out, uint32_t cap) {
+static int vol_path(struct squashfs_mnt *m, const char *path, char *out, uint32_t cap) {
     if (!path || !out || cap == 0) return VFS_EINVAL;
     const char *rel = path;
-    size_t mplen = strlen(g_mountpoint);
+    size_t mplen = m ? strlen(m->mp) : 0;
 
     if (mplen > 1) {
-        if (strncmp(path, g_mountpoint, mplen) != 0) return VFS_ENOTFOUND;
+        if (strncmp(path, m->mp, mplen) != 0) return VFS_ENOTFOUND;
         rel = path + mplen;
         if (*rel == '\0') rel = "/";
     }
@@ -124,35 +145,51 @@ static int squashfs_vfs_mount(const char *device, const char *mountpoint, void *
     r = parse_device(device, &drive, &lba, &ram);
     if (r != VFS_OK) return r;
 
+    struct squashfs_mnt *m = NULL;
+    for (int i = 0; i < SQUASHFS_VFS_MAX_MOUNTS; i++)
+        if (!g_squash_mnts[i].used) { m = &g_squash_mnts[i]; break; }
+    if (!m) return VFS_ENOSPC;
+
+    int slot;
     if (ram) {
         if (!squashfs_ramdisk_registered()) {
             console_puts("[squashfs] mount failed: no ramdisk registered "
                          "(call squashfs_register_ramdisk first)\n");
             return VFS_EINVAL;
         }
-        r = squashfs_mount_ramdisk();
+        slot = squashfs_mount_ramdisk();
     } else {
-        r = squashfs_mount(drive, lba);
+        slot = squashfs_mount(drive, lba);
     }
-    if (r != SQUASHFS_OK) return map_err(r);
+    if (slot < 0) return map_err(slot);
 
-    g_ram = ram;
-    strncpy(g_mountpoint, mountpoint, sizeof(g_mountpoint) - 1);
-    g_mountpoint[sizeof(g_mountpoint) - 1] = '\0';
-    if (fs_data) *fs_data = (void *)(uintptr_t)(ram ? 0x100u : (uint32_t)drive);
+    memset(m, 0, sizeof(*m));
+    m->used = 1;
+    m->drive = drive;
+    m->ram = ram;
+    m->vol = slot;
+    strncpy(m->mp, mountpoint, sizeof(m->mp) - 1);
+    m->mp[sizeof(m->mp) - 1] = '\0';
+    if (fs_data) *fs_data = m;
+    console_printf("[squashfs] vfs mount drive=%d at %s (volume slot %d)\n",
+                   (int64_t)drive, m->mp, (int64_t)slot);
     return VFS_OK;
 }
 
 static int squashfs_vfs_unmount(const char *mountpoint) {
-    (void)mountpoint;
-    squashfs_unmount();
-    g_mountpoint[0] = '\0';
-    g_ram = 0;
+    struct squashfs_mnt *m = squash_mnt_find_by_point(mountpoint);
+    if (!m) return VFS_ENOTFOUND;
+    if (!m->ram && m->drive >= 0) (void)squashfs_unmount_drive(m->drive);
+    else                          squashfs_unmount();
+    memset(m, 0, sizeof(*m));
     return VFS_OK;
 }
 
 static int squashfs_vfs_open(void *fs_data, const char *path, int flags,
                              void **file_handle) {
+    struct squashfs_mnt *m = (struct squashfs_mnt *)fs_data;
+    if (!m || !m->used) return VFS_EINVAL;
+    (void)squashfs_select_volume(m->vol);
     char vp[VFS_MAX_PATH];
     struct squashfs_file *fh = NULL;
     /* VFS_O_RDWR (0x3) contains VFS_O_RDONLY's bit, so test the access-mode
@@ -167,7 +204,7 @@ static int squashfs_vfs_open(void *fs_data, const char *path, int flags,
         squashfs_ro_log("open for writing");
         return VFS_EROFS;
     }
-    r = vol_path(path, vp, sizeof(vp));
+    r = vol_path(m, path, vp, sizeof(vp));
     if (r != VFS_OK) return r;
 
     r = squashfs_open(vp, &fh);
@@ -204,13 +241,16 @@ static int squashfs_vfs_seek(void *file_handle, uint32_t offset, int whence) {
 }
 
 static int squashfs_vfs_opendir(void *fs_data, const char *path, void **dir_handle) {
+    struct squashfs_mnt *m = (struct squashfs_mnt *)fs_data;
+    if (!m || !m->used) return VFS_EINVAL;
+    (void)squashfs_select_volume(m->vol);
     char vp[VFS_MAX_PATH];
     struct squashfs_dir *d = NULL;
     int r;
 
     (void)fs_data;
     if (!dir_handle) return VFS_EINVAL;
-    r = vol_path(path, vp, sizeof(vp));
+    r = vol_path(m, path, vp, sizeof(vp));
     if (r != VFS_OK) return r;
 
     r = squashfs_opendir(vp, &d);
@@ -241,13 +281,16 @@ static int squashfs_vfs_closedir(void *dir_handle) {
 }
 
 static int squashfs_vfs_stat(void *fs_data, const char *path, struct vfs_stat *st) {
+    struct squashfs_mnt *m = (struct squashfs_mnt *)fs_data;
+    if (!m || !m->used) return VFS_EINVAL;
+    (void)squashfs_select_volume(m->vol);
     char vp[VFS_MAX_PATH];
     struct squashfs_stat ss;
     int r;
 
     (void)fs_data;
     if (!st) return VFS_EINVAL;
-    r = vol_path(path, vp, sizeof(vp));
+    r = vol_path(m, path, vp, sizeof(vp));
     if (r != VFS_OK) return r;
 
     r = squashfs_stat(vp, &ss);
@@ -272,42 +315,60 @@ static int squashfs_vfs_stat(void *fs_data, const char *path, struct vfs_stat *s
 }
 
 static int squashfs_vfs_mkdir(void *fs_data, const char *path, uint32_t mode) {
+    struct squashfs_mnt *m = (struct squashfs_mnt *)fs_data;
+    if (!m || !m->used) return VFS_EINVAL;
+    (void)squashfs_select_volume(m->vol);
     (void)fs_data; (void)path; (void)mode;
     squashfs_ro_log("mkdir");
     return VFS_EROFS;
 }
 
 static int squashfs_vfs_rmdir(void *fs_data, const char *path) {
+    struct squashfs_mnt *m = (struct squashfs_mnt *)fs_data;
+    if (!m || !m->used) return VFS_EINVAL;
+    (void)squashfs_select_volume(m->vol);
     (void)fs_data; (void)path;
     squashfs_ro_log("rmdir");
     return VFS_EROFS;
 }
 
 static int squashfs_vfs_unlink(void *fs_data, const char *path) {
+    struct squashfs_mnt *m = (struct squashfs_mnt *)fs_data;
+    if (!m || !m->used) return VFS_EINVAL;
+    (void)squashfs_select_volume(m->vol);
     (void)fs_data; (void)path;
     squashfs_ro_log("unlink");
     return VFS_EROFS;
 }
 
 static int squashfs_vfs_rename(void *fs_data, const char *oldpath, const char *newpath) {
+    struct squashfs_mnt *m = (struct squashfs_mnt *)fs_data;
+    if (!m || !m->used) return VFS_EINVAL;
+    (void)squashfs_select_volume(m->vol);
     (void)fs_data; (void)oldpath; (void)newpath;
     squashfs_ro_log("rename");
     return VFS_EROFS;
 }
 
 static int squashfs_vfs_sync(void *fs_data) {
+    struct squashfs_mnt *m = (struct squashfs_mnt *)fs_data;
+    if (!m || !m->used) return VFS_EINVAL;
+    (void)squashfs_select_volume(m->vol);
     (void)fs_data;
     return VFS_OK;                        /* nothing to flush: read-only */
 }
 
 static int squashfs_vfs_get_free_space(void *fs_data, uint64_t *free_bytes,
                                        uint64_t *total_bytes) {
+    struct squashfs_mnt *m = (struct squashfs_mnt *)fs_data;
+    if (!m || !m->used) return VFS_EINVAL;
+    (void)squashfs_select_volume(m->vol);
     (void)fs_data;
     if (!squashfs_is_mounted()) return VFS_EBUSY;
     /* SquashFS images are packed read-only volumes: there is no free space. */
     if (free_bytes) *free_bytes = 0;
     if (total_bytes) {
-        *total_bytes = (uint64_t)g_squashfs_fs.sb.bytes_used;
+        *total_bytes = (uint64_t)g_squashfs_fs->sb.bytes_used;
     }
     return VFS_OK;
 }
