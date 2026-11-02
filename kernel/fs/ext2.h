@@ -1,22 +1,43 @@
-/* SutureOS: ext2 (revision 0 / revision 1) READ-ONLY filesystem driver
+/* SutureOS: ext2 (revision 0 / revision 1) READ-WRITE filesystem driver
  *
- * Ported/adapted from: Cinux kernel/fs/ext2_*.cpp + libs/ext2 (MIT)
+ * READ-ONLY HALF (mount/superblock/group descriptors/inode read/directories/
+ * file read/symlink inode/triple-indirect read) ported/adapted from:
+ *   Cinux kernel/fs/ext2_*.cpp + libs/ext2 (MIT)
  *   C:\Users\fanqi\Desktop\自研操作系统\Cinux\libs\ext2
+ *
+ * WRITE HALF (bitmap allocation, inode allocation, direct/single/double
+ * indirect data writes, truncate, directory entry insert/remove, mkdir/rmdir/
+ * unlink/rename, metadata flushing) written for SutureOS after reading these
+ * Apache-2.0 reference implementations (algorithm reference only - no code was
+ * copied; the on-disk format itself is the ext2 specification):
+ *   - XJ380   driver/fs/ext4/ext4.cpp   (Apache-2.0)
+ *     C:\Users\fanqi\Desktop\自研操作系统\XJ380\driver\fs\ext4\ext4.cpp
+ *   - Deshab-OS CODE/dsk/ext4.c         (Apache-2.0)
+ *     C:\Users\fanqi\Desktop\自研操作系统\Deshab-OS\CODE\dsk\ext4.c
  * Adaptations for SutureOS:
- *   - SutureOS block layer (blk_read from kernel/drivers/block.h) plus a RAM
- *     disk path (ext2_register_ramdisk) so a test image can live in kernel RAM
+ *   - SutureOS block layer (blk_read/blk_write/blk_flush from
+ *     kernel/drivers/block.h) plus a RAM disk path (ext2_register_ramdisk) so a
+ *     test image can live in kernel RAM
  *   - no C++/STL/mutex: single-volume context, per-operation heap scratch
  *     (lemis_heap_alloc), console_printf("[ext2] ...") logging
- *   - triple-indirect block pointers (Cinux stops at double indirect)
+ *   - triple-indirect block pointers on the read path (Cinux stops at double
+ *     indirect); the write path refuses triple indirect with EXT2_ENOTSUP
  *   - sparse holes zero-fill, on-disk value validation, bounded traversal
- *   - read-only: no write/mkdir/unlink path at all
+ *   - every mutation re-syncs the superblock + group descriptors + inode, so a
+ *     bad bitmap can never be "fixed up later"
  *
  * Scope (honest):
  *   - ext2 rev0/rev1 with classic block pointers; 1 KiB / 2 KiB / 4 KiB blocks
  *   - extents (EXT4_FEATURE_INCOMPAT_EXTENTS), 64-bit, meta_bg, journal and
  *     MMP filesystems are REJECTED at mount (unsupported incompat features)
- *   - symlink *targets* are not resolved (stat reports a symlink, open fails)
- *   - no write support: write/mkdir/rmdir/unlink/rename all fail read-only
+ *   - symlink *targets* are not resolved (stat reports a symlink, open fails);
+ *     symlink *creation* is not implemented
+ *   - writes are supported for direct blocks, single indirect and double
+ *     indirect; a write that would need the triple-indirect pointer fails with
+ *     EXT2_ENOTSUP (read still works)
+ *   - backup superblocks/group descriptor copies are NOT rewritten; only the
+ *     primary copy is updated (documented in the report, not a silent gap)
+ *   - inode timestamps are not advanced (the driver has no clock dependency)
  */
 #ifndef STITCH_EXT2_H
 #define STITCH_EXT2_H
@@ -88,6 +109,9 @@ typedef enum ext2_err {
     EXT2_ENOMEM   = -8,
     EXT2_ENOTSUP  = -9,
     EXT2_EBUSY    = -10,
+    EXT2_EEXIST   = -11,
+    EXT2_ENOTEMPTY = -12,
+    EXT2_ENOSPC   = -13,
 } ext2_err_t;
 
 /* ==================== on-disk structures (packed, byte-exact) ==================== */
@@ -195,6 +219,7 @@ struct ext2_fs {
     int      drive;              /* block-device number for the block path */
     uint32_t start_lba;          /* partition offset, 512-byte sectors */
     const uint8_t *ram;          /* RAM image base (ramdisk path), NULL = none */
+    uint8_t *ram_w;              /* writable alias of the same image, NULL = RO */
     uint32_t ram_size;           /* RAM image size in bytes */
 
     /* geometry (derived from the superblock, validated against the device) */
@@ -207,9 +232,12 @@ struct ext2_fs {
     uint32_t inodes_per_group;
     uint32_t inode_size;
     uint32_t first_data_block;
+    uint32_t first_ino;          /* first non-reserved inode (>= 11) */
     uint32_t group_count;
     uint32_t ptrs_per_block;     /* block_size / 4 */
     uint32_t max_logical;        /* direct+single+double+triple addressable */
+    uint32_t gdt_block;          /* first block of the primary descriptor table */
+    uint32_t gdt_entries_per_block;
     uint32_t rev_level;          /* 0 or 1 (validated at mount) */
 
     /* superblock copy */
@@ -245,6 +273,7 @@ struct ext2_file {
     int      used;
     uint32_t ino;
     uint32_t size;
+    int      append;     /* opened O_APPEND: every write lands at EOF */
 };
 
 struct ext2_dir {
@@ -292,6 +321,71 @@ int ext2_read_file(uint32_t ino, void *buf, uint32_t offset, uint32_t size);
 int ext2_open(const char *path, struct ext2_file **out);
 int ext2_file_read(struct ext2_file *f, void *buf, uint32_t size, uint32_t offset);
 int ext2_close(struct ext2_file *f);
+
+/* Open with creation/truncation (the VFS adapter's O_CREAT / O_TRUNC /
+ * O_APPEND path). `create` creates a 0644 regular file when missing,
+ * `trunc` shrinks it to zero bytes first, `append` makes writes land at EOF. */
+int ext2_file_open(const char *path, int create, int trunc, int append,
+                   struct ext2_file **out);
+
+/* ==================== write API ==================== */
+
+/* Create an empty regular file; fails with EXT2_EEXIST if the name is taken and
+ * EXT2_ENOTDIR if a path component is not a directory. */
+int ext2_create(const char *path, uint32_t mode, uint32_t *out_ino);
+
+/* Write `size` bytes at `offset` into inode `ino`, allocating direct, single-
+ * indirect or double-indirect blocks as needed. Returns bytes written (>= 0) or
+ * a negative ext2_err_t; the inode and the volume metadata are flushed before
+ * returning. */
+int ext2_write_at(uint32_t ino, const void *buf, uint32_t offset, uint32_t size);
+int ext2_file_write(struct ext2_file *f, const void *buf, uint32_t size, uint32_t offset);
+
+/* Set the file length. Shrinking frees data blocks from the new EOF onwards and
+ * releases indirect tables that are no longer needed; growing zero-fills. */
+int ext2_truncate(uint32_t ino, uint32_t new_size);
+
+/* Directory mutation. All of these flush the superblock + group descriptors +
+ * every touched inode before returning. */
+int ext2_mkdir(const char *path, uint32_t mode);
+int ext2_rmdir(const char *path);
+int ext2_unlink(const char *path);
+int ext2_rename(const char *oldpath, const char *newpath);
+
+/* Flush the superblock, the group descriptor table and the block device. */
+int ext2_sync(void);
+
+/* Measure the free block / inode counts straight from the bitmaps (does not
+ * trust the cached superblock). Returns EXT2_OK and the measured values. */
+int ext2_count_free(uint32_t *free_blocks, uint32_t *free_inodes);
+
+/* Compare the superblock + every group descriptor's free counters against the
+ * bitmaps. Returns 1 when consistent, 0 when they differ (details are logged).
+ * The guest write self-test prints the "[ext2] bitmaps consistent" line only
+ * when this returns 1. */
+int ext2_bitmaps_consistent(void);
+
+/* Destructive mutation of the volume from the guest: creates /WRTDIR, writes
+ * 13 blocks (crossing direct -> single indirect), reads it back byte by byte,
+ * renames it (same directory, then across directories, plus a directory
+ * rename), truncates it, unlinks it and removes the directory. Then leaves
+ * /WRT_KEEP.BIN behind (same pattern/size) as byte-exact material for the
+ * host-side verifier scripts/verify_ext2_write.py, and checks the bitmaps.
+ * Runs only when the volume looks like the generated test image. */
+int ext2_write_selftest(void);
+
+/* VFS-layer round trip (implemented in ext2_vfs.c): create/open(O_CREAT) ->
+ * write -> read -> open(O_TRUNC) -> mkdir -> rename -> unlink -> rmdir through
+ * the vfs_* API on the mounted ext2 volume. Proves that the adapter - not just
+ * the ext2 core - really is read-write. */
+int ext2_vfs_selftest(void);
+
+/* Content rule shared with scripts/mkfs_ext2_testimg.py,
+ * scripts/verify_ext2_read.py and scripts/verify_ext2_write.py. */
+#define EXT2_WRITE_BLOCKS      13u   /* 13 logical blocks = 13 KiB @1 KiB */
+#define EXT2_KEEP_NAME         "/WRT_KEEP.BIN"
+#define EXT2_WST_PATTERN(i)    (uint8_t)((((uint32_t)(i)) * 37u + 13u) & 0xFFu)
+#define EXT2_KEEP_PATTERN(i)   (uint8_t)((((uint32_t)(i)) * 41u + 5u) & 0xFFu)
 
 /* Directory iteration. readdir() returns EXT2_OK per entry and EXT2_ENOENT at
  * the end; "." and ".." are skipped (same convention as the FAT32 driver). */

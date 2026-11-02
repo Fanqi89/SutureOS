@@ -78,6 +78,7 @@
 | `kernel/fs/iso9660.c/.h`、`iso9660_vfs.c` | CoolPotOS `module/iso9660`（参考） | MIT | ✅ v0.16.0 |
 | `kernel/drivers/ac97.c/.h` | HBOS `src/ac97.c` | GPL-3.0 | ✅ v0.16.0 |
 | `kernel/fs/fatfs.c` LFN 写侧 | PlantOS ChaN FatFs `put_lfn()` 规则 | MIT | ✅ v0.16.0 |
+| `kernel/fs/ext2.c` 写路径 | XJ380 / Deshab-OS 的 ext4 实现（**算法参考，未拷代码**） | Apache-2.0 | ✅ v0.17.0 |
 
 ## 5. 维护规则
 

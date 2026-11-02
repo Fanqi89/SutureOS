@@ -2,8 +2,8 @@
 
 > **一个由 16 个爱好者操作系统项目拼接而成的 x86_64 单内核操作系统**
 > 
-> 当前版本：**v0.16.0-alpha** · 内核编译 **97** 个源文件（源码树约 210 个 C/H/ASM、约 5.3 万行）
-> · 内核 ELF 约 **1.87 MB**（含调试符号）· 可引导 ISO 约 **14.3 MB** · **GPL-3.0** 许可证
+> 当前版本：**v0.17.0-alpha** · 内核编译 **97** 个源文件（源码树约 210 个 C/H/ASM、约 5.6 万行）
+> · 内核 ELF 约 **1.97 MB**（含调试符号）· 可引导 ISO 约 **14.7 MB** · **GPL-3.0** 许可证
 >
 > 移植与许可说明：[`docs/provenance.md`](docs/provenance.md)（模块→上游·文件路径）
 > · [`docs/licensing-audit.md`](docs/licensing-audit.md)（**上游许可证实读核对**，含待确认项）
@@ -59,6 +59,8 @@ SutureOS（缝合怪系统）是一个实验性的 x86_64 单内核操作系统�
 | v0.16.0 | ATAPI 光驱 + ISO9660 只读 | Uinxed-Kernel（Apache-2.0）+ CoolPotOS（MIT） | `kernel/drivers/atapi.*`、`kernel/fs/iso9660*` | ✅ 数据盘挂 `/mnt/cd`，宿主 224/224 |
 | v0.16.0 | AC'97 声卡 PCM 输出 | HBOS（GPL-3.0） | `kernel/drivers/ac97.*` + shell `beep` | ✅ WAV 1.000 s / 440.01 Hz |
 | v0.16.0 | FAT32 VFAT 长名（写） | PlantOS（MIT，ChaN FatFs 规则） | `kernel/fs/fatfs.c` | ✅ 创建/改名/删除长名，宿主 21/21 |
+| v0.17.0 | **ext2 可写**（建/删/改名/大文件/跨目录 rename） | 算法参考 XJ380 / Deshab-OS ext4（Apache-2.0） | `kernel/fs/ext2.c`（2958 行）、`ext2.h`、`ext2_vfs.c` | ✅ 1 KiB/4 KiB 镜像写自检 PASS，宿主 44/44 ×2 |
+| v0.17.0 | **ramfs 扩容**（64 节点/2 KiB → 512 节点/256 KiB） | 自研（GPL-3.0） | `kernel/vfs/vfs.h`、`vfs.c` | ✅ 64 KiB 读回 + 100 文件自检，`df` 131072 1K-blocks |
 
 ---
 
@@ -116,9 +118,9 @@ SutureOS（缝合怪系统）是一个实验性的 x86_64 单内核操作系统�
 
 ### Phase 3: 文件系统
 - ✅ **统一 VFS 核心**: 驱动注册、挂载表、fd 表、目录游标、`vfs_read_file/vfs_write_file/vfs_mkdir_p/vfs_list_mounts`、seek 修复
-- ✅ **xj_vfs (ramfs)**: 真实目录游标 + stat + O_TRUNC + 空间统计；作为根文件系统，启动时种入 `/hello.txt`、`/etc/motd`
+- ✅ **xj_vfs (ramfs)**: 真实目录游标 + stat + O_TRUNC + 空间统计；作为根文件系统，启动时种入 `/hello.txt`、`/etc/motd`。**v0.17.0 扩容**：节点 64→**512**、单目录子项 64→**128**、文件数据改为堆上 **4 KiB 块增长**（单文件上限 **256 KiB**，rm 时释放）；开机自检写 64 KiB 并逐字节读回 + 建 100 个文件
 - ✅ **FAT32（自写驱动，替代原 CoolPotOS 桩）**: superfloppy 挂载（BPB 严格校验，实测 `clusters=70544 fat_lba=32 fat_sz=552 root=2`）、8.3 目录项、FAT1/FAT2 双写、FSInfo 同步、簇链、create/read/write/truncate/mkdir/rmdir/unlink/sync；**读路径实测**（`cat /mnt/fat/hello.txt` 正确、`df` 显示真实空闲簇）；**写路径实测通过**（启动自检 `[fat32] write self-test PASS` + `[fat32] ops self-test PASS (mkdir/rmdir, rename, unlink: 3/3)`，并由宿主侧独立解析镜像验收 `checks=17 ok=17`：新文件逐字节正确、旧文件未改动、FAT1==FAT2、FSInfo 计数与实测一致、整盘 CRC 变化、**rename 后内容逐字节保留且旧名消失、unlink/rmdir 后条目消失且 FAT 里没有孤儿簇链**）。**rename 已实现**（同一目录内的 8.3 名字段就地改写，簇链/时间戳/属性不动；跨目录移动如实拒绝并打日志，因为 8.3-only 需要新建目录项）。
-- ✅ **ext2（只读，真实驱动）**: `kernel/fs/ext2.c` 解析 superblock/BGDT、单/双/三级间接块、稀疏空洞、readdir/stat/read，写操作返回 EROFS；`ext2_vfs.c` 接入统一 VFS，kmain 自动挂 `-hdb`（drive 1）并自检
+- ✅ **ext2（v0.17.0 起可读写，真实驱动）**: `kernel/fs/ext2.c`（2958 行）解析 superblock/BGDT、单/双/三间接块（读）、稀疏空洞、readdir/stat/read；**写路径**：块/inode 位图分配（每次写后按位图重算 sb+GDT 空闲计数并落盘）、直接+单+双间接写、追加/覆盖/truncate（含空洞）、create/mkdir/rmdir/unlink/rename（同目录+跨目录、POSIX 覆盖、目录 `..` 改写、祖先环检查）、VFS 默认 rw 挂载；`ext2_vfs.c` 接入统一 VFS，kmain 自动挂 `-hdb`（drive 1）并跑读/写/VFS 三个自检。宿主独立校验 `scripts/verify_ext2_write.py` **44/44**
 - ✅ **SquashFS 4.0（只读，真实驱动）**: `kernel/fs/squashfs.c`(1895 行)+`squashfs.h`+`squashfs_vfs.c`。gzip 数据块（复用新抽出的 `kernel/pkg/inflate.c`，全树只留一份 RFC1951 inflate，`deb.c` 改为调用它）、元数据块（压缩与未压缩两种）、fragment 表、id 表、目录表、fast/extended 符号链接、多块大文件与 partial read。**宿主侧三层验证**：`mkfs_squashfs_testimg.py` 自写镜像并独立重解析 PASS；`verify_squashfs_read.py build/squashfs.img` **checks=83 ok=83**；`tests/squashfs_harness/harness.c` 用**真实驱动源码**编到宿主跑 **checks=138 ok=138**（23 组、含 11 组负例：坏 magic/版本/xz/zstd 压缩号/块大小不一致/镜像截断/IO 失败/越界 inode/越界 fragment 索引/越界数据块表/未挂载句柄）。guest 侧 `-hdb build/squashfs.img` 实测 `[squashfs] selftest PASS (hello=0x7370589f large=0x37fe697d nested=0xb5d4a9fe uncomp=0x1fe9652d frag=0x681964c1)`，并用 `verify_squashfs_read.py --guest-log` 把 guest 打印的 CRC 与镜像独立比对 **checks=95 ok=95**。与 ext2 可共存（SquashFS 也会探测 virtio 盘：`-hdb ext2.img` + virtio 挂 SqFS 实测两者同时 selftest PASS）。**不支持**：lzo/lzma/xz/lz4/zstd（mount 时明确拒绝）、xattr、export/NFS 表、目录索引项（线性 readdir）、>4096 数据块的文件、uid/gid 只回报表索引、无任何写路径（EROFS→VFS_EPERM）
 - ❌ **VimtuFS2 (vfs64)**: 已改为真实委托到统一 VFS（不再是假成功），但 VimtuFS2 自身的磁盘格式（超级块/inode/位图）与多卷槽位 ❌ 未实现
 
@@ -517,7 +519,15 @@ py -3 scripts\verify_fat32_write.py build\fat32_virtio.img build\fat32.img
 23. **（已知限制）e1000 的开机自检 ping 在 QEMU 11.1 下会超时**：日志为 `[net] selftest ping TIMEOUT (... yields=N)` + `[net] e1000 diag: GPRC=0 ...`，但**同一次启动里交互 `ping 10.0.2.2` 3/3 正常**——设备模型没有在"中断屏蔽 + 轮询自检"这段窗口里把收到的包 DMA 进 ring。上一轮 wip 分支的实现同样复现，不是本版引入的回归；因此 e1000 的权威验收走 `scripts/nic_acceptance.py`（键入 ping），而不是只看开机自检那一行。驱动本身是轮询、无中断。
 24. **（v0.16.0 新增）光驱只读 + ISO9660 主卷子集**：`kernel/drivers/atapi.c` 是 **PIO 轮询**实现（无 IRQ/UDMA），单条 `READ(10)` ≤8 块、只支持 2048B 块 CD-ROM、无换盘检测（拔盘后读会如实报 `READ(10) failed` + sense）。`kernel/fs/iso9660.c` 只解析主卷：**Joliet 长名、Rock Ridge（POSIX 权限/长名/符号链接）、multi-extent、UDF 都没做**，所以文件名是大写 8.3（查找大小写不敏感）；单卷单挂、8 文件/8 目录句柄静态池；写/删除/重命名返回 EPERM。启动盘（El Torito）会被识别并跳过，数据盘自动挂 `/mnt/cd`。
 25. **（v0.16.0 新增）AC'97 声卡的限制**：单次播放 ≤2.0 秒（静态 DMA 缓冲约 480 KiB）、原生 48 kHz（其它采样率需 codec 报 VRA，否则返回 -2 而不是偷偷变速）、纯轮询不录音；MMIO BAR 分支已实现但 QEMU 只给 I/O BAR，未在真机验证。没有声卡时只多一行 `[ac97] no codec (skipped)`。
-17. **`arch/x86_64/acpi.h` 与 `madt.h` 重复定义 `acpi_madt`/`acpi_madt_t`**，任何同时包含两者的翻译单元都编不过（本次在 ioapic.c 里用 `extern` 声明绕开，未合并这两个头）。
+
+26. **（v0.17.0 新增）ext2 可写路径的子集**：三间接块**写入/释放如实拒绝**（`ENOTSUP`，1 KiB 卷
+    在逻辑块 65804 实测）；只写**主**超级块与主 GDT（备份副本不更新，mount 时打印说明，
+    `e2fsck` 可从主副本重建）；4 KiB 块的 4 MiB 测试卷太小，覆盖不到双间接写；每次写都全量重算
+    位图并 flush sb/GDT（"宁可慢不留坏位图"），所以挂 ext2 测试盘时开机 ext2 阶段明显变慢
+    （QEMU 需等 ≥30 s，不挂 ext2 盘无额外开销）；inode 时间戳不更新、无 symlink/硬链接/xattr、
+    文件上限 4 GiB、空洞写一律分配补零（读路径仍识别空洞）。
+27. **（v0.17.0 更新）ramfs 仍是内存盘**：单文件上限 256 KiB、512 个节点（含目录）、单目录 128 项；
+    重启丢失（持久化要等"安装器"批次）。数据块从内核堆按 4 KiB 增长，`rm` 时释放。17. **`arch/x86_64/acpi.h` 与 `madt.h` 重复定义 `acpi_madt`/`acpi_madt_t`**，任何同时包含两者的翻译单元都编不过（本次在 ioapic.c 里用 `extern` 声明绕开，未合并这两个头）。
 18. **FAT32 的 ops 自检需要"干净"的测试镜像**：第二次在同一个盘上开机时，`TMPFILE.TXT → RENAMED.TXT` 会因为目标已存在而**正确地**返回 `FATFS_EEXIST`，于是自检打印 `2/3`（这恰好证明"不覆盖已存在目标"生效）。每次验证前用 `scripts/mkfat32_testimg.py` 重新生成或从 `build/fat32.img` 复制一份。
 
 ---
@@ -616,6 +626,11 @@ py -3 scripts/gui_appearance_check.py build/shot_look.ppm --live-shot build/shot
 py -3 scripts/mkfat32_testimg.py
 # 启动一次（脚本见 scripts/qemu_boot.ps1），然后：
 py -3 scripts/verify_fat32_write.py build/fat32_ata.img build/fat32.img
+
+# ext2 可写：客机写自检 + 宿主独立解析脏镜像（44 项；--clean 传干净副本）
+py -3 scripts/mkfs_ext2_testimg.py
+# QEMU 加 ext2 盘：-drive id=bdisk,file=build/ext2.img,format=raw,if=ide,index=1
+py -3 scripts/verify_ext2_write.py build/ext2.img --clean build/ext2_clean.img --guest-log build/serial_ext2.log
 
 # ISO9660 数据盘：造夹具 + 客机挂载 + 宿主独立 ECMA-119 解析（224 项）
 py -3 scripts/mkiso9660_testcd.py

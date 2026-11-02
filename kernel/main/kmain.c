@@ -417,20 +417,28 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
         if (r != VFS_OK) console_puts("[init] no FAT32 volume on any block device\n");
     }
 
-    /* ext2 (read-only) on the second IDE disk (-hdb build/ext2.img). The driver
-     * reports mount geometry, then proves the read path (direct blocks, single
-     * and double indirect, hole) against the generated test image. */
+    /* ext2 on the second IDE disk (-hdb build/ext2.img). The driver reports
+     * mount geometry, proves the read path (direct blocks, single and double
+     * indirect, hole) and then proves the write path (mkdir, create, 13-block
+     * write across the single-indirect boundary, readback, truncate, rename,
+     * unlink, rmdir, bitmap consistency) against the generated test image. */
     {
         extern int ext2_mount(int drive, uint32_t start_lba);
         extern int ext2_selftest(void);
+        extern int ext2_write_selftest(void);
+        extern int ext2_vfs_selftest(void);
         extern int ext2_is_mounted(void);
         if (ext2_mount(1, 0) == 0) {
             if (vfs_mount("1", "/mnt/ext2", "ext2") == VFS_OK) {
-                console_puts("[  OK  ] ext2 volume (read-only) mounted at /mnt/ext2\n");
+                console_puts("[  OK  ] ext2 volume (read-write) mounted at /mnt/ext2\n");
             } else {
                 console_puts("[init] ext2: volume mounted but vfs_mount failed\n");
             }
-            if (ext2_is_mounted()) ext2_selftest();
+            if (ext2_is_mounted()) {
+                ext2_selftest();
+                ext2_write_selftest();
+                ext2_vfs_selftest();
+            }
         } else {
             console_puts("[init] ext2: no ext2 volume on drive 1 (expected without -hdb)\n");
         }

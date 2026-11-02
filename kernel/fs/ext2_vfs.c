@@ -4,44 +4,41 @@
  * core in kernel/fs/ext2.c - the same shape as kernel/fs/fatfs_vfs.c.
  * Driver name is "ext2" so `mount ext2 0 /mnt/ext2` finds it.
  *
- * READ-ONLY. kernel/vfs/vfs.h has no VFS_EROFS code, so every mutating call
- * returns VFS_EROFS, defined below as VFS_EPERM (the closest honest code the
- * VFS can report) after logging the rejection once.
+ * READ-WRITE since the B3 port batch: the volume is mounted read-write by
+ * default and create / write / truncate (O_TRUNC) / mkdir / rmdir / unlink /
+ * rename / sync all reach the ext2 core. The VFS driver interface has no
+ * separate truncate() entry, so a truncate reaches ext2 through
+ * open(O_TRUNC) - that is exactly what vfs_write_file() and the
+ * truncate(2) syscall wrapper use.
  */
 #include "vfs.h"
 #include <stitch/types.h>
 #include <stitch/string.h>
 #include <stitch/console.h>
+#include "heap.h"
 #include "ext2.h"
-
-/* vfs.h has no EROFS; alias it so the intent is explicit at every call site. */
-#define VFS_EROFS VFS_EPERM
 
 /* ---- single mounted volume ---- */
 static char g_mountpoint[VFS_MAX_PATH] = "";
 static int  g_ram = 0;
-static int  g_ro_logged = 0;
-
-static void ext2_ro_log(const char *what) {
-    if (g_ro_logged) return;
-    g_ro_logged = 1;
-    console_printf("[ext2] read-only filesystem: %s rejected\n", what);
-}
 
 /* Map core error codes to VFS error codes. */
 static int map_err(int e) {
     switch (e) {
-        case EXT2_OK:      return VFS_OK;
-        case EXT2_ENOENT:  return VFS_ENOTFOUND;
-        case EXT2_ENOTDIR: return VFS_ENOTDIR;
-        case EXT2_EISDIR:  return VFS_EISDIR;
-        case EXT2_EINVAL:  return VFS_EINVAL;
-        case EXT2_EIO:     return VFS_EIO;
-        case EXT2_EROFS:   return VFS_EROFS;
-        case EXT2_ENOMEM:  return VFS_ENOSPC;
-        case EXT2_ENOTSUP: return VFS_EPERM;
-        case EXT2_EBUSY:   return VFS_EBUSY;
-        default:           return VFS_ERR;
+        case EXT2_OK:       return VFS_OK;
+        case EXT2_ENOENT:   return VFS_ENOTFOUND;
+        case EXT2_ENOTDIR:  return VFS_ENOTDIR;
+        case EXT2_EISDIR:   return VFS_EISDIR;
+        case EXT2_EINVAL:   return VFS_EINVAL;
+        case EXT2_EIO:      return VFS_EIO;
+        case EXT2_EROFS:    return VFS_EPERM;
+        case EXT2_ENOMEM:   return VFS_ENOSPC;
+        case EXT2_ENOSPC:   return VFS_ENOSPC;
+        case EXT2_EEXIST:   return VFS_ECONFLICT;
+        case EXT2_ENOTEMPTY: return VFS_ECONFLICT;
+        case EXT2_ENOTSUP:  return VFS_EPERM;
+        case EXT2_EBUSY:    return VFS_EBUSY;
+        default:            return VFS_ERR;
     }
 }
 
@@ -141,6 +138,7 @@ static int ext2_vfs_mount(const char *device, const char *mountpoint, void **fs_
 
 static int ext2_vfs_unmount(const char *mountpoint) {
     (void)mountpoint;
+    ext2_sync();                     /* push the counters out before leaving */
     ext2_unmount();
     g_mountpoint[0] = '\0';
     g_ram = 0;
@@ -151,21 +149,28 @@ static int ext2_vfs_open(void *fs_data, const char *path, int flags, void **file
     char vp[VFS_MAX_PATH];
     struct ext2_file *fh = NULL;
     int acc = flags & VFS_O_RDWR;      /* 0 = unspecified, 1 RDONLY, 2 WRONLY, 3 RDWR */
+    int wants_write;
     int r;
 
     (void)fs_data;
     if (!file_handle) return VFS_EINVAL;
     /* VFS_O_RDWR (0x3) contains VFS_O_RDONLY's bit, so test the access mode
      * value instead of AND-ing the three flags together. */
-    if (acc == VFS_O_WRONLY || acc == VFS_O_RDWR ||
-        (flags & (VFS_O_CREAT | VFS_O_TRUNC | VFS_O_APPEND)) != 0) {
-        ext2_ro_log("open for writing");
-        return VFS_EROFS;
-    }
+    wants_write = (acc == VFS_O_WRONLY || acc == VFS_O_RDWR ||
+                   (flags & (VFS_O_CREAT | VFS_O_TRUNC | VFS_O_APPEND)) != 0);
+
     r = vol_path(path, vp, sizeof(vp));
     if (r != VFS_OK) return r;
 
-    r = ext2_open(vp, &fh);
+    if (wants_write) {
+        r = ext2_file_open(vp,
+                           (flags & VFS_O_CREAT) ? 1 : 0,
+                           (flags & VFS_O_TRUNC) ? 1 : 0,
+                           (flags & VFS_O_APPEND) ? 1 : 0,
+                           &fh);
+    } else {
+        r = ext2_open(vp, &fh);
+    }
     if (r != EXT2_OK) return map_err(r);
     *file_handle = fh;
     return VFS_OK;
@@ -184,9 +189,10 @@ static int ext2_vfs_read(void *file_handle, void *buf, uint32_t size, uint32_t o
 }
 
 static int ext2_vfs_write(void *file_handle, const void *buf, uint32_t size, uint32_t offset) {
-    (void)file_handle; (void)buf; (void)size; (void)offset;
-    ext2_ro_log("write");
-    return VFS_EROFS;
+    int n;
+    if (!file_handle) return VFS_EINVAL;
+    n = ext2_file_write((struct ext2_file *)file_handle, buf, size, offset);
+    return (n < 0) ? map_err(n) : n;      /* >= 0 = bytes written */
 }
 
 static int ext2_vfs_seek(void *file_handle, uint32_t offset, int whence) {
@@ -264,45 +270,226 @@ static int ext2_vfs_stat(void *fs_data, const char *path, struct vfs_stat *st) {
 }
 
 static int ext2_vfs_mkdir(void *fs_data, const char *path, uint32_t mode) {
-    (void)fs_data; (void)path; (void)mode;
-    ext2_ro_log("mkdir");
-    return VFS_EROFS;
+    char vp[VFS_MAX_PATH];
+    int r;
+
+    (void)fs_data;
+    r = vol_path(path, vp, sizeof(vp));
+    if (r != VFS_OK) return r;
+    return map_err(ext2_mkdir(vp, mode & 0xFFFu));
 }
 
 static int ext2_vfs_rmdir(void *fs_data, const char *path) {
-    (void)fs_data; (void)path;
-    ext2_ro_log("rmdir");
-    return VFS_EROFS;
+    char vp[VFS_MAX_PATH];
+    int r;
+
+    (void)fs_data;
+    r = vol_path(path, vp, sizeof(vp));
+    if (r != VFS_OK) return r;
+    return map_err(ext2_rmdir(vp));
 }
 
 static int ext2_vfs_unlink(void *fs_data, const char *path) {
-    (void)fs_data; (void)path;
-    ext2_ro_log("unlink");
-    return VFS_EROFS;
+    char vp[VFS_MAX_PATH];
+    int r;
+
+    (void)fs_data;
+    r = vol_path(path, vp, sizeof(vp));
+    if (r != VFS_OK) return r;
+    return map_err(ext2_unlink(vp));
 }
 
 static int ext2_vfs_rename(void *fs_data, const char *oldpath, const char *newpath) {
-    (void)fs_data; (void)oldpath; (void)newpath;
-    ext2_ro_log("rename");
-    return VFS_EROFS;
+    char ovp[VFS_MAX_PATH], nvp[VFS_MAX_PATH];
+    int r;
+
+    (void)fs_data;
+    r = vol_path(oldpath, ovp, sizeof(ovp));
+    if (r != VFS_OK) return r;
+    r = vol_path(newpath, nvp, sizeof(nvp));
+    if (r != VFS_OK) return r;
+    return map_err(ext2_rename(ovp, nvp));
 }
 
 static int ext2_vfs_sync(void *fs_data) {
     (void)fs_data;
-    return VFS_OK;                        /* nothing to flush: read-only */
+    if (!ext2_is_mounted()) return VFS_EBUSY;
+    return map_err(ext2_sync());
 }
 
 static int ext2_vfs_get_free_space(void *fs_data, uint64_t *free_bytes,
                                    uint64_t *total_bytes) {
+    uint32_t free_blocks = 0, free_inodes = 0;
     (void)fs_data;
     if (!ext2_is_mounted()) return VFS_EBUSY;
-    if (free_bytes) {
+    /* measure instead of trusting the cached counters: df must never lie */
+    if (ext2_count_free(&free_blocks, &free_inodes) == EXT2_OK) {
+        if (free_bytes) *free_bytes = (uint64_t)free_blocks * g_ext2_fs.block_size;
+    } else if (free_bytes) {
         *free_bytes = (uint64_t)g_ext2_fs.sb.s_free_blocks_count * g_ext2_fs.block_size;
     }
     if (total_bytes) {
         *total_bytes = (uint64_t)g_ext2_fs.blocks_count * g_ext2_fs.block_size;
     }
     return VFS_OK;
+}
+
+/* ==================== VFS-layer write self-test ==================== */
+
+/* Names used by the probe below; the host verifier checks that they are gone. */
+#define EXT2_VFS_PROBE_FILE   "/VFSPROBE.BIN"
+#define EXT2_VFS_PROBE_DIR    "/VFSDIR"
+#define EXT2_VFS_PROBE_MOVED  "/VFSDIR/MOVED.BIN"
+
+static int ext2_vfs_probe_fail(const char *what) {
+    console_printf("[ext2] vfs write self-test FAIL (%s)\n", what);
+    return EXT2_ERR;
+}
+
+/* Build "<mountpoint><suffix>" into out (the mountpoint is "/mnt/ext2" in the
+ * default boot, but never assume it). */
+static int ext2_vfs_probe_path(const char *suffix, char *out, uint32_t cap) {
+    size_t mp = strlen(g_mountpoint);
+    int n;
+    if (cap == 0) return VFS_EINVAL;
+    if (mp == 0) return VFS_EINVAL;
+    n = snprintf(out, cap, "%s%s", g_mountpoint, suffix);
+    if (n <= 0 || (uint32_t)n >= cap) return VFS_EINVAL;
+    return VFS_OK;
+}
+
+/* Round trip through the VFS adapter only - no direct ext2 core call. Proves
+ * that ext2_vfs.c really is read-write: O_CREAT/O_TRUNC create and truncate the
+ * file, write/read go through the driver's write/read entry points, and
+ * mkdir/rename/unlink/rmdir reach the directory code. */
+int ext2_vfs_selftest(void) {
+    char file_p[VFS_MAX_PATH], dir_p[VFS_MAX_PATH], moved_p[VFS_MAX_PATH];
+    uint8_t *buf = NULL;
+    uint32_t bs = g_ext2_fs.block_size, total, i, k;
+    vfs_stat_t st;
+    int open_ok = 0, write_ok = 0, read_ok = 0, truncate_ok = 0;
+    int mkdir_ok = 0, rename_ok = 0, unlink_ok = 0, rmdir_ok = 0;
+    int fd = -1, r;
+
+    if (!ext2_is_mounted() || g_mountpoint[0] == '\0') {
+        console_puts("[ext2] vfs write self-test skipped (no ext2 mount point)\n");
+        return EXT2_OK;
+    }
+    /* Destructive probe: only run it on the generated test volume, i.e. when the
+     * core write self-test has already left its /WRT_KEEP.BIN artifact behind. */
+    {
+        struct ext2_stat es;
+        if (ext2_stat(EXT2_KEEP_NAME, &es) != EXT2_OK) {
+            console_puts("[ext2] vfs write self-test skipped "
+                         "(not the generated test image)\n");
+            return EXT2_OK;
+        }
+    }
+    if (ext2_vfs_probe_path(EXT2_VFS_PROBE_FILE, file_p, sizeof(file_p)) != VFS_OK ||
+        ext2_vfs_probe_path(EXT2_VFS_PROBE_DIR, dir_p, sizeof(dir_p)) != VFS_OK ||
+        ext2_vfs_probe_path(EXT2_VFS_PROBE_MOVED, moved_p, sizeof(moved_p)) != VFS_OK) {
+        return ext2_vfs_probe_fail("cannot build the probe paths");
+    }
+
+    total = 3u * bs;
+    buf = (uint8_t *)lemis_heap_alloc(bs);
+    if (!buf) return ext2_vfs_probe_fail("out of memory");
+
+    /* leftovers from an interrupted earlier boot */
+    if (vfs_stat(file_p, &st) == VFS_OK) vfs_unlink(file_p);
+    if (vfs_stat(moved_p, &st) == VFS_OK) vfs_unlink(moved_p);
+    if (vfs_stat(dir_p, &st) == VFS_OK) vfs_rmdir(dir_p);
+
+    /* ---- create (O_CREAT|O_WRONLY|O_TRUNC) and write 3 blocks ---- */
+    fd = vfs_open(file_p, VFS_O_CREAT | VFS_O_WRONLY | VFS_O_TRUNC);
+    if (fd < 0) { ext2_vfs_probe_fail("open(O_CREAT) failed"); goto done; }
+    open_ok = 1;
+    for (i = 0; i < 3; i++) {
+        for (k = 0; k < bs; k++) {
+            buf[k] = (uint8_t)((((uint32_t)i * bs + k) * 53u + 7u) & 0xFFu);
+        }
+        r = vfs_write(fd, buf, bs);
+        if (r != (int)bs) { ext2_vfs_probe_fail("write failed"); goto done; }
+    }
+    write_ok = 1;
+    r = vfs_close(fd);
+    fd = -1;
+    if (r != VFS_OK) { ext2_vfs_probe_fail("close after write failed"); goto done; }
+
+    /* ---- read it back through the VFS ---- */
+    if (vfs_stat(file_p, &st) != VFS_OK || st.size != total) {
+        ext2_vfs_probe_fail("stat after write failed");
+        goto done;
+    }
+    fd = vfs_open(file_p, VFS_O_RDONLY);
+    if (fd < 0) { ext2_vfs_probe_fail("open(O_RDONLY) failed"); goto done; }
+    read_ok = 1;
+    for (i = 0; i < 3 && read_ok; i++) {
+        r = vfs_read(fd, buf, bs);
+        if (r != (int)bs) { read_ok = 0; break; }
+        for (k = 0; k < bs; k++) {
+            if (buf[k] != (uint8_t)((((uint32_t)i * bs + k) * 53u + 7u) & 0xFFu)) {
+                read_ok = 0;
+                break;
+            }
+        }
+    }
+    vfs_close(fd);
+    fd = -1;
+    if (!read_ok) { ext2_vfs_probe_fail("readback mismatch"); goto done; }
+
+    /* ---- truncate through open(O_TRUNC) ---- */
+    fd = vfs_open(file_p, VFS_O_WRONLY | VFS_O_TRUNC);
+    if (fd < 0) { ext2_vfs_probe_fail("open(O_TRUNC) failed"); goto done; }
+    vfs_close(fd);
+    fd = -1;
+    if (vfs_stat(file_p, &st) != VFS_OK || st.size != 0) {
+        ext2_vfs_probe_fail("truncate did not reach 0 bytes");
+        goto done;
+    }
+    truncate_ok = 1;
+
+    /* ---- mkdir / rename / unlink / rmdir ---- */
+    if (vfs_mkdir(dir_p, 0755) != VFS_OK) { ext2_vfs_probe_fail("mkdir failed"); goto done; }
+    mkdir_ok = 1;
+    if (vfs_rename(file_p, moved_p) != VFS_OK) {
+        ext2_vfs_probe_fail("rename failed");
+        goto done;
+    }
+    if (vfs_stat(file_p, &st) == VFS_OK) {
+        ext2_vfs_probe_fail("rename left the source name behind");
+        goto done;
+    }
+    if (vfs_stat(moved_p, &st) != VFS_OK || st.type != VFS_NODE_FILE) {
+        ext2_vfs_probe_fail("renamed file is missing");
+        goto done;
+    }
+    rename_ok = 1;
+    if (vfs_unlink(moved_p) != VFS_OK) { ext2_vfs_probe_fail("unlink failed"); goto done; }
+    unlink_ok = 1;
+    if (vfs_rmdir(dir_p) != VFS_OK) { ext2_vfs_probe_fail("rmdir failed"); goto done; }
+    rmdir_ok = 1;
+    if (vfs_sync(g_mountpoint) != VFS_OK) {
+        ext2_vfs_probe_fail("sync failed");
+        goto done;
+    }
+
+done:
+    if (fd >= 0) vfs_close(fd);
+    if (buf) lemis_heap_free(buf);
+
+    if (open_ok && write_ok && read_ok && truncate_ok && mkdir_ok && rename_ok &&
+        unlink_ok && rmdir_ok) {
+        console_puts("[ext2] vfs write self-test PASS (open=1 write=1 read=1 "
+                     "truncate=1 mkdir=1 rename=1 unlink=1 rmdir=1)\n");
+        return EXT2_OK;
+    }
+    console_printf("[ext2] vfs write self-test FAIL (open=%u write=%u read=%u "
+                   "truncate=%u mkdir=%u rename=%u unlink=%u rmdir=%u)\n",
+                   (uint64_t)open_ok, (uint64_t)write_ok, (uint64_t)read_ok,
+                   (uint64_t)truncate_ok, (uint64_t)mkdir_ok, (uint64_t)rename_ok,
+                   (uint64_t)unlink_ok, (uint64_t)rmdir_ok);
+    return EXT2_ERR;
 }
 
 /* ==================== driver export ==================== */

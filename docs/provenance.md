@@ -125,6 +125,8 @@ add copies from that repository.
 | `kernel/fs/fatfs.c` VFAT LFN read path | PlantOS (MIT, ChaN FatFs lineage) + SpiritFoxOS algorithm notes | MIT / ⚠️ | reimplemented inside `fatfs.c`; no new SpiritFoxOS code copied (v0.15.0) |
 | `kernel/fs/fatfs.c` VFAT LFN **write** path (create/rename/unlink of long names, UTF-16 chain writer + UTF-8 readback) | PlantOS ChaN FatFs `put_lfn()` rules (MIT) | MIT | SutureOS implementation (v0.16.0) |
 | `kernel/drivers/ac97.c/.h` | HBOS `src/ac97.c` | GPL-3.0 | PCI probe + NAM + NABM PCM OUT (v0.16.0) |
+| `kernel/fs/ext2.c` **write path** | XJ380 `driver/fs/ext4/ext4.cpp` / Deshab-OS `CODE/dsk/ext4.c` (algorithm reference only) | Apache-2.0 | bitmaps, direct/single/double indirect writes, dir insert/remove, rename, truncate (v0.17.0) |
+| `kernel/vfs/vfs.c` ramfs capacity | local | GPL-3.0 | 512 nodes / 256 KiB per file, heap chunks (v0.17.0) |
 
 ---
 

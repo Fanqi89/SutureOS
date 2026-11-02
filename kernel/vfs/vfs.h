@@ -193,12 +193,17 @@ const char *vfs_get_cwd(void);
 void vfs_set_cwd(const char *path);
 
 /* ==================== Legacy xj_vfs API (for compatibility) ==================== */
-#define XJ_VFS_MAX_NAME   64
-#define XJ_VFS_MAX_NODES  64
-/* per-file payload capacity (was a 64-byte uint32_t[16] array, which
- * silently truncated /etc/motd and could not hold /etc/passwd or
- * /etc/shadow - the user database needs real files) */
-#define XJ_VFS_MAX_FILE_SIZE 2048
+#define XJ_VFS_MAX_NAME     128
+/* Node slots (files + directories). WAS 64: /etc + /usr seeding plus a handful
+ * of user files filled the pool, so `touch` failed with ENOSPC on a fresh boot. */
+#define XJ_VFS_MAX_NODES    512
+/* Per-directory child limit. Kept separate from the node count so a single
+ * directory cannot swallow the whole pool. */
+#define XJ_VFS_MAX_CHILDREN 128
+/* Per-file payload: the data now lives on the kernel heap and grows in chunks.
+ * WAS a fixed 2048-byte inline array, which made "write a 3 KB file" fail. */
+#define XJ_VFS_FILE_CHUNK   4096u
+#define XJ_VFS_FILE_MAX     (256u * 1024u)
 
 #define XJ_VFS_OK          0
 #define XJ_VFS_ERR        -1
@@ -217,10 +222,11 @@ typedef enum xj_vfs_node_type {
 typedef struct xj_vfs_node {
     char name[XJ_VFS_MAX_NAME];
     xj_vfs_node_type_t type;
-    uint32_t size;
-    uint8_t  data[XJ_VFS_MAX_FILE_SIZE];
+    uint32_t size;              /* bytes of valid payload                  */
+    uint32_t capacity;          /* bytes allocated in data (chunk rounded) */
+    uint8_t *data;              /* heap payload, NULL until first write    */
     struct xj_vfs_node *parent;
-    struct xj_vfs_node *children[XJ_VFS_MAX_NODES];
+    struct xj_vfs_node *children[XJ_VFS_MAX_CHILDREN];
     uint32_t child_count;
 } xj_vfs_node_t;
 

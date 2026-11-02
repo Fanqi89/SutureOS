@@ -528,6 +528,8 @@ xj_vfs_node_t *xj_vfs_create(const char *path, xj_vfs_node_type_t type) {
         xj_root->name[1] = '\0';
         xj_root->type = XJ_VFS_NODE_DIR;
         xj_root->size = 0;
+        xj_root->capacity = 0;
+        xj_root->data = NULL;
         xj_root->parent = NULL;
         xj_root->child_count = 0;
         return xj_root;
@@ -540,7 +542,7 @@ xj_vfs_node_t *xj_vfs_create(const char *path, xj_vfs_node_type_t type) {
     *last_slash = '\0';
     xj_vfs_node_t *parent = xj_vfs_lookup(parent_path[0] ? parent_path : "/");
     if (!parent || parent->type != XJ_VFS_NODE_DIR) return NULL;
-    if (parent->child_count >= XJ_VFS_MAX_NODES) return NULL;
+    if (parent->child_count >= XJ_VFS_MAX_CHILDREN) return NULL;
 
     xj_vfs_node_t *node = xj_alloc_node();
     if (!node) return NULL;
@@ -548,6 +550,8 @@ xj_vfs_node_t *xj_vfs_create(const char *path, xj_vfs_node_type_t type) {
     node->name[XJ_VFS_MAX_NAME - 1] = '\0';
     node->type = type;
     node->size = 0;
+    node->capacity = 0;
+    node->data = NULL;
     node->parent = parent;
     node->child_count = 0;
     parent->children[parent->child_count++] = node;
@@ -579,20 +583,44 @@ xj_vfs_node_t *xj_vfs_lookup(const char *path) {
     return cur;
 }
 
+/* Grow a file's heap payload to hold at least `need` bytes. The buffer is
+ * allocated in XJ_VFS_FILE_CHUNK steps so a small file costs one chunk and a
+ * large one does not copy on every byte. Returns 0 or XJ_VFS_ENOSPC. */
+static int xj_vfs_grow(xj_vfs_node_t *node, uint32_t need) {
+    if (need <= node->capacity) return 0;
+    if (need > XJ_VFS_FILE_MAX) return XJ_VFS_ENOSPC;
+
+    uint32_t cap = (node->capacity == 0) ? XJ_VFS_FILE_CHUNK : node->capacity;
+    while (cap < need) {
+        if (cap > XJ_VFS_FILE_MAX - XJ_VFS_FILE_CHUNK) { cap = XJ_VFS_FILE_MAX; break; }
+        cap += XJ_VFS_FILE_CHUNK;
+    }
+    uint8_t *nb = (uint8_t *)lemis_heap_alloc(cap);
+    if (!nb) return XJ_VFS_ENOSPC;
+    if (node->data != NULL && node->size > 0) {
+        memcpy(nb, node->data, node->size);
+    }
+    if (node->data != NULL) lemis_heap_free(node->data);
+    node->data = nb;
+    node->capacity = cap;
+    return 0;
+}
+
 int xj_vfs_read(xj_vfs_node_t *node, uint32_t offset, uint32_t size, void *buf) {
     if (!node || !buf) return XJ_VFS_EINVAL;
     if (node->type != XJ_VFS_NODE_FILE) return XJ_VFS_EISDIR;
-    if (offset >= node->size) return XJ_VFS_OK;
+    if (offset >= node->size || node->data == NULL) return XJ_VFS_OK;
     if (offset + size > node->size) size = node->size - offset;
-    memcpy(buf, (uint8_t *)node->data + offset, size);
+    memcpy(buf, node->data + offset, size);
     return (int)size;
 }
 
 int xj_vfs_write(xj_vfs_node_t *node, uint32_t offset, uint32_t size, const void *buf) {
     if (!node || !buf) return XJ_VFS_EINVAL;
     if (node->type != XJ_VFS_NODE_FILE) return XJ_VFS_EISDIR;
-    if (offset + size > sizeof(node->data)) return XJ_VFS_ENOSPC;
-    memcpy((uint8_t *)node->data + offset, buf, size);
+    if (size > XJ_VFS_FILE_MAX || offset > XJ_VFS_FILE_MAX - size) return XJ_VFS_ENOSPC;
+    if (xj_vfs_grow(node, offset + size) != 0) return XJ_VFS_ENOSPC;
+    memcpy(node->data + offset, buf, size);
     if (offset + size > node->size) node->size = offset + size;
     return (int)size;
 }
@@ -611,6 +639,9 @@ int xj_vfs_rm(const char *path) {
     for (uint32_t i = 0; i < parent->child_count; i++) {
         if (parent->children[i] == node) {
             parent->children[i] = parent->children[--parent->child_count];
+            if (node->data != NULL) { lemis_heap_free(node->data); node->data = NULL; }
+            node->size = 0;
+            node->capacity = 0;
             return XJ_VFS_OK;
         }
     }
@@ -679,6 +710,48 @@ void st_xj_vfs_test(void) {
 
     if (xj_vfs_rm("/test.txt") != XJ_VFS_OK) pass = false;
     if (xj_vfs_lookup("/test.txt") != NULL) pass = false;
+
+    /* Capacity regression: a file larger than the old 2048-byte inline buffer
+     * must round-trip through several heap chunks, and the node pool must hold
+     * many files (it used to be 64 total). */
+    {
+        enum { BIG = 64 * 1024 };
+        xj_vfs_node_t *big = xj_vfs_create("/big.bin", XJ_VFS_NODE_FILE);
+        static uint8_t pattern[BIG];
+        static uint8_t readback[BIG];
+        for (int i = 0; i < BIG; i++) pattern[i] = (uint8_t)(i * 7 + 3);
+        if (!big) {
+            pass = false;
+        } else if (xj_vfs_write(big, 0, BIG, pattern) != BIG) {
+            pass = false;
+        } else if (xj_vfs_read(big, 0, BIG, readback) != BIG) {
+            pass = false;
+        } else if (memcmp(pattern, readback, BIG) != 0) {
+            pass = false;
+        } else if (big->size != BIG) {
+            pass = false;
+        }
+
+        /* 100 files in one directory (old pool was 64 nodes total). */
+        char path[64];
+        int made = 0;
+        for (int i = 0; i < 100; i++) {
+            int n = 0;
+            path[n++] = '/'; path[n++] = 'n';
+            if (i >= 100) path[n++] = (char)('0' + (i / 100) % 10);
+            if (i >= 10) path[n++] = (char)('0' + (i / 10) % 10);
+            path[n++] = (char)('0' + i % 10);
+            path[n] = '\0';
+            if (xj_vfs_create(path, XJ_VFS_NODE_FILE) != NULL) made++;
+        }
+        if (made != 100) pass = false;
+        if (xj_vfs_rm("/big.bin") != XJ_VFS_OK) pass = false;
+
+        console_printf("[ramfs] capacity self-test: big=%d bytes chunks=%u files=%d nodes=%u/%u\n",
+                       (int64_t)BIG, (uint32_t)(BIG / XJ_VFS_FILE_CHUNK),
+                       (int64_t)made, (uint64_t)xj_node_count,
+                       (uint64_t)XJ_VFS_MAX_NODES);
+    }
 
     st_run("xj_vfs", pass);
 }
@@ -852,10 +925,13 @@ static int xj_vfs_driver_sync(void *fs_data) {
 
 static int xj_vfs_driver_get_free_space(void *fs_data, uint64_t *free_bytes, uint64_t *total_bytes) {
     (void)fs_data;
-    /* The ramfs is backed by a static node pool; capacity is measured in
-     * node slots (each file node holds up to 64 bytes of inline data). */
-    uint64_t total = (uint64_t)XJ_VFS_MAX_NODES * sizeof(((xj_vfs_node_t *)0)->data);
-    uint64_t used  = (uint64_t)xj_node_count * sizeof(((xj_vfs_node_t *)0)->data);
+    /* Capacity = node slots x per-file cap; usage = the heap chunks actually
+     * handed to files. (Was a fixed 2048-byte inline array per node.) */
+    uint64_t total = (uint64_t)XJ_VFS_MAX_NODES * (uint64_t)XJ_VFS_FILE_MAX;
+    uint64_t used = 0;
+    for (uint32_t i = 0; i < xj_node_count; i++) {
+        used += (uint64_t)xj_node_pool[i].capacity;
+    }
     if (free_bytes) *free_bytes = (total > used) ? total - used : 0;
     if (total_bytes) *total_bytes = total;
     return VFS_OK;

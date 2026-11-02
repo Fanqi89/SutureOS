@@ -6,6 +6,40 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.17.0-alpha]
+
+**系统卷能写了：ext2 从只读驱动变成真正可写（建文件/建目录/删/改名/大文件写）；
+根内存盘从 64 节点 / 单文件 2 KiB 扩到 512 节点 / 单文件 256 KiB（堆上按 4 KiB 块增长）。
+启动呈现与 GUI 外观未变。**
+
+### Added
+- **ext2 可写**（`kernel/fs/ext2.c` 1078 → 2958 行、`ext2.h` 415、`ext2_vfs.c` 516）：
+  位图块/inode 分配（每次写后按位图重算组描述符与超级块空闲计数并落盘）、直接+单+双间接写、
+  追加/覆盖/truncate（含空洞）、create/mkdir/rmdir/unlink/rename（同目录+跨目录、POSIX 覆盖、
+  目录 `..` 改写、祖先环检查、nlink/used_dirs）、VFS 默认 rw 挂载 + `df` 实测计数。
+  算法参考 XJ380 / Deshab-OS 的 ext4 实现（Apache-2.0，只读参考，未拷代码）。
+- **ext2 写自检 / VFS 写自检 / 位图一致性自检**。
+- **ramfs 扩容**（`kernel/vfs/vfs.h`、`vfs.c`）：节点 64→512、单目录子项 64→128；文件数据改为
+  堆上 4 KiB 块增长（256 KiB/文件上限，rm 释放）；`df` 按实际分配统计；开机自检写 64 KiB
+  并逐字节读回 + 创建 100 个文件。
+- **`scripts/verify_ext2_write.py`**（711 行）：独立 ext2 解析器（位图/sb/GDT 计数、inode
+  直接+单+双间接块逐字节、目录链、父 nlink、孤儿/重复块、原始文件未改动）。
+
+### Verification
+- 1 KiB ext2：写自检 PASS、位图一致、VFS 写自检 PASS；宿主 **44/44**（276 块双间接产物）。
+- 4 KiB ext2：同样 PASS → 宿主 **44/44**；同镜像二次启动再验 **44/44**。
+- 只读回归：干净镜像 **47/47**、4 KiB **35/35**、三间接夹具 **16/16**。
+- ramfs：`[ramfs] capacity self-test: big=65536 bytes chunks=16 files=100 nodes=104/512`，
+  `[selftest][xj_vfs] PASS`；shell `df` 131072 1K-blocks、mkdir/touch/ls 正常。
+- 回归：FAT32 长名写 + 宿主 21/21、网卡验收两卡 PASS、自检 13/14、无 PANIC；
+  GUI 外观门禁动态矩形外 **0 像素**。
+
+### Limits
+- ext2 三间接块写入/释放如实拒绝（ENOTSUP）；只写主超级块/GDT（备份副本不更新）；
+  4 KiB 测试卷覆盖不到双间接；每次写全量重算位图并 flush，挂 ext2 盘时开机变慢（≥30 s）；
+  时间戳不更新、无 symlink/硬链接/xattr、文件上限 4 GiB。
+- ramfs 仍是内存盘（256 KiB/文件、512 节点、重启丢数据）。
+
 ## [v0.16.0-alpha]
 
 **按 docs/porting-roadmap.md 开始批量移植：光驱数据盘能读（ATAPI + ISO9660）、系统第一次能出声
