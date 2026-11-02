@@ -27,7 +27,8 @@
 | B4 | v0.18.0-alpha | **图片查看器**（BMP/QOI，SutureOS 自绘界面、懒启动） | HBOS `src/bmp.c`(GPL-3.0)、PlantOS `src/plic/qoi.c`(MIT) | 真实鼠标点开始菜单 → 窗口创建 → 截图四象限像素精确匹配（BMP + QOI 各一轮）；默认桌面仍 3 窗口 | ✅ 本轮完成 |
 | B5 | v0.18.0-alpha | **ring-3 文件工具**（rls/rcat/rcp/rmv/rrm/rmkdir/rtouch/rdf + ushell fork/execve/wait4；内核补目录 fd、exec argv 帧、fd 从 3 起） | 自研（argv/目录 fd 约定参考 VimtuOS GPL-3.0） | ushell 22 条命令自断言 37/37 + 宿主 FAT32 21/21 + 无 PANIC | ✅ 本轮完成 |
 | B5 | v0.18.0-alpha | **ring-3 文件工具**（rls/rcat/rcp/rmv/rrm/rmkdir/rtouch/rdf + ushell fork/execve/wait4；内核补目录 fd、exec argv 帧、fd 从 3 起） | 自研（argv/目录 fd 约定参考 VimtuOS GPL-3.0） | ushell 22 条命令自断言 37/37 + 宿主 FAT32 21/21 + 无 PANIC | ✅ 本轮完成 |
-| B6 | v0.21.0-alpha | **CJK 字体 + UTF-8**（终端优先，GUI 后续） | 素材库内自带 CJK 的仓库（实读确认许可）或 Unifont(公共域) | 终端打印中文不出现空白/替换符；ASCII 外观不变 | 下一轮 |
+| B6 | v0.19.0-alpha（部分，先做了终端写文件） | **终端文本工具** write/append/hexdump | 自研（GPL-3.0） | 宿主独立解析 FAT32 镜像逐字节一致 + 8/8 断言 | ✅ 本轮完成 |
+| B6b | 下一轮 | **CJK 中文显示**（终端 16×16 点阵，GB2312 子集） | HBOS 字体资源（16 点阵，独立授权待确认）/ 自研渲染 | 终端打印 `中文 长名.txt` 时字形与点阵逐像素一致、滚动后不丢 | ⏳ 本轮试做后回退 |
 | B7 | v0.22.0-alpha | **USB EHCI + HID 键鼠** | Uinxed-Kernel `usb/host/ehci`(Apache-2.0) | QEMU `-device usb-ehci -device usb-kbd/usb-mouse` 下键盘/鼠标可用 | 下一轮 |
 | B8 | v0.23.0-alpha | **USB Mass Storage（U 盘）** | Uinxed-Kernel `usb/storage`(Apache-2.0) | `-device usb-storage` 下挂 FAT32 U 盘、写自检 17/17 | 下一轮 |
 | B9 | — | **HDA 声卡**（比 AC97 兼容更好，AC97 完成后再评估） | VimtuOS `hda64.cpp`(GPL-3.0) | 与 AC97 同一套 WAV 判据 | 可选 |

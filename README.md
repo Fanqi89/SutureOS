@@ -2,7 +2,7 @@
 
 > **一个由 16 个爱好者操作系统项目拼接而成的 x86_64 单内核操作系统**
 > 
-> 当前版本：**v0.18.0-alpha** · 内核编译 **105** 个源文件（源码树约 220 个 C/H/ASM、约 6.0 万行）
+> 当前版本：**v0.19.0-alpha** · 内核编译 **105** 个源文件（源码树约 220 个 C/H/ASM、约 6.0 万行）
 > · 内核 ELF 约 **2.06 MB**（含调试符号）· 可引导 ISO 约 **15.0 MB** · **GPL-3.0** 许可证
 >
 > 移植与许可说明：[`docs/provenance.md`](docs/provenance.md)（模块→上游·文件路径）
@@ -64,6 +64,7 @@ SutureOS（缝合怪系统）是一个实验性的 x86_64 单内核操作系统�
 | v0.18.0 | **图片查看器**（BMP/QOI） | HBOS bmp.c（GPL-3.0）、PlantOS qoi.c（MIT） | `kernel/gui/{apps.c,img_bmp.c,img_qoi.c}` | ✅ 真实鼠标点菜单 → 四象限像素精确匹配（BMP+QOI） |
 | v0.18.0 | **ring-3 文件工具**（8 个）+ ushell 子进程模型 | 自研（GPL-3.0；argv/目录 fd 约定参考 VimtuOS） | `user/apps/r3*.c`、`kernel/syscall/*` | ✅ 22 条命令 37/37，宿主 21/21 |
 | v0.18.0 | **FAT32 多簇目录修复** | 自研 | `kernel/fs/fatfs.c`（`dir_cluster_is_last`） | ✅ lfn-write 自检 PASS、宿主 21/21 |
+| v0.19.0 | **终端文件写入工具**（write/append/hexdump） | 自研（GPL-3.0） | `kernel/shell/shell.c` | ✅ 宿主解析镜像逐字节一致，8/8 |
 
 ---
 
@@ -539,6 +540,12 @@ py -3 scripts\verify_fat32_write.py build\fat32_virtio.img build\fat32.img
     fork+execve+wait4）；`-r` 递归删除如实拒绝；跨目录 rename 被 VFS 拒绝（EXDEV）；`touch` 不改
     mtime（VFS 没有 mtime 设置）；`rdf` 报的是 SutureOS 方言 statfs（两个 u64 字节数）。18. **FAT32 的 ops 自检需要"干净"的测试镜像**：第二次在同一个盘上开机时，`TMPFILE.TXT → RENAMED.TXT` 会因为目标已存在而**正确地**返回 `FATFS_EEXIST`，于是自检打印 `2/3`（这恰好证明"不覆盖已存在目标"生效）。每次验证前用 `scripts/mkfat32_testimg.py` 重新生成或从 `build/fat32.img` 复制一份。
 
+30. **（v0.19.0 新增）write/append 是整文件重写**：VFS 还没有 append 标志，`append` 把文件读进
+    2 KiB 静态缓冲再整体写回（超过 2 KiB 明确报错，不静默截断）；`write` 单行上限 512 字节，
+    参数按空格连接（不保留连续空格，不支持引号/转义）；`hexdump` 无分页。
+31. **（v0.19.0 说明）CJK 中文显示仍在做**：本轮实现了 16×16 点阵字体子集（GB2312 7443 字形）
+    与 flanterm 宽字符钩子，但实机渲染成实心块，按"不发半成品"原则整体回退；终端目前仍把
+    非 ASCII 字符画成方块（串口/宿主解析正常），下一批重做。
 ---
 
 ## 🔧 构建系统

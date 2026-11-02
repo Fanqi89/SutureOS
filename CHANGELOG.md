@@ -6,6 +6,26 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.19.0-alpha]
+
+**终端第一次能自己写文件（`write` / `append` / `hexdump`），只用公开 VFS API，ramfs/FAT32/ext2
+一致生效；内容由宿主侧独立解析镜像逐字节核对。启动呈现与 GUI 外观未变。**
+
+### Added
+- `write <file> <text...>`：创建/整体替换文本文件，自动补行尾换行，回显字节数。
+- `append <file> <text...>`：追加一行（读出 → 补换行 → 整文件写回），回显新大小。
+- `hexdump <file> [offset] [length]`：偏移 + 16 字节 hex + ASCII 视图，支持十进制/0x 参数。
+- `scripts/shell_text_tools_acceptance.py`：QMP 注入三条命令 + 8 条断言 + 宿主 FAT32 解析。
+
+### Verification
+- guest：`write ... (23 bytes)`、`append ... now 36 bytes`、`cat` 两行、`hexdump` 偏移+hex+ASCII。
+- 宿主：`NOTE.TXT` 内容与 `"hello shell text tools\nsecond line\n"` 逐字节相同，原夹具文件仍在。
+- 回归：内核自检 13/14、FAT32 三自检 PASS、无 PANIC、GUI 外观门禁 0 像素。
+
+### Limits
+- write/append 是整文件重写（VFS 无 append 标志），append 上限 2 KiB、write 单行 512 字节。
+- CJK 显示仍未进版：本轮做了字体子集 + flanterm 宽字符钩子但渲染成实心块，已整体回退（不发半成品）。
+
 ## [v0.18.0-alpha]
 
 **桌面多了图片查看器（BMP/QOI 解码，SutureOS 自绘界面、按需创建所以默认截图不变）；

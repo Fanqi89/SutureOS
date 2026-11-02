@@ -68,6 +68,9 @@ static const struct shell_cmd g_commands[] = {
     {"cd",      shell_cmd_cd,      "Change directory"},
     {"pwd",     shell_cmd_pwd,     "Print working directory"},
     {"cat",     shell_cmd_cat,     "Display file contents"},
+    {"write",   shell_cmd_write,   "Create/replace a text file: write <file> <text...>"},
+    {"append",  shell_cmd_append,  "Append one text line: append <file> <text...>"},
+    {"hexdump", shell_cmd_hexdump, "Hex + ASCII dump: hexdump <file> [offset] [length]"},
     {"ps",      shell_cmd_ps,      "List processes"},
     {"kill",    shell_cmd_kill,    "Kill a process"},
     {"sudo",    shell_cmd_sudo,    "Execute command as root"},
@@ -662,6 +665,178 @@ int shell_cmd_cat(int argc, char **argv) {
     vfs_close(fd);
     if (total == 0 || last != '\n') shell_putc('\n');
     shell_printf("(%llu bytes)\n", (unsigned long long)total);
+    return 0;
+}
+
+/* ---- small text-file tools (v0.19.0) ----------------------------------
+ * `write` / `append` / `hexdump` are the missing half of `cat`: there was no way
+ * to create a file from the terminal, so every test needed a pre-built image.
+ * They only use the public VFS API, so they work on ramfs, FAT32 and ext2. */
+static uint32_t shell_parse_u32(const char *s) {
+    uint32_t v = 0;
+    if (!s) return 0;
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+        s += 2;
+        while (*s) {
+            uint32_t d;
+            if (*s >= '0' && *s <= '9') d = (uint32_t)(*s - '0');
+            else if (*s >= 'a' && *s <= 'f') d = (uint32_t)(*s - 'a' + 10);
+            else if (*s >= 'A' && *s <= 'F') d = (uint32_t)(*s - 'A' + 10);
+            else break;
+            v = v * 16u + d;
+            s++;
+        }
+        return v;
+    }
+    while (*s >= '0' && *s <= '9') { v = v * 10u + (uint32_t)(*s - '0'); s++; }
+    return v;
+}
+
+/* "arg2 arg3 ...\n" into buf (returns the length, 0 on overflow). */
+static uint32_t shell_join_args(int argc, char **argv, char *buf, uint32_t cap) {
+    uint32_t n = 0;
+    for (int i = 2; i < argc; i++) {
+        if (i > 2) {
+            if (n + 1 >= cap) return 0;
+            buf[n++] = ' ';
+        }
+        for (const char *p = argv[i]; *p; p++) {
+            if (n + 1 >= cap) return 0;
+            buf[n++] = *p;
+        }
+    }
+    if (n + 1 >= cap) return 0;
+    buf[n++] = '\n';
+    return n;
+}
+
+int shell_cmd_write(int argc, char **argv) {
+    if (argc < 3) {
+        shell_puts("Usage: write <file> <text...>\n");
+        return -1;
+    }
+    char path[256];
+    shell_abspath(argv[1], path, sizeof(path));
+    char buf[512];
+    const uint32_t n = shell_join_args(argc, argv, buf, sizeof(buf));
+    if (n == 0) {
+        shell_puts("write: text too long\n");
+        return -1;
+    }
+    int r = vfs_write_file(path, buf, n);
+    if (r != VFS_OK) {
+        shell_printf("write: %s: %s\n", path, vfs_err_str(r));
+        return -1;
+    }
+    shell_printf("write: %s (%lu bytes)\n", path, (unsigned long)n);
+    return 0;
+}
+
+int shell_cmd_append(int argc, char **argv) {
+    if (argc < 3) {
+        shell_puts("Usage: append <file> <text...>\n");
+        return -1;
+    }
+    char path[256];
+    shell_abspath(argv[1], path, sizeof(path));
+
+    static char buf[2048];
+    uint32_t n = 0;
+
+    vfs_stat_t st;
+    if (vfs_stat(path, &st) == VFS_OK && st.type == VFS_NODE_FILE) {
+        int fd = vfs_open(path, VFS_O_RDONLY);
+        if (fd < 0) {
+            shell_printf("append: %s: %s\n", path, vfs_err_str(fd));
+            return -1;
+        }
+        int got;
+        while (n + 32u < sizeof(buf) &&
+               (got = vfs_read(fd, buf + n, (uint32_t)(sizeof(buf) - n - 1u))) > 0) {
+            n += (uint32_t)got;
+        }
+        vfs_close(fd);
+        /* keep exactly one trailing newline in front of the new line */
+        if (n > 0 && buf[n - 1] != '\n') {
+            if (n + 1u >= sizeof(buf)) { shell_puts("append: file too big\n"); return -1; }
+            buf[n++] = '\n';
+        }
+    }
+
+    const uint32_t add = shell_join_args(argc, argv, buf + n, (uint32_t)(sizeof(buf) - n));
+    if (add == 0) {
+        shell_puts("append: text too long\n");
+        return -1;
+    }
+    n += add;
+
+    int r = vfs_write_file(path, buf, n);
+    if (r != VFS_OK) {
+        shell_printf("append: %s: %s\n", path, vfs_err_str(r));
+        return -1;
+    }
+    shell_printf("append: %s now %lu bytes\n", path, (unsigned long)n);
+    return 0;
+}
+
+int shell_cmd_hexdump(int argc, char **argv) {
+    if (argc < 2) {
+        shell_puts("Usage: hexdump <file> [offset] [length]\n");
+        return -1;
+    }
+    char path[256];
+    shell_abspath(argv[1], path, sizeof(path));
+    const uint32_t off = (argc >= 3) ? shell_parse_u32(argv[2]) : 0;
+    const uint32_t want = (argc >= 4) ? shell_parse_u32(argv[3]) : 128u;
+
+    int fd = vfs_open(path, VFS_O_RDONLY);
+    if (fd < 0) {
+        shell_printf("hexdump: %s: %s\n", path, vfs_err_str(fd));
+        return -1;
+    }
+    if (off && vfs_seek(fd, (int32_t)off, VFS_SEEK_SET) < 0) {
+        shell_printf("hexdump: cannot seek to %lu\n", (unsigned long)off);
+        vfs_close(fd);
+        return -1;
+    }
+
+    static const char hexd[] = "0123456789abcdef";
+    uint8_t row[16];
+    uint32_t done = 0;
+    while (done < want) {
+        uint32_t chunk = want - done;
+        if (chunk > sizeof(row)) chunk = sizeof(row);
+        int got = vfs_read(fd, row, chunk);
+        if (got <= 0) break;
+        char line[8 + 1 + 3 * 16 + 1 + 16 + 1];
+        char *p = line;
+        const uint32_t base = off + done;
+        for (int s = 28; s >= 0; s -= 4) *p++ = hexd[(base >> s) & 0xF];
+        *p++ = ' ';
+        *p++ = ' ';
+        for (int i = 0; i < 16; i++) {
+            if (i < got) {
+                *p++ = hexd[(row[i] >> 4) & 0xF];
+                *p++ = hexd[row[i] & 0xF];
+            } else {
+                *p++ = ' ';
+                *p++ = ' ';
+            }
+            *p++ = ' ';
+        }
+        *p++ = '|';
+        for (int i = 0; i < got; i++) {
+            const uint8_t c = row[i];
+            *p++ = (c >= 0x20 && c < 0x7F) ? (char)c : '.';
+        }
+        *p++ = '|';
+        *p = 0;
+        shell_puts(line);
+        shell_putc('\n');
+        done += (uint32_t)got;
+    }
+    vfs_close(fd);
+    shell_printf("(%lu bytes at offset %lu)\n", (unsigned long)done, (unsigned long)off);
     return 0;
 }
 
