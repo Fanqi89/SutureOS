@@ -297,6 +297,42 @@ def main():
     except:
         pass
     
+    # ---- 2b. CJK bitmap font blob (scripts/mkfont_cjk.py) ------------------
+    # Generated from the SIL OFL-1.1 face shipped in the collection and embedded
+    # like the other binaries (ASCII temp dir: MSYS2 objcopy hates Unicode paths).
+    font_bin = BUILD / "font_cjk.bin"
+    font_gen = ROOT / "scripts" / "mkfont_cjk.py"
+    if (not font_bin.exists()) or (font_bin.stat().st_mtime < font_gen.stat().st_mtime):
+        print("Generating CJK bitmap font...")
+        gen = subprocess.run([sys.executable, str(font_gen)], cwd=str(ROOT))
+        if gen.returncode != 0 or not font_bin.exists():
+            print("CJK font generation failed")
+            return 1
+
+    font_obj = OBJ / "font_cjk.bin.o"
+    temp_font_bin = temp_dir / "font_cjk.bin"
+    temp_font_obj = temp_dir / "font_cjk.bin.o"
+    shutil.copy2(font_bin, temp_font_bin)
+    print("Converting CJK font blob to object file...")
+    result = subprocess.run([
+        str(OBJCOPY), "-I", "binary", "-O", "elf64-x86-64", "-B", "i386:x86-64",
+        "--rename-section", ".data=.rodata,alloc,load,readonly,data,contents",
+        "--redefine-sym", "_binary_font_cjk_bin_start=font_cjk_bin_start",
+        "--redefine-sym", "_binary_font_cjk_bin_end=font_cjk_bin_end",
+        "--redefine-sym", "_binary_font_cjk_bin_size=font_cjk_bin_size",
+        "font_cjk.bin", "font_cjk.bin.o"
+    ], cwd=str(temp_dir))
+    if result.returncode != 0:
+        print("objcopy failed for the CJK font blob")
+        return 1
+    shutil.copy2(temp_font_obj, font_obj)
+    try:
+        os.remove(temp_font_bin)
+        os.remove(temp_font_obj)
+    except OSError:
+        pass
+    print(f"CJK font object created: {font_obj}")
+
     # Collect sources
     sources = []
     for pattern in ["boot/*.S", "arch/x86_64/*.c", "arch/x86_64/*.S", 
@@ -339,10 +375,11 @@ def main():
     
     # Add trampoline + ring-3 user blob objects to link
     objs.append(str(trampoline_obj))
+    objs.append(str(font_obj))
     if user_obj is not None:
         objs.append(str(user_obj))
     objs.extend(user_embed_objs)
-    print(f"Compiled {len(objs)-2} source files + trampoline + user blob")
+    print(f"Compiled {len(objs)-3} source files + trampoline + font + user blob")
     
     # Link
     elf = BUILD / "kernel.elf"

@@ -858,6 +858,24 @@ static void flanterm_fb_deinit(struct flanterm_context *_ctx, void (*_free)(void
     _free(ctx, sizeof(struct flanterm_fb_context));
 }
 
+/* SutureOS addition (not upstream): hand the framebuffer + cell metrics to the
+ * terminal adapter (kernel/term/term.c) for CJK bitmap blitting. */
+void flanterm_fb_metrics(struct flanterm_context *_ctx,
+                         uint32_t **fb, size_t *pitch_px,
+                         size_t *width, size_t *height,
+                         size_t *cell_w, size_t *cell_h,
+                         size_t *off_x, size_t *off_y) {
+    struct flanterm_fb_context *ctx = (void *)_ctx;
+    if (fb)        *fb        = (uint32_t *)ctx->framebuffer;
+    if (pitch_px)  *pitch_px  = (size_t)(ctx->pitch / 4);
+    if (width)     *width     = ctx->width;
+    if (height)    *height    = ctx->height;
+    if (cell_w)    *cell_w    = ctx->glyph_width;
+    if (cell_h)    *cell_h    = ctx->glyph_height;
+    if (off_x)     *off_x     = ctx->offset_x;
+    if (off_y)     *off_y     = ctx->offset_y;
+}
+
 struct flanterm_context *flanterm_fb_init(
     void *(*_malloc)(size_t),
     void (*_free)(void *, size_t),

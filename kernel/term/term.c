@@ -12,7 +12,12 @@
 #include <stitch/console.h>
 
 #include "term.h"
+#include "cjk16.h"
 #include "flanterm/flanterm.h"
+/* SutureOS addition: the CJK blit needs flanterm's cursor position and cell
+ * metrics, so this adapter (and only this adapter) sees the private header. */
+#define FLANTERM_IN_FLANTERM 1
+#include "flanterm/flanterm_private.h"
 #include "flanterm/flanterm_backends/fb.h"
 
 /* Published by kernel/main/limine.c from the Limine framebuffer request.
@@ -179,6 +184,15 @@ void term_init_from_limine(void)
         TERM_NUM_GLYPH
     );
 
+    /* CJK bitmap font (16x16, GB2312 subset). Without it the terminal still
+     * works: wide characters fall through to flanterm's replacement box. */
+    if (cjk16_init() == 0) {
+        console_printf("[term] CJK font: %d glyphs, 16x16\n",
+                       (int64_t)cjk16_count());
+    } else {
+        console_puts("[term] CJK font missing - wide characters render as boxes\n");
+    }
+
     if (term_ctx == NULL) {
         term_arena_used = arena_mark;   /* give the arena back: init stays retry-able */
         console_printf("[term] flanterm init FAILED\n");
@@ -211,12 +225,167 @@ int term_available(void)
  * always lag by one character).  term_putc() keeps the documented behaviour
  * "one character in, one character on screen" by flushing right after it; the
  * flush only redraws the queued cell plus the cursor, so it stays cheap. */
+/* ==================== CJK (16x16) support ====================
+ * flanterm's built-in font is 8x16 cp437: a CJK codepoint decodes as UTF-8 and
+ * then falls back to the "no glyph" box. SutureOS therefore intercepts the text
+ * stream one level above flanterm:
+ *   - ASCII bytes go to flanterm unchanged,
+ *   - a wide codepoint is written as TWO spaces (so wrapping, scrolling and the
+ *     cell grid stay flanterm's business), then the 16x16 bitmap is blitted over
+ *     the two cells in the framebuffer.
+ * Known limit: the bitmap is painted on top of flanterm's cells, so a later full
+ * repaint of those cells (scroll) clears it. That is documented in README. */
+static uint8_t  cjk_seq[4];
+static uint32_t cjk_seq_len;
+static uint8_t  cjk_seq_need;
+
+static uint32_t cjk_decode(uint32_t n) {
+    uint32_t cp;
+    switch (n) {
+    case 2:  cp = (uint32_t)(cjk_seq[0] & 0x1Fu) << 6;  break;
+    case 3:  cp = (uint32_t)(cjk_seq[0] & 0x0Fu) << 12; break;
+    default: cp = (uint32_t)(cjk_seq[0] & 0x07u) << 18; break;
+    }
+    for (uint32_t i = 1; i < n; i++)
+        cp |= (uint32_t)(cjk_seq[i] & 0x3Fu) << (6u * (n - 1u - i));
+    return cp;
+}
+
+/* CJK overlay list: flanterm's grid only knows 8x16 cells, so every glyph we
+ * paint on top of two cells is remembered here. When the terminal scrolls (a
+ * newline on the last row) the list is shifted up and repainted, which is what
+ * keeps Chinese text readable after `ls` produces more lines than the screen
+ * holds. Cleared by term_clear()/term_clear_full(). */
+#define CJK_OVERLAY_MAX 512
+struct cjk_overlay_entry {
+    uint16_t x;
+    uint16_t y;
+    uint32_t cp;
+};
+static struct cjk_overlay_entry g_cjk_overlay[CJK_OVERLAY_MAX];
+static uint32_t g_cjk_overlay_count;
+
+static void cjk_overlay_repaint(void) {
+    if (!term_ctx || g_cjk_overlay_count == 0) return;
+    uint32_t *fb = NULL;
+    size_t pitch = 0, w = 0, h = 0, cw = 8, ch = 16, ox = 0, oy = 0;
+    flanterm_fb_metrics(term_ctx, &fb, &pitch, &w, &h, &cw, &ch, &ox, &oy);
+    if (!fb || !cw || !ch) return;
+    for (uint32_t i = 0; i < g_cjk_overlay_count; i++) {
+        const struct cjk_overlay_entry *e = &g_cjk_overlay[i];
+        cjk16_draw(fb, (uint32_t)pitch, (uint32_t)w, (uint32_t)h,
+                   (int)ox + (int)e->x * (int)cw,
+                   (int)oy + (int)e->y * (int)ch, e->cp,
+                   term_default_fg, term_default_bg);
+    }
+}
+
+static void cjk_overlay_scroll(uint32_t rows) {
+    uint32_t keep = 0;
+    for (uint32_t i = 0; i < g_cjk_overlay_count; i++) {
+        if (g_cjk_overlay[i].y >= rows) {
+            g_cjk_overlay[keep] = g_cjk_overlay[i];
+            g_cjk_overlay[keep].y = (uint16_t)(g_cjk_overlay[i].y - rows);
+            keep++;
+        }
+    }
+    g_cjk_overlay_count = keep;
+    flanterm_flush(term_ctx);      /* grid first (see term_blit_cjk) */
+    cjk_overlay_repaint();
+}
+
+static void cjk_overlay_clear(void) {
+    g_cjk_overlay_count = 0;
+}
+
+static void cjk_overlay_add(uint32_t x, uint32_t y, uint32_t cp) {
+    if (g_cjk_overlay_count >= CJK_OVERLAY_MAX) {
+        /* drop the oldest quarter, keep the newest text */
+        const uint32_t drop = CJK_OVERLAY_MAX / 4;
+        for (uint32_t i = drop; i < g_cjk_overlay_count; i++)
+            g_cjk_overlay[i - drop] = g_cjk_overlay[i];
+        g_cjk_overlay_count -= drop;
+    }
+    g_cjk_overlay[g_cjk_overlay_count].x = (uint16_t)x;
+    g_cjk_overlay[g_cjk_overlay_count].y = (uint16_t)y;
+    g_cjk_overlay[g_cjk_overlay_count].cp = cp;
+    g_cjk_overlay_count++;
+}
+
+/* Blit one wide glyph over the two cells that were just blanked. */
+static void term_blit_cjk(uint32_t cp, uint32_t before_cols, uint32_t before_rows) {
+    (void)before_cols; (void)before_rows;
+    if (!cjk16_is_wide(cp) || !cjk16_lookup(cp)) {
+        /* not in the subset: let flanterm draw its replacement box */
+        flanterm_write(term_ctx, "  ", 2);
+        return;
+    }
+    flanterm_write(term_ctx, "  ", 2);
+
+    size_t cx = 0, cy = 0;
+    if (term_ctx->get_cursor_pos) term_ctx->get_cursor_pos(term_ctx, &cx, &cy);
+    int gx, gy;
+    if (cx >= 2) { gx = (int)cx - 2; gy = (int)cy; }
+    else         { gx = (int)term_cols() - 2; gy = (int)cy - 1; }
+    if (gx < 0 || gy < 0) return;
+
+    uint32_t *fb = NULL;
+    size_t pitch = 0, w = 0, h = 0, cw = 8, ch = 16, ox = 0, oy = 0;
+    flanterm_fb_metrics(term_ctx, &fb, &pitch, &w, &h, &cw, &ch, &ox, &oy);
+    if (!fb || !cw || !ch) return;
+
+    /* Flush flanterm's cell grid FIRST: the backend is double buffered, so a
+     * flush after the blit would repaint the blanked cells over the glyph. */
+    flanterm_flush(term_ctx);
+    cjk16_draw(fb, (uint32_t)pitch, (uint32_t)w, (uint32_t)h,
+               (int)ox + gx * (int)cw, (int)oy + gy * (int)ch, cp,
+               term_default_fg, term_default_bg);
+    cjk_overlay_add((uint32_t)gx, (uint32_t)gy, cp);
+    /* Cursor: flanterm repaints it on its next flush, which now happens before
+     * the next blit, so the cursor stays visible without erasing the glyph. */
+}
+
+/* Feed one byte of the text stream. */
+static void term_feed(uint8_t b) {
+    if (cjk_seq_need == 0) {
+        if (b < 0x80u) {
+            const int is_nl = (b == '\n');
+            size_t cx = 0, cy = 0;
+            if (is_nl && term_ctx->get_cursor_pos)
+                term_ctx->get_cursor_pos(term_ctx, &cx, &cy);
+            flanterm_putchar(term_ctx, b);
+            if (is_nl && term_ctx->rows && cy + 1 >= (size_t)term_ctx->rows)
+                cjk_overlay_scroll(1);
+            return;
+        }
+        if ((b & 0xE0u) == 0xC0u)      { cjk_seq_need = 2; }
+        else if ((b & 0xF0u) == 0xE0u) { cjk_seq_need = 3; }
+        else if ((b & 0xF8u) == 0xF0u) { cjk_seq_need = 4; }
+        else { flanterm_putchar(term_ctx, '?'); return; }
+        cjk_seq[0] = b;
+        cjk_seq_len = 1;
+        return;
+    }
+    if ((b & 0xC0u) != 0x80u) {          /* broken sequence: drop it */
+        cjk_seq_need = 0;
+        cjk_seq_len = 0;
+        flanterm_putchar(term_ctx, '?');
+        return;
+    }
+    cjk_seq[cjk_seq_len++] = b;
+    if (cjk_seq_len < cjk_seq_need) return;
+    const uint32_t cp = cjk_decode(cjk_seq_need);
+    cjk_seq_need = 0;
+    cjk_seq_len = 0;
+    term_blit_cjk(cp, 0, 0);
+}
+
 void term_putc(char c)
 {
     if (term_ctx == NULL) {
         return;
     }
-    flanterm_putchar(term_ctx, (uint8_t)c);
+    term_feed((uint8_t)c);
     flanterm_flush(term_ctx);
 }
 
@@ -225,7 +394,12 @@ void term_write(const char *s, uint32_t n)
     if (term_ctx == NULL || s == NULL) {
         return;
     }
-    flanterm_write(term_ctx, s, (size_t)n);
+    if (cjk16_count() == 0) {            /* no font: flanterm's own path */
+        flanterm_write(term_ctx, s, (size_t)n);
+        return;
+    }
+    for (uint32_t i = 0; i < n; i++) term_feed((uint8_t)s[i]);
+    flanterm_flush(term_ctx);
 }
 
 void term_puts(const char *s)
@@ -265,6 +439,7 @@ static void term_wipe_framebuffer(void)
 
 void term_clear(void)
 {
+    cjk_overlay_clear();
     if (term_ctx == NULL) {
         return;
     }
@@ -327,6 +502,7 @@ void term_clear(void)
  * (now empty) cell buffer, which is what a real "clear the screen" needs. */
 void term_clear_full(void)
 {
+    cjk_overlay_clear();
     term_clear();
 }
 

@@ -6,6 +6,34 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.20.0-alpha]
+
+**终端第一次能显示中文：GB2312 全集 16×16 点阵（7443 字形，SIL OFL-1.1 字体，构建期渲染），
+UTF-8 流式解码 + 双宽排布 + 滚动安全的覆盖层；宿主在截图上按 16×16 逐像素断言。
+启动呈现与 GUI 外观未变。**
+
+### Added
+- `kernel/term/cjk16.c/.h`：16×16 点阵 blob 解析 + 二分查找 + framebuffer 贴图。
+- `scripts/mkfont_cjk.py`：构建期从 OFL 字体渲染 GB2312 全集 → `build/font_cjk.bin`（构建自动执行）。
+- `kernel/term/term.c`：UTF-8 流式解码、宽字符双空格排布、512 条覆盖层（滚动上移重绘）、
+  flush-before-blit 顺序；`flanterm_backends/fb.c/.h` 只读 metrics 访问器。
+- `scripts/cjk_terminal_acceptance.py`：启动 + `ls` + 截图 + numpy 全屏字形匹配 + 滚动复验。
+- `docs/licenses/OFL-1.1.txt` + provenance/licensing-audit 字体条目。
+
+### Fixed
+- 中文首版渲染成实心块/滚动后丢失：点阵写在 framebuffer 后仍 flush 双缓冲栅格，空格被重画；
+  → 先 flush 再贴像素，滚动时覆盖层整体上移并重绘。
+- 多字节 UTF-8 序列在 term_putc/term_write 之间被拆散：→ term.c 统一流式解码。
+
+### Verification
+- 宿主像素断言：`中文长名` 四字形与点阵逐像素相同（中(3,368) 文(21,368) 长(48,368) 名(66,368)）；
+  30 回车滚动后仍逐像素相同、整体上移整 7 行 → **10/10 PASS**。
+- 回归：内核自检 13/14、FAT32 三自检 PASS、无 PANIC、GUI 外观门禁 0 像素。
+
+### Limits
+- 仅 GB2312（7443 字形）；位图固定 16×16；GUI 尚无中文；覆盖层 512 字形、只跟踪滚动；
+  中文输入不支持。
+
 ## [v0.19.0-alpha]
 
 **终端第一次能自己写文件（`write` / `append` / `hexdump`），只用公开 VFS API，ramfs/FAT32/ext2

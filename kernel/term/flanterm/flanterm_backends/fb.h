@@ -41,6 +41,14 @@ extern "C" {
 
 #    endif
 
+/* SutureOS addition (not upstream): expose the framebuffer and cell geometry so
+ * the terminal adapter can blit 16x16 CJK bitmaps on top of the cell grid. */
+void flanterm_fb_metrics(struct flanterm_context *ctx,
+                         uint32_t **fb, size_t *pitch_px,
+                         size_t *width, size_t *height,
+                         size_t *cell_w, size_t *cell_h,
+                         size_t *off_x, size_t *off_y);
+
 struct flanterm_context *flanterm_fb_init(
     /* If _malloc and _free are nulled, use the bump allocated instance (1 use only). */
     void *(*_malloc)(size_t size),
