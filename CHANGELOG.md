@@ -6,6 +6,25 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.28.0-alpha]
+
+**新增 `sync`：写盘不再必须 umount（FAT32 FSInfo / ext2 计数是延迟写的）。验收刻意不卸载，
+宿主解析原始镜像逐字节确认。启动呈现与 GUI 外观未变。**
+
+### Added
+- `kernel/shell/shell.c`：`shell_cmd_sync()` —— 遍历 `vfs_list_mounts()` 逐个 `vfs_sync()`，
+  逐卷报告结果与汇总，失败返回非 0。
+- `scripts/sync_acceptance.py`：write → sync → cat（不 umount）+ 宿主侧 FAT32 逐字节校验。
+
+### Not shipped (honest)
+- ext2 多卷尝试：结构改动可跑通（两卷同挂、各自读写），但宿主写验证器在卷 1 报
+  `artifact content byte-exact` 失败，怀疑多卷切换下写路径串卷；根因未查明，**已整体回退**，
+  记录在 docs/porting-roadmap.md B12。
+
+### Verification
+- guest `sync: /mnt/fat (fat32) ok` + `sync: 1 ok, 0 failed`；宿主 `SYNC.TXT` 内容逐字节一致
+  → **6/6 PASS**；内核 13/14、FAT32 宿主 21/21、GUI 外观门禁 0 像素。
+
 ## [v0.27.0-alpha]
 
 **Intel HDA 音频（B9）：控制器 + CORB/RIRB verb + codec 枚举 + 音频输出路径 + 环形 BDL 播放，

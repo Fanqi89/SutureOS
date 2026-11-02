@@ -76,6 +76,7 @@ static const struct shell_cmd g_commands[] = {
     {"tail",    shell_cmd_tail,    "Last lines: tail <file> [n]"},
     {"grep",    shell_cmd_grep,    "Print matching lines: grep <pattern> <file>"},
     {"stat",    shell_cmd_stat,    "Show type/size of a path: stat <path>"},
+    {"sync",    shell_cmd_sync,    "Flush every mounted filesystem: sync"},
     {"ps",      shell_cmd_ps,      "List processes"},
     {"kill",    shell_cmd_kill,    "Kill a process"},
     {"sudo",    shell_cmd_sudo,    "Execute command as root"},
@@ -1062,6 +1063,35 @@ int shell_cmd_stat(int argc, char **argv) {
     shell_printf("  Type: %s\n", st.type == VFS_NODE_DIR ? "directory" : "regular file");
     shell_printf("  Size: %lu bytes\n", (unsigned long)st.size);
     return 0;
+}
+
+/* ---- sync (v0.28.0) -----------------------------------------------------
+ * Until now a freshly written file only reached the disk when the volume was
+ * unmounted (or when a later write flushed the FSInfo). `sync` walks the mount
+ * table and asks every driver to flush, which is what a user expects after
+ * `write` on a FAT32/ext2 volume. */
+int shell_cmd_sync(int argc, char **argv) {
+    (void)argc; (void)argv;
+    vfs_mount_info_t mounts[VFS_MAX_MOUNTS];
+    int n = vfs_list_mounts(mounts, VFS_MAX_MOUNTS);
+    if (n <= 0) {
+        shell_puts("sync: no filesystems mounted\n");
+        return 0;
+    }
+    int ok = 0, failed = 0;
+    for (int i = 0; i < n; i++) {
+        int r = vfs_sync(mounts[i].mountpoint);
+        if (r == VFS_OK) {
+            ok++;
+            shell_printf("sync: %s (%s) ok\n", mounts[i].mountpoint, mounts[i].fstype);
+        } else {
+            failed++;
+            shell_printf("sync: %s (%s) FAILED (%d)\n", mounts[i].mountpoint,
+                         mounts[i].fstype, r);
+        }
+    }
+    shell_printf("sync: %d ok, %d failed\n", ok, failed);
+    return failed == 0 ? 0 : -1;
 }
 
 int shell_cmd_ps(int argc, char **argv) {
