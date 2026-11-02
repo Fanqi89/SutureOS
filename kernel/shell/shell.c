@@ -71,6 +71,11 @@ static const struct shell_cmd g_commands[] = {
     {"write",   shell_cmd_write,   "Create/replace a text file: write <file> <text...>"},
     {"append",  shell_cmd_append,  "Append one text line: append <file> <text...>"},
     {"hexdump", shell_cmd_hexdump, "Hex + ASCII dump: hexdump <file> [offset] [length]"},
+    {"wc",      shell_cmd_wc,      "Count lines/words/bytes: wc <file>"},
+    {"head",    shell_cmd_head,    "First lines: head <file> [n]"},
+    {"tail",    shell_cmd_tail,    "Last lines: tail <file> [n]"},
+    {"grep",    shell_cmd_grep,    "Print matching lines: grep <pattern> <file>"},
+    {"stat",    shell_cmd_stat,    "Show type/size of a path: stat <path>"},
     {"ps",      shell_cmd_ps,      "List processes"},
     {"kill",    shell_cmd_kill,    "Kill a process"},
     {"sudo",    shell_cmd_sudo,    "Execute command as root"},
@@ -838,6 +843,223 @@ int shell_cmd_hexdump(int argc, char **argv) {
     }
     vfs_close(fd);
     shell_printf("(%lu bytes at offset %lu)\n", (unsigned long)done, (unsigned long)off);
+    return 0;
+}
+
+/* ---- text utilities (v0.26.0): wc / head / tail / grep / stat ------------
+ * All of them stream through the public VFS, so they work on ramfs, FAT32, ext2
+ * and squashfs alike. grep uses a hand-rolled substring match because the kernel
+ * libc has no strstr().
+ */
+static const char *shell_find_sub(const char *hay, const char *needle) {
+    if (!hay || !needle || !*needle) return NULL;
+    for (const char *p = hay; *p; p++) {
+        const char *a = p, *b = needle;
+        while (*a && *b && *a == *b) { a++; b++; }
+        if (*b == 0) return p;
+    }
+    return NULL;
+}
+
+/* Open a file and print the usual error; returns fd or -1. */
+static int shell_open_text(const char *arg, char *path, uint32_t cap, int *is_dir) {
+    shell_abspath(arg, path, cap);
+    vfs_stat_t st;
+    int r = vfs_stat(path, &st);
+    if (r != VFS_OK) {
+        shell_printf("%s: %s: %s\n", "open", path, vfs_err_str(r));
+        return -1;
+    }
+    if (is_dir) *is_dir = (st.type == VFS_NODE_DIR);
+    if (st.type == VFS_NODE_DIR) {
+        shell_printf("%s: %s: is a directory\n", "open", path);
+        return -1;
+    }
+    int fd = vfs_open(path, VFS_O_RDONLY);
+    if (fd < 0) shell_printf("open: %s: %s\n", path, vfs_err_str(fd));
+    return fd;
+}
+
+int shell_cmd_wc(int argc, char **argv) {
+    if (argc < 2) {
+        shell_puts("Usage: wc <file>\n");
+        return -1;
+    }
+    char path[256];
+    int fd = shell_open_text(argv[1], path, sizeof(path), NULL);
+    if (fd < 0) return -1;
+
+    char buf[256];
+    uint64_t lines = 0, words = 0, bytes = 0;
+    int in_word = 0, n;
+    while ((n = vfs_read(fd, buf, sizeof(buf))) > 0) {
+        for (int i = 0; i < n; i++) {
+            const char c = buf[i];
+            bytes++;
+            if (c == '\n') lines++;
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+                in_word = 0;
+            } else if (!in_word) {
+                in_word = 1;
+                words++;
+            }
+        }
+    }
+    vfs_close(fd);
+    shell_printf("%llu %llu %llu %s\n", (unsigned long long)lines,
+                 (unsigned long long)words, (unsigned long long)bytes, path);
+    return 0;
+}
+
+int shell_cmd_head(int argc, char **argv) {
+    if (argc < 2) {
+        shell_puts("Usage: head <file> [lines]\n");
+        return -1;
+    }
+    const uint32_t want = (argc >= 3) ? (uint32_t)shell_parse_u32(argv[2]) : 10u;
+    char path[256];
+    int fd = shell_open_text(argv[1], path, sizeof(path), NULL);
+    if (fd < 0) return -1;
+
+    char buf[256];
+    uint32_t shown = 0;
+    int done = 0;
+    while (!done && (int)(0) == 0) {
+        int n = vfs_read(fd, buf, sizeof(buf));
+        if (n <= 0) break;
+        for (int i = 0; i < n; i++) {
+            shell_putc(buf[i]);
+            if (buf[i] == '\n') {
+                if (++shown >= want) { done = 1; break; }
+            }
+        }
+    }
+    if (!done) shell_putc('\n');
+    vfs_close(fd);
+    return 0;
+}
+
+int shell_cmd_tail(int argc, char **argv) {
+    if (argc < 2) {
+        shell_puts("Usage: tail <file> [lines]\n");
+        return -1;
+    }
+    const uint32_t want = (argc >= 3) ? (uint32_t)shell_parse_u32(argv[2]) : 10u;
+    char path[256];
+    int fd = shell_open_text(argv[1], path, sizeof(path), NULL);
+    if (fd < 0) return -1;
+
+    /* keep the last `want` lines as file offsets, then re-read from there */
+    char buf[256];
+    static uint32_t starts[64];
+    uint32_t count = 0;
+    uint64_t off = 0;
+    int n;
+    int first = 1;
+    while ((n = vfs_read(fd, buf, sizeof(buf))) > 0) {
+        for (int i = 0; i < n; i++, off++) {
+            if (buf[i] == '\n') {
+                if (count < want) {
+                    starts[count++] = (uint32_t)off + 1u;
+                } else {
+                    for (uint32_t k = 1; k < want; k++) starts[k - 1] = starts[k];
+                    starts[want - 1] = (uint32_t)off + 1u;
+                }
+                first = 0;
+            }
+        }
+    }
+    if (count == 0) {                    /* one unterminated line: whole file */
+        vfs_close(fd);
+        return shell_cmd_head(argc, argv);
+    }
+    (void)first;
+    uint32_t start_off = 0;
+    if (count >= want) {
+        start_off = starts[0];
+    }
+    if (vfs_seek(fd, (int32_t)start_off, VFS_SEEK_SET) < 0) {
+        shell_puts("tail: seek failed\n");
+        vfs_close(fd);
+        return -1;
+    }
+    while ((n = vfs_read(fd, buf, sizeof(buf))) > 0) {
+        for (int i = 0; i < n; i++) shell_putc(buf[i]);
+    }
+    shell_putc('\n');
+    vfs_close(fd);
+    return 0;
+}
+
+int shell_cmd_grep(int argc, char **argv) {
+    if (argc < 3) {
+        shell_puts("Usage: grep <pattern> <file>\n");
+        return -1;
+    }
+    char path[256];
+    int fd = shell_open_text(argv[2], path, sizeof(path), NULL);
+    if (fd < 0) return -1;
+
+    char line[512];
+    uint32_t len = 0;
+    uint32_t lineno = 0, hits = 0;
+    int n;
+    for (;;) {
+        n = vfs_read(fd, line + len, (uint32_t)(sizeof(line) - 2u - len));
+        if (n <= 0) break;
+        len += (uint32_t)n;
+        line[len] = '\0';
+        char *start = line;
+        /* the match points into the mutable local buffer, so the cast is safe */
+        char *nl;
+        while ((nl = (char *)shell_find_sub(start, "\n")) != NULL) {
+            *nl = '\0';
+            lineno++;
+            if (shell_find_sub(start, argv[1])) {
+                shell_printf("%lu: %s\n", (unsigned long)lineno, start);
+                hits++;
+            }
+            start = nl + 1;
+        }
+        len = (uint32_t)strlen(start);
+        memmove(line, start, len + 1u);
+        if (len + 8u >= sizeof(line)) {     /* line longer than the buffer */
+            if (shell_find_sub(line, argv[1])) {
+                shell_printf("%lu: %s(...)\n", (unsigned long)++lineno, line);
+                hits++;
+            }
+            len = 0;
+        }
+    }
+    if (len > 0) {                          /* last line without newline */
+        line[len] = '\0';
+        lineno++;
+        if (shell_find_sub(line, argv[1])) {
+            shell_printf("%lu: %s\n", (unsigned long)lineno, line);
+            hits++;
+        }
+    }
+    vfs_close(fd);
+    shell_printf("grep: %lu match(es) in %s\n", (unsigned long)hits, path);
+    return hits > 0 ? 0 : 1;
+}
+
+int shell_cmd_stat(int argc, char **argv) {
+    if (argc < 2) {
+        shell_puts("Usage: stat <path>\n");
+        return -1;
+    }
+    char path[256];
+    shell_abspath(argv[1], path, sizeof(path));
+    vfs_stat_t st;
+    int r = vfs_stat(path, &st);
+    if (r != VFS_OK) {
+        shell_printf("stat: %s: %s\n", path, vfs_err_str(r));
+        return -1;
+    }
+    shell_printf("  File: %s\n", path);
+    shell_printf("  Type: %s\n", st.type == VFS_NODE_DIR ? "directory" : "regular file");
+    shell_printf("  Size: %lu bytes\n", (unsigned long)st.size);
     return 0;
 }
 

@@ -6,6 +6,25 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.26.0-alpha]
+
+**命令行补齐五个文本工具：`wc` / `head` / `tail` / `grep` / `stat`（全部走公开 VFS，四种文件系统
+一致可用）；验收用 shell 自己造多行文件再逐条断言，宿主侧解析 FAT32 镜像逐字节复核。
+启动呈现与 GUI 外观未变。**
+
+### Added
+- `kernel/shell/shell.c`：`wc`（行/词/字节流式统计）、`head`（前 n 行）、`tail`（最后 n 行，
+  偏移窗口 + vfs_seek 回读）、`grep`（字面子串 + 行号 + 命中计数）、`stat`（类型/大小）。
+- `scripts/textutils_acceptance.py`：QMP 注入 10 条命令 + 串口断言 + 宿主侧 FAT32 逐字节校验。
+
+### Verification
+- `wc` → `5 10 53`；`head 2` 只前两行；`tail 2` 只后两行；`grep alpha` → 2 处带行号；
+  `stat` → regular file / 53 bytes → **7/7 PASS**；宿主 `TXT.TXT` 逐字节一致。
+- 回归：内核 13/14、FAT32 宿主 21/21、无 PANIC、GUI 外观门禁 0 像素。
+
+### Limits
+- grep 非正则、区分大小写、无 -i/-v；单行 >512 字节截断；tail 窗口 64 行；无管道；tail 扫两遍。
+
 ## [v0.25.0-alpha]
 
 **第五个桌面应用：Text Editor —— 开始菜单打开、真实键盘输入、回车保存到 /mnt/fat/EDIT.TXT，

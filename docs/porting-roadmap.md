@@ -59,3 +59,4 @@
 | B8 | v0.23.0-alpha | **USB 2.0 EHCI + 大容量存储（BOT/SCSI）** | HanOS（MIT）骨架 + HBOS（GPL-3.0）BOT 参考 | QEMU 有/无 USB 两组 + `verify_usb_disk.py` 8/8（只读整盘 CRC 未变 5/5） | ✅ 本轮完成 |
 | B8b | v0.24.0-alpha | **FAT32 多卷**（多挂载点同时可用，去掉单卷限制） | SutureOS 自有（GPL-3.0） | 双卷同挂 + 交叉写 + 宿主双镜像逐字节校验 **12/12** | ✅ 本轮完成 |
 | B10 | v0.25.0-alpha | **文本编辑器**（GUI 第五个应用：加载/编辑/回车保存） | SutureOS 自绘（GPL-3.0） | 真实鼠标+键盘注入 → 宿主解析 FAT32 镜像逐字节 **5/5** | ✅ 本轮完成 |
+| B11 | v0.26.0-alpha | **命令行文本工具**（wc/head/tail/grep/stat） | SutureOS 自有（GPL-3.0） | shell 造多行文件 + 五命令断言 + 宿主 FAT32 逐字节 **7/7** | ✅ 本轮完成 |
