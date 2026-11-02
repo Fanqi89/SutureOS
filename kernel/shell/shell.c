@@ -119,6 +119,7 @@ static const struct shell_cmd g_commands[] = {
     {"tcpapi",  shell_cmd_tcpapi,  "TCP echo server over the socket ABI: tcpapi <port>"},
     {"kbdstat", shell_cmd_kbdstat, "Show keyboard IRQ1 ring counters"},
     {"beep",    shell_cmd_beep,    "Play a sine tone on AC'97: beep [freq_hz 20..12000] [ms 10..1000]"},
+    {"hdatest", shell_cmd_hdatest, "Intel HDA status + tone: hdatest [freq_hz 20..12000] [ms 10..1000]"},
     {NULL, NULL, NULL}
 };
 
@@ -2422,6 +2423,50 @@ int shell_cmd_beep(int argc, char **argv) {
                      (unsigned)freq, (unsigned)dur);
     else
         shell_puts("[ac97] beep FAILED (DMA/rate error)\n");
+    return 0;
+}
+
+/* Intel HDA: report the controller/codec the boot probe found and play the
+ * acceptance tone on demand.  `hdatest` alone = 440 Hz / 1000 ms (the same tone
+ * as the boot self-test); optional arguments override frequency and duration
+ * within the driver's 48 kHz / 16-bit / stereo limits.  This is the on-demand
+ * trigger for the WAV acceptance run on the HDA path. */
+int shell_cmd_hdatest(int argc, char **argv) {
+    extern int hda_init(void);
+    extern int hda_present(void);
+    extern const char *hda_name(void);
+    extern int hda_beep(uint32_t freq_hz, uint32_t duration_ms);
+    uint32_t freq = 440u, dur = 1000u;
+
+    if (!hda_present() && hda_init() != 0) {
+        shell_puts("hdatest: no Intel HDA controller (boot QEMU with "
+                   "-device intel-hda -device hda-duplex,audiodev=a0)\n");
+        return 0;
+    }
+    if (argc > 1) {
+        const int f = shell_atoi(argv[1]);
+        if (f < 20 || f > 12000) {
+            shell_puts("hdatest: frequency must be 20..12000 Hz\n");
+            return 0;
+        }
+        freq = (uint32_t)f;
+    }
+    if (argc > 2) {
+        const int d = shell_atoi(argv[2]);
+        if (d < 10 || d > 1000) {
+            shell_puts("hdatest: duration must be 10..1000 ms\n");
+            return 0;
+        }
+        dur = (uint32_t)d;
+    }
+
+    shell_printf("[hda] %s: playing %u Hz for %u ms...\n", hda_name(),
+                 (unsigned)freq, (unsigned)dur);
+    if (hda_beep(freq, dur) == 0)
+        shell_printf("[hda] beep done (%u Hz, %u ms)\n",
+                     (unsigned)freq, (unsigned)dur);
+    else
+        shell_puts("[hda] beep FAILED (controller/stream error)\n");
     return 0;
 }
 

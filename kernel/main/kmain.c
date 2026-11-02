@@ -847,6 +847,23 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
         (void)ac97_selftest();
     }
 
+    /* ==================== Audio: Intel HDA PCM output ====================
+     * Same optional-controller contract as AC'97: a machine without HDA gets
+     * exactly one added line ("[hda] no controller") and no extra boot
+     * latency, so the frozen boot presentation is preserved.  With the
+     * controller present the driver enumerates the codec, programs the analog
+     * output pin + converter for 48 kHz/16-bit/stereo and the boot self-test
+     * plays the same 440 Hz acceptance tone. */
+    {
+        extern int hda_init(void);
+        extern int hda_selftest(void);
+        extern const char *hda_name(void);
+        if (hda_init() == 0) {
+            console_printf("[  OK  ] HDA: %s\n", hda_name());
+        }
+        (void)hda_selftest();
+    }
+
     console_puts("\n[stitch] Phase-1 self-tests complete. Initializing scheduler...\n");
 
     /* Initialize EEVDF scheduler and create idle task BEFORE enabling interrupts */

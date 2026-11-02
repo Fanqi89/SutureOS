@@ -122,6 +122,8 @@ int shell_cmd_tcpapi(int argc, char **argv);
 int shell_cmd_kbdstat(int argc, char **argv);
 /* AC'97 audio (kernel/drivers/ac97.c): play a sine tone through the codec. */
 int shell_cmd_beep(int argc, char **argv);
+/* Intel HDA (kernel/drivers/hda.c): codec status + acceptance tone. */
+int shell_cmd_hdatest(int argc, char **argv);
 
 /* Terminal output helpers */
 void shell_putc(char c);

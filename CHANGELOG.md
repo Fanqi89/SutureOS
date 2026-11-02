@@ -6,6 +6,34 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.27.0-alpha]
+
+**Intel HDA 音频（B9）：控制器 + CORB/RIRB verb + codec 枚举 + 音频输出路径 + 环形 BDL 播放，
+QEMU 里真实出声；宿主侧解析 WAV 证明 48 kHz/2ch/16bit、1.002 s、0.5000 FS、440.01 Hz。
+启动呈现与 GUI 外观未变。**
+
+### Added
+- `kernel/drivers/hda.c`（1236 行）+ `hda.h`：PCI 探测 / BAR0 MMIO / GCTL 复位 / CORB-RIRB DMA verb /
+  codec-AFG-widget 枚举 / 输出引脚→转换器路径 DFS / amp+EAPD+PIN_OUT_ENABLE / SD0 环形 BDL 播放 /
+  正弦合成；骨架 PlantOS（MIT），改动逐条记在文件头。
+- `scripts/verify_hda_wav.py`：宿主侧 WAV 校验（采样率/声道/位深/时长/峰值/频率）。
+- `kmain.c` 接入（无设备只多一行日志）；shell 新增 `hdatest [freq] [ms]`。
+
+### Fixed / learned (QEMU 实测)
+- CORB 第一条命令必须写在索引 1（复位后 WP=0，写回 0 无命令）。
+- RINTCNT 是每批响应数；必须 RINTCNT=1 + RIRB 响应状态位 + 每条响应 W1C 清 RIRBSTS。
+- SD_CTL 的 RUN 是 bit1(0x02)；stream tag 在 bits23:20。
+- GET_PARAMETER id 与输出 SD0 基址（0x100）按规范取值。
+
+### Verification
+- 有 HDA：codec 枚举 → 播放 → `selftest: PASS played 48000 frames @48000 Hz`；
+  宿主 WAV **6/6 PASS**（48000/2ch/16bit/1.002 s/0.5 FS/440.01 Hz）。
+- 无 HDA：模板差异仅 `+[hda] no controller`；13/14 自检、FAT32 21/21、外观门禁 0 像素；警告零新增。
+
+### Limits
+- 仅 QEMU 验证（真机未测）；单 codec/单输出 pin；无采集、无音量控件、无中断；
+  固定 48 kHz/16-bit/立体声；单次 ≤1 s；WAV 含 600 ms drain 静音尾巴；有 HDA 时开机 +1~2 s。
+
 ## [v0.26.0-alpha]
 
 **命令行补齐五个文本工具：`wc` / `head` / `tail` / `grep` / `stat`（全部走公开 VFS，四种文件系统
