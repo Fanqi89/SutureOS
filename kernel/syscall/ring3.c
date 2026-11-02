@@ -333,6 +333,34 @@ extern const uint8_t _binary_sigtest_bin_size[];
 extern const uint8_t _binary_forktest_bin_start[];
 extern const uint8_t _binary_forktest_bin_end[];
 extern const uint8_t _binary_forktest_bin_size[];
+/* B5 file tools (user/apps/r*.c): the ring-3 side of ls/cat/cp/mv/rm/mkdir/touch/df.
+ * They are the same kind of built-in blob as the acceptance programs above: `run
+ * <name>` starts one with no arguments (it then uses the current directory), and
+ * the ring-3 shell execs them with an argument line ("rls /mnt/fat"). */
+extern const uint8_t _binary_rls_bin_start[];
+extern const uint8_t _binary_rls_bin_end[];
+extern const uint8_t _binary_rls_bin_size[];
+extern const uint8_t _binary_rcat_bin_start[];
+extern const uint8_t _binary_rcat_bin_end[];
+extern const uint8_t _binary_rcat_bin_size[];
+extern const uint8_t _binary_rcp_bin_start[];
+extern const uint8_t _binary_rcp_bin_end[];
+extern const uint8_t _binary_rcp_bin_size[];
+extern const uint8_t _binary_rmv_bin_start[];
+extern const uint8_t _binary_rmv_bin_end[];
+extern const uint8_t _binary_rmv_bin_size[];
+extern const uint8_t _binary_rrm_bin_start[];
+extern const uint8_t _binary_rrm_bin_end[];
+extern const uint8_t _binary_rrm_bin_size[];
+extern const uint8_t _binary_rmkdir_bin_start[];
+extern const uint8_t _binary_rmkdir_bin_end[];
+extern const uint8_t _binary_rmkdir_bin_size[];
+extern const uint8_t _binary_rtouch_bin_start[];
+extern const uint8_t _binary_rtouch_bin_end[];
+extern const uint8_t _binary_rtouch_bin_size[];
+extern const uint8_t _binary_rdf_bin_start[];
+extern const uint8_t _binary_rdf_bin_end[];
+extern const uint8_t _binary_rdf_bin_size[];
 
 typedef struct {
     const char *name;
@@ -351,25 +379,156 @@ static const user_program_t g_programs[] = {
     /* Multi-process acceptance: `run forktest`. Also not auto-run - the boot log
      * must stay byte-for-byte the same shape. */
     { "forktest", _binary_forktest_bin_start, _binary_forktest_bin_size },
+    /* B5 file tools. Not auto-run either: the boot log stays unchanged. */
+    { "rls", _binary_rls_bin_start, _binary_rls_bin_size },
+    { "rcat", _binary_rcat_bin_start, _binary_rcat_bin_size },
+    { "rcp", _binary_rcp_bin_start, _binary_rcp_bin_size },
+    { "rmv", _binary_rmv_bin_start, _binary_rmv_bin_size },
+    { "rrm", _binary_rrm_bin_start, _binary_rrm_bin_size },
+    { "rmkdir", _binary_rmkdir_bin_start, _binary_rmkdir_bin_size },
+    { "rtouch", _binary_rtouch_bin_start, _binary_rtouch_bin_size },
+    { "rdf", _binary_rdf_bin_start, _binary_rdf_bin_size },
 };
 
 /* ---- execve support ----
  * Called from syscall_dispatch_c() for SYS_EXECVE: rebuilds the *current* address
  * space with the requested built-in program and rewrites the syscall return frame
  * so iretq lands at the new entry point. Returns 0 or a negative errno. */
+
+/* ---------------- argument passing ----------------
+ * SutureOS' ring-3 exec form takes ONE string: the program name, optionally
+ * followed by a space-separated argument list ("rls /mnt/fat"). The kernel builds
+ * the [argc][argv..][NULL][envp NULL] start frame inside the new address space
+ * itself, which is exactly the frame user/lib/crt0.S already reads when [rsp]
+ * looks like an argc (1..16). Without arguments the old blob convention
+ * ([rsp] == 0 -> argc = 1, argv[0] = "user64") is kept byte for byte.
+ *
+ * Why the kernel does this and not the libc: execve replaces the image, so the
+ * argument bytes have to be copied out of the window before userspace_load()
+ * zeroes it, and the pointers have to be rewritten to their new addresses.
+ */
+#define RING3_ARG_MAX     8
+#define RING3_ARGLINE_MAX 256
+#define RING3_FRAME_BYTES 1024
+#define RING3_FRAME_STR   128        /* bytes reserved for argc/argv[8]/NULL/envp[0] */
+
+/* Map a VA inside the user window to the kernel's identity-mapped bytes. Only one
+ * page is allowed: every caller writes a small frame into the stack, never across
+ * a page boundary. */
+static uint8_t *user_va_bytes(userspace_t *us, uint64_t va, uint64_t len)
+{
+    uint64_t off, page, inpage, pa;
+
+    if (us == NULL || va < USERSPACE_VA) return NULL;
+    off = va - USERSPACE_VA;
+    if (off + len > USERSPACE_BYTES) return NULL;
+    page = off / 4096u;
+    inpage = off % 4096u;
+    if (inpage + len > 4096u) return NULL;
+    pa = us->page_pa[page];
+    if (pa == 0) return NULL;
+    return (uint8_t *)(uintptr_t)(pa + inpage);
+}
+
+/* Copy an exec line out of user memory (the window is zeroed by the load). */
+static void copy_argline(char *dst, size_t cap, const char *src)
+{
+    size_t n = 0;
+
+    if (cap == 0) return;
+    if (src != NULL) {
+        while (src[n] != '\0' && n + 1 < cap) {
+            dst[n] = src[n];
+            n++;
+        }
+    }
+    dst[n] = '\0';
+}
+
+/* Split `line` in place on spaces/tabs. Returns the token count. */
+static int split_argline(char *line, char **tok, int max)
+{
+    int n = 0;
+    char *p = line;
+
+    while (*p != '\0' && n < max) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '\0') break;
+        tok[n++] = p;
+        while (*p != '\0' && *p != ' ' && *p != '\t') p++;
+        if (*p != '\0') *p++ = '\0';
+    }
+    return n;
+}
+
+/* Build the initial process frame at the top of the user stack. Returns the stack
+ * pointer to start with (16-byte aligned), or 0 when the line does not fit. */
+static uint64_t user_build_argv(userspace_t *us, char *line)
+{
+    char *tok[RING3_ARG_MAX];
+    uint64_t base_va = userspace_stack_top(us) - RING3_FRAME_BYTES;
+    uint8_t *k;
+    uint64_t argc, i;
+    uint64_t str_off = RING3_FRAME_STR;
+
+    if (us == NULL) return 0;
+    base_va &= ~0xFULL;
+    k = user_va_bytes(us, base_va, RING3_FRAME_BYTES);
+    if (k == NULL) return 0;
+    {
+        const int n = split_argline(line, tok, RING3_ARG_MAX);
+        if (n <= 0) return 0;
+        argc = (uint64_t)n;
+    }
+    memset(k, 0, RING3_FRAME_BYTES);
+    *(uint64_t *)(void *)(k + 0) = argc;
+    for (i = 0; i < argc; i++) {
+        const size_t n = strlen(tok[i]) + 1;
+        if (str_off + n + 16 > RING3_FRAME_BYTES) return 0;    /* does not fit */
+        memcpy(k + str_off, tok[i], n);
+        *(uint64_t *)(void *)(k + 8 + 8 * i) = base_va + str_off;
+        str_off += n;
+    }
+    /* argv[argc] = NULL, envp[0] = NULL (crt0 derives envp as argv + argc + 1). */
+    *(uint64_t *)(void *)(k + 8 + 8 * argc) = 0;
+    *(uint64_t *)(void *)(k + 8 + (8 * (argc + 1))) = 0;
+    return base_va;
+}
+
 int user_exec_in_place(const char *path, void *ctx_void)
 {
     user_context_t *ctx = (user_context_t *)ctx_void;
-    const char *name = path;
     userspace_t *us = proc_current_us();      /* the *calling* process's window */
     const uint8_t *blob = NULL;
     uint64_t len = 0;
+    uint64_t rsp;
+    char line[RING3_ARGLINE_MAX];
+    char pname[RING3_ARGLINE_MAX];
+    char *args = NULL;
 
-    if (name == NULL || us == NULL || ctx == NULL) return -14;          /* EFAULT */
-    while (*name == '/') name++;
+    if (path == NULL || us == NULL || ctx == NULL) return -14;          /* EFAULT */
+    /* The line lives in the user window that userspace_load() is about to zero. */
+    copy_argline(line, sizeof(line), path);
+    {
+        char *p = line;
+        while (*p == '/') p++;                     /* accept "/rls" as well */
+        {
+            size_t n = 0;
+            while (p[n] != '\0' && p[n] != ' ' && p[n] != '\t') n++;
+            if (n >= sizeof(pname)) n = sizeof(pname) - 1;
+            memcpy(pname, p, n);
+            pname[n] = '\0';
+            if (p[n] == ' ' || p[n] == '\t') args = p + n + 1;
+        }
+        /* keep the full line (name + arguments) in `line` for user_build_argv */
+        if ((const char *)p != line) {
+            size_t n = strlen(p) + 1;
+            memmove(line, p, n);
+        }
+    }
 
     for (uint64_t i = 0; i < sizeof(g_programs) / sizeof(g_programs[0]); i++) {
-        if (strcmp(g_programs[i].name, name) == 0) {
+        if (strcmp(g_programs[i].name, pname) == 0) {
             blob = g_programs[i].start;
             len = (uint64_t)(uintptr_t)g_programs[i].size_ptr;
             break;
@@ -380,11 +539,18 @@ int user_exec_in_place(const char *path, void *ctx_void)
     if (userspace_load(us, blob, len) != 0) return -12;                 /* ENOMEM */
     mmu_flush_tlb();
 
+    rsp = userspace_stack_top(us);
+    if (args != NULL) {
+        const uint64_t built = user_build_argv(us, line);
+        if (built == 0) return -7;                                      /* E2BIG */
+        rsp = built;
+    }
+
     ctx->rip = userspace_entry(us);
-    ctx->rsp = userspace_stack_top(us);
+    ctx->rsp = rsp;
     ctx->rax = 0;
     console_printf("[user] execve('/%s') -> new image, entry=0x%llx\n",
-                   name, (uint64_t)ctx->rip);
+                   pname, (uint64_t)ctx->rip);
     return 0;
 }
 
@@ -395,23 +561,34 @@ int user_exec_from_frame(const char *path, void *frame_void)
 {
     uint8_t *f = (uint8_t *)frame_void;
     userspace_t *us = proc_current_us();      /* the *calling* process's window */
-    const char *name = path;
-    char name_copy[32];
     const uint8_t *blob = NULL;
     uint64_t len = 0;
+    uint64_t rsp;
+    char line[RING3_ARGLINE_MAX];
+    char pname[RING3_ARGLINE_MAX];
+    char *args = NULL;
 
-    if (name == NULL || us == NULL || f == NULL) return -14;            /* EFAULT */
-    while (*name == '/') name++;
-    /* the path lives in the user window that userspace_load() is about to zero */
+    if (path == NULL || us == NULL || f == NULL) return -14;            /* EFAULT */
+    copy_argline(line, sizeof(line), path);
     {
-        size_t n = strlen(name);
-        if (n >= sizeof(name_copy)) n = sizeof(name_copy) - 1;
-        memcpy(name_copy, name, n);
-        name_copy[n] = '\0';
+        char *p = line;
+        while (*p == '/') p++;
+        {
+            size_t n = 0;
+            while (p[n] != '\0' && p[n] != ' ' && p[n] != '\t') n++;
+            if (n >= sizeof(pname)) n = sizeof(pname) - 1;
+            memcpy(pname, p, n);
+            pname[n] = '\0';
+            if (p[n] == ' ' || p[n] == '\t') args = p + n + 1;
+        }
+        if ((const char *)p != line) {
+            size_t n = strlen(p) + 1;
+            memmove(line, p, n);
+        }
     }
 
     for (uint64_t i = 0; i < sizeof(g_programs) / sizeof(g_programs[0]); i++) {
-        if (strcmp(g_programs[i].name, name) == 0) {
+        if (strcmp(g_programs[i].name, pname) == 0) {
             blob = g_programs[i].start;
             len = (uint64_t)(uintptr_t)g_programs[i].size_ptr;
             break;
@@ -421,11 +598,18 @@ int user_exec_from_frame(const char *path, void *frame_void)
     if (userspace_load(us, blob, len) != 0) return -12;                 /* ENOMEM */
     mmu_flush_tlb();
 
+    rsp = userspace_stack_top(us);
+    if (args != NULL) {
+        const uint64_t built = user_build_argv(us, line);
+        if (built == 0) return -7;                                      /* E2BIG */
+        rsp = built;
+    }
+
     *(uint64_t *)(void *)(f + 0x88) = userspace_entry(us);              /* rip */
-    *(uint64_t *)(void *)(f + 0xA0) = userspace_stack_top(us);          /* rsp */
+    *(uint64_t *)(void *)(f + 0xA0) = rsp;                              /* rsp */
     *(uint64_t *)(void *)(f + 0x70) = 0;                                /* rax = 0 */
     console_printf("[user] execve('/%s') ok, entry=0x%llx\n",
-                   name_copy, userspace_entry(us));
+                   pname, userspace_entry(us));
     return 0;
 }
 
@@ -475,7 +659,11 @@ int user_run_builtin(const char *name)
     return -1;
 }
 
-const char *user_builtin_list(void) { return "hello probe shell sigtest forktest"; }
+const char *user_builtin_list(void)
+{
+    return "hello probe shell sigtest forktest "
+           "rls rcat rcp rmv rrm rmkdir rtouch rdf";
+}
 
 /* ---------------- acceptance ---------------- */
 

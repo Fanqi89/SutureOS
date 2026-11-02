@@ -6,6 +6,49 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.18.0-alpha]
+
+**桌面多了图片查看器（BMP/QOI 解码，SutureOS 自绘界面、按需创建所以默认截图不变）；
+ring-3 用户态第一次有可用的文件工具（8 个程序 + fork/execve/wait4 的子进程模型）；
+修掉一个真 FAT32 bug：目录长到第二个簇以后，新建条目在查找/列目录里“看不见”。
+启动呈现与 GUI 外观未变。**
+
+### Added
+- **图片查看器**（`kernel/gui/apps.c` + 新增 `img_bmp.c`/`img_qoi.c`/`imgdecode.h`）：
+  BMP 1/4/8/16/24/32bpp（BIFF_RGB、top-down/底行优先）与 QOI 全 opcode，无 malloc、有界、
+  600×480 上限；状态行显示 `文件 宽x高 格式 (位深)`，整数倍最近邻缩放居中；窗口内点击切换图源。
+  解码算法参考 HBOS `src/bmp.c`（GPL-3.0）/ PlantOS `src/plic/qoi.c`（MIT），重写而非拷贝。
+- **懒启动**（`gui.h`/`gui.c`/`apps.c`）：开始菜单第一次点图片查看器才 `gui_create_window()`，
+  默认桌面仍是 3 个窗口，冻结基线截图逐像素不变。
+- **ring-3 文件工具 8 个**：`rls/rcat/rcp/rmv/rrm/rmkdir/rtouch/rdf`（`user/apps/r3tool.h` 薄封装，
+  直调 Linux 号系统调用、返回真 -errno）；`ushell` 命令表扩展。
+- **内核 ring-3 基础设施三处补齐**：目录 fd + `getdents64`（`FD_FLAG_DIR`、read/write 返 EISDIR、
+  fork 不继承游标）、`execve` 的 argv 启动帧、ring-3 fd 从 3 起分配。
+- 脚本：`scripts/imgview_acceptance.py`、`scripts/ring3_tools_acceptance.py`；`mkfat32_testimg.py`
+  新增 `IMG.BMP`/`IMG.QOI` 夹具。
+
+### Fixed
+- **FAT32 多簇目录的目录结尾判定**：`dir_find`/`dir_find_lfn`/`readdir`/`rmdir`/unlink 的 LFN 扫描
+  都把第一个 `0x00` 槽当目录结尾；目录长大到第二个簇后，老簇尾部全是 `0x00`，新条目永远扫不到
+  （表现为 rename 报成功但新名字打不开、unlink 失败、留下孤儿簇）。新增 `dir_cluster_is_last()`
+  查 FAT 链，只有链的最后一个簇的 `0x00` 才算结尾。
+- `scripts/verify_fat32_write.py` 同步：读整条根目录链、接受合法的多簇根目录、孤儿簇统计
+  把整条根链算作 live。
+
+### Verification
+- 图片查看器：真实鼠标（QMP）点开始菜单 → Image Viewer → `[img] decoded /mnt/fat/IMG.BMP 32x32 bmp bpp=24`，
+  截图四象限像素精确匹配；点击切换 QOI → `[img] switched to /mnt/fat/IMG.QOI (32x32)` 同样匹配。
+- ring-3 工具：`ushell` 22 条命令自断言 **37/37**；宿主 `verify_fat32_write.py` **21/21**；
+  无 PANIC、无 user fault；`run probe/hello/forktest` 仍 PASS。
+- FAT32：lfn-write 自检 PASS（含 rename/unlink），宿主 21/21，根目录链合法（fat[2]=0x1b）、0 孤儿簇。
+- 回归：内核自检 13/14、FAT32 三个自检 PASS、GUI 默认桌面 3 窗口、外观门禁动态矩形外 **0 像素**。
+
+### Limits
+- 图片查看器无文件浏览器（冻结 chrome 无列表控件），固定候选路径；最大 600×480；最近邻缩放。
+- ring-3：`run` 不能传参；`-r` 递归删除如实拒绝；跨目录 rename 被 VFS 拒绝；touch 不改 mtime；
+  `rdf` 是 SutureOS 方言 statfs（两个 u64）。
+- FAT32 多簇目录空出的整簇不回收（留作目录空间）；终端仍无 CJK 字体。
+
 ## [v0.17.0-alpha]
 
 **系统卷能写了：ext2 从只读驱动变成真正可写（建文件/建目录/删/改名/大文件写）；

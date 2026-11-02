@@ -79,6 +79,9 @@
 | `kernel/drivers/ac97.c/.h` | HBOS `src/ac97.c` | GPL-3.0 | ✅ v0.16.0 |
 | `kernel/fs/fatfs.c` LFN 写侧 | PlantOS ChaN FatFs `put_lfn()` 规则 | MIT | ✅ v0.16.0 |
 | `kernel/fs/ext2.c` 写路径 | XJ380 / Deshab-OS 的 ext4 实现（**算法参考，未拷代码**） | Apache-2.0 | ✅ v0.17.0 |
+| `kernel/gui/img_bmp.c` | HBOS `src/bmp.c`（算法参考重写） | GPL-3.0 | ✅ v0.18.0 |
+| `kernel/gui/img_qoi.c` | PlantOS `src/plic/qoi.c`（算法参考重写） | MIT | ✅ v0.18.0 |
+| `user/apps/r3*.c` | 自研；argv 帧/目录 fd 约定参考 VimtuOS | GPL-3.0 | ✅ v0.18.0 |
 
 ## 5. 维护规则
 

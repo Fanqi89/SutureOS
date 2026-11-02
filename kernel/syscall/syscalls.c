@@ -6,6 +6,7 @@
 #include "task.h"
 #include "vfs.h"
 #include "pipe.h"        /* pipe fds are not VFS fds (kernel/ipc) */
+#include "process.h"     /* PROC_SLOT_BASE: a ring-3 process gets a private fd row */
 #include "el0_validate.h"
 #include "mmu.h"
 #include "heap.h"
@@ -23,8 +24,17 @@ struct fd_entry {
     int vfs_fd;   /* VFS layer file descriptor, -1 when unused */
     int pipe_fd;  /* pipe end behind this slot (dup of a pipe), -1 otherwise */
     int sock_fd;  /* kernel/net socket slot behind this fd, -1 otherwise */
-    uint32_t flags;  /* O_RDONLY=0, O_WRONLY=1, O_RDWR=2 */
+    uint32_t flags;  /* O_RDONLY=0, O_WRONLY=1, O_RDWR=2 + FD_FLAG_DIR */
 };
+
+/* A descriptor that names a *directory* rather than an open file. The VFS keeps
+ * directory cursors in their own table (vfs_opendir/vfs_readdir/vfs_closedir), so
+ * the slot records which kind it holds and every operation that would treat the
+ * cursor as a file refuses it instead of indexing the open-file table with the
+ * wrong number. This is what makes getdents64() reachable from ring 3: a program
+ * opens a directory (O_DIRECTORY) and reads it with getdents64. */
+#define FD_FLAG_DIR 0x100u
+#define O_DIRECTORY_ 0x10000u
 
 static struct fd_entry fd_tables[SCHED_MAX_TASKS][MAX_FDS];
 
@@ -43,10 +53,17 @@ void fd_tables_init(void) {
     }
 }
 
-/* 分配空闲 fd */
+/* 分配空闲 fd
+ *
+ * Descriptors 0/1/2 mean stdin/stdout/stderr. A ring-3 process needs that rule for
+ * real: `write(1, ...)` must stay the console even while files are open, otherwise
+ * the first open() of a program takes slot 0, the second one takes slot 1 and the
+ * program's own printf output lands inside the file it is copying. Kernel-side
+ * callers keep the old "lowest free slot" rule (their 0/1/2 slots are the console
+ * by convention too, and the kernel self-tests assert the numbers they get). */
 static int fd_alloc(int tid) {
     if (tid < 0 || tid >= SCHED_MAX_TASKS) return -1;
-    for (int i = 0; i < MAX_FDS; i++) {
+    for (int i = (tid >= PROC_SLOT_BASE) ? 3 : 0; i < MAX_FDS; i++) {
         if (fd_tables[tid][i].vfs_fd < 0 && fd_tables[tid][i].pipe_fd < 0 &&
             fd_tables[tid][i].sock_fd < 0) return i;
     }
@@ -93,11 +110,15 @@ int fd_table_clone(int from_slot, int to_slot)
         } else if (src->pipe_fd >= 0) {
             if (pipe_ref_fd(src->pipe_fd) != 0) return -1;
             dst->pipe_fd = src->pipe_fd;
-        } else if (src->vfs_fd >= 0) {
+        } else if (src->vfs_fd >= 0 && (src->flags & FD_FLAG_DIR) == 0) {
             if (vfs_ref(src->vfs_fd) != VFS_OK) return -1;
             dst->vfs_fd = src->vfs_fd;
         }
+        /* A directory cursor is not inherited across fork(): the VFS has no
+         * refcount for a dir handle, so sharing one would let the child close the
+         * parent's cursor. The child simply sees that descriptor closed. */
         dst->flags = src->flags;
+        if (src->vfs_fd >= 0 && (src->flags & FD_FLAG_DIR) != 0) dst->flags = 0;
     }
     return 0;
 }
@@ -136,6 +157,17 @@ int fd_vfs_fd(int fd)
     if (fd < 0 || fd >= MAX_FDS) return -1;
     if (tid < 0 || tid >= SCHED_MAX_TASKS) return -1;
     return fd_tables[tid][fd].vfs_fd;
+}
+
+/* 1 when the descriptor names a directory cursor rather than an open file. */
+int fd_is_dir(int fd)
+{
+    extern sched_cpu_t sched_cpu;
+    const int tid = fd_slot();
+
+    if (fd < 0 || fd >= MAX_FDS) return 0;
+    if (tid < 0 || tid >= SCHED_MAX_TASKS) return 0;
+    return (fd_tables[tid][fd].flags & FD_FLAG_DIR) != 0;
 }
 
 /* Kernel/net socket behind a descriptor slot, or -1 (defined below). */
@@ -191,7 +223,10 @@ static void fd_close_slot(int tid, int fd)
     } else if (fd_tables[tid][fd].pipe_fd >= 0) {
         (void)pipe_close_fd(fd_tables[tid][fd].pipe_fd);
     } else if (fd_tables[tid][fd].vfs_fd >= 0) {
-        (void)vfs_close(fd_tables[tid][fd].vfs_fd);
+        if ((fd_tables[tid][fd].flags & FD_FLAG_DIR) != 0)
+            (void)vfs_closedir(fd_tables[tid][fd].vfs_fd);
+        else
+            (void)vfs_close(fd_tables[tid][fd].vfs_fd);
     }
     fd_tables[tid][fd].vfs_fd = -1;
     fd_tables[tid][fd].pipe_fd = -1;
@@ -233,6 +268,9 @@ int fd_dup_lowest(int oldfd)
         return newfd;
     }
     if (fd_tables[tid][oldfd].vfs_fd < 0) return -9;
+    /* A directory cursor cannot be duplicated: the VFS dir table has no reference
+     * count, so two descriptors naming one cursor could not be closed safely. */
+    if ((fd_tables[tid][oldfd].flags & FD_FLAG_DIR) != 0) return -9;   /* -EBADF */
     newfd = fd_alloc(tid);
     if (newfd < 0) return -24;
     if (vfs_ref(fd_tables[tid][oldfd].vfs_fd) != VFS_OK) return -5;  /* -EIO */
@@ -276,6 +314,7 @@ int fd_dup_to(int oldfd, int newfd)
         return newfd;
     }
     if (fd_tables[tid][oldfd].vfs_fd < 0) return -9;
+    if ((fd_tables[tid][oldfd].flags & FD_FLAG_DIR) != 0) return -9;   /* -EBADF, see dup() */
     fd_close_slot(tid, newfd);
     if (vfs_ref(fd_tables[tid][oldfd].vfs_fd) != VFS_OK) return -5;
     fd_tables[tid][newfd].vfs_fd = fd_tables[tid][oldfd].vfs_fd;
@@ -312,6 +351,7 @@ uint64_t sys_read(uint64_t fd, uint64_t buf, uint64_t len,
     }
     struct fd_entry *f = &fd_tables[tid][fd];
     if (f->vfs_fd < 0) return (uint64_t)-1;
+    if ((f->flags & FD_FLAG_DIR) != 0) return (uint64_t)(int64_t)(-21);  /* -EISDIR */
     EL0_CHECK(buf, len);
     int ret = vfs_read(f->vfs_fd, (void *)(uintptr_t)buf, (uint32_t)len);
     return ret;
@@ -363,6 +403,7 @@ uint64_t sys_write(uint64_t fd, uint64_t buf, uint64_t len,
     }
     struct fd_entry *f = &fd_tables[tid][fd];
     if (f->vfs_fd < 0) return (uint64_t)-1;
+    if ((f->flags & FD_FLAG_DIR) != 0) return (uint64_t)(int64_t)(-21);  /* -EISDIR */
     EL0_CHECK(buf, len);
     int ret = vfs_write(f->vfs_fd, (const void *)(uintptr_t)buf, (uint32_t)len);
     return ret;
@@ -384,17 +425,34 @@ uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode,
     if (flags & 0x200) vfs_flags |= VFS_O_TRUNC; /* O_TRUNC */
     
     int vfs_fd = vfs_open(path, vfs_flags);
-    if (vfs_fd < 0) return (uint64_t)-2;  /* ENOENT */
+    int is_dir = 0;
+    if (vfs_fd < 0) {
+        /* A directory is not an open file in this VFS: open(2) of one has to hand
+         * back a directory cursor (vfs_opendir) instead, which is what Linux does
+         * and what getdents64() needs. Only attempted after vfs_open() refused, so
+         * the fast path for regular files is unchanged. */
+        vfs_stat_t dst;
+        if (vfs_stat(path, &dst) == VFS_OK && dst.type == VFS_NODE_DIR) {
+            vfs_fd = vfs_opendir(path);
+            is_dir = 1;
+        }
+        if (vfs_fd < 0) return (uint64_t)-2;  /* ENOENT */
+    }
+    /* O_DIRECTORY on a regular file is -ENOTDIR (POSIX). */
+    if ((flags & O_DIRECTORY_) != 0 && !is_dir) {
+        (void)vfs_close(vfs_fd);
+        return (uint64_t)(int64_t)(-20);      /* -ENOTDIR */
+    }
     
     int fd = fd_alloc(fd_slot());
     if (fd < 0) {
-        vfs_close(vfs_fd);
+        if (is_dir) (void)vfs_closedir(vfs_fd); else (void)vfs_close(vfs_fd);
         return (uint64_t)-1;  /* EMFILE */
     }
     fd_tables[tid][fd].vfs_fd = vfs_fd;
     fd_tables[tid][fd].pipe_fd = -1;
     fd_tables[tid][fd].sock_fd = -1;
-    fd_tables[tid][fd].flags = flags & 3;
+    fd_tables[tid][fd].flags = (flags & 3) | (is_dir ? FD_FLAG_DIR : 0);
     return fd;
 }
 
@@ -433,6 +491,13 @@ uint64_t sys_close(uint64_t fd, uint64_t a2, uint64_t a3,
         return (uint64_t)(int64_t)r;
     }
     if (fd_tables[tid][fd].vfs_fd < 0) return (uint64_t)-1;
+    /* A directory cursor is closed in the VFS dir table, not as an open file. */
+    if ((fd_tables[tid][fd].flags & FD_FLAG_DIR) != 0) {
+        const int r = vfs_closedir(fd_tables[tid][fd].vfs_fd);
+        fd_tables[tid][fd].vfs_fd = -1;
+        fd_tables[tid][fd].flags = 0;
+        return (uint64_t)(int64_t)r;
+    }
     int ret = vfs_close(fd_tables[tid][fd].vfs_fd);
     fd_tables[tid][fd].vfs_fd = -1;
     fd_tables[tid][fd].pipe_fd = -1;

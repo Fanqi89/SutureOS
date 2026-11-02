@@ -24,9 +24,9 @@
 | B3 | v0.17.0-alpha | **ext2 写支持**（位图分配/直接+单+双间接/目录项/rename/truncate） | XJ380、Deshab-OS ext4（Apache-2.0 算法参考） | 1 KiB/4 KiB 写自检 PASS；宿主 `verify_ext2_write.py` **44/44 ×2**（276 块双间接产物逐字节）；只读回归 47/47、35/35、16/16 | ✅ 本轮完成 |
 | B3 | — | **NVMe/virtio/AHCI flush 回归**（代码已有，补验收） | Cinux(MIT) | **说明：审计里"无 flush"已过期**——`nvme.c`/`virtio_blk.c`/`ahci.c` 都已实现 `->flush` 并挂到 `blk_flush()`，FAT32/ext2 `sync` 会调用；断电一致性未做破坏性测试 | ⏭ 降级为 P2 |
 | B4 | v0.19.0-alpha | **virtio-gpu 2D**（QEMU 显示加速，framebuffer 回退） | Deshab `virtio_gpu.c`(Apache-2.0) | 检测到设备时走 GPU 呈现、否则回退；外观逐像素不变 | 下一轮 |
-| B4 | v0.19.0-alpha | **图片查看器**（BMP/QOI 解码，SutureOS 自绘 UI） | HBOS `bmp.c`(GPL-3.0)、PlantOS `qoi.c`(MIT) | GUI 里打开测试图，像素/尺寸正确；外观门禁通过 | 下一轮 |
-| B5 | v0.20.0-alpha | **ring-3 文件工具**（ls/cat/cp/mv/rm/mkdir） | 自写（VimtuOS busybox 仅参考，GPL-3.0） | `ushell` 里跑通，宿主侧比对文件系统 | 下一轮 |
-| B5 | v0.20.0-alpha | **HTTP 下载客户端**（ring-3 `wget`） | HBOS `wget.c`(GPL-3.0)、Deshab `curl`(Apache-2.0) 参考 | 从 slirp 内建 HTTP 服务下载文件并校验 sha256 | 下一轮 |
+| B4 | v0.18.0-alpha | **图片查看器**（BMP/QOI，SutureOS 自绘界面、懒启动） | HBOS `src/bmp.c`(GPL-3.0)、PlantOS `src/plic/qoi.c`(MIT) | 真实鼠标点开始菜单 → 窗口创建 → 截图四象限像素精确匹配（BMP + QOI 各一轮）；默认桌面仍 3 窗口 | ✅ 本轮完成 |
+| B5 | v0.18.0-alpha | **ring-3 文件工具**（rls/rcat/rcp/rmv/rrm/rmkdir/rtouch/rdf + ushell fork/execve/wait4；内核补目录 fd、exec argv 帧、fd 从 3 起） | 自研（argv/目录 fd 约定参考 VimtuOS GPL-3.0） | ushell 22 条命令自断言 37/37 + 宿主 FAT32 21/21 + 无 PANIC | ✅ 本轮完成 |
+| B5 | v0.18.0-alpha | **ring-3 文件工具**（rls/rcat/rcp/rmv/rrm/rmkdir/rtouch/rdf + ushell fork/execve/wait4；内核补目录 fd、exec argv 帧、fd 从 3 起） | 自研（argv/目录 fd 约定参考 VimtuOS GPL-3.0） | ushell 22 条命令自断言 37/37 + 宿主 FAT32 21/21 + 无 PANIC | ✅ 本轮完成 |
 | B6 | v0.21.0-alpha | **CJK 字体 + UTF-8**（终端优先，GUI 后续） | 素材库内自带 CJK 的仓库（实读确认许可）或 Unifont(公共域) | 终端打印中文不出现空白/替换符；ASCII 外观不变 | 下一轮 |
 | B7 | v0.22.0-alpha | **USB EHCI + HID 键鼠** | Uinxed-Kernel `usb/host/ehci`(Apache-2.0) | QEMU `-device usb-ehci -device usb-kbd/usb-mouse` 下键盘/鼠标可用 | 下一轮 |
 | B8 | v0.23.0-alpha | **USB Mass Storage（U 盘）** | Uinxed-Kernel `usb/storage`(Apache-2.0) | `-device usb-storage` 下挂 FAT32 U 盘、写自检 17/17 | 下一轮 |

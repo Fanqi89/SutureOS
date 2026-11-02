@@ -215,6 +215,7 @@ static const struct {
     { "Task Manager",   APP_ID_TMGR     },
     { "Calculator",     APP_ID_CALC     },
     { "About SutureOS", APP_ID_SETTINGS },
+    { "Image Viewer",   APP_ID_IMG      },
     { NULL,             START_KIND_SEP  },
     { "Exit to terminal", START_KIND_EXIT },
 };
@@ -815,6 +816,12 @@ static struct gui_window* gui_find_app_window(int app_id)
 static void gui_activate_app(int app_id)
 {
     struct gui_window* w = gui_find_app_window(app_id);
+    /* Apps that are not part of the default desktop are created on first use
+     * (gui_apps_launch in apps.c). This keeps the frozen baseline screenshot
+     * identical: only Task Manager / Calculator / About exist at start-up. */
+    if (w == NULL && gui_apps_launch(app_id)) {
+        w = gui_find_app_window(app_id);
+    }
     if (w != NULL) {
         w->visible = true;               /* re-open after the close button  */
         gui_set_active(w);               /* raises + marks active          */

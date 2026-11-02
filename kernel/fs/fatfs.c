@@ -421,6 +421,18 @@ static int name_eq_ci(const char *a, const char *b) {
     return *a == '\0' && *b == '\0';
 }
 
+/* A 0x00 marker means "no entry has ever been written here", which is the end
+ * of the directory ONLY in its last cluster: once a directory grows (17th
+ * entry), the earlier clusters still hold 0x00 slots that are followed by the
+ * new cluster. Treating the first 0x00 as the end made every entry created
+ * after the growth invisible to lookup/readdir - that is the "rename returned
+ * OK but the new name cannot be opened" bug this helper fixes. */
+static int dir_cluster_is_last(uint32_t cl, uint8_t *s) {
+    uint32_t next = 0;
+    if (fat_get(cl, s, &next) != FATFS_OK) return 1;   /* be conservative */
+    return (next >= FAT32_EOC || next < 2) ? 1 : 0;
+}
+
 /* Find an entry whose VFAT long name matches `want` (case-insensitive). On success
  * the short entry is copied to out_ent and its 11 raw name bytes to out_raw, so the
  * caller can keep using the 8.3 machinery for everything else. */
@@ -437,7 +449,10 @@ static int dir_find_lfn(uint32_t dir_cl, const char *want, uint8_t *s,
             for (uint32_t e = 0; e < ENTRIES_PER_SEC; e++) {
                 uint8_t *ent = s + e * DIR_ENTRY_SIZE;
                 char longname[LFN_MAX_CHARS + 1];
-                if (ent[0] == 0x00) return FATFS_ENOENT;
+                if (ent[0] == 0x00) {
+                    if (dir_cluster_is_last(cl, s)) return FATFS_ENOENT;
+                    continue;              /* free slot before a later cluster */
+                }
                 if (ent[0] == 0xE5) { lfn_reset(&acc); continue; }
                 if (lfn_is_entry(ent)) { lfn_feed(&acc, ent); continue; }
                 if (ent[11] & ATTR_VOL) { lfn_reset(&acc); continue; }
@@ -821,7 +836,10 @@ static int dir_find(uint32_t dir_cl, const char raw[11], uint8_t *s,
             if (r != FATFS_OK) return r;
             for (uint32_t e = 0; e < ENTRIES_PER_SEC; e++) {
                 uint8_t *ent = s + e * DIR_ENTRY_SIZE;
-                if (ent[0] == 0x00) return FATFS_ENOENT;
+                if (ent[0] == 0x00) {
+                    if (dir_cluster_is_last(cl, s)) return FATFS_ENOENT;
+                    continue;              /* free slot before a later cluster */
+                }
                 if (ent[0] == 0xE5) continue;
                 if (ent[11] == ATTR_LFN_EXACT) continue;
                 if (ent[11] & ATTR_VOL) continue;
@@ -1441,7 +1459,11 @@ int fatfs_readdir(fatfs_dir_t *d, char *name, uint32_t name_cap,
         idx++;
         d->entry = idx;
 
-        if (ent[0] == 0x00) { r = FATFS_ENOTFOUND; goto out; }
+        if (ent[0] == 0x00) {
+            if (dir_cluster_is_last(cl, s)) { r = FATFS_ENOTFOUND; goto out; }
+            r = FATFS_OK;                  /* skip: a later cluster has entries */
+            continue;
+        }
         if (ent[0] == 0xE5) { lfn_reset(&d->lfn); r = FATFS_OK; continue; }
         if (ent[11] == ATTR_LFN_EXACT) { lfn_feed(&d->lfn, ent); r = FATFS_OK; continue; }
         if (ent[11] & ATTR_VOL) { lfn_reset(&d->lfn); r = FATFS_OK; continue; }
@@ -1578,7 +1600,10 @@ int fatfs_rmdir(const char *path) {
             if (r != FATFS_OK) break;
             uint8_t *e2 = s + off;
             idx++;
-            if (e2[0] == 0x00) break;
+            if (e2[0] == 0x00) {
+                if (dir_cluster_is_last(dcl, s)) break;
+                continue;                  /* keep scanning the later cluster */
+            }
             if (e2[0] == 0xE5) continue;
             if (e2[11] == ATTR_LFN_EXACT) continue;
             if (e2[0] == '.' && (e2[1] == ' ' || (e2[1] == '.' && e2[2] == ' '))) continue;
@@ -1751,7 +1776,10 @@ int fatfs_rename(const char *old_path, const char *new_path) {
                 if (sec_read(lba, s) != FATFS_OK) break;
                 uint8_t *ent = s + off;
                 idx++;
-                if (ent[0] == 0x00) break;
+                if (ent[0] == 0x00) {
+                    if (dir_cluster_is_last(cl, s)) break;
+                    continue;              /* keep scanning the later cluster */
+                }
                 if (ent[0] == 0xE5) { lfn_reset(&acc); continue; }
                 if (lfn_is_entry(ent)) { lfn_feed(&acc, ent); continue; }
                 if (ent[11] & ATTR_VOL) { lfn_reset(&acc); continue; }

@@ -22,6 +22,7 @@ int fd_dup_to(int oldfd, int newfd);   /* install the duplicate at newfd, or -er
 int fd_pipe_end(int fd);               /* pipe end behind fd, or -1 */
 int fd_is_open(int fd);                /* 1 when fd names a file, pipe end or socket */
 int fd_vfs_fd(int fd);                 /* VFS fd behind fd, or -1 */
+int fd_is_dir(int fd);                 /* 1 when fd is a directory cursor */
 int fd_sock_fd(int fd);                /* kernel/net socket behind fd, or -1 */
 int fd_install_socket(int sock);       /* give a net socket its lowest free fd */
 

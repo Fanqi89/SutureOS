@@ -148,6 +148,77 @@ def make_lfn_chain(long_name: str, short11: bytes) -> bytes:
     return bytes(out)
 
 
+IMG_W = 32
+IMG_H = 32
+
+
+def image_quadrants():
+    """32x32 test picture: red / green / blue / white quadrants.
+
+    The GUI image viewer draws this at an integer scale, so the acceptance script
+    can assert the four quadrant colours from a screen dump (decode -> draw).
+    """
+    px = []
+    for y in range(IMG_H):
+        row = []
+        for x in range(IMG_W):
+            if x < 16 and y < 16:
+                row.append((255, 0, 0))
+            elif x >= 16 and y < 16:
+                row.append((0, 255, 0))
+            elif x < 16:
+                row.append((0, 0, 255))
+            else:
+                row.append((255, 255, 255))
+        px.append(row)
+    return px
+
+
+def make_bmp() -> bytes:
+    """24-bit uncompressed bottom-up BMP of the quadrant picture."""
+    px = image_quadrants()
+    stride = ((IMG_W * 3) + 3) & ~3
+    pixel_bytes = bytearray()
+    for y in range(IMG_H - 1, -1, -1):          # BMP rows are bottom-up
+        row = bytearray()
+        for x in range(IMG_W):
+            r, g, b = px[y][x]
+            row += bytes((b, g, r))
+        row += b"\x00" * (stride - len(row))
+        pixel_bytes += row
+    off = 14 + 40
+    header = bytearray()
+    header += b"BM"
+    header += struct.pack("<I", off + len(pixel_bytes))
+    header += struct.pack("<HH", 0, 0)
+    header += struct.pack("<I", off)
+    header += struct.pack("<I", 40)             # BITMAPINFOHEADER
+    header += struct.pack("<i", IMG_W)
+    header += struct.pack("<i", IMG_H)
+    header += struct.pack("<HH", 1, 24)
+    header += struct.pack("<I", 0)              # BI_RGB
+    header += struct.pack("<I", len(pixel_bytes))
+    header += struct.pack("<i", 2835)           # 72 DPI
+    header += struct.pack("<i", 2835)
+    header += struct.pack("<I", 0)
+    header += struct.pack("<I", 0)
+    return bytes(header) + bytes(pixel_bytes)
+
+
+def make_qoi() -> bytes:
+    """QOI encoding of the same picture (RGB opcode for every pixel)."""
+    px = image_quadrants()
+    out = bytearray(b"qoif")
+    out += struct.pack(">II", IMG_W, IMG_H)
+    out += bytes((3, 0))                        # channels=RGB, sRGB
+    for y in range(IMG_H):
+        for x in range(IMG_W):
+            r, g, b = px[y][x]
+            out += bytes((0xFE, r, g, b))
+    out += bytes((0, 0, 0, 0, 0, 0, 0, 1))      # end marker
+    return bytes(out)
+
+
 def build_image(files: dict) -> bytes:
     """files: {name: bytes} placed in the root directory."""
     # FAT size must cover total clusters; solve iteratively.
@@ -368,13 +439,19 @@ def main():
               "hello.deb is a real Debian package; the kernel installs it\n"
               "at boot (see kmain deb demo).\n").encode()
 
+    bmp = make_bmp()
+    qoi = make_qoi()
+
     img, fat_sz, clusters = build_image({
         "HELLO.TXT": hello,
         "README.TXT": readme,
         "HELLO.DEB": deb,
+        "IMG.BMP": bmp,
+        "IMG.QOI": qoi,
     })
     found = verify_image(img, {"HELLO.TXT": hello, "README.TXT": readme,
-                               "HELLO.DEB": deb})
+                               "HELLO.DEB": deb,
+                               "IMG.BMP": bmp, "IMG.QOI": qoi})
 
     with open(IMG_PATH, "wb") as f:
         f.write(img)
@@ -382,6 +459,7 @@ def main():
     print(f"  clusters  : {clusters} (genuine FAT32: >=65525)")
     print(f"  fat size  : {fat_sz} sectors x2 (mirrored, verified equal)")
     print(f"  root files: {', '.join(sorted(found))}")
+    print(f"  image fixtures: IMG.BMP {len(bmp)}B, IMG.QOI {len(qoi)}B")
     print(f"hello.deb   : {len(deb)} bytes (ar + control.tar.gz + data.tar.gz)")
     print("host-side verification: PASS")
 

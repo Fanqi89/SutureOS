@@ -127,6 +127,9 @@ add copies from that repository.
 | `kernel/drivers/ac97.c/.h` | HBOS `src/ac97.c` | GPL-3.0 | PCI probe + NAM + NABM PCM OUT (v0.16.0) |
 | `kernel/fs/ext2.c` **write path** | XJ380 `driver/fs/ext4/ext4.cpp` / Deshab-OS `CODE/dsk/ext4.c` (algorithm reference only) | Apache-2.0 | bitmaps, direct/single/double indirect writes, dir insert/remove, rename, truncate (v0.17.0) |
 | `kernel/vfs/vfs.c` ramfs capacity | local | GPL-3.0 | 512 nodes / 256 KiB per file, heap chunks (v0.17.0) |
+| `kernel/gui/img_bmp.c` | HBOS `src/bmp.c` (algorithm reference) | GPL-3.0 | BMP 8/24/32bpp decode for the image viewer (v0.18.0) |
+| `kernel/gui/img_qoi.c` | PlantOS `src/plic/qoi.c` (algorithm reference) | MIT | QOI decoder (v0.18.0) |
+| `user/apps/r3*.c` | local (argv frame / dir-fd conventions from VimtuOS) | GPL-3.0 | ring-3 file tools (v0.18.0) |
 
 ---
 

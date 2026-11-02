@@ -38,6 +38,7 @@ extern "C" {
 #define APP_ID_TERM      3
 #define APP_ID_TMGR      4
 #define APP_ID_SETTINGS  5
+#define APP_ID_IMG       6   /* Image Viewer (v0.18.0) */
 
 /* 鼠标光标形状 */
 #define MOUSE_CUR_ARROW    0
@@ -137,6 +138,12 @@ void gui_draw_str(int x, int y, const char* s, uint32_t rgb);
 void gui_draw_u32(int x, int y, uint32_t v, uint32_t rgb);   /* decimal helper */
 void gui_close_all_windows(void);
 int gui_close_app(int app_id);
+
+/* Lazy application launch: the start menu calls this when an APP_ID_* has no
+ * window yet, so an app that is not part of the default desktop (like the image
+ * viewer) does not change the frozen baseline screenshot. Returns 1 when a
+ * window for `app_id` now exists. */
+int gui_apps_launch(int app_id);
 
 /* 语言 */
 bool gui_lang_zh(void);

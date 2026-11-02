@@ -9,6 +9,7 @@
 #include "heap.h"
 #include "pipe.h"
 #include "rtc.h"
+#include "ring3.h"    /* ring3_active(): ring-3 fds are descriptor numbers, kernel ones are VFS fds */
 #include "signal.h"
 #include "syscall.h"
 #include "task.h"
@@ -64,6 +65,28 @@ static int      g_cwd_initialised;
 
 static uint64_t ok(int rc) { return (uint64_t)(int64_t)rc; }
 static uint64_t err(int e) { return (uint64_t)(int64_t)(-e); }
+
+/* Translate a negative VFS result into the matching Linux errno. The VFS codes
+ * (kernel/vfs/vfs.h) are finer grained than "-ENOENT"; collapsing them would make
+ * the ring-3 tools print a wrong reason for a refused operation (a non-empty
+ * directory answering "no such file" is the classic one). */
+static uint64_t err_from_vfs(int r)
+{
+    switch (r) {
+    case VFS_OK:        return 0;
+    case VFS_ENOTFOUND: return err(ENOENT_);
+    case VFS_ENOTDIR:   return err(ENOTDIR_);
+    case VFS_EISDIR:    return err(EISDIR_);
+    case VFS_ENOSPC:    return err(ENOSPC_);
+    case VFS_ECONFLICT: return err(39);      /* -ENOTEMPTY / EEXIST family */
+    case VFS_EINVAL:    return err(EINVAL_);
+    case VFS_EPERM:     return err(EPERM_);
+    case VFS_EACCES:    return err(EACCES_);
+    case VFS_EBUSY:     return err(16);      /* -EBUSY */
+    case VFS_EXDEV:     return err(18);      /* -EXDEV: cross-directory rename */
+    default:            return err(EIO_);
+    }
+}
 
 /* Validate a user pointer when ring 3 is actually running (no-op otherwise), the
  * same rule the first batch of syscalls uses. */
@@ -249,6 +272,15 @@ static uint64_t sys2_fstat(uint64_t fd, uint64_t st_va, uint64_t a3, uint64_t a4
     (void)a3; (void)a4; (void)a5; (void)a6;
 
     if (out == NULL || !ptr_ok(st_va, sizeof(*out))) return err(EFAULT_);
+    /* A directory cursor is not an open file: report it as a directory (size 0)
+     * instead of letting vfs_seek() index the open-file table with a dir number. */
+    if (fd_is_dir((int)fd)) {
+        memset(out, 0, sizeof(*out));
+        out->st_mode = S_IFDIR_ | 0755;
+        out->st_nlink = 2;
+        out->st_blksize = 4096;
+        return 0;
+    }
     if (fd_pipe_end((int)fd) >= 0) {
         /* a pipe has no on-disk identity: report a FIFO, size 0 */
         memset(out, 0, sizeof(*out));
@@ -294,6 +326,10 @@ static uint64_t sys2_lseek(uint64_t fd, uint64_t offset, uint64_t whence,
     const int vfd = vfs_fd_of(fd);
     (void)a4; (void)a5; (void)a6;
     if (fd_pipe_end((int)fd) >= 0) return err(ESPIPE_);
+    /* A directory cursor has no file offset in this VFS (Linux allows lseek on a
+     * directory, SutureOS does not); refuse instead of seeking an unrelated file
+     * that happens to live at the same VFS index. */
+    if (fd_is_dir((int)fd)) return err(EBADF_);
     if (vfs_seek(vfd, (uint32_t)offset, (int)whence) < 0) return err(EINVAL_);
     return vfs_seek(vfd, 0, SEEK_CUR_);
 }
@@ -499,7 +535,7 @@ static uint64_t sys2_mkdir(uint64_t path_va, uint64_t mode, uint64_t a3,
         vfs_stat_t st;
         if (vfs_stat(abs, &st) == VFS_OK) return err(EEXIST_);
     }
-    return (vfs_mkdir(abs, 0755) == VFS_OK) ? 0 : err(EIO_);
+    return err_from_vfs(vfs_mkdir(abs, 0755));
 }
 
 static uint64_t sys2_rmdir(uint64_t path_va, uint64_t a2, uint64_t a3, uint64_t a4,
@@ -511,7 +547,7 @@ static uint64_t sys2_rmdir(uint64_t path_va, uint64_t a2, uint64_t a3, uint64_t 
 
     if (path == NULL) return err(EFAULT_);
     resolve_path(path, abs, sizeof(abs));
-    return (vfs_rmdir(abs) == VFS_OK) ? 0 : err(ENOENT_);
+    return err_from_vfs(vfs_rmdir(abs));
 }
 
 static uint64_t sys2_unlink(uint64_t path_va, uint64_t a2, uint64_t a3, uint64_t a4,
@@ -523,7 +559,7 @@ static uint64_t sys2_unlink(uint64_t path_va, uint64_t a2, uint64_t a3, uint64_t
 
     if (path == NULL) return err(EFAULT_);
     resolve_path(path, abs, sizeof(abs));
-    return (vfs_unlink(abs) == VFS_OK) ? 0 : err(ENOENT_);
+    return err_from_vfs(vfs_unlink(abs));
 }
 
 static uint64_t sys2_rename(uint64_t old_va, uint64_t new_va, uint64_t a3,
@@ -537,7 +573,7 @@ static uint64_t sys2_rename(uint64_t old_va, uint64_t new_va, uint64_t a3,
     if (oldp == NULL || newp == NULL) return err(EFAULT_);
     resolve_path(oldp, a, sizeof(a));
     resolve_path(newp, b, sizeof(b));
-    return (vfs_rename(a, b) == VFS_OK) ? 0 : err(EPERM_);
+    return err_from_vfs(vfs_rename(a, b));
 }
 
 /* ---- creat / the *at family / statx ---------------------------------------- */
@@ -691,13 +727,28 @@ static uint64_t sys2_getdents64(uint64_t fd, uint64_t buf_va, uint64_t len,
 {
     uint8_t *out = (uint8_t *)(uintptr_t)buf_va;
     uint32_t written = 0;
+    int dfd;
     (void)a4; (void)a5; (void)a6;
 
     if (out == NULL || !ptr_ok(buf_va, len)) return err(EFAULT_);
+    /* Two kinds of caller share this entry point:
+     *   - ring 3 passes a *descriptor* that it got from open(dir, O_DIRECTORY); that
+     *     number has to be resolved to the VFS directory cursor behind it;
+     *   - the kernel's own self-test passes a raw vfs_opendir() fd, which is not in
+     *     any task's descriptor table, so it is used as it is.
+     * Only a directory descriptor is accepted from ring 3 - anything else would
+     * index the VFS dir table with a file number. */
+    if (ring3_active()) {
+        if (!fd_is_dir((int)fd)) return err(EBADF_);
+        dfd = fd_vfs_fd((int)fd);
+        if (dfd < 0) return err(EBADF_);
+    } else {
+        dfd = (int)fd;
+    }
     for (;;) {
         char name[VFS_MAX_NAME];
         vfs_node_type_t type;
-        int r = vfs_readdir((int)fd, name, &type);
+        int r = vfs_readdir(dfd, name, &type);
         struct linux_dirent64 *de;
         uint32_t reclen;
 

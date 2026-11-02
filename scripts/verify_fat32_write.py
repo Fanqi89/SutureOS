@@ -61,7 +61,9 @@ def parse(img: bytes):
             guard += 1
         return out[:size] if size else out
 
-    root = img[data_start * S:(data_start + spc) * S]
+    # The root directory can grow past one cluster (the LFN write self-test adds
+    # enough entries to trigger that on the current fixture), so read its chain.
+    root = read_chain(rootclus)
     entries = {}
     lfn_chains = []          # [(short11, decoded long name)]: chains that validate
     lfn_orphans = []         # [(short display, long name, reasons)]: broken chains
@@ -105,7 +107,10 @@ def parse(img: bytes):
     for i in range(0, len(root), 32):
         e = root[i:i + 32]
         if e[0] == 0:
-            break
+            # 0x00 marks a never-used slot. Once the directory has grown the slot
+            # just ends that cluster, and the next cluster still has entries, so
+            # skip instead of stopping (the chain was read to its end above).
+            continue
         if e[0] == 0xE5:
             pending = []
             continue
@@ -161,9 +166,23 @@ def main():
               f"{zlib.crc32(pristine) & 0xffffffff:08X} -> {zlib.crc32(img) & 0xffffffff:08X}")
 
     check("FAT1 == FAT2", v["fat0"] == v["fat1"])
-    check("root cluster marked allocated",
-          v["fget"](v["rootclus"]) == 0x0FFFFFFF,
-          f"fat[{v['rootclus']}]=0x{v['fget'](v['rootclus']):x}")
+    # The root directory may be a single cluster (FAT entry = EOC) or - legally,
+    # once it grows past 16 entries - the head of a cluster chain. Both are fine;
+    # what must never happen is a free or looping link.
+    _rooth = v["fget"](v["rootclus"])
+    _root_chain_ok = _rooth == 0x0FFFFFFF
+    if not _root_chain_ok and 2 <= _rooth < 0x0FFFFFF8:
+        _seen, _cl, _guard = set(), _rooth, 0
+        while 2 <= _cl < 0x0FFFFFF8 and _guard < 1024:
+            if _cl in _seen:
+                break
+            _seen.add(_cl)
+            _cl = v["fget"](_cl)
+            _guard += 1
+        _root_chain_ok = _cl == 0x0FFFFFFF
+    check("root directory chain is allocated and terminates",
+          _root_chain_ok,
+          f"fat[{v['rootclus']}]=0x{_rooth:x}")
 
     # 1) new file, byte-for-byte
     if "SUTURE.TXT" in v["entries"]:
@@ -226,7 +245,11 @@ def main():
             live.add(cl)
             cl = v["fget"](cl)
             guard += 1
-    live.add(v["rootclus"])
+    _cl, _guard = v["rootclus"], 0
+    while 2 <= _cl < 0x0FFFFFF8 and _guard < 4096:
+        live.add(_cl)
+        _cl = v["fget"](_cl)
+        _guard += 1
     orphan = [cl for cl in range(2, v["clusters"] + 2)
               if v["fget"](cl) != 0 and cl not in live]
     check("no orphaned cluster chains left behind (rmdir/unlink freed them)",

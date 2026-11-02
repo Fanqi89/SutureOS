@@ -666,12 +666,14 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
                     }
                 }
 
-                if (vfs_rename(lw_path, lw_new) == VFS_OK &&
+                int ren_rc = vfs_rename(lw_path, lw_new);
+                if (ren_rc == VFS_OK &&
                     vfs_stat(lw_new, &st) == VFS_OK && st.size == plen &&
                     vfs_stat(lw_path, &st) != VFS_OK)
                     renamed = 1;
 
-                if (vfs_unlink(lw_new) == VFS_OK &&
+                int unl_rc = vfs_unlink(lw_new);
+                if (unl_rc == VFS_OK &&
                     vfs_stat(lw_new, &st) != VFS_OK)
                     unlinked = 1;
 
@@ -696,12 +698,13 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
                 }
 
                 console_printf("[fat32] lfn-write self-test %s "
-                               "(create=%d readdir=%d rename=%d unlink=%d utf8=%d)\n",
+                               "(create=%d readdir=%d rename=%d unlink=%d utf8=%d"
+                               " rc_ren=%d rc_unl=%d)\n",
                                (created && listed && renamed && unlinked && utf8_ok)
                                    ? "PASS" : "FAIL",
                                (int64_t)created, (int64_t)listed,
                                (int64_t)renamed, (int64_t)unlinked,
-                               (int64_t)utf8_ok);
+                               (int64_t)utf8_ok, (int64_t)ren_rc, (int64_t)unl_rc);
                 /* The files above allocate clusters; flush FSInfo so the on-disk
                  * free count matches the FAT (the host verifier checks it). */
                 vfs_sync("/mnt/fat");

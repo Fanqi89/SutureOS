@@ -52,6 +52,59 @@ static void do_exec(const char *name)
     printf("exec '%s' failed: %ld\n", name, r);
 }
 
+/* ---- B5 file tools ---------------------------------------------------------
+ * Each tool is its own built-in blob (user/apps/r*.c), so it has to run as a
+ * *separate process* and not by execve(): execve replaces this shell's image and
+ * the prompt would be gone after one command. fork() gives us a copy-on-write
+ * child; execve() (syscall 59, whose path may carry the arguments - the kernel
+ * builds the child's argc/argv frame) replaces only the child; wait4() collects
+ * its exit status and the shell keeps running. */
+static const char *const g_tools[] = {
+    "rls", "rcat", "rcp", "rmv", "rrm", "rmkdir", "rtouch", "rdf", NULL
+};
+
+/* "rls /mnt/fat" -> "rls"; "rlsx" -> NULL. */
+static const char *match_tool(const char *line)
+{
+    int i;
+
+    for (i = 0; g_tools[i] != NULL; i++) {
+        const size_t n = strlen(g_tools[i]);
+        if (strncmp(line, g_tools[i], n) == 0 &&
+            (line[n] == '\0' || line[n] == ' ')) {
+            return g_tools[i];
+        }
+    }
+    return NULL;
+}
+
+/* Run `line` (tool name + arguments) in a child process. Returns the tool's exit
+ * code, or -1 when the child could not be started or reaped. */
+static int run_tool(const char *tool, const char *line)
+{
+    extern long __v64_syscall(long nr, long a1, long a2, long a3, long a4, long a5);
+    const int cpid = fork();
+
+    if (cpid == 0) {
+        const long r = __v64_syscall(59, (long)line, 0, 0, 0, 0);
+        printf("ushell: exec '%s' failed (rc=%ld)\n", tool, r);
+        _exit(127);
+    }
+    if (cpid < 0) {
+        printf("ushell: fork failed (%d)\n", cpid);
+        return -1;
+    }
+    {
+        int st = -1;
+        const int w = wait4(cpid, &st, 0, 0);
+        if (w < 0) {
+            printf("ushell: wait4(%d) failed (%d)\n", cpid, w);
+            return -1;
+        }
+        return st & 0xFF;
+    }
+}
+
 int main(int argc, char **argv)
 {
     char line[128];
@@ -59,6 +112,7 @@ int main(int argc, char **argv)
     printf("SutureOS ring-3 shell (pid=%d, ppid=%d, argc=%d)\n",
            getpid(), getppid(), argc);
     printf("commands: help hello probe fork crash pid ticks root exec exit\n");
+    printf("tools   : rls rcat rcp rmv rrm rmkdir rtouch rdf (e.g. 'rls /mnt/fat')\n");
 
     for (;;) {
         printf("user$ ");
@@ -66,6 +120,14 @@ int main(int argc, char **argv)
         trim(line);
 
         if (line[0] == '\0') continue;
+        {
+            const char *tool = match_tool(line);
+            if (tool != NULL) {
+                const int rc = run_tool(tool, line);
+                if (rc > 0) printf("[ushell] %s exited with %d\n", tool, rc);
+                continue;
+            }
+        }
         if (strcmp(line, "exit") == 0 || strcmp(line, "quit") == 0) {
             puts("bye");
             return 0;
@@ -81,6 +143,15 @@ int main(int argc, char **argv)
             puts("root   - write to kernel memory (same as crash)");
             puts("exec   - execve the ring-3 shell again");
             puts("exit   - leave the shell");
+            puts("--- ring-3 file tools (run in a child process, arguments allowed) ---");
+            puts("rls [path]              - list a directory ('name/' for directories)");
+            puts("rcat <file>...          - print file contents");
+            puts("rcp <src> <dst>         - copy a file");
+            puts("rmv <src> <dst>         - rename inside one directory");
+            puts("rrm [-r] <path>...      - remove files / empty directories");
+            puts("rmkdir [-p] <path>...   - create directories");
+            puts("rtouch <file>...        - create empty files");
+            puts("rdf [path]              - free/total space of a mount");
             continue;
         }
         if (strcmp(line, "fork") == 0) {

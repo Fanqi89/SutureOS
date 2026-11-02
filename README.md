@@ -2,8 +2,8 @@
 
 > **一个由 16 个爱好者操作系统项目拼接而成的 x86_64 单内核操作系统**
 > 
-> 当前版本：**v0.17.0-alpha** · 内核编译 **97** 个源文件（源码树约 210 个 C/H/ASM、约 5.6 万行）
-> · 内核 ELF 约 **1.97 MB**（含调试符号）· 可引导 ISO 约 **14.7 MB** · **GPL-3.0** 许可证
+> 当前版本：**v0.18.0-alpha** · 内核编译 **105** 个源文件（源码树约 220 个 C/H/ASM、约 6.0 万行）
+> · 内核 ELF 约 **2.06 MB**（含调试符号）· 可引导 ISO 约 **15.0 MB** · **GPL-3.0** 许可证
 >
 > 移植与许可说明：[`docs/provenance.md`](docs/provenance.md)（模块→上游·文件路径）
 > · [`docs/licensing-audit.md`](docs/licensing-audit.md)（**上游许可证实读核对**，含待确认项）
@@ -61,6 +61,9 @@ SutureOS（缝合怪系统）是一个实验性的 x86_64 单内核操作系统�
 | v0.16.0 | FAT32 VFAT 长名（写） | PlantOS（MIT，ChaN FatFs 规则） | `kernel/fs/fatfs.c` | ✅ 创建/改名/删除长名，宿主 21/21 |
 | v0.17.0 | **ext2 可写**（建/删/改名/大文件/跨目录 rename） | 算法参考 XJ380 / Deshab-OS ext4（Apache-2.0） | `kernel/fs/ext2.c`（2958 行）、`ext2.h`、`ext2_vfs.c` | ✅ 1 KiB/4 KiB 镜像写自检 PASS，宿主 44/44 ×2 |
 | v0.17.0 | **ramfs 扩容**（64 节点/2 KiB → 512 节点/256 KiB） | 自研（GPL-3.0） | `kernel/vfs/vfs.h`、`vfs.c` | ✅ 64 KiB 读回 + 100 文件自检，`df` 131072 1K-blocks |
+| v0.18.0 | **图片查看器**（BMP/QOI） | HBOS bmp.c（GPL-3.0）、PlantOS qoi.c（MIT） | `kernel/gui/{apps.c,img_bmp.c,img_qoi.c}` | ✅ 真实鼠标点菜单 → 四象限像素精确匹配（BMP+QOI） |
+| v0.18.0 | **ring-3 文件工具**（8 个）+ ushell 子进程模型 | 自研（GPL-3.0；argv/目录 fd 约定参考 VimtuOS） | `user/apps/r3*.c`、`kernel/syscall/*` | ✅ 22 条命令 37/37，宿主 21/21 |
+| v0.18.0 | **FAT32 多簇目录修复** | 自研 | `kernel/fs/fatfs.c`（`dir_cluster_is_last`） | ✅ lfn-write 自检 PASS、宿主 21/21 |
 
 ---
 
@@ -528,7 +531,13 @@ py -3 scripts\verify_fat32_write.py build\fat32_virtio.img build\fat32.img
     文件上限 4 GiB、空洞写一律分配补零（读路径仍识别空洞）。
 27. **（v0.17.0 更新）ramfs 仍是内存盘**：单文件上限 256 KiB、512 个节点（含目录）、单目录 128 项；
     重启丢失（持久化要等"安装器"批次）。数据块从内核堆按 4 KiB 增长，`rm` 时释放。17. **`arch/x86_64/acpi.h` 与 `madt.h` 重复定义 `acpi_madt`/`acpi_madt_t`**，任何同时包含两者的翻译单元都编不过（本次在 ioapic.c 里用 `extern` 声明绕开，未合并这两个头）。
-18. **FAT32 的 ops 自检需要"干净"的测试镜像**：第二次在同一个盘上开机时，`TMPFILE.TXT → RENAMED.TXT` 会因为目标已存在而**正确地**返回 `FATFS_EEXIST`，于是自检打印 `2/3`（这恰好证明"不覆盖已存在目标"生效）。每次验证前用 `scripts/mkfat32_testimg.py` 重新生成或从 `build/fat32.img` 复制一份。
+
+28. **（v0.18.0 新增）图片查看器的边界**：没有文件浏览器（冻结 chrome 里没有列表控件），图源是固定
+    候选路径（`/mnt/fat/IMG.BMP`、`/mnt/fat/IMG.QOI`、`/images/*`）；解码上限 600×480（更大拒绝），
+    缩放是整数倍最近邻（不做平滑插值）；窗口内点击在两张图间切换。
+29. **（v0.18.0 新增）ring-3 文件的边界**：`run <name>` 不能传参（带参数必须走 `ushell`，它用
+    fork+execve+wait4）；`-r` 递归删除如实拒绝；跨目录 rename 被 VFS 拒绝（EXDEV）；`touch` 不改
+    mtime（VFS 没有 mtime 设置）；`rdf` 报的是 SutureOS 方言 statfs（两个 u64 字节数）。18. **FAT32 的 ops 自检需要"干净"的测试镜像**：第二次在同一个盘上开机时，`TMPFILE.TXT → RENAMED.TXT` 会因为目标已存在而**正确地**返回 `FATFS_EEXIST`，于是自检打印 `2/3`（这恰好证明"不覆盖已存在目标"生效）。每次验证前用 `scripts/mkfat32_testimg.py` 重新生成或从 `build/fat32.img` 复制一份。
 
 ---
 

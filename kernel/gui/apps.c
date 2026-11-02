@@ -15,6 +15,9 @@
  */
 #include "sutureos/version.h"
 #include "gui.h"
+#include "imgdecode.h"
+#include "heap.h"
+#include "vfs.h"
 #include <stitch/types.h>
 #include <stitch/string.h>
 #include <stitch/console.h>
@@ -235,6 +238,238 @@ static void about_draw(struct gui_window* w) {
     for (unsigned i = 0; i < sizeof(lines) / sizeof(lines[0]); i++) {
         gui_draw_str(x, y + (int)i * 16, lines[i], i == 0 ? 0x143C8Cu : 0x1A1A1Au);
     }
+}
+
+/* ==================== Image Viewer (v0.18.0) ====================
+ * New application, but NOT part of the default desktop: it is created the first
+ * time the start menu asks for it (gui_apps_launch below), so the frozen
+ * baseline screenshot is untouched.
+ *
+ * Chrome and layout are SutureOS' own (same client background, same status line
+ * conventions as the other apps). Decoders live in kernel/gui/img_bmp.c and
+ * img_qoi.c; algorithm references: HBOS bmp.c (GPL-3.0) / PlantOS qoi.c (MIT).
+ */
+#define IMG_MAX_W 600
+#define IMG_MAX_H 480
+#define IMG_MAX_PIXELS (IMG_MAX_W * IMG_MAX_H)
+#define IMG_SCALE_MAX 12
+
+static struct {
+    int       loaded;          /* 0 = not tried, 1 = pixels valid            */
+    int       fmt;             /* IMG_FMT_*                                  */
+    int       w, h;
+    uint32_t *px;              /* heap buffer, IMG_MAX_PIXELS words          */
+    int       pattern;         /* 1 = built-in colour pattern, no file       */
+    char      name[40];        /* source name for the status line            */
+    char      line[72];        /* "IMG.BMP 32x32 bmp (24bpp)"                */
+} g_img;
+
+static void put_u32_dec(char **pp, uint32_t v) {
+    char tmp[10];
+    int n = 0;
+    if (v == 0) tmp[n++] = '0';
+    while (v) { tmp[n++] = (char)('0' + (v % 10)); v /= 10; }
+    while (n) *(*pp)++ = tmp[--n];
+}
+
+/* suffix test (no strstr in this kernel's libc subset) */
+static int img_suffix_is(const char* s, const char* suf) {
+    const size_t n = strlen(s);
+    const size_t m = strlen(suf);
+    if (n < m) return 0;
+    return strcmp(s + n - m, suf) == 0;
+}
+
+/* Built-in 64x48 gradient with a red/green/blue frame, used when no image file
+ * is present: the window still proves the draw path without lying about it. */
+static void img_build_pattern(void) {
+    for (int y = 0; y < 48; y++) {
+        for (int x = 0; x < 64; x++) {
+            uint32_t r = (uint32_t)(x * 255 / 63);
+            uint32_t g = (uint32_t)(y * 255 / 47);
+            uint32_t b = (uint32_t)(((x ^ y) & 0x20) ? 200 : 40);
+            if (x < 2 || y < 2 || x >= 62 || y >= 46) {
+                /* frame: split into red / green / blue quarters */
+                r = (x < 32) ? 255u : 0u;
+                g = (x < 32) ? 0u : 255u;
+                b = (y < 24) ? 0u : 255u;
+            }
+            g_img.px[y * 64 + x] = (r << 16) | (g << 8) | b;
+        }
+    }
+    g_img.w = 64;
+    g_img.h = 48;
+    g_img.fmt = IMG_FMT_NONE;
+    g_img.pattern = 1;
+    g_img.loaded = 1;
+    { char *p = g_img.line; const char *q = "no image file - built-in pattern"; while (*q) *p++ = *q++; *p = 0; }
+}
+
+/* Try every known location once. The FAT32 test disk is the natural place to
+ * drop IMG.BMP / IMG.QOI for an acceptance run. */
+static void img_load_once(void) {
+    static const char* paths[] = {
+        "/mnt/fat/IMG.BMP", "/mnt/fat/IMG.QOI",
+        "/images/IMG.BMP", "/images/IMG.QOI",
+        "/IMG.BMP", "/IMG.QOI",
+    };
+    if (!g_img.px) {
+        g_img.px = (uint32_t*)lemis_heap_alloc((uintptr_t)IMG_MAX_PIXELS * 4u);
+        if (!g_img.px) return;
+    }
+    for (unsigned i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+        size_t len = 0;
+        void* buf = vfs_read_file(paths[i], &len);
+        if (!buf) continue;
+        img_decoded_t dec;
+        int ok = 0;
+        const uint32_t n = (uint32_t)len;
+        if (img_suffix_is(paths[i], ".QOI")) {
+            dec.px = g_img.px;
+            ok = img_decode_qoi((const uint8_t*)buf, n, &dec, IMG_MAX_PIXELS);
+        } else {
+            dec.px = g_img.px;
+            ok = img_decode_bmp((const uint8_t*)buf, n, &dec, IMG_MAX_PIXELS);
+        }
+        lemis_heap_free(buf);
+        if (!ok) {
+            console_printf("[img] cannot decode %s (%u bytes) - trying next\n",
+                           paths[i], (uint64_t)n);
+            continue;
+        }
+        g_img.loaded = 1;
+        g_img.pattern = 0;
+        g_img.w = dec.w;
+        g_img.h = dec.h;
+        g_img.fmt = dec.fmt;
+        {
+            const char* base = paths[i];
+            const char* slash = strrchr(base, '/');
+            if (slash) base = slash + 1;
+            unsigned k = 0;
+            while (base[k] && k < sizeof(g_img.name) - 1) { g_img.name[k] = base[k]; k++; }
+            g_img.name[k] = 0;
+        }
+        {
+            char* q = g_img.line;
+            const char* nm = g_img.name;
+            while (*nm) *q++ = *nm++;
+            *q++ = ' ';
+            put_u32_dec(&q, (uint32_t)g_img.w);
+            *q++ = 'x';
+            put_u32_dec(&q, (uint32_t)g_img.h);
+            *q++ = ' ';
+            {
+                const char* f = img_fmt_name(dec.fmt);
+                while (*f) *q++ = *f++;
+            }
+            if (dec.bpp) {
+                *q++ = ' ';
+                *q++ = '(';
+                put_u32_dec(&q, (uint32_t)dec.bpp);
+                const char* b = "bpp)";
+                while (*b) *q++ = *b++;
+            }
+            *q = 0;
+        }
+        console_printf("[img] decoded %s %ux%u %s bpp=%u\n", paths[i],
+                       (uint64_t)g_img.w, (uint64_t)g_img.h,
+                       img_fmt_name(g_img.fmt), (uint64_t)dec.bpp);
+        return;
+    }
+    img_build_pattern();
+    console_puts("[img] no decodable image on disk - showing the built-in pattern\n");
+}
+
+static void img_draw(struct gui_window* w) {
+    if (!g_img.loaded) img_load_once();
+
+    const int x = w->client_x + 10;
+    int y = w->client_y + 8;
+    const int inner_w = clamp_min(w->client_w - 20, 8);
+    const int inner_h = clamp_min(w->client_h - 34, 8);
+
+    /* status line + divider, same conventions as the other apps */
+    gui_draw_str(x, y, g_img.line, 0x143C8Cu);
+    y += 20;
+    gui_fill_rect(x, y, inner_w, 1, 0xC0C6CEu);
+    y += 6;
+
+    const int avail_h = clamp_min(inner_h - 22, 8);
+    if (g_img.px && g_img.w > 0 && g_img.h > 0) {
+        int sx = inner_w / g_img.w;
+        int sy = avail_h / g_img.h;
+        int scale = (sx < sy) ? sx : sy;
+        if (scale < 1) scale = 1;
+        if (scale > IMG_SCALE_MAX) scale = IMG_SCALE_MAX;
+        const int dw = g_img.w * scale;
+        const int dh = g_img.h * scale;
+        int ox = x + (inner_w - dw) / 2;
+        int oy = y + (avail_h - dh) / 2;
+        if (ox < x) ox = x;
+        if (oy < y) oy = y;
+
+        for (int dy = 0; dy < dh; dy++) {
+            const int src_y = dy / scale;
+            if (src_y >= g_img.h) break;
+            const uint32_t* row = g_img.px + (uint64_t)src_y * (uint64_t)g_img.w;
+            for (int dx = 0; dx < dw; dx += scale) {
+                const int src_x = dx / scale;
+                if (src_x >= g_img.w) break;
+                const uint32_t c = row[src_x];
+                gui_fill_rect(ox + dx, oy + dy, scale, 1,
+                              ((c >> 16) & 0xFFu) << 16 |
+                              ((c >> 8) & 0xFFu) << 8 | (c & 0xFFu));
+            }
+        }
+        gui_frame_rect(ox - 1, oy - 1, dw + 2, dh + 2, 0x808890u);
+        y = oy + dh + 6;
+        if (y + 14 <= w->client_y + w->client_h) {
+            char foot[40];
+            char* p = foot;
+            const char* n = "scale x";
+            while (*n) *p++ = *n++;
+            put_u32_dec(&p, (uint32_t)scale);
+            *p = 0;
+            gui_draw_str(x, y, foot, 0x707880u);
+        }
+    } else {
+        gui_draw_str(x, y + 10, "no image loaded", 0x707880u);
+    }
+}
+
+/* Click cycles to the next image source (the viewer has no file browser: the
+ * frozen chrome has no list widget and this app must not invent one). */
+static void img_click(struct gui_window* w, int cx, int cy) {
+    (void)w; (void)cx; (void)cy;
+    if (!g_img.loaded) return;
+    static int idx = 0;
+    static const char* paths[] = { "/mnt/fat/IMG.BMP", "/mnt/fat/IMG.QOI" };
+    idx = (idx + 1) % (int)(sizeof(paths) / sizeof(paths[0]));
+    size_t len = 0;
+    void* buf = vfs_read_file(paths[idx], &len);
+    if (!buf) return;
+    img_decoded_t dec;
+    dec.px = g_img.px;
+    int ok = img_suffix_is(paths[idx], ".QOI")
+                 ? img_decode_qoi((const uint8_t*)buf, (uint32_t)len, &dec, IMG_MAX_PIXELS)
+                 : img_decode_bmp((const uint8_t*)buf, (uint32_t)len, &dec, IMG_MAX_PIXELS);
+    lemis_heap_free(buf);
+    if (ok) {
+        g_img.w = dec.w; g_img.h = dec.h; g_img.fmt = dec.fmt; g_img.pattern = 0;
+        console_printf("[img] switched to %s (%ux%u)\n", paths[idx],
+                       (uint64_t)dec.w, (uint64_t)dec.h);
+    }
+}
+
+/* Called by the start menu the first time "Image Viewer" is chosen. */
+int gui_apps_launch(int app_id) {
+    if (app_id != APP_ID_IMG) return 0;
+    struct gui_window* w = gui_create_window("Image Viewer", 150, 80, 420, 340,
+                                             img_draw, NULL, img_click, APP_ID_IMG);
+    if (!w) return 0;
+    console_puts("[gui] image viewer window created\n");
+    return 1;
 }
 
 /* ==================== bring-up ==================== */
