@@ -91,11 +91,13 @@ int vfs_init(void) {
     extern const vfs_fs_driver_t ext2_driver;
     extern const vfs_fs_driver_t fatfs_driver;
     extern const vfs_fs_driver_t squashfs_driver;
+    extern const vfs_fs_driver_t iso9660_driver;
     extern const vfs_fs_driver_t xj_vfs_driver;
     
     vfs_register_driver(&ext2_driver);
     vfs_register_driver(&fatfs_driver);
     vfs_register_driver(&squashfs_driver);
+    vfs_register_driver(&iso9660_driver);
     vfs_register_driver(&xj_vfs_driver);
     
     console_puts("[vfs] VFS subsystem initialized\n");

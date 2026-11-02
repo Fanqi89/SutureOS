@@ -262,6 +262,13 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
     blk_ata_init();      /* controller-level setup (mask IRQs, polling mode) */
     blk_ata_probe();     /* detect primary master/slave -> ata0/ata1 */
 
+    /* ---- ATAPI 光驱（数据盘） ---------------------------------------------
+     * 同样走 legacy IDE 通道：扫描主/次两个通道的 4 个位置，把真实存在的
+     * ATAPI 光盘注册成只读块设备（驱动号 12..15，2048 字节块）。空位与
+     * “不是 ATAPI 的设备”都静默跳过 —— 没有光驱时这里不注册任何东西、不打印
+     * 任何日志，开机日志与改动前逐行一致。 */
+    (void)blk_atapi_probe();
+
     /* ---- SATA (AHCI), NVMe and virtio-blk ---------------------------------
      * All three are PCI controllers: each driver discovers its own hardware and
      * logs exactly why it found nothing, so this runs unchanged on a machine
@@ -461,6 +468,16 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
             console_puts("[init] squashfs: no SquashFS volume on drive 1/virtio\n");
     }
 
+    /* ISO9660 数据光盘（只读）：光驱里如果有“数据盘”，挂到 /mnt/cd 并读根目录
+     * 一个已知文件做内容/大小自检。启动介质本身是 limine 的 El Torito ISO
+     * （也是 ISO9660），它带 El Torito 引导记录，会被识别为“启动盘”并跳过，
+     * 不会把 /boot/limine 之类的内部文件当成光盘内容。没有光驱、或只有启动
+     * 盘时安静跳过（只打印一行 [iso9660] skip 说明原因），不阻塞启动。 */
+    {
+        extern int iso9660_automount(const char *mountpoint);
+        (void)iso9660_automount("/mnt/cd");
+    }
+
     /* deb package manager demo: install /mnt/fat/hello.deb when present */
     {
         extern int deb_db_init(const char *db_path);
@@ -600,6 +617,87 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
                                (int64_t)opened, (int64_t)payload_ok,
                                (int64_t)listed);
             }
+
+            /* VFAT long-name self-test (WRITE side, v0.16). Creates a real LFN
+             * chain itself, reads the file back through the long name, lists it
+             * with readdir, renames it to a second long name and finally unlinks
+             * it - so both the chain writer and the chain cleanup run on a real
+             * disk. Marker-gated like the other FAT tests: a user's disk is never
+             * touched. Host side: scripts/verify_fat32_write.py. */
+            {
+                static const char lw_path[] =
+                    "/mnt/fat/Long Created Name.txt";
+                static const char lw_name[] = "Long Created Name.txt";
+                static const char lw_new[] =
+                    "/mnt/fat/Renamed Long Name.txt";
+                static const char lw_payload[] =
+                    "created through the VFAT long-name write path\n";
+                const uint32_t plen = (uint32_t)sizeof(lw_payload) - 1u;
+                vfs_stat_t st;
+                int created = 0, listed = 0, renamed = 0, unlinked = 0;
+
+                if (vfs_write_file(lw_path, lw_payload, plen) == VFS_OK &&
+                    vfs_stat(lw_path, &st) == VFS_OK && st.size == plen) {
+                    int fd = vfs_open(lw_path, VFS_O_RDONLY);
+                    char rb[64];
+                    int n = (fd >= 0) ? vfs_read(fd, rb, sizeof(rb)) : -1;
+                    if (fd >= 0) vfs_close(fd);
+                    if (n == (int)plen && memcmp(rb, lw_payload, plen) == 0)
+                        created = 1;
+                }
+
+                {
+                    int d = vfs_opendir("/mnt/fat");
+                    if (d >= 0) {
+                        char name[VFS_MAX_NAME];
+                        vfs_node_type_t type;
+                        while (vfs_readdir(d, name, &type) == VFS_OK) {
+                            if (strcmp(name, lw_name) == 0) { listed = 1; break; }
+                        }
+                        vfs_closedir(d);
+                    }
+                }
+
+                if (vfs_rename(lw_path, lw_new) == VFS_OK &&
+                    vfs_stat(lw_new, &st) == VFS_OK && st.size == plen &&
+                    vfs_stat(lw_path, &st) != VFS_OK)
+                    renamed = 1;
+
+                if (vfs_unlink(lw_new) == VFS_OK &&
+                    vfs_stat(lw_new, &st) != VFS_OK)
+                    unlinked = 1;
+
+                /* Non-ASCII long name: stored as a UTF-16 chain, read back as
+                 * UTF-8, and resolvable again through the same bytes. The file is
+                 * left in place so the host verifier can decode the chain itself. */
+                static const char utf8_path[] =
+                    "/mnt/fat/\xE4\xB8\xAD\xE6\x96\x87 \xE9\x95\xBF\xE5\x90\x8D.txt";
+                static const char utf8_payload[] = "utf8 name\n";
+                int utf8_ok = 0;
+                if (vfs_write_file(utf8_path, utf8_payload,
+                                   (uint32_t)sizeof(utf8_payload) - 1u) == VFS_OK &&
+                    vfs_stat(utf8_path, &st) == VFS_OK &&
+                    st.size == (uint32_t)sizeof(utf8_payload) - 1u) {
+                    int fd = vfs_open(utf8_path, VFS_O_RDONLY);
+                    char rb[16];
+                    int n = (fd >= 0) ? vfs_read(fd, rb, sizeof(rb)) : -1;
+                    if (fd >= 0) vfs_close(fd);
+                    if (n == (int)(sizeof(utf8_payload) - 1u) &&
+                        memcmp(rb, utf8_payload, (size_t)n) == 0)
+                        utf8_ok = 1;
+                }
+
+                console_printf("[fat32] lfn-write self-test %s "
+                               "(create=%d readdir=%d rename=%d unlink=%d utf8=%d)\n",
+                               (created && listed && renamed && unlinked && utf8_ok)
+                                   ? "PASS" : "FAIL",
+                               (int64_t)created, (int64_t)listed,
+                               (int64_t)renamed, (int64_t)unlinked,
+                               (int64_t)utf8_ok);
+                /* The files above allocate clusters; flush FSInfo so the on-disk
+                 * free count matches the FAT (the host verifier checks it). */
+                vfs_sync("/mnt/fat");
+            }
         }
     }
 
@@ -677,6 +775,22 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
         } else {
             console_puts("[init] no RTL8139 (start QEMU with -device rtl8139,netdev=n0)\n");
         }
+    }
+
+    /* ==================== Audio: AC'97 PCM output ====================
+     * The controller is optional: QEMU's default machine has none, and on such
+     * a machine ac97_init() returns -1 without printing anything and without a
+     * 256-bus PCI walk, so the boot log and boot time stay exactly as they
+     * were.  When the controller is there, the driver resets/unmutes the codec
+     * and the boot self-test plays the 440 Hz acceptance tone (1.00 s). */
+    {
+        extern int ac97_init(void);
+        extern int ac97_selftest(void);
+        extern const char *ac97_name(void);
+        if (ac97_init() == 0) {
+            console_printf("[  OK  ] AC'97: %s\n", ac97_name());
+        }
+        (void)ac97_selftest();
     }
 
     console_puts("\n[stitch] Phase-1 self-tests complete. Initializing scheduler...\n");

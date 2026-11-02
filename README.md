@@ -1,14 +1,15 @@
 # SutureOS (缝合怪系统)
 
-> **一个由 14 个爱好者操作系统项目拼接而成的 x86_64 单内核操作系统**
+> **一个由 16 个爱好者操作系统项目拼接而成的 x86_64 单内核操作系统**
 > 
-> 当前版本：**v0.15.0-alpha** · 内核编译 **93** 个源文件（源码树约 198 个 C/H/ASM、约 5.0 万行）
-> · 内核 ELF **1.77 MB**（含调试符号）· 可引导 ISO **14.1 MB** · **GPL-3.0** 许可证
+> 当前版本：**v0.16.0-alpha** · 内核编译 **97** 个源文件（源码树约 210 个 C/H/ASM、约 5.3 万行）
+> · 内核 ELF 约 **1.87 MB**（含调试符号）· 可引导 ISO 约 **14.3 MB** · **GPL-3.0** 许可证
 >
 > 移植与许可说明：[`docs/provenance.md`](docs/provenance.md)（模块→上游·文件路径）
 > · [`docs/licensing-audit.md`](docs/licensing-audit.md)（**上游许可证实读核对**，含待确认项）
 > · [`docs/audit-unfinished.md`](docs/audit-unfinished.md)（未完成项审计）
 > · [`docs/port-candidates.md`](docs/port-candidates.md)（50 个开源自制 OS 的候选评估）
+> · [`docs/porting-roadmap.md`](docs/porting-roadmap.md)（**分批移植路线图：B1..B10**）
 
 ---
 
@@ -24,17 +25,17 @@ SutureOS（缝合怪系统）是一个实验性的 x86_64 单内核操作系统�
 
 ---
 
-## 📦 上游项目来源（14 个）
+## 📦 上游项目来源（16 个）
 
 > 许可证一列以**本地 `LICENSE`/`COPYING` 实读**为准（核对结果与待确认项见
 > [`docs/licensing-audit.md`](docs/licensing-audit.md)）。模块→文件→前缀的完整映射见
-> [`docs/provenance.md`](docs/provenance.md)。
+> [`docs/provenance.md`](docs/provenance.md)，逐项版权声明见 `THIRD_PARTY_LICENSES.md`。
 
 | 项目 | 许可证 | 贡献模块 |
 |------|--------|----------|
-| **CoolPotOS** | MIT | SquashFS (多压缩: gzip/lz4/lzma/xz/zstd)、ext2 基础、红黑树 |
+| **CoolPotOS** | MIT | SquashFS (多压缩: gzip/lz4/lzma/xz/zstd)、ext2 基础、红黑树、**ISO9660 参考（v0.16.0）** |
 | **SpiritFoxOS** | **无 LICENSE 文件** ⚠️ | TCP/IP 协议栈、AHCI 驱动、网络栈架构（出处待作者确认，见许可审计 §2.1） |
-| **Cinux** | MIT | ext2/ext4 文件系统、NVMe 驱动、VirtIO-blk、ELF 加载器、**e1000 网卡（v0.15.0 新增）** |
+| **Cinux** | MIT | ext2/ext4 文件系统、NVMe 驱动、VirtIO-blk、ELF 加载器、**e1000 网卡（v0.15.0）** |
 | **Phobos** | GPL-3.0（`atomic/COPYING`） | 队列/锁原语、调度器基础 |
 | **MOOS** | Unlicense | 内存分配器、物理页管理 |
 | **MoeOS** | GPL-3.0 | 任务调度、上下文切换 |
@@ -43,16 +44,21 @@ SutureOS（缝合怪系统）是一个实验性的 x86_64 单内核操作系统�
 | **HeloOS** | GPL-3.0 | 中断处理、IDT/GDT 设置 |
 | **XJ380** | Apache-2.0 | VFS 抽象层、简单文件系统 |
 | **NAOS** | BSD-3-Clause | 串口驱动、控制台输出、IOAPIC |
-| **PlantOS** | MIT | 帧缓冲、字体渲染、**FAT32 VFAT 长文件名规则（v0.15.0 新增）** |
+| **PlantOS** | MIT | 帧缓冲、字体渲染、**FAT32 VFAT 长文件名规则（v0.15.0/v0.16.0）** |
 | **Lemis** | GPL-3.0 | 堆分配器、Slab 分配器 |
 | **VimtuOS** | GPL-3.0 | VimtuFS2 (v4)、GUI 框架、EL0 切换、Limine 引导 |
+| **Uinxed-Kernel** | Apache-2.0 | **ATAPI 光驱 PIO 驱动（v0.16.0）** |
+| **HBOS** | GPL-3.0 | **AC'97 声卡 PCM 输出（v0.16.0）** |
 
-**v0.15.0-alpha 的两处新移植（详细验收见 `docs/release-notes-v0.15.0-alpha.md`）：**
+**分批移植记录（详见 `docs/porting-roadmap.md`）：**
 
-| 能力 | 上游（许可） | 落点 | 状态 |
-|---|---|---|---|
-| Intel e1000 (8254x) 网卡 | Cinux `kernel/driver/net/e1000.cpp`（**MIT**） | `kernel/drivers/e1000.c/.h` + `kernel/net/net.c` 链路层分发 | ✅ VMware/QEMU 均能识别并收发（交互 ping 3/3） |
-| FAT32 VFAT 长文件名（读） | PlantOS ChaN FatFs 血统（MIT）+ SpiritFoxOS 算法结论 ⚠️ | `kernel/fs/fatfs.c` | ✅ `ls`/`open`/`stat` 可用长名，写侧仍 8.3 |
+| 版本 | 能力 | 上游（许可） | 落点 | 状态 |
+|---|---|---|---|---|
+| v0.15.0 | Intel e1000 网卡 | Cinux（**MIT**） | `kernel/drivers/e1000.c/.h` + `kernel/net/net.c` 链路层分发 | ✅ 两块网卡均验收（e1000 交互 ping 3/3） |
+| v0.15.0 | FAT32 VFAT 长名（读） | PlantOS（MIT）+ SpiritFoxOS 算法 ⚠️ | `kernel/fs/fatfs.c` | ✅ `ls`/`open`/`stat` 认长名 |
+| v0.16.0 | ATAPI 光驱 + ISO9660 只读 | Uinxed-Kernel（Apache-2.0）+ CoolPotOS（MIT） | `kernel/drivers/atapi.*`、`kernel/fs/iso9660*` | ✅ 数据盘挂 `/mnt/cd`，宿主 224/224 |
+| v0.16.0 | AC'97 声卡 PCM 输出 | HBOS（GPL-3.0） | `kernel/drivers/ac97.*` + shell `beep` | ✅ WAV 1.000 s / 440.01 Hz |
+| v0.16.0 | FAT32 VFAT 长名（写） | PlantOS（MIT，ChaN FatFs 规则） | `kernel/fs/fatfs.c` | ✅ 创建/改名/删除长名，宿主 21/21 |
 
 ---
 
@@ -502,13 +508,15 @@ py -3 scripts\verify_fat32_write.py build\fat32_virtio.img build\fat32.img
 12. **多驱动共用块层的驱动器号只能靠约定**：`blk_register()` 不拒绝重复的驱动器号，`blk_find_by_drive()` 返回最后注册的那个。现行分配见 `block.h`（ata0/1=0/1、AHCI=4..7、NVMe=8、ram0=9、vda=10），四个控制器同时接入的实测输出见"验证记录"。
 13. **`scripts/qemu_boot.ps1`（新）**：本机自动化跑 QEMU 的封装——工作目录固定为项目根（QEMU 打不开非 ASCII 绝对路径）、monitor 走 **QMP**（干净 JSON，无 readline 回显）、支持按顺序 `sendkey` 注入与任意 monitor 命令（`i /4 0xc100`、`xp /96bx ...` 这类寄存器/内存取证就是靠它做的），并且**始终以 `quit` 收尾**再读日志（强杀会丢 `-serial file:` 尾部，曾因此误判 AP 未上线）。
 14. **TCP 是"停等 + 只收按序段"的子集**（见 Phase 5）：没有监听队列（`listen/accept` 仍返回 ENOSYS）、没有乱序重组、没有拥塞控制和窗口缩放；`net_alloc_port()` 只查 UDP socket 表，TCP 端口不与它去重。RTO 固定 500 ms × 4 次，失败即如实报错（`[tcp] give up: ...`），不假装成功。
-15. **FAT32 名字：读支持 VFAT 长名，写仍只有 8.3**（v0.15.0 起）：`readdir` 会把一条 LFN 链拼回显示名（`ls` 可见 `Long file name test.txt` 这类名字），`path_resolve()` 在 8.3 找不到时查 LFN 链并取**短名别名**交给原 8.3 机制，因此 `open/stat/cat` 也能用长名打开；校验和不匹配的链会被丢弃（防残留条目误读），删除/改名会把链标记为已删除。限制：创建/改名仍只产出 8.3 名字，LFN 上限 255 个 UTF-16 单元 / 20 个链条目；rename 仍是"同目录名字段改写"，跨目录移动与超过 8.3 的新名字仍被如实拒绝（`FATFS_EINVAL`）。开机自检 `[fat32] lfn self-test PASS (open=1 payload=1 readdir=1)`。
+15. **FAT32 名字：读写都支持 VFAT 长名，但 rename 仍限同目录**（v0.15.0 读 / v0.16.0 写）：`readdir` 拼回长名、`path_resolve`/`resolve_component()` 能用长名打开；v0.16.0 起 `create_dirent()` 自己写 LFN 链（物理顺序 `N|0x40…1`、13 个 UTF-16 单元/条、短名 11 字节校验和、唯一 8.3 别名），删除/改名会清理整条链，UTF-16→UTF-8 读回让非 ASCII 长名能按原串再打开。限制：`rename` 仍是同目录（跨目录如实拒绝）；LFN 上限 255 个 UTF-16 单元 / 20 条链；非 ASCII 名字在终端显示乱码（**终端没有 CJK 字体**，属于后续"中文支持"批次）。开机自检 `[fat32] lfn self-test PASS (...)` + `[fat32] lfn-write self-test PASS (create=1 readdir=1 rename=1 unlink=1 utf8=1)`，宿主 `scripts/verify_fat32_write.py` 21/21。
 16. **（已修复一半）IOAPIC 从来没有被初始化过**：`arch/x86_64/ioapic.c` 的移植版把地址硬编码成 0xFEC00000，然后因为"地址 ≥1 GiB、不在恒等映射里"直接 `return false`（注释写"deferring to Phase-3"），于是 IOAPIC 一个寄存器都没碰过。这台机器上电即 APIC 模式、8259 的 INTR 接到 IOAPIC pin 0，而该重定向项默认是屏蔽的——**这就是"IRQ0 永远送不到"的真正原因**（系统节拍因此改用 LAPIC 定时器，现在依然如此，两路都用 0x20 会双倍计数，所以 IRQ0 保持屏蔽）。修法：用 `hanos_madt_get_ioapic_addr()` 取地址 + `mmu_map_mmio_identity(0xFEC00000, 0x2000)`（与 LAPIC/帧缓冲/AHCI 同一套路），再把 pin 0 设成 ExtINT 并解除屏蔽，同时把 IRQ1 从 8259 IMR 里放出来。另外 **ExtINT 交付的 IRQ 还必须给 LAPIC 发 EOI**（`hanos_lapic_eoi()`），否则 LAPIC 的 in-service 位一直挂着——实测不发就只有**第一个** legacy IRQ 能进来。残留：IRQ1 实际只送 2 个中断就停（`kbdstat` 可查），因此键盘保持**纯轮询**：我把中断处理写成"只计数、不读 0x60"，因为一旦让中断去读端口就会和轮询读端口的路径打架（实测同一条 27 字符命令只到 18 字符，比纯轮询更差）。所以 IRQ1 目前只是可观测的接线成果，输入仍走轮询。
 19. **SquashFS 是 gzip-only 的只读子集**（见 Phase 3）：lzo/lzma/xz/lz4/zstd 镜像在 mount 时被明确拒绝而不是误读；xattr/export 表/目录索引项不解析；单文件超过 4096 个数据块（4 KiB 块即 16 MiB）拒绝；uid/gid 只给出 id 表索引；内核没有压缩器，`squashfs_compress()` 返回 ENOTSUP。
 20. **（已修复）VMware 下 SATA 读盘全挂 —— 完成判定太严**：用户 VMware 实测截图里第一次读盘就报 `[ahci] port 0 error: tfd=0x8 serr=0x0 cmd=0x24 (tf not idle after completion)`，接着端口重启重试又撞上 `device busy before cmd=0x24`，最终 `sata0 read failed` → FAT32/ext2/SquashFS 全部挂不上。原因是 **VMware 的 AHCI 模型在命令完成那一瞬间 PxTFD 仍显示 DRQ=0x8**（QEMU 不会），而驱动把"完成但 Task File 未空闲"直接判成失败。已修：判据只认 ERR/DF 与 PxIS 致命位；完成后再给一小段有界等待，若仍显示 DRQ/BSY 就记一次 `(device quirk); transfer accepted (PxCI clear, no ERR/DF)` 并置 sticky 标志，后续命令不再为它付等待。VMware 17.5.2 实测：`VMware Virtual SATA Hard Drive sectors=71680` → FAT32 挂载成功 → write/ops 自检 PASS → 宿主校验 `checks=17 ok=17`；QEMU 侧四控制器回归无变化（不会走到 quirk 分支）。
 21. **（已修复）内存大就卡死在 ACPI —— ACPI 表可能落在恒等映射窗口之外**：4 GB 内存的 VMware 虚拟机启动时**卡在 `[SMP] BSP LAPIC timer armed` 之后，`[ACPI]` 一行都不打**（同一配置改成 512 MB 就正常，QEMU 小内存也正常，所以一直没暴露）。原因是固件在 RAM 很大时会把 RSDT/MADT 放到内核恒等映射窗口之外，`arch/x86_64/acpi.c` 直接解引用 → 取指/取数异常后卡死。已修：新增 `acpi_touch()`，读任何 ACPI 结构前先用 `mmu_map_mmio_identity()` 按 2 MiB 恒等映射（RSDT、每个候选表头、匹配到的整张表、MADT 全表），并且**先校验长度再遍历**（`length` 有上下界，避免 `entry_count` 下溢和天量校验和循环）；`madt.c` 的 `p += hdr->length` 也加了"0 长度子表即停"的校验。验证：① QEMU `-m 4096` + 四盘 → `[ACPI] Found 2 enabled LAPIC(s)`、AP online、ext2/squashfs 自检 PASS；② 用与用户 VM 同配置的复刻机（virtualHW 21 / 4 GB / lsilogic+AHCI / e1000 / USB+EHCI / sound / PCI 桥 / hpet）实测 4 GB 全程启动到 `sutureos#`；③ **用户自己的那台虚拟机**用重建后的 ISO 实测启动到 shell（`[ACPI] Found 2 ...` → `AP 1 online` → `[  OK  ] ACPI power management` → `[  OK  ] IOAPIC: 8259 cascade routed` → scheduler → shell）。
 22. **（v0.15.0 已修复）VMware 里没有网络 → 补上 e1000 驱动**：VMware 默认虚拟网卡是 **e1000**（可选项里没有 RTL8139），而 SutureOS 此前只驱动 RTL8139/8139C+，所以 VMware 下会打印 `[net] init failed: rtl8139 not found on PCI`，ping/TCP 都不可用。现在 `kernel/drivers/e1000.c`（移植自 Cinux，MIT）通过 `ll_send()/ll_poll_rx()` 接进同一套链路层：**RTL8139 优先、e1000 回退**（QEMU 用 rtl8139 时启动日志与基线一致；VMware 只有 e1000，走回退分支）。验收脚本 `scripts/nic_acceptance.py` 对两块网卡各自跑一遍（链路识别行 + 交互 `ping 10.0.2.2` 3/3）。**VMware NAT 网段与 slirp 的 10.0.2.x 不同，真正上网要先执行 `dhcp`（DHCP 客户端自 v0.11.3 起可用）**。
 23. **（已知限制）e1000 的开机自检 ping 在 QEMU 11.1 下会超时**：日志为 `[net] selftest ping TIMEOUT (... yields=N)` + `[net] e1000 diag: GPRC=0 ...`，但**同一次启动里交互 `ping 10.0.2.2` 3/3 正常**——设备模型没有在"中断屏蔽 + 轮询自检"这段窗口里把收到的包 DMA 进 ring。上一轮 wip 分支的实现同样复现，不是本版引入的回归；因此 e1000 的权威验收走 `scripts/nic_acceptance.py`（键入 ping），而不是只看开机自检那一行。驱动本身是轮询、无中断。
+24. **（v0.16.0 新增）光驱只读 + ISO9660 主卷子集**：`kernel/drivers/atapi.c` 是 **PIO 轮询**实现（无 IRQ/UDMA），单条 `READ(10)` ≤8 块、只支持 2048B 块 CD-ROM、无换盘检测（拔盘后读会如实报 `READ(10) failed` + sense）。`kernel/fs/iso9660.c` 只解析主卷：**Joliet 长名、Rock Ridge（POSIX 权限/长名/符号链接）、multi-extent、UDF 都没做**，所以文件名是大写 8.3（查找大小写不敏感）；单卷单挂、8 文件/8 目录句柄静态池；写/删除/重命名返回 EPERM。启动盘（El Torito）会被识别并跳过，数据盘自动挂 `/mnt/cd`。
+25. **（v0.16.0 新增）AC'97 声卡的限制**：单次播放 ≤2.0 秒（静态 DMA 缓冲约 480 KiB）、原生 48 kHz（其它采样率需 codec 报 VRA，否则返回 -2 而不是偷偷变速）、纯轮询不录音；MMIO BAR 分支已实现但 QEMU 只给 I/O BAR，未在真机验证。没有声卡时只多一行 `[ac97] no codec (skipped)`。
 17. **`arch/x86_64/acpi.h` 与 `madt.h` 重复定义 `acpi_madt`/`acpi_madt_t`**，任何同时包含两者的翻译单元都编不过（本次在 ioapic.c 里用 `extern` 声明绕开，未合并这两个头）。
 18. **FAT32 的 ops 自检需要"干净"的测试镜像**：第二次在同一个盘上开机时，`TMPFILE.TXT → RENAMED.TXT` 会因为目标已存在而**正确地**返回 `FATFS_EEXIST`，于是自检打印 `2/3`（这恰好证明"不覆盖已存在目标"生效）。每次验证前用 `scripts/mkfat32_testimg.py` 重新生成或从 `build/fat32.img` 复制一份。
 
@@ -600,13 +608,22 @@ sudo dd if=build/sutureos.iso of=/dev/sdX bs=4M status=progress && sync
 # 两块网卡：链路识别 + 交互 ping 3/3（QMP 注入按键，读串口日志断言）
 py -3 scripts/nic_acceptance.py
 
-# GUI 外观门禁：与 docs/baseline/base_gui.png 对比，动态数值矩形外必须 0 差异
-py -3 scripts/gui_appearance_check.py build/shot_look.ppm
+# GUI 外观门禁：与 docs/baseline/base_gui.png 对比，动态矩形外必须 0 差异
+# （--live-shot 传入同一构建的第二次截图，自动学习"活数据掩码"）
+py -3 scripts/gui_appearance_check.py build/shot_look.ppm --live-shot build/shot_look2.ppm
 
-# FAT32 写/目录操作：客机自检 + 宿主侧独立解析同一张盘
+# FAT32 写/目录/长名：客机自检 + 宿主侧独立解析同一张盘（21 项）
 py -3 scripts/mkfat32_testimg.py
 # 启动一次（脚本见 scripts/qemu_boot.ps1），然后：
 py -3 scripts/verify_fat32_write.py build/fat32_ata.img build/fat32.img
+
+# ISO9660 数据盘：造夹具 + 客机挂载 + 宿主独立 ECMA-119 解析（224 项）
+py -3 scripts/mkiso9660_testcd.py
+# QEMU 加一张数据盘：-drive id=cd2,file=build/test_cd.iso,format=raw,if=none -device ide-cd,drive=cd2,bus=ide.1
+py -3 scripts/verify_iso9660_read.py --guest-log build/serial_cd.log
+
+# AC'97 声卡：QEMU 加 -audiodev wav,id=a0,path=build/audio.wav,out.frequency=48000 -device AC97,audiodev=a0
+py -3 scripts/verify_ac97_wav.py build/audio.wav
 ```
 
 ---

@@ -379,8 +379,11 @@ static void lfn_feed(struct lfn_acc *a, const uint8_t *ent) {
     }
 }
 
-/* Assemble the pending chain into `out` (ASCII only; anything above 0x7F becomes
- * '_' because this driver has no codepage). Returns 1 when a name was produced. */
+/* Assemble the pending chain into `out` as UTF-8. Returns 1 when a name was
+ * produced. UTF-8 (rather than ASCII with '_' placeholders) is what makes a
+ * non-ASCII long name usable: the bytes read back here are exactly the bytes a
+ * caller passes to fatfs_open(), so the name round-trips. Surrogate pairs are
+ * rejected - the writer never creates them. */
 static int lfn_assemble(const struct lfn_acc *a, const uint8_t sfn[11],
                         char *out, uint32_t cap) {
     uint32_t n = 0;
@@ -389,8 +392,19 @@ static int lfn_assemble(const struct lfn_acc *a, const uint8_t sfn[11],
     for (uint32_t i = 0; i < LFN_MAX_CHARS; i++) {
         uint16_t c = a->name[i];
         if (c == 0x0000u || c == 0xFFFFu) break;
-        if (n + 1u >= cap) break;
-        out[n++] = (c >= 0x20u && c < 0x7Fu) ? (char)c : '_';
+        if (c < 0x80u) {
+            if (n + 1u >= cap) break;
+            out[n++] = (char)c;
+        } else if (c < 0x800u) {
+            if (n + 2u >= cap) break;
+            out[n++] = (char)(0xC0u | (c >> 6));
+            out[n++] = (char)(0x80u | (c & 0x3Fu));
+        } else {
+            if (n + 3u >= cap) break;
+            out[n++] = (char)(0xE0u | (c >> 12));
+            out[n++] = (char)(0x80u | ((c >> 6) & 0x3Fu));
+            out[n++] = (char)(0x80u | (c & 0x3Fu));
+        }
     }
     out[n] = '\0';
     return n > 0;
@@ -488,6 +502,313 @@ static int make_raw(const char *name, char raw[11]) {
     return FATFS_OK;
 }
 
+/* ==================== VFAT long names: WRITE side ====================
+ * The read side above only needs to understand someone else's chains. Creating a
+ * long name means writing the whole chain OURSELVES, in the order the VFAT spec
+ * requires: physically the LAST 13-character chunk comes first, carrying
+ * ord = N|0x40, and the short entry follows the ord = 1 chunk. Every entry must
+ * repeat the same checksum of the 11 short-name bytes, otherwise the chain is
+ * dead on arrival (the reader - including our own - discards it).
+ *
+ * Written from the VFAT specification and the ChaN FatFs `put_lfn()` algorithm
+ * (PlantOS ships that lineage under MIT; see docs/licensing-audit.md). Only 1/2/3
+ * byte UTF-8 sequences are accepted - no surrogate pairs - because this driver
+ * has no wide-char console anyway.
+ */
+#define LFN_MAX_ENTRIES 20u
+
+/* dir_find() is defined further down (the 8.3 lookup); the creation helpers above
+ * it need it to reject duplicates, so declare it here. */
+static int dir_find(uint32_t dir_cl, const char raw[11], uint8_t *s,
+                    struct dir_slot *out, uint8_t *out_ent);
+
+/* Path helpers shared by open(create) and rename (definitions below). */
+static void path_split(const char *path, char *dir, uint32_t cap, const char **base);
+static int resolve_dir_cluster(const char *dirpath, uint8_t *s, uint8_t *v,
+                               uint32_t *out_cl);
+
+/* Decode UTF-8 into UTF-16 code units. Returns the count, or -1 when the string
+ * is malformed or longer than `cap` units. */
+static int lfn_encode(const char *name, uint16_t *units, uint32_t cap) {
+    uint32_t n = 0;
+    const unsigned char *p = (const unsigned char *)name;
+    while (*p) {
+        uint32_t cp;
+        if (p[0] < 0x80u) {
+            cp = p[0];
+            p += 1;
+        } else if ((p[0] & 0xE0u) == 0xC0u && (p[1] & 0xC0u) == 0x80u) {
+            cp = ((uint32_t)(p[0] & 0x1Fu) << 6) | (uint32_t)(p[1] & 0x3Fu);
+            p += 2;
+        } else if ((p[0] & 0xF0u) == 0xE0u && (p[1] & 0xC0u) == 0x80u &&
+                   (p[2] & 0xC0u) == 0x80u) {
+            cp = ((uint32_t)(p[0] & 0x0Fu) << 12) |
+                 ((uint32_t)(p[1] & 0x3Fu) << 6) | (uint32_t)(p[2] & 0x3Fu);
+            p += 3;
+        } else {
+            return -1;                       /* 4-byte / invalid: no surrogates */
+        }
+        if (cp == 0 || cp > 0xFFFFu) return -1;
+        if (n >= cap) return -1;
+        units[n++] = (uint16_t)cp;
+    }
+    return (int)n;
+}
+
+/* Does this name have to use an LFN chain? (i.e. is it not representable as 8.3:
+ * base > 8, ext > 3, lower case, spaces, more than one dot, or non-ASCII) */
+static int lfn_need(const char *name) {
+    uint32_t base = 0, ext = 0;
+    int dot = 0;
+    for (const char *p = name; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '.') {
+            if (dot) return 1;               /* second dot */
+            dot = 1;
+            continue;
+        }
+        if (c < 0x20u || c >= 0x7Fu) return 1;      /* control / non-ASCII */
+        if (c >= 'a' && c <= 'z') return 1;         /* stored short names are upper */
+        if (c == ' ') return 1;
+        if (!dot) base++; else ext++;
+    }
+    if (base == 0 || base > 8 || ext > 3) return 1;
+    return 0;
+}
+
+/* Build the N-th candidate 8.3 alias for `name` (seq 0 = ideal, 1.. = ~1, ~2 ...).
+ * Non-ASCII and punctuation that 8.3 forbids collapse to '_'. */
+static void lfn_short_alias(const char *name, int seq, char raw[11]) {
+    char base[9], ext[4];
+    uint32_t bi = 0, ei = 0;
+    int dot = 0;
+    for (const char *p = name; *p && (bi < 8 || ei < 3); p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '.') { dot = 1; continue; }
+        if (c >= 'a' && c <= 'z') c = (unsigned char)(c - 32);
+        if (c <= 0x20u || c >= 0x7Fu) c = '_';
+        if (!dot && bi < 8) { base[bi++] = (char)c; }
+        else if (dot && ei < 3) { ext[ei++] = (char)c; }
+    }
+    if (bi == 0) { base[bi++] = '_'; }
+    if (seq > 0) {
+        char tail[4];
+        uint32_t ti = 0;
+        int v = seq;
+        tail[ti++] = '~';
+        if (v >= 10) tail[ti++] = (char)('0' + (v / 10) % 10);
+        tail[ti++] = (char)('0' + v % 10);
+        uint32_t keep = (bi + ti <= 8) ? bi : (8 - ti);
+        memcpy(base + keep, tail, ti);
+        bi = keep + ti;
+    }
+    memset(raw, ' ', 11);
+    for (uint32_t i = 0; i < bi && i < 8; i++) raw[i] = base[i];
+    for (uint32_t i = 0; i < ei && i < 3; i++) raw[8 + i] = ext[i];
+}
+
+/* Fill one 32-byte LFN directory entry. `units` holds the whole name; this entry
+ * covers the 13 units starting at `first`. */
+static void lfn_make_entry(uint8_t *ent, uint8_t ord, uint8_t chk,
+                           const uint16_t *units, uint32_t n_units,
+                           uint32_t first, int is_last_physical) {
+    memset(ent, 0, DIR_ENTRY_SIZE);
+    ent[0] = (uint8_t)(ord | (is_last_physical ? 0x40u : 0u));
+    ent[11] = ATTR_LFN_EXACT;
+    ent[12] = 0;
+    ent[13] = chk;
+    for (uint32_t k = 0; k < 13u; k++) {
+        uint32_t idx = first + k;
+        uint16_t c = 0xFFFFu;
+        if (idx < n_units) c = units[idx];
+        else if (idx == n_units) c = 0x0000u;       /* terminator */
+        ent[g_lfn_ofs[k]] = (uint8_t)(c & 0xFFu);
+        ent[g_lfn_ofs[k] + 1u] = (uint8_t)(c >> 8);
+    }
+}
+
+/* Number of LFN entries a name of n_units needs (a name that is an exact multiple
+ * of 13 still needs a terminator entry). */
+static uint32_t lfn_entry_count(uint32_t n_units) {
+    return (n_units / 13u) + 1u;
+}
+
+/* Find `count` consecutive free directory slots. Free = 0xE5, or everything after
+ * the 0x00 end marker (which is then zeroed for the rest of that sector). Returns
+ * the first slot; the caller must also know it got `count` usable slots, which is
+ * guaranteed by construction. Grows the directory by one cluster when needed. */
+static int dir_alloc_run(uint32_t dir_cl, uint32_t count, uint8_t *s, uint8_t *v,
+                         struct dir_slot *out) {
+    if (count == 0) return FATFS_EINVAL;
+    uint32_t cl = dir_cl;
+    uint32_t prev_cl = 0;
+    while (cl >= 2 && cl < FAT32_EOC) {
+        uint32_t slots = (g_vol.cluster_bytes / DIR_ENTRY_SIZE);
+        uint32_t run = 0, run_start = 0;
+        for (uint32_t i = 0; i < slots; i++) {
+            uint32_t lba = cluster_lba(cl) + (i * DIR_ENTRY_SIZE) / 512u;
+            uint32_t off = (i * DIR_ENTRY_SIZE) % 512u;
+            int r = sec_read(lba, s);
+            if (r != FATFS_OK) return r;
+            uint8_t *ent = s + off;
+            int free_slot = (ent[0] == 0xE5 || ent[0] == 0x00 || ent[0] == 0x05);
+            if (free_slot) {
+                if (run == 0) run_start = i;
+                run++;
+                if (run == count) {
+                    /* Zero the tail marker when the run swallowed it. */
+                    uint32_t z = i;
+                    uint32_t zlba = cluster_lba(cl) + (z * DIR_ENTRY_SIZE) / 512u;
+                    uint32_t zoff = (z * DIR_ENTRY_SIZE) % 512u;
+                    if (sec_read(zlba, s) == FATFS_OK && s[zoff] == 0x00 &&
+                        (z + 1u) < slots) {
+                        for (uint32_t q = z + 1u; q < slots; q++) {
+                            uint32_t qlba = cluster_lba(cl) + (q * DIR_ENTRY_SIZE) / 512u;
+                            uint32_t qoff = (q * DIR_ENTRY_SIZE) % 512u;
+                            if (sec_read(qlba, s) != FATFS_OK) return FATFS_ERR;
+                            memset(s + qoff, 0, DIR_ENTRY_SIZE);
+                            int wr = sec_write_checked(qlba, s, v, "dir tail", qoff);
+                            if (wr != FATFS_OK) return wr;
+                        }
+                    }
+                    out->lba = cluster_lba(cl) + (run_start * DIR_ENTRY_SIZE) / 512u;
+                    out->offset = (run_start * DIR_ENTRY_SIZE) % 512u;
+                    out->valid = 1;
+                    return FATFS_OK;
+                }
+            } else {
+                run = 0;
+            }
+        }
+        prev_cl = cl;
+        uint32_t next;
+        int r = fat_get(cl, s, &next);
+        if (r != FATFS_OK) return r;
+        if (next >= FAT32_EOC || next < 2) break;
+        cl = next;
+    }
+
+    /* No room: append one cluster to the directory and use its first slots. */
+    uint32_t new_cl;
+    int r = alloc_run(1, s, v, &new_cl);
+    if (r != FATFS_OK) return r;
+    if (prev_cl == 0) { chain_free(new_cl, s, v); return FATFS_EIO; }
+    r = fat_set_c(prev_cl, new_cl, s, v, "dir grow");
+    if (r != FATFS_OK) { chain_free(new_cl, s, v); return r; }
+    {
+        uint32_t first_lba = cluster_lba(new_cl);
+        r = sec_read(first_lba, s);
+        if (r != FATFS_OK) return r;
+        memset(s, 0, 512);
+        r = sec_write_checked(first_lba, s, v, "dir grow zero", first_lba);
+        if (r != FATFS_OK) return r;
+    }
+    out->lba = cluster_lba(new_cl);
+    out->offset = 0;
+    out->valid = 1;
+    return FATFS_OK;
+}
+
+/* Write one directory entry at an absolute (lba, offset) slot. */
+static int dir_put_slot(uint32_t lba, uint32_t off, const uint8_t *ent,
+                        uint8_t *s, uint8_t *v) {
+    int r = sec_read(lba, s);
+    if (r != FATFS_OK) return r;
+    memcpy(s + off, ent, DIR_ENTRY_SIZE);
+    return sec_write_checked(lba, s, v, "dirent", off);
+}
+
+/* Create a directory entry named `name` (8.3 or VFAT long) inside dir_cl.
+ * attr: ATTR_RO for a file or ATTR_DIR for a directory. Writes the LFN chain (when
+ * needed) followed by the short entry, and returns the SHORT name in out_raw so
+ * the caller can keep using the 8.3 machinery. */
+static int create_dirent(uint32_t dir_cl, const char *name, uint8_t attr,
+                         uint32_t first_cl, uint32_t size,
+                         uint8_t *s, uint8_t *v, char out_raw[11]) {
+    if (!name || !name[0]) return FATFS_EINVAL;
+
+    char raw[11];
+    if (!lfn_need(name)) {
+        int r = make_raw(name, raw);
+        if (r != FATFS_OK) return r;
+        struct dir_slot slot;
+        uint8_t ent[DIR_ENTRY_SIZE];
+        if (dir_find(dir_cl, raw, s, &slot, ent) == FATFS_OK) return FATFS_EEXIST;
+        r = dir_alloc_run(dir_cl, 1, s, v, &slot);
+        if (r != FATFS_OK) return r;
+        memset(ent, 0, DIR_ENTRY_SIZE);
+        memcpy(ent, raw, 11);
+        ent[11] = attr;
+        ent[20] = (uint8_t)(first_cl >> 16); ent[21] = (uint8_t)(first_cl >> 24);
+        ent[26] = (uint8_t)first_cl; ent[27] = (uint8_t)(first_cl >> 8);
+        memcpy(ent + 28, &size, 4);
+        r = dir_put_slot(slot.lba, slot.offset, ent, s, v);
+        if (r != FATFS_OK) return r;
+        memcpy(out_raw, raw, 11);
+        return FATFS_OK;
+    }
+
+    /* Long name: build the chain. */
+    uint16_t units[LFN_MAX_CHARS + 1];
+    int n_units = lfn_encode(name, units, LFN_MAX_CHARS);
+    if (n_units <= 0) return FATFS_ENAMETOOLONG;
+    uint32_t n_ent = lfn_entry_count((uint32_t)n_units);
+
+    /* Reject an existing long name outright (same semantics as 8.3 create). */
+    {
+        struct dir_slot tmp_slot;
+        uint8_t tmp_ent[DIR_ENTRY_SIZE];
+        if (dir_find_lfn(dir_cl, name, s, &tmp_slot, tmp_ent, raw) == FATFS_OK)
+            return FATFS_EEXIST;
+    }
+
+    /* Pick a short alias that is still free. */
+    int have_raw = 0;
+    for (int seq = 0; seq < 100 && !have_raw; seq++) {
+        char cand[11];
+        lfn_short_alias(name, seq, cand);
+        struct dir_slot tmp_slot;
+        uint8_t tmp_ent[DIR_ENTRY_SIZE];
+        if (dir_find(dir_cl, cand, s, &tmp_slot, tmp_ent) != FATFS_OK) {
+            memcpy(raw, cand, 11);
+            have_raw = 1;
+        }
+    }
+    if (!have_raw) return FATFS_EEXIST;
+
+    struct dir_slot start;
+    int r = dir_alloc_run(dir_cl, n_ent + 1u, s, v, &start);
+    if (r != FATFS_OK) return r;
+
+    const uint8_t chk = lfn_checksum((const uint8_t *)raw);
+    /* Slot math: the run is contiguous inside one cluster, so slot i lives at
+     * (start_lba + (start_off + i*32)/512, (start_off + i*32)%512). */
+    for (uint32_t i = 0; i < n_ent; i++) {
+        uint8_t ent[DIR_ENTRY_SIZE];
+        uint32_t ord = n_ent - i;                    /* physical order: N..1 */
+        uint32_t first_unit = (ord - 1u) * 13u;
+        lfn_make_entry(ent, (uint8_t)ord, chk, units, (uint32_t)n_units,
+                       first_unit, i == 0u);
+        uint32_t lin = start.offset + i * DIR_ENTRY_SIZE;
+        r = dir_put_slot(start.lba + lin / 512u, lin % 512u, ent, s, v);
+        if (r != FATFS_OK) return r;
+    }
+    {
+        uint8_t ent[DIR_ENTRY_SIZE];
+        memset(ent, 0, DIR_ENTRY_SIZE);
+        memcpy(ent, raw, 11);
+        ent[11] = attr;
+        ent[20] = (uint8_t)(first_cl >> 16); ent[21] = (uint8_t)(first_cl >> 24);
+        ent[26] = (uint8_t)first_cl; ent[27] = (uint8_t)(first_cl >> 8);
+        memcpy(ent + 28, &size, 4);
+        uint32_t lin = start.offset + n_ent * DIR_ENTRY_SIZE;
+        r = dir_put_slot(start.lba + lin / 512u, lin % 512u, ent, s, v);
+        if (r != FATFS_OK) return r;
+    }
+    memcpy(out_raw, raw, 11);
+    return FATFS_OK;
+}
+
 /* ==================== directory entries ==================== */
 
 static int dir_find(uint32_t dir_cl, const char raw[11], uint8_t *s,
@@ -519,64 +840,6 @@ static int dir_find(uint32_t dir_cl, const char raw[11], uint8_t *s,
         cl = next;
     }
     return FATFS_ENOENT;
-}
-
-static int dir_free_slot(uint32_t dir_cl, uint8_t *s, uint8_t *v,
-                         struct dir_slot *out, uint8_t *out_ent) {
-    uint32_t cl = dir_cl;
-    uint32_t prev_cl = 0;
-    while (cl >= 2 && cl < FAT32_EOC) {
-        for (uint32_t k = 0; k < g_vol.spc; k++) {
-            uint32_t lba = cluster_lba(cl) + k;
-            int r = sec_read(lba, s);
-            if (r != FATFS_OK) return r;
-            for (uint32_t e = 0; e < ENTRIES_PER_SEC; e++) {
-                uint8_t *ent = s + e * DIR_ENTRY_SIZE;
-                if (ent[0] == 0xE5) {
-                    out->lba = lba;
-                    out->offset = e * DIR_ENTRY_SIZE;
-                    out->valid = 1;
-                    memset(out_ent, 0, DIR_ENTRY_SIZE);
-                    out_ent[0] = 0xE5;
-                    return FATFS_OK;
-                }
-                if (ent[0] == 0x00) {
-                    memset(ent, 0, DIR_ENTRY_SIZE);
-                    for (uint32_t z = e + 1; z < ENTRIES_PER_SEC; z++) {
-                        memset(s + z * DIR_ENTRY_SIZE, 0, DIR_ENTRY_SIZE);
-                    }
-                    r = sec_write_checked(lba, s, v, "dir term", lba);
-                    if (r != FATFS_OK) return r;
-                    out->lba = lba;
-                    out->offset = e * DIR_ENTRY_SIZE;
-                    out->valid = 1;
-                    memset(out_ent, 0, DIR_ENTRY_SIZE);
-                    return FATFS_OK;
-                }
-            }
-        }
-        prev_cl = cl;
-        uint32_t next;
-        int r = fat_get(cl, s, &next);
-        if (r != FATFS_OK) return r;
-        if (next >= FAT32_EOC || next < 2) break;
-        cl = next;
-    }
-
-    uint32_t new_cl;
-    int r = alloc_run(1, s, v, &new_cl);
-    if (r != FATFS_OK) return r;
-    if (prev_cl == 0) return FATFS_EIO;
-    r = fat_set_c(prev_cl, new_cl, s, v, "dir grow");
-    if (r != FATFS_OK) {
-        chain_free(new_cl, s, v);
-        return r;
-    }
-    out->lba = cluster_lba(new_cl);
-    out->offset = 0;
-    out->valid = 1;
-    memset(out_ent, 0, DIR_ENTRY_SIZE);
-    return FATFS_OK;
 }
 
 /* Resolve ONE path component inside directory `dir`. The 8.3 name is tried
@@ -845,36 +1108,45 @@ int fatfs_open(const char *path, int create, fatfs_file_t **out) {
     uint8_t *v = lemis_heap_alloc(512);
     if (!v) { lemis_heap_free(s); return FATFS_ERR; }
 
-    uint32_t parent;
+    uint32_t parent = 0;
     char raw[11];
-    int r = path_resolve(path, s, v, &parent, raw);
-    if (r != FATFS_OK) goto out;
-    if (parent == 0) { r = FATFS_EISDIR; goto out; }
-
     struct dir_slot slot;
     uint8_t ent[DIR_ENTRY_SIZE];
-    r = dir_find(parent, raw, s, &slot, ent);
-    if (r == FATFS_ENOENT && create) {
-        const char *base = strrchr(path, '/');
-        base = base ? base + 1 : path;
+    int r = path_resolve(path, s, v, &parent, raw);
+    if (r != FATFS_OK && !(r == FATFS_ENOENT && create)) goto out;
+
+    if (r == FATFS_ENOENT) {
+        /* Creating a name that does not exist yet. For an 8.3 name path_resolve
+         * would have returned OK, so this is the long-name case: resolve the
+         * directory part by hand and let create_dirent write the VFAT chain. */
+        char dir[256];
+        const char *base = NULL;
+        path_split(path, dir, sizeof(dir), &base);
+        r = resolve_dir_cluster(dir, s, v, &parent);
+        if (r != FATFS_OK) goto out;
+        if (!base[0]) { r = FATFS_EINVAL; goto out; }
         char craw[11];
-        r = make_raw(base, craw);
+        r = create_dirent(parent, base, ATTR_RO, 0, 0, s, v, craw);
         if (r != FATFS_OK) goto out;
-        r = dir_free_slot(parent, s, v, &slot, ent);
+        r = dir_find(parent, craw, s, &slot, ent);
         if (r != FATFS_OK) goto out;
-        memset(ent, 0, DIR_ENTRY_SIZE);
-        memcpy(ent, craw, 11);
-        ent[11] = ATTR_RO;
-        r = sec_read(slot.lba, s);
-        if (r != FATFS_OK) goto out;
-        memcpy(s + slot.offset, ent, DIR_ENTRY_SIZE);
-        r = sec_write_checked(slot.lba, s, v, "create dirent", slot.offset);
-        if (r != FATFS_OK) goto out;
-    } else if (r != FATFS_OK) {
-        goto out;
-    } else if (ent[11] & ATTR_DIR) {
-        r = FATFS_EISDIR;
-        goto out;
+    } else {
+        if (parent == 0) { r = FATFS_EISDIR; goto out; }
+        r = dir_find(parent, raw, s, &slot, ent);
+        if (r == FATFS_ENOENT && create) {
+            const char *base = strrchr(path, '/');
+            base = base ? base + 1 : path;
+            char craw[11];
+            r = create_dirent(parent, base, ATTR_RO, 0, 0, s, v, craw);
+            if (r != FATFS_OK) goto out;
+            r = dir_find(parent, craw, s, &slot, ent);
+            if (r != FATFS_OK) goto out;
+        } else if (r != FATFS_OK) {
+            goto out;
+        } else if (ent[11] & ATTR_DIR) {
+            r = FATFS_EISDIR;
+            goto out;
+        }
     }
 
     fh->used = 1;
@@ -1248,20 +1520,11 @@ int fatfs_mkdir(const char *path) {
     r = sec_write_checked(cluster_lba(cl), s, v, path, cluster_lba(cl));
     if (r != FATFS_OK) { chain_free(cl, s, v); goto out; }
 
-    struct dir_slot slot;
-    uint8_t ent[DIR_ENTRY_SIZE];
-    r = dir_free_slot(parent, s, v, &slot, ent);
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    char craw[11];
+    r = create_dirent(parent, base, ATTR_DIR, cl, 0, s, v, craw);
     if (r != FATFS_OK) { chain_free(cl, s, v); goto out; }
-    memset(ent, 0, DIR_ENTRY_SIZE);
-    memcpy(ent, raw, 11);
-    ent[11] = ATTR_DIR;
-    ent[20] = (uint8_t)(cl >> 16); ent[21] = (uint8_t)(cl >> 24);
-    ent[26] = (uint8_t)cl; ent[27] = (uint8_t)(cl >> 8);
-    r = sec_read(slot.lba, s);
-    if (r == FATFS_OK) {
-        memcpy(s + slot.offset, ent, DIR_ENTRY_SIZE);
-        r = sec_write_checked(slot.lba, s, v, path, slot.offset);
-    }
 
 out:
     lemis_heap_free(s);
@@ -1327,6 +1590,7 @@ int fatfs_rmdir(const char *path) {
 
     r = chain_free(cl, s, v);
     if (r != FATFS_OK) goto out;
+    dir_mark_lfn_chain(slot.lba, slot.offset, s);
     r = sec_read(slot.lba, s);
     if (r != FATFS_OK) goto out;
     s[slot.offset] = 0xE5;
@@ -1366,6 +1630,9 @@ int fatfs_unlink(const char *path) {
         r = chain_free(cl, s, v);
         if (r != FATFS_OK) goto out;
     }
+    /* Remove the VFAT name chain that belongs to this short entry, otherwise the
+     * long name would survive as an orphan and be picked up by a later scan. */
+    dir_mark_lfn_chain(slot.lba, slot.offset, s);
     r = sec_read(slot.lba, s);
     if (r != FATFS_OK) goto out;
     s[slot.offset] = 0xE5;
@@ -1377,18 +1644,54 @@ out:
     return r;
 }
 
-/* Rename an entry inside one directory (8.3 names, no LFN).
+/* ==================== rename (8.3 and VFAT long names) ====================
+ * A FAT rename is still "create the new dirent, then delete the old one": the
+ * cluster chain, attributes and size are copied over, so the data itself never
+ * moves. Doing it that way (instead of rewriting the 11 name bytes in place) is
+ * what makes long names possible at all - the new name may need a whole VFAT
+ * chain in front of its short entry, and the old chain has to be marked deleted
+ * so it does not survive as an orphan.
  *
- * A FAT rename is a name-field rewrite: attributes, timestamps, first cluster
- * and size all stay where they are, so the cluster chain (and therefore the
- * data) is untouched. This implementation is honest about its scope:
- *   - same directory only; a cross-directory move would need a fresh dirent in
- *     the destination plus the source's first-cluster/size copied over and is
- *     refused with a log instead of being faked;
+ * Honest scope:
+ *   - same directory only (a cross-directory move is refused with a log line);
  *   - the destination must not already exist (FATFS_EEXIST);
- *   - renaming to the same 8.3 name (case-insensitive) is a no-op success.
- * The rewritten sector is read back and compared byte-for-byte before the call
- * is considered successful, like every other write in this driver. */
+ *   - renaming to the same visible name (case-insensitive) is a no-op success.
+ */
+static void path_split(const char *path, char *dir, uint32_t cap, const char **base) {
+    const char *slash = strrchr(path, '/');
+    if (!slash) {
+        dir[0] = '/'; dir[1] = '\0';
+        *base = path;
+        return;
+    }
+    uint32_t n = (uint32_t)(slash - path);
+    if (n == 0) {
+        dir[0] = '/'; dir[1] = '\0';
+    } else {
+        if (n >= cap) n = cap - 1;
+        memcpy(dir, path, n);
+        dir[n] = '\0';
+    }
+    *base = slash + 1;
+}
+
+static int resolve_dir_cluster(const char *dirpath, uint8_t *s, uint8_t *v,
+                               uint32_t *out_cl) {
+    if (strcmp(dirpath, "/") == 0) { *out_cl = g_vol.root_cluster; return FATFS_OK; }
+    uint32_t parent;
+    char raw[11];
+    int r = path_resolve(dirpath, s, v, &parent, raw);
+    if (r != FATFS_OK) return r;
+    struct dir_slot slot;
+    uint8_t ent[DIR_ENTRY_SIZE];
+    r = dir_find(parent, raw, s, &slot, ent);
+    if (r != FATFS_OK) return r;
+    if (!(ent[11] & ATTR_DIR)) return FATFS_ENOTDIR;
+    uint32_t cl = ((uint32_t)ent[20] << 16) | ent[26];
+    *out_cl = (cl == 0) ? g_vol.root_cluster : cl;
+    return FATFS_OK;
+}
+
 int fatfs_rename(const char *old_path, const char *new_path) {
     if (!g_vol.mounted) return FATFS_EBUSY;
     if (!old_path || !new_path || old_path[0] != '/' || new_path[0] != '/')
@@ -1399,49 +1702,86 @@ int fatfs_rename(const char *old_path, const char *new_path) {
     uint8_t *v = lemis_heap_alloc(512);
     if (!v) { lemis_heap_free(s); return FATFS_ERR; }
 
-    uint32_t old_parent = 0, new_parent = 0;
-    char old_raw[11], new_raw[11];
-    struct dir_slot oslot;
-    uint8_t oent[DIR_ENTRY_SIZE];
-    int r = path_resolve(old_path, s, v, &old_parent, old_raw);
-    if (r != FATFS_OK) goto out;
-    r = path_resolve(new_path, s, v, &new_parent, new_raw);
-    if (r != FATFS_OK) goto out;
+    char odir[256], ndir[256];
+    const char *obase = NULL, *nbase = NULL;
+    path_split(old_path, odir, sizeof(odir), &obase);
+    path_split(new_path, ndir, sizeof(ndir), &nbase);
+    int r;
+    if (!obase[0] || !nbase[0]) { r = FATFS_EINVAL; goto out; }
 
-    if (old_raw[0] == '\0' || new_raw[0] == '\0') {   /* "/" is not renameable */
-        r = FATFS_EINVAL;
-        goto out;
-    }
-    if (old_parent != new_parent) {
+    uint32_t old_cl = 0, new_cl = 0;
+    r = resolve_dir_cluster(odir, s, v, &old_cl);
+    if (r != FATFS_OK) goto out;
+    r = resolve_dir_cluster(ndir, s, v, &new_cl);
+    if (r != FATFS_OK) goto out;
+    if (old_cl != new_cl) {
         console_printf("[fat32] rename: cross-directory move not supported (%s -> %s)\n",
                        old_path, new_path);
         r = FATFS_EINVAL;
         goto out;
     }
 
-    r = dir_find(old_parent, old_raw, s, &oslot, oent);
-    if (r != FATFS_OK) {
-        r = FATFS_ENOENT;
-        goto out;
-    }
-    if (raw_equal(old_raw, new_raw)) {                /* already that name */
-        r = FATFS_OK;
-        goto out;
-    }
+    struct dir_slot oslot;
+    uint8_t oent[DIR_ENTRY_SIZE];
+    char oraw[11];
+    r = resolve_component(old_cl, obase, s, &oslot, oent, oraw);
+    if (r != FATFS_OK) { r = FATFS_ENOENT; goto out; }
+
+    /* No-op when the visible name does not actually change. */
     {
-        struct dir_slot nslot;
-        uint8_t nent[DIR_ENTRY_SIZE];
-        if (dir_find(new_parent, new_raw, s, &nslot, nent) == FATFS_OK) {
-            console_printf("[fat32] rename: target '%s' already exists\n", new_path);
-            r = FATFS_EEXIST;
-            goto out;
+        char cur[LFN_MAX_CHARS + 1];
+        struct lfn_acc acc;
+        lfn_reset(&acc);
+        cur[0] = '\0';
+        {
+            /* Collect the chain that sits in front of the short entry: walk the
+             * directory again with the same resumable scan readdir uses. */
+            uint32_t idx = 0;
+            uint32_t per_cl = g_vol.cluster_bytes / DIR_ENTRY_SIZE;
+            uint32_t cl = old_cl;
+            int done = 0;
+            while (!done && cl >= 2 && cl < FAT32_EOC) {
+                if (idx >= per_cl) {
+                    uint32_t next;
+                    if (fat_get(cl, s, &next) != FATFS_OK) break;
+                    cl = next; idx = 0; continue;
+                }
+                uint32_t lba = cluster_lba(cl) + (idx * DIR_ENTRY_SIZE) / 512u;
+                uint32_t off = (idx * DIR_ENTRY_SIZE) % 512u;
+                if (sec_read(lba, s) != FATFS_OK) break;
+                uint8_t *ent = s + off;
+                idx++;
+                if (ent[0] == 0x00) break;
+                if (ent[0] == 0xE5) { lfn_reset(&acc); continue; }
+                if (lfn_is_entry(ent)) { lfn_feed(&acc, ent); continue; }
+                if (ent[11] & ATTR_VOL) { lfn_reset(&acc); continue; }
+                if (raw_equal((const char *)ent, oraw)) {
+                    if (!lfn_assemble(&acc, ent, cur, sizeof(cur)))
+                        raw_to_name((const char *)ent, cur, sizeof(cur));
+                    done = 1;
+                }
+                lfn_reset(&acc);
+            }
         }
+        if (cur[0] && name_eq_ci(cur, nbase)) { r = FATFS_OK; goto out; }
     }
 
+    uint32_t first_cl = ((uint32_t)oent[20] << 16) | oent[26];
+    uint32_t fsize = 0;
+    memcpy(&fsize, oent + 28, 4);
+
+    /* Create the new name first: if it fails (EEXIST, no space) the old entry is
+     * still intact and nothing was lost. */
+    char nraw[11];
+    r = create_dirent(new_cl, nbase, oent[11], first_cl, fsize, s, v, nraw);
+    if (r != FATFS_OK) goto out;
+
+    /* Then retire the old entry and its VFAT chain. */
+    dir_mark_lfn_chain(oslot.lba, oslot.offset, s);
     r = sec_read(oslot.lba, s);
     if (r != FATFS_OK) goto out;
-    memcpy(s + oslot.offset, new_raw, 11);
-    r = sec_write_checked(oslot.lba, s, v, new_path, oslot.offset);
+    s[oslot.offset] = 0xE5;
+    r = sec_write_checked(oslot.lba, s, v, old_path, oslot.offset);
     if (r == FATFS_OK)
         console_printf("[fat32] renamed %s -> %s\n", old_path, new_path);
 

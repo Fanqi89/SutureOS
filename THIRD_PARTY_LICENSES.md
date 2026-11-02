@@ -119,6 +119,30 @@ GPL-3.0 **聚合兼容**（aggregate compatible），即本项目整体可按 GP
 
 ---
 
+## 后续版本新增的移植（v0.15.0 起，逐版追加）
+
+### 16. Cinux — MIT（网卡）
+- 上游文件: `kernel/driver/net/e1000.cpp` + `e1000_layout.hpp`（**MIT**，Copyright (c) 2026
+  Charliechen114514；旧注释曾误写 GPL-3.0，已在 v0.15.0 改正）
+- 引入文件: `kernel/drivers/e1000.c`, `kernel/drivers/e1000.h`（v0.15.0）
+- 说明: 轮询式 8254x 驱动，保留上游"轮询收包必须先做一次 MMIO 读"等结论；DMA 缓冲改静态 `.bss`。
+
+### 17. PlantOS — MIT（FAT32 长文件名规则）
+- 上游文件: ChaN FatFs 血统（`src/fs/fatfs/ff.c` 的 LFN 规则与 `put_lfn()` 算法）
+- 引入文件: `kernel/fs/fatfs.c` 的 VFAT 长名读写段（v0.15.0 读侧 / v0.16.0 写侧）
+- 说明: 规则实现自行编写；SpiritFoxOS 仅作为"校验和 + 别名回退"的算法对照，未拷贝其代码
+  （该仓库没有 LICENSE 文件，见 `docs/licensing-audit.md` §2.1）。
+
+### 18. HBOS — GPL-3.0（声卡）
+- 上游: https://github.com/HeBitOS/HBOS
+- 上游文件: `src/ac97.c` + `src/ac97.h`（GPL-3.0）
+- 引入文件: `kernel/drivers/ac97.c`, `kernel/drivers/ac97.h`（v0.16.0）
+- 说明: PCI 探测 + NAM codec 初始化 + NABM PCM OUT 32 条 BDL 轮询播放；与本项目同协议，
+  改动清单写在两个新文件头部。
+
+
+---
+
 ## 本项目原创部分
 - `boot/linker.ld`, `kernel/main/*`, `lib/kprintf.c`, `lib/string.c`,
   `include/stitch/{types,console,selftest,string}.h`, `kernel/sched/*`（胶水）、

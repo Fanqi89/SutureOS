@@ -19,6 +19,7 @@ extern "C" {
 #define BLK_TYPE_VIRTIO   3
 #define BLK_TYPE_ATA      4
 #define BLK_TYPE_RAM      5
+#define BLK_TYPE_ATAPI    6
 
 /* 驱动器号分配（全树必须保持互不重叠——blk_register() 不会拒绝重复的
  * 驱动器号，blk_find_by_drive() 返回最后注册的那个，所以冲突只能靠约定避免）：
@@ -28,11 +29,18 @@ extern "C" {
  *   8       NVMe 命名空间 nvme0        (NVME_DRIVE_NVME0)
  *   9       RAM 磁盘 ram0              (BLK_DRIVE_RAM)
  *   10      VirtIO-blk 盘 vda          (VIRTIO_BLK_DRIVE)
+ *   12..15  ATAPI 光驱（2048 字节块）   (BLK_DRIVE_ATAPI_BASE + IDE 位置号)
+ *
+ * ATAPI 的位置号沿用 IDE 习惯：0=主通道主盘, 1=主通道从盘, 2=次通道主盘,
+ * 3=次通道从盘；块设备名 atapi0..atapi3 的后缀就是位置号，驱动号是 12+位置号。
+ * 光驱是只读设备（BLK_FLAG_READONLY），扇区大小 2048 字节（CD-ROM 用户数据块），
+ * 所以 blk_read(drive, lba, count, buf) 里的 lba 是 2048 字节块号而不是 512 字节扇区。
  */
 #define BLK_DRIVE_RAM     9
 #define BLK_DRIVE_AHCI_BASE 4
 #define BLK_DRIVE_NVME0     8
 #define BLK_DRIVE_VIRTIO0   10
+#define BLK_DRIVE_ATAPI_BASE 12
 
 /* 块设备标志 */
 #define BLK_FLAG_READONLY  (1 << 0)
@@ -111,6 +119,11 @@ int blk_virtio_probe(void);
 /* ATA 驱动 (legacy) */
 int blk_ata_init(void);
 int blk_ata_probe(void);
+
+/* ATAPI 光驱驱动 (kernel/drivers/atapi.c, 见 atapi.h) */
+int blk_atapi_probe(void);
+int blk_atapi_device_count(void);
+int blk_atapi_drive_at(int index);
 
 #ifdef __cplusplus
 }

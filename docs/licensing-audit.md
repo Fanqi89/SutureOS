@@ -21,6 +21,8 @@
 | HeloOS | `LICENSE` | **GPL-3.0** | ✅ | IDT/GDT |
 | VimtuOS | `LICENSE` | **GPL-3.0** | ✅ | GUI/EL0/VimtuFS2 |
 | Phobos | `atomic/COPYING`、`mainline/COPYING` | **GPL-3.0** | ✅ | **根目录没有 LICENSE**，只在子目录里；`provenance.md` 旧表曾误写 MIT |
+| Uinxed-Kernel | `LICENSE` | **Apache-2.0** | ✅ | v0.16.0 起：ATAPI 光驱驱动参考 |
+| HBOS | `LICENSE` | **GPL-3.0** | ✅ | v0.16.0 起：AC'97 声卡参考 |
 
 ## 2. 有问题的来源（必须处理，不能假装合规）
 
@@ -72,6 +74,10 @@
 | `kernel/net/net.c` 链路层分发 | 本仓库自写 | GPL-3.0 | ✅ |
 | `kernel/fs/fatfs.c` LFN 读侧 | PlantOS(MIT) 的 ChaN FatFs 血统 + SpiritFoxOS 算法结论 | MIT + 待确认 | ⚠️ 见 §2.1；实现为在 `fatfs.c` 内重写 |
 | `scripts/nic_acceptance.py`、`scripts/gui_appearance_check.py` | 本仓库自写 | GPL-3.0 | ✅ |
+| `kernel/drivers/atapi.c/.h` | Uinxed-Kernel `drivers/block/ata/pata/atapi.c` | Apache-2.0 | ✅ v0.16.0 |
+| `kernel/fs/iso9660.c/.h`、`iso9660_vfs.c` | CoolPotOS `module/iso9660`（参考） | MIT | ✅ v0.16.0 |
+| `kernel/drivers/ac97.c/.h` | HBOS `src/ac97.c` | GPL-3.0 | ✅ v0.16.0 |
+| `kernel/fs/fatfs.c` LFN 写侧 | PlantOS ChaN FatFs `put_lfn()` 规则 | MIT | ✅ v0.16.0 |
 
 ## 5. 维护规则
 

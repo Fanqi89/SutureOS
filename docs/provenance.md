@@ -116,13 +116,15 @@ item is SpiritFoxOS: the repository carries no LICENSE/COPYING, so its derived m
 redistribution grant yet. This is tracked in `docs/licensing-audit.md`; new code must not
 add copies from that repository.
 
-### v0.15.0-alpha additions
+### v0.15.0-alpha / v0.16.0-alpha additions
 
 | Added | Upstream | License | Note |
 |---|---|---|---|
-| `kernel/drivers/e1000.c/.h` | Cinux `kernel/driver/net/e1000.cpp` | MIT | ported; header now names MIT and credits the author |
+| `kernel/drivers/e1000.c/.h` | Cinux `kernel/driver/net/e1000.cpp` | MIT | ported; header now names MIT and credits the author (v0.15.0) |
 | `kernel/net/net.c` link-layer dispatch (`ll_send`/`ll_poll_rx`) | local | GPL-3.0 | — |
-| `kernel/fs/fatfs.c` VFAT LFN read path | PlantOS (MIT, ChaN FatFs lineage) + SpiritFoxOS algorithm notes | MIT / ⚠️ | reimplemented inside `fatfs.c`; no new SpiritFoxOS code copied |
+| `kernel/fs/fatfs.c` VFAT LFN read path | PlantOS (MIT, ChaN FatFs lineage) + SpiritFoxOS algorithm notes | MIT / ⚠️ | reimplemented inside `fatfs.c`; no new SpiritFoxOS code copied (v0.15.0) |
+| `kernel/fs/fatfs.c` VFAT LFN **write** path (create/rename/unlink of long names, UTF-16 chain writer + UTF-8 readback) | PlantOS ChaN FatFs `put_lfn()` rules (MIT) | MIT | SutureOS implementation (v0.16.0) |
+| `kernel/drivers/ac97.c/.h` | HBOS `src/ac97.c` | GPL-3.0 | PCI probe + NAM + NABM PCM OUT (v0.16.0) |
 
 ---
 

@@ -6,6 +6,51 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.16.0-alpha]
+
+**按 docs/porting-roadmap.md 开始批量移植：光驱数据盘能读（ATAPI + ISO9660）、系统第一次能出声
+（AC'97）、FAT32 长文件名能创建/改名/删除（写侧）。启动呈现与 GUI 外观未变。**
+
+### Added
+- **ATAPI 光驱 + ISO9660 只读文件系统**：`kernel/drivers/atapi.c/.h`（PIO 轮询：
+  IDENTIFY PACKET/PACKET+CDB/READ(10)/READ CAPACITY/REQUEST SENSE，注册只读 blk_device
+  驱动号 12..15、2048B 块）+ `kernel/fs/iso9660.c/.h` + `kernel/fs/iso9660_vfs.c`。
+  开机扫整段卷描述符集、用 El Torito 引导记录区分启动盘，自动挂 `/mnt/cd`。
+  来源：Uinxed-Kernel（Apache-2.0）+ CoolPotOS（MIT）。
+- **AC'97 声卡 PCM 输出**：`kernel/drivers/ac97.c/.h`，PCI 探测 + NAM codec + NABM PCM OUT
+  32 条 BDL 轮询播放 16-bit 48 kHz；shell 新增 `beep`。来源：HBOS（GPL-3.0）。
+- **FAT32 VFAT 长名写侧**（`kernel/fs/fatfs.c`）：自写 LFN 链（N|0x40…1 物理顺序、
+  13 个 UTF-16 单元/条、短名校验和）、唯一 8.3 别名、删除/改名清链；UTF-16→UTF-8 读回，
+  非 ASCII 长名可按原串打开。规则来源：PlantOS 的 ChaN FatFs 血统（MIT）。
+- 验收脚本：`scripts/mkiso9660_testcd.py`、`scripts/verify_iso9660_read.py`（224 项）、
+  `scripts/verify_ac97_wav.py`；`scripts/gui_appearance_check.py` 新增 `--live-shot`
+  （用同一构建的第二次截图学习"活数据掩码"）。
+- `docs/porting-roadmap.md`：素材库 50 仓库的可移植项分 B1..B10 批次。
+
+### Fixed
+- `fatfs_open(create)` 永远走不到长名创建分支（`path_resolve` 对不存在的长名直接 ENOENT）
+  → 新增"父目录 + 长名组件"解析路径。
+- unlink/rmdir 只删短名条目、长名链变孤儿 → 删除/改名时先标记整条 LFN 链。
+- 长名写测试后 FSInfo 与实测差 1 簇 → 自检末尾补 `vfs_sync()`。
+- 外观门禁误报：Task Manager 活数据数字超出旧动态矩形（pristine v0.15.0 也报 29 px）
+  → 门禁升级为"动态矩形 + 双次运行活数据掩码"。
+
+### Verification
+- ISO9660：`mount drive=15 vol=SUTURE_CD files=4`、`selftest PASS`；三级目录 / 跨 3 块
+  4680 B 文件 / 60 条目录项全部命中；宿主 `verify_iso9660_read.py` **224/224**。
+- AC'97：WAV 实录 **48000 Hz / 1.000 s / 0.5000 FS / 440.01 Hz** 全 PASS。
+- FAT32：`lfn-write self-test PASS (create=1 readdir=1 rename=1 unlink=1 utf8=1)`；
+  宿主 `verify_fat32_write.py` **21/21**。
+- 回归：自检 13/14、`syscalls: 81`、`nic_acceptance.py` 两网卡 PASS、无 PANIC；
+  GUI 外观门禁矩形外 **0 像素**。
+
+### Limits
+- ISO9660 只读、仅主卷（Joliet/Rock Ridge/multi-extent/UDF 未做）、大写 8.3 名、单卷单挂；
+  ATAPI 仅 PIO、单条 READ(10) ≤8 块、无换盘检测。
+- AC'97 单次 ≤2.0 s、原生 48 kHz、纯轮询、不录音；MMIO BAR 分支未真机验证。
+- FAT32 长名写仍限同目录 rename；非 ASCII 名终端显示乱码（无 CJK 字体，下一批做）。
+- About 窗口 "14 upstream hobby OS projects" 属冻结外观文案，未改；真实上游数（16）见 README。
+
 ## [v0.15.0-alpha]
 
 **两块从素材库移植的真实能力：Intel e1000 网卡（VMware 下第一次有网络）+ FAT32 VFAT 长文件名

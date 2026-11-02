@@ -109,6 +109,7 @@ static const struct shell_cmd g_commands[] = {
     {"tcpooo",  shell_cmd_tcpooo,  "Self-test: TCP passive open + out-of-order reassembly"},
     {"tcpapi",  shell_cmd_tcpapi,  "TCP echo server over the socket ABI: tcpapi <port>"},
     {"kbdstat", shell_cmd_kbdstat, "Show keyboard IRQ1 ring counters"},
+    {"beep",    shell_cmd_beep,    "Play a sine tone on AC'97: beep [freq_hz 20..12000] [ms 10..1000]"},
     {NULL, NULL, NULL}
 };
 
@@ -1771,6 +1772,48 @@ int shell_cmd_kbdstat(int argc, char **argv) {
                  (unsigned)mbos_kbd_irq_count(),
                  (unsigned)mbos_kbd_dropped_count(),
                  (unsigned)moos_intr_count(0x21));
+    return 0;
+}
+
+/* AC'97 audio: play a sine tone through the PCM OUT bus-master channel.
+ * `beep` alone = 440 Hz / 1000 ms (the boot self-test tone); the two optional
+ * arguments override the frequency (20..12000 Hz) and the duration
+ * (10..1000 ms).  This is the on-demand trigger for the WAV acceptance run. */
+int shell_cmd_beep(int argc, char **argv) {
+    extern int ac97_present(void);
+    extern const char *ac97_name(void);
+    extern int ac97_beep(uint32_t freq_hz, uint32_t duration_ms);
+    uint32_t freq = 440u, dur = 1000u;
+
+    if (!ac97_present()) {
+        shell_puts("beep: no AC'97 codec (boot QEMU with "
+                   "-device AC97,audiodev=a0)\n");
+        return 0;
+    }
+    if (argc > 1) {
+        const int f = shell_atoi(argv[1]);
+        if (f < 20 || f > 12000) {
+            shell_puts("beep: frequency must be 20..12000 Hz\n");
+            return 0;
+        }
+        freq = (uint32_t)f;
+    }
+    if (argc > 2) {
+        const int d = shell_atoi(argv[2]);
+        if (d < 10 || d > 1000) {
+            shell_puts("beep: duration must be 10..1000 ms\n");
+            return 0;
+        }
+        dur = (uint32_t)d;
+    }
+
+    shell_printf("[ac97] %s: playing %u Hz for %u ms...\n", ac97_name(),
+                 (unsigned)freq, (unsigned)dur);
+    if (ac97_beep(freq, dur) == 0)
+        shell_printf("[ac97] beep done (%u Hz, %u ms)\n",
+                     (unsigned)freq, (unsigned)dur);
+    else
+        shell_puts("[ac97] beep FAILED (DMA/rate error)\n");
     return 0;
 }
 

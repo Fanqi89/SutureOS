@@ -63,16 +63,60 @@ def parse(img: bytes):
 
     root = img[data_start * S:(data_start + spc) * S]
     entries = {}
+    lfn_chains = []          # [(short11, decoded long name)]: chains that validate
+    lfn_orphans = []         # [(short display, long name, reasons)]: broken chains
+    pending = []             # LFN entries seen since the last short entry
+    lfn_ofs = (1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30)
+
+    def lfn_checksum(short11):
+        total = 0
+        for b in short11:
+            total = ((total >> 1) + (total << 7) + b) & 0xFF
+        return total
+
+    def lfn_decode(chain):
+        """Validate a physical chain (N|0x40, N-1, ..., 1) and decode its name."""
+        if not chain:
+            return "", "empty chain"
+        n = chain[0][0] & 0x3F
+        if not (chain[0][0] & 0x40):
+            return "", "first entry lacks the 0x40 end marker"
+        if n == 0 or n > 20 or len(chain) != n:
+            return "", f"ord count {n} vs {len(chain)} entries"
+        units = {}
+        for idx, ent in enumerate(chain):
+            want = n - idx
+            if (ent[0] & 0x3F) != want:
+                return "", f"ord out of order at {idx}"
+            if idx and (ent[0] & 0x40):
+                return "", "0x40 marker not on the first entry"
+            if ent[13] != chain[0][13]:
+                return "", "checksum differs inside the chain"
+            for k, off in enumerate(lfn_ofs):
+                units[(want - 1) * 13 + k] = ent[off] | (ent[off + 1] << 8)
+        out = []
+        for i in range(n * 13):
+            c = units.get(i, 0xFFFF)
+            if c in (0x0000, 0xFFFF):
+                break
+            out.append(chr(c))
+        return "".join(out), None
+
     for i in range(0, len(root), 32):
         e = root[i:i + 32]
         if e[0] == 0:
             break
         if e[0] == 0xE5:
+            pending = []
             continue
         # VFAT long-name entries (attr exactly 0x0F) and the volume label are not
         # files; their cluster fields are zero, so parsing them as files walks off
         # the volume and crashes the reader.
-        if e[11] == 0x0F or e[11] == 0x08:
+        if e[11] == 0x0F:
+            pending.append(e)
+            continue
+        if e[11] == 0x08:
+            pending = []
             continue
         name = e[0:8].decode("latin1").rstrip()
         ext = e[8:11].decode("latin1").rstrip()
@@ -80,12 +124,24 @@ def parse(img: bytes):
         first = struct.unpack_from("<H", e, 26)[0] | (struct.unpack_from("<H", e, 20)[0] << 16)
         size = struct.unpack_from("<I", e, 28)[0]
         entries[full] = (first, size)
+        if pending:
+            long_name, why = lfn_decode(pending)
+            if why is None and lfn_checksum(e[0:11]) != pending[0][13]:
+                why = "chain checksum does not match the short entry"
+            if why is None:
+                lfn_chains.append((e[0:11], long_name))
+            else:
+                lfn_orphans.append((full, long_name, why))
+            pending = []
+    if pending:
+        lfn_orphans.append(("<end of directory>", "", "chain not followed by a short entry"))
     free_measured = sum(1 for cl in range(2, clusters + 2) if fget(cl) == 0)
     fsinfo_free = struct.unpack_from("<I", img, fsinfo * S + 488)[0]
     return dict(reserved=reserved, nfats=nfats, fatsz=fatsz, rootclus=rootclus,
                 spc=spc, clusters=clusters, fat0=fat0, fat1=fat1, fget=fget,
                 read_chain=read_chain, entries=entries,
-                free_measured=free_measured, fsinfo_free=fsinfo_free)
+                free_measured=free_measured, fsinfo_free=fsinfo_free,
+                lfn_chains=lfn_chains, lfn_orphans=lfn_orphans)
 
 
 def main():
@@ -175,6 +231,25 @@ def main():
               if v["fget"](cl) != 0 and cl not in live]
     check("no orphaned cluster chains left behind (rmdir/unlink freed them)",
           not orphan, f"{len(orphan)} orphan(s): {orphan[:8]}")
+
+    # ---- VFAT long-name write side (v0.16) -----------------------------------
+    # Every LFN chain in the root must be complete (N|0x40 ... 1), must match the
+    # checksum of the short entry that follows it, and must not be left dangling.
+    check("no broken/orphaned VFAT LFN chains in the root directory",
+          not v["lfn_orphans"],
+          f"{len(v['lfn_orphans'])} bad: {v['lfn_orphans'][:3]}")
+    # The fixture ships one long name; the guest's write test creates, renames and
+    # deletes two more, so exactly the fixture chain may survive.
+    check("guest long-name create/rename/unlink left no residue",
+          all("Created" not in nm and "Renamed" not in nm
+              for (_raw, nm) in v["lfn_chains"]),
+          f"chains={[nm for (_r, nm) in v['lfn_chains']]}")
+    check("non-ASCII UTF-16 long name decodes back to its UTF-8 form",
+          any(nm == "\u4e2d\u6587 \u957f\u540d.txt" for (_r, nm) in v["lfn_chains"]),
+          f"chains={[nm for (_r, nm) in v['lfn_chains']]}")
+    check("fixture long name still readable from the raw image",
+          any(nm == "Long file name test.txt" for (_r, nm) in v["lfn_chains"]),
+          f"chains={[nm for (_r, nm) in v['lfn_chains']]}")
 
     print(f"image: {dirty_path} ({len(img)} bytes, {v['clusters']} clusters)")
     ok_count = 0
