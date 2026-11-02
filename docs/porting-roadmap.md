@@ -73,3 +73,6 @@
 | B16 | ⏳ 未做 | **virtio-gpu 2D 呈现增强**（显存脏矩形/多缓冲） | 现有 framebuffer 路径在 QEMU 的 `-vga std` 下已稳定且外观门禁逐像素通过；引入 virtio-gpu 需要新的 PCI 驱动 + 扫描回写路径，收益主要是性能，风险是可能改变启动呈现。按"外观冻结"红线评估后推迟。 |
 
 两项都保留了调研结论与参考出处（见 `docs/provenance.md` 的 collection 清单），下一轮可直接接着做。
+| B17 | v0.31.0-alpha | **GUI 任务栏增强 + Windows 键快捷键**（窗口按钮/时钟/当前用户） | SutureOS 自绘（用户 2026-11-03 要求，外观基线已更新） | 真 QMP 注入 + 截图断言 **7/7** | ✅ 本轮完成 |
+| B18 | 进行中 | **ISO 系统安装盘**（真实写盘/分区/引导/系统文件/可选密码） | 队友 worktree port-installer | 待：宿主解析装好的镜像 + 从硬盘启动 | ⏳ |
+| B19 | 进行中 | **多用户**（useradd/userdel/passwd/login/su 切换 + GUI 切换用户） | 队友 worktree port-multiuser | 待：验收脚本与宿主格式校验 | ⏳ |

@@ -37,6 +37,12 @@ DYNAMIC = [
     ('Task Manager CPU-busy bar',                           (40, 200, 360, 226)),
     ('Calculator display + status line',                    (382, 50, 622, 184)),
     ('About window version string',                         (648, 118, 970, 148)),
+    # Taskbar right-hand side: RTC clock, current user name and measured FPS are
+    # live data (v0.31.0 taskbar). The window buttons are static text and stay
+    # inside the checked area on purpose.
+    ('Taskbar clock/user/FPS',                              (760, 730, 1024, 766)),
+    # Taskbar button highlight follows keyboard focus (Tab cycles windows).
+    ('Taskbar window-button strip',                          (108, 730, 700, 766)),
 ]
 
 

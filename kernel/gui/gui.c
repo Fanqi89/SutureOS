@@ -17,6 +17,16 @@
 #include "mb_kbd.h"           /* mbos_kbd_poll / mbos_kbd_decode (same pattern as shell.c) */
 #include "power.h"            /* power_reset / power_off (ACPI S5 + reset register) */
 #include "font.h"             /* font8x16: ASCII 32..126 bitmap font (fbcon's font asset) */
+#include "../security/userdb.h"  /* current user name for the taskbar (user switching) */
+
+/* Taskbar helpers (defined further below; the taskbar click handler needs them
+ * before their definitions). */
+#define TASKBAR_MAX_BTNS 6
+#define TASKBAR_BTN_MAX_CHARS 14
+static int gui_taskbar_windows(struct gui_window** out, int max);
+static int gui_taskbar_btn_rect(struct gui_window** wins, int idx,
+                                int* bx, int* bw);
+static const char* gui_current_user_name(void);
 
 /* 全局状态 */
 static struct gui_window g_wins[GUI_MAX_WINDOWS];
@@ -739,6 +749,22 @@ static void gui_click_at(int cx, int cy, int button)
                            g_start_open ? "opened" : "closed",
                            (int64_t)cx, (int64_t)cy);
             gui_invalidate();
+            return;
+        }
+        /* window buttons: raise + focus (+ un-minimise) the clicked window */
+        {
+            struct gui_window* tbw[TASKBAR_MAX_BTNS];
+            const int tbn = gui_taskbar_windows(tbw, TASKBAR_MAX_BTNS);
+            for (int i = 0; i < tbn; i++) {
+                int bx = 0, bw = 0;
+                if (!gui_taskbar_btn_rect(tbw, i, &bx, &bw)) break;
+                if (cx >= bx && cx < bx + bw) {
+                    console_printf("[gui] taskbar: focus '%s'\n", tbw[i]->title);
+                    gui_set_active(tbw[i]);
+                    gui_invalidate();
+                    return;
+                }
+            }
         }
         return;
     }
@@ -938,9 +964,44 @@ static bool gui_handle_keys(void) {
             }
         }
 
+        /* E0-prefixed keys: the Windows/Super key (0xE0 0x5B / 0x5C) toggles the
+         * start menu, exactly like the concept the user asked for. The prefix
+         * byte is consumed here so the decoder never sees a stray 0xE0. */
+        static int win_prefix = 0;
+        if ((sc & 0xFF) == 0xE0) {
+            win_prefix = 1;
+            continue;
+        }
+        if (win_prefix) {
+            win_prefix = 0;
+            const int code = sc & 0x7F;
+            const int release = (sc & 0x80) != 0;      /* break code: ignore */
+            if (!release && (sc & 0xFF) == 0x5B) {     /* Left Win  (E0 5B) */
+                g_start_open = !g_start_open;
+                console_printf("[gui] Win key: start menu %s\n",
+                               g_start_open ? "opened" : "closed");
+                gui_invalidate();
+                continue;
+            }
+            if (!release && (sc & 0xFF) == 0x5C) {     /* Right Win (E0 5C) */
+                g_start_open = !g_start_open;
+                console_printf("[gui] Win key: start menu %s\n",
+                               g_start_open ? "opened" : "closed");
+                gui_invalidate();
+                continue;
+            }
+            (void)code;
+        }
+
         if (ch <= 0) continue;                    /* break/modifier/unmapped */
         if (ch == '\t') { gui_focus_next(); continue; }          /* Tab  */
-        if (ch == 0x1B) {                                        /* ESC quits */
+        if (ch == 0x1B) {                                        /* ESC */
+            if (g_start_open) {                                  /* close menu first */
+                g_start_open = 0;
+                console_puts("[gui] ESC: start menu closed\n");
+                gui_invalidate();
+                continue;
+            }
             quit = true;
             break;
         }
@@ -984,6 +1045,53 @@ static void gui_draw_desktop(int x0, int y0, int x1, int y1) {
     }
 }
 
+/* ==================== taskbar helpers (window buttons / clock / user) ======
+ * The taskbar shows one button per open window (click = raise+focus, also
+ * un-minimises), the wall clock from the CMOS RTC and the current user name.
+ * Everything is drawn with SutureOS' own primitives - no foreign UI.
+ */
+static int gui_taskbar_windows(struct gui_window** out, int max) {
+    struct gui_window* arr[24];
+    int n = 0;
+    for (struct gui_window* w = g_z; w && n < 24; w = w->next) arr[n++] = w;
+    /* g_z is topmost-first; show oldest-first so buttons keep their place */
+    for (int i = 0; i < n / 2; i++) {
+        struct gui_window* t = arr[i];
+        arr[i] = arr[n - 1 - i];
+        arr[n - 1 - i] = t;
+    }
+    int cnt = 0;
+    for (int i = 0; i < n && cnt < max; i++)
+        if (arr[i]->visible) out[cnt++] = arr[i];
+    return cnt;
+}
+
+static int gui_taskbar_btn_rect(struct gui_window** wins, int idx,
+                                int* bx, int* bw) {
+    int x = START_BTN_X + START_BTN_W + 12;
+    for (int i = 0; i < idx; i++) {
+        int len = (int)strlen(wins[i]->title);
+        if (len > TASKBAR_BTN_MAX_CHARS) len = TASKBAR_BTN_MAX_CHARS;
+        x += 8 * len + 16 + 4;
+    }
+    int len = (int)strlen(wins[idx]->title);
+    if (len > TASKBAR_BTN_MAX_CHARS) len = TASKBAR_BTN_MAX_CHARS;
+    int w = 8 * len + 16;
+    /* keep the right side free for clock + user + FPS */
+    const int right_limit = g_gui_screen_w - 8 - 8 * 24;
+    if (x + w > right_limit) return 0;
+    *bx = x;
+    *bw = w;
+    return 1;
+}
+
+static const char* gui_current_user_name(void) {
+    extern uint32_t cred_euid(void);
+    extern const userdb_user_t* userdb_by_uid(uint32_t uid);
+    const userdb_user_t* u = userdb_by_uid(cred_euid());
+    return (u != NULL && u->name[0]) ? u->name : "root";
+}
+
 static void gui_draw_taskbar(void) {
     const int w = g_gui_screen_w, h = g_gui_screen_h;
     int y0 = h - GUI_TASKBAR_H;
@@ -995,19 +1103,55 @@ static void gui_draw_taskbar(void) {
     /* the system name is the start button (click = menu opens upwards) */
     gui_draw_start_button();
 
-    gui_draw_text(START_BTN_X + START_BTN_W + 8, ty,
-                  "click name for menu | Tab:focus r:repaint q/ESC:quit",
-                  0x9FB2CCu);
-    /* right side: measured fps */
-    char d[12];
-    const int dl = gui_u32_dec(g_fps_meas, d);
-    char buf[24];
-    int p = 0;
-    const char* s = "FPS ";
-    while (*s) buf[p++] = *s++;
-    for (int i = 0; i < dl; i++) buf[p++] = d[i];
-    buf[p] = 0;
-    gui_draw_text(w - 8 - p * 8, ty, buf, 0x9FB2CCu);
+    /* ---- window buttons (one per open window) ---- */
+    struct gui_window* tbw[TASKBAR_MAX_BTNS];
+    const int tbn = gui_taskbar_windows(tbw, TASKBAR_MAX_BTNS);
+    for (int i = 0; i < tbn; i++) {
+        int bx = 0, bw = 0;
+        if (!gui_taskbar_btn_rect(tbw, i, &bx, &bw)) break;
+        const int active = tbw[i]->active && !tbw[i]->minimized;
+        gui_fill(bx, y0 + 5, bw, GUI_TASKBAR_H - 10,
+                 active ? 0x2E5A9Eu : 0x24293Au);
+        gui_fill(bx, y0 + 5, 1, GUI_TASKBAR_H - 10, 0x3C4454u);
+        {
+            const int sx0 = g_clip_x0, sy0 = g_clip_y0;
+            const int sx1 = g_clip_x1, sy1 = g_clip_y1;
+            g_clip_x0 = bx + 1; g_clip_y0 = y0;
+            g_clip_x1 = bx + bw - 1; g_clip_y1 = y0 + GUI_TASKBAR_H;
+            gui_draw_text(bx + 8, ty, tbw[i]->title,
+                          active ? 0xFFFFFFu : 0x9FB2CCu);
+            g_clip_x0 = sx0; g_clip_y0 = sy0; g_clip_x1 = sx1; g_clip_y1 = sy1;
+        }
+        if (tbw[i]->minimized) gui_fill(bx, y0 + 5, bw, 2, 0x6B7890u);
+    }
+
+    /* ---- right side: clock, current user, measured fps ---- */
+    {
+        extern uint64_t rtc_now_epoch(void);
+        extern void rtc_format_epoch(uint64_t epoch, char* buf, uint32_t cap);
+        char full[32];
+        rtc_format_epoch(rtc_now_epoch(), full, sizeof(full));   /* YYYY-MM-DD HH:MM:SS UTC */
+        char clock[6];
+        for (int i = 0; i < 5; i++) clock[i] = full[11 + i];     /* "HH:MM" */
+        clock[5] = 0;
+
+        char fps[24];
+        int p = 0;
+        const char* fp = "FPS ";
+        while (*fp) fps[p++] = *fp++;
+        char d[12];
+        const int dl = gui_u32_dec(g_fps_meas, d);
+        for (int i = 0; i < dl; i++) fps[p++] = d[i];
+        fps[p] = 0;
+
+        const char* user = gui_current_user_name();
+        int x = w - 8 - p * 8;
+        gui_draw_text(x, ty, fps, 0x9FB2CCu);                   /* rightmost */
+        x -= 12 + (int)strlen(user) * 8;
+        gui_draw_text(x, ty, user, 0xE8ECF4u);
+        x -= 12 + 5 * 8;
+        gui_draw_text(x, ty, clock, 0x9FB2CCu);
+    }
 }
 
 /* decorative title buttons (min/max/close) - keyboard-only build: drawn for

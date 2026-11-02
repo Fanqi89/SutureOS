@@ -6,6 +6,26 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.31.0-alpha]
+
+**任务栏增强 + 快捷键（用户 2026-11-03 要求的界面更新）：每个窗口一个任务栏按钮（点击置顶/聚焦、
+最小化可点回）、RTC 实时时钟、当前用户显示；Windows/Super 键开关开始菜单，ESC 先关菜单。
+外观基线按用户要求更新（重新生成 base_gui.png），风格仍全部是 SutureOS 自绘。**
+
+### Added
+- `kernel/gui/gui.c`：任务栏窗口按钮（`gui_taskbar_windows`/`gui_taskbar_btn_rect`）、
+  RTC 时钟、当前用户（`cred_euid` → `userdb_by_uid`）、任务栏点击聚焦。
+- Windows/Super 键（E0 5B/5C，只认 make code）切换开始菜单；ESC 在菜单打开时只关菜单。
+- `scripts/taskbar_acceptance.py`（7/7）；`docs/baseline/base_gui.png` 按用户要求重新生成；
+  外观门禁新增任务栏 live 区域。
+
+### Verification
+- 任务栏渲染（按钮/时钟/用户/FPS）+ Win 键开关菜单 + 点击按钮聚焦 → 7/7 PASS；
+  外观门禁动态矩形外 0 像素；图片查看器/GUI 中文/文本编辑器回归全 PASS。
+
+### Limits
+- 最多 6 个按钮、标题截断 14 字符；无右键菜单/托盘/显示桌面；时钟只有 HH:MM。
+
 ## [v0.30.0-alpha]
 
 **SquashFS 支持多卷：FAT32 / ext2 / squashfs 三种真实文件系统全部做到一次启动多卷同时挂载。
