@@ -83,6 +83,7 @@
 | `kernel/gui/img_qoi.c` | PlantOS `src/plic/qoi.c`（算法参考重写） | MIT | ✅ v0.18.0 |
 | `user/apps/r3*.c` | 自研；argv 帧/目录 fd 约定参考 VimtuOS | GPL-3.0 | ✅ v0.18.0 |
 | `kernel/term/cjk16.c` 字体子集 | HBOS `fonts/ZhengGeDianHei-16.ttf`（name 表 nameID 13 实读为 **SIL OFL-1.1**；Copyright 2026 yzdnn / Fontworks DotGothic16） | OFL-1.1 | ✅ v0.20.0（OFL 全文在 docs/licenses/OFL-1.1.txt） |
+| `kernel/drivers/usb_ehci.c` | HanOS EHCI 驱动（MIT）为骨架；HBOS `src/usb_msc.c`（GPL-3.0）的 CBW/CSW 布局与 BOT 流程作参考 | MIT + GPL-3.0 | ✅ v0.23.0 |
 
 ## 5. 维护规则
 

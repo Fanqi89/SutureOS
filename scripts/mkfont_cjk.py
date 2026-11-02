@@ -25,8 +25,15 @@ import struct
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_TTF = os.path.join(os.path.dirname(ROOT), '自研操作系统', 'HBOS', 'fonts',
-                           'ZhengGeDianHei-16.ttf')
+# The font lives in the project collection next to this repo. A git worktree
+# lives under build/, so dirname(ROOT) is the repo itself - try the known
+# absolute location as well instead of failing the build.
+FONT_REL = os.path.join('HBOS', 'fonts', 'ZhengGeDianHei-16.ttf')
+_TTF_CANDIDATES = [
+    os.path.join(os.path.dirname(ROOT), '自研操作系统', FONT_REL),
+    os.path.join(r'C:\Users\fanqi\Desktop', '自研操作系统', FONT_REL),
+]
+DEFAULT_TTF = next((c for c in _TTF_CANDIDATES if os.path.exists(c)), _TTF_CANDIDATES[0])
 OUT = os.path.join(ROOT, 'build', 'font_cjk.bin')
 GLYPH_W, GLYPH_H = 16, 16
 

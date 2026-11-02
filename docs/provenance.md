@@ -131,6 +131,7 @@ add copies from that repository.
 | `kernel/gui/img_qoi.c` | PlantOS `src/plic/qoi.c` (algorithm reference) | MIT | QOI decoder (v0.18.0) |
 | `user/apps/r3*.c` | local (argv frame / dir-fd conventions from VimtuOS) | GPL-3.0 | ring-3 file tools (v0.18.0) |
 | `kernel/term/cjk16.c/.h` + `scripts/mkfont_cjk.py` | font asset `ZhengGeDianHei-16.ttf` from HBOS/fonts (name table declares SIL OFL-1.1; Copyright 2026 yzdnn, derived from Fontworks DotGothic16) | OFL-1.1 (font), GPL-3.0 (code) | GB2312 16x16 bitmap subset rendered at build time (v0.20.0) |
+| `kernel/drivers/usb_ehci.c/.h` | HanOS `kernel/device/usb/ehci.c` (MIT) as the EHCI skeleton; CBW/CSW + BOT flow cross-checked against HBOS `src/usb_msc.c` (GPL-3.0) | MIT + GPL-3.0 (compatible) | USB 2.0 host controller + mass storage as block device 16 (v0.23.0) |
 
 ---
 

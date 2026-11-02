@@ -262,6 +262,17 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
     blk_ata_init();      /* controller-level setup (mask IRQs, polling mode) */
     blk_ata_probe();     /* detect primary master/slave -> ata0/ata1 */
 
+    /* ---- USB 2.0 (EHCI) host controller + mass storage --------------------
+     * Probe order matters for the appearance freeze: when no EHCI controller
+     * exists (the default -machine pc has only UHCI) this logs exactly one
+     * "[usb] ..." line and changes nothing else - no block device is created,
+     * so the FAT32 candidate list, the self-tests and the GUI are unaffected.
+     * A USB stick becomes block device 16 (BLK_DRIVE_USB). */
+    {
+        extern int usb_probe(void);
+        (void)usb_probe();
+    }
+
     /* ---- ATAPI 光驱（数据盘） ---------------------------------------------
      * 同样走 legacy IDE 通道：扫描主/次两个通道的 4 个位置，把真实存在的
      * ATAPI 光盘注册成只读块设备（驱动号 12..15，2048 字节块）。空位与
@@ -415,6 +426,39 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
                            (int64_t)d, (int64_t)r);
         }
         if (r != VFS_OK) console_puts("[init] no FAT32 volume on any block device\n");
+    }
+
+    /* ---- USB mass storage: FAT32 volume at /mnt/usb ----------------------
+     * Only runs when usb_probe() actually registered a device, so a machine
+     * without a stick never reaches this block. fatfs keeps one volume at a
+     * time (its g_vol), so if the disk above already mounted /mnt/fat this
+     * mount reports EBUSY instead of silently stealing the volume. */
+    {
+        extern int usb_present(void);
+        extern int usb_drive(void);
+        extern void usb_selftest(void);
+        if (usb_present()) {
+            char usrc[8];
+            int ud = usb_drive();
+
+            snprintf(usrc, sizeof(usrc), "%d", ud);
+            r = vfs_mount(usrc, "/mnt/usb", "fat32");
+            if (r == VFS_OK)
+                console_printf("[usb] mount /mnt/usb OK (drive %d)\n",
+                               (int64_t)ud);
+            else if (r == VFS_EBUSY)
+                /* fatfs keeps a single volume (its g_vol): when another FAT32
+                 * disk already mounted /mnt/fat this is a filesystem-layer
+                 * limit, not a USB failure - say so instead of leaving a bare
+                 * error code in the log. */
+                console_printf("[usb] mount /mnt/usb skipped: fatfs keeps one "
+                               "volume and /mnt/fat already owns it (mount=%d)\n",
+                               (int64_t)r);
+            else
+                console_printf("[usb] mount /mnt/usb FAILED (mount=%d)\n",
+                               (int64_t)r);
+            usb_selftest();
+        }
     }
 
     /* ext2 on the second IDE disk (-hdb build/ext2.img). The driver reports

@@ -6,6 +6,37 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.23.0-alpha]
+
+**第一次把 U 盘当盘用：EHCI（USB 2.0）主控 + 高速枚举 + BOT/SCSI 读写 → 块设备 drive 16 →
+FAT32 自动挂 `/mnt/usb`，可 `ls`/`cat`/`write`；宿主侧解析 U 盘镜像逐扇区逐字节验证。
+启动呈现与 GUI 外观未变。**
+
+### Added
+- `kernel/drivers/usb_ehci.c`（1430 行）+ `usb_ehci.h`：EHCI 端口复位/枚举、异步 QH/qTD、
+  BOT、SCSI（INQUIRY/READ CAPACITY/READ(10)/WRITE(10)/TUR/SYNC CACHE）、`blk_register` drive 16、
+  开机自检。骨架 HanOS（MIT），BOT 流程参照 HBOS（GPL-3.0），改动见文件头。
+- `block.h`：`BLK_TYPE_USB=7`、`BLK_DRIVE_USB=16`；`kmain.c`：`usb_probe()` + `/mnt/usb` 挂载/自检。
+- `scripts/mk_usb_testimg.py`、`scripts/verify_usb_disk.py`（宿主侧独立校验）。
+- `scripts/mkfont_cjk.py`：字体路径加绝对候选，修掉 git worktree 下构建失败。
+
+### Fixed
+- PORTSC 偏移漏加 CAPLENGTH → 读到全 0（看起来像没插设备）。
+- CBW/CSW 与数据阶段共用 bounce buffer → CSW 覆盖数据（INQUIRY vendor 空、READ CAPACITY 异常）。
+- 高速判据不读 QEMU 恒为 0 的 `PORTSC.PSPD`，改用"复位释放后 PED=1"。
+
+### Verification
+- 有 USB：枚举→`storage: 71680 blocks x 512`→`mount /mnt/usb OK`→`selftest PASS`；`ls` 4 条目；
+  `write`+`cat`+`umount` 后宿主 `verify_usb_disk.py --allow-write` **8/8**（6 扇区变化全在合法区域、
+  W.TXT 逐字节正确、原文件未变）。
+- 只读启动整盘 CRC32 `93F4BB22` 未变 → 5/5。
+- 无 USB：只多 `[usb] no controller`；13/14 自检、FAT32 21/21、wget 8/8、终端中文 10/10、
+  GUI 中文 4/4、外观门禁 0 像素。
+
+### Limits
+- 仅高速设备；第一台 mass storage、LUN 0；仅开机枚举无热插拔；无 EHCI HID；fatfs 单卷
+  （同时挂 IDE FAT32 时 `/mnt/usb` skipped 并如实失败）；USB CRC 错误路径未验。
+
 ## [v0.22.0-alpha]
 
 **第一次能把网上的文件下载进本地盘：`wget http://<ipv4>[:port]/<path> [outfile]`（HTTP/1.0 GET

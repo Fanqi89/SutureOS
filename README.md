@@ -2,7 +2,7 @@
 
 > **一个由 16 个爱好者操作系统项目拼接而成的 x86_64 单内核操作系统**
 > 
-> 当前版本：**v0.22.0-alpha** · 内核编译 **105** 个源文件（源码树约 220 个 C/H/ASM、约 6.0 万行）
+> 当前版本：**v0.23.0-alpha** · 内核编译 **105** 个源文件（源码树约 220 个 C/H/ASM、约 6.0 万行）
 > · 内核 ELF 约 **2.06 MB**（含调试符号）· 可引导 ISO 约 **15.0 MB** · **GPL-3.0** 许可证
 >
 > 移植与许可说明：[`docs/provenance.md`](docs/provenance.md)（模块→上游·文件路径）
@@ -68,6 +68,7 @@ SutureOS（缝合怪系统）是一个实验性的 x86_64 单内核操作系统�
 | v0.20.0 | **终端中文显示**（16×16 点阵，GB2312 7443 字形） | 字体 ZhengGeDianHei-16.ttf（**SIL OFL-1.1**，素材库 HBOS） | `kernel/term/cjk16.c/.h`、`term.c`、`scripts/mkfont_cjk.py` | ✅ 宿主逐像素匹配 4 字形；滚动后仍精确，10/10 |
 | v0.21.0 | **GUI 中文文本**（UTF-8 + 16×16 点阵复用） | 同一 OFL-1.1 字体子集 | `kernel/gui/gui.c`、`scripts/gui_cjk_acceptance.py` | ✅ 图片查看器“缩放”字形逐像素匹配 4/4 |
 | v0.22.0 | **HTTP 下载（wget）** | SutureOS 自有实现（GPL-3.0），复用内核 TCP | `kernel/shell/shell.c`、`scripts/wget_acceptance.py` | ✅ 真实 HTTP 服务器 + 宿主逐字节比对 8/8 |
+| v0.23.0 | **USB 2.0 存储（EHCI + BOT/SCSI）** | HanOS EHCI 骨架（MIT）+ HBOS BOT 参考（GPL-3.0） | `kernel/drivers/usb_ehci.c`、`scripts/verify_usb_disk.py` | ✅ 枚举/挂载/读写 + 宿主逐扇区校验 8/8 + 只读整盘 CRC 未变 |
 
 ---
 
