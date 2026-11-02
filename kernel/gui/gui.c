@@ -114,6 +114,8 @@ static void gui_rect(int x, int y, int w, int h, uint32_t c) {
     gui_fill(x + w - 1, y, 1, h, c);
 }
 
+#include "../term/cjk16.h"   /* 16x16 CJK bitmap subset (shared with the terminal) */
+
 /* text: font8x16 (95 glyphs, ASCII 32..126) - the same asset fbcon renders with */
 static void gui_draw_char(int x, int y, char ch, uint32_t fg) {
     if (ch < 32 || ch > 126) ch = '?';
@@ -128,9 +130,41 @@ static void gui_draw_char(int x, int y, char ch, uint32_t fg) {
 
 static void gui_draw_text(int x, int y, const char* s, uint32_t fg) {
     if (!s) return;
-    while (*s) {
-        gui_draw_char(x, y, *s++, fg);
-        x += 8;
+    const unsigned char* p = (const unsigned char*)s;
+    while (*p) {
+        if (*p < 0x80u) {
+            gui_draw_char(x, y, (char)*p++, fg);
+            x += 8;
+            continue;
+        }
+        /* UTF-8 sequence -> codepoint; wide CJK glyphs are 16x16 and take two
+         * ASCII cells, exactly like the terminal (kernel/term/cjk16.c). */
+        uint32_t cp;
+        int n;
+        if ((*p & 0xE0u) == 0xC0u)      { cp = *p & 0x1Fu; n = 2; }
+        else if ((*p & 0xF0u) == 0xE0u) { cp = *p & 0x0Fu; n = 3; }
+        else if ((*p & 0xF8u) == 0xF0u) { cp = *p & 0x07u; n = 4; }
+        else { p++; continue; }
+        int ok = 1;
+        for (int i = 1; i < n; i++) {
+            if ((p[i] & 0xC0u) != 0x80u) { ok = 0; break; }
+            cp = (cp << 6) | (uint32_t)(p[i] & 0x3Fu);
+        }
+        if (!ok) { p++; continue; }
+        p += n;
+        const uint8_t* g = cjk16_is_wide(cp) ? cjk16_lookup(cp) : NULL;
+        if (g == NULL) {
+            gui_draw_char(x, y, '?', fg);
+            x += 8;
+            continue;
+        }
+        for (int row = 0; row < 16; row++) {
+            const uint32_t bits = ((uint32_t)g[row * 2] << 8) | (uint32_t)g[row * 2 + 1];
+            if (!bits) continue;
+            for (int col = 0; col < 16; col++)
+                if (bits & (0x8000u >> col)) gui_px(x + col, y + row, fg);
+        }
+        x += 16;
     }
 }
 

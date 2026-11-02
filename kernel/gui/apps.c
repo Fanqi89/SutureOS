@@ -309,6 +309,7 @@ static void img_build_pattern(void) {
  * drop IMG.BMP / IMG.QOI for an acceptance run. */
 static void img_load_once(void) {
     static const char* paths[] = {
+        "/mnt/fat/\xE5\x9B\xBE\xE7\x89\x87.BMP",   /* 图片.BMP: CJK status line */
         "/mnt/fat/IMG.BMP", "/mnt/fat/IMG.QOI",
         "/images/IMG.BMP", "/images/IMG.QOI",
         "/IMG.BMP", "/IMG.QOI",
@@ -427,7 +428,7 @@ static void img_draw(struct gui_window* w) {
         if (y + 14 <= w->client_y + w->client_h) {
             char foot[40];
             char* p = foot;
-            const char* n = "scale x";
+            const char* n = "\xE7\xBC\xA9\xE6\x94\xBE x";  /* 缩放 x */
             while (*n) *p++ = *n++;
             put_u32_dec(&p, (uint32_t)scale);
             *p = 0;

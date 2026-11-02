@@ -6,6 +6,27 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.21.0-alpha]
+
+**中文从终端走进窗口：GUI 文本绘制支持 UTF-8 与 16×16 点阵（复用 GB2312 子集），图片查看器
+底部显示 `缩放 xN`，宿主截图逐像素断言。启动呈现与默认桌面外观未变。**
+
+### Added
+- `kernel/gui/gui.c`：`gui_draw_text()` 增加 UTF-8 解码与宽字符 16×16 点阵绘制（两格宽，走
+  既有 `gui_px()` 裁剪）；字体子集复用 `kernel/term/cjk16.c`。
+- 图片查看器页脚 `scale xN` → `缩放 xN`（新建窗口，不影响默认桌面）。
+- `scripts/gui_cjk_acceptance.py`：QMP 点开始菜单 → Image Viewer → 截图 → 按页脚颜色与
+  16×16 点阵精确匹配“缩/放”。
+
+### Verification
+- GUI：checks=4 ok=4（缩(161,402)、放(177,402) 逐像素相同）。
+- 终端回归：10/10（`ls` 中文名 + 滚动后仍精确）。
+- 回归：内核自检 13/14、FAT32 三自检 PASS、无 PANIC；外观门禁 0 像素。
+
+### Limits
+- 仅新建窗口内中文；窗口标题/开始菜单/默认应用仍英文（冻结外观）。
+- GB2312 子集、位图 16×16 不缩放、无输入法、GUI 文本不折行。
+
 ## [v0.20.0-alpha]
 
 **终端第一次能显示中文：GB2312 全集 16×16 点阵（7443 字形，SIL OFL-1.1 字体，构建期渲染），

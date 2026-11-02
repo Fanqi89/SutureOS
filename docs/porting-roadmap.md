@@ -53,3 +53,5 @@
 5. 外观：`scripts/gui_appearance_check.py build/shot_look.ppm` → 动态矩形外 0 像素。
 6. 发布：改 `include/sutureos/version.h` → CHANGELOG + release notes + tag notes →
    `scripts/publish_all.ps1` 一条命令（提交/标签/Release/ISO/自证）。
+
+| B6c | v0.21.0-alpha | **GUI 中文文本**（UTF-8 + 16×16 点阵，复用终端字体子集） | 同一 OFL-1.1 字体子集 | 图片查看器 `缩放 xN` 字形在截图中逐像素匹配 4/4 | ✅ 本轮完成 |
