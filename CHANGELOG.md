@@ -6,6 +6,26 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.22.0-alpha]
+
+**第一次能把网上的文件下载进本地盘：`wget http://<ipv4>[:port]/<path> [outfile]`（HTTP/1.0 GET
+over 内核 TCP 客户端，边收边写 VFS，Content-Length 校验）。宿主起真实 HTTP 服务器、事后解析
+FAT32 镜像逐字节比对相同。启动呈现与 GUI 外观未变。**
+
+### Added
+- `kernel/shell/shell.c`：`shell_cmd_wget()` —— URL 解析、HTTP 请求/响应头处理、`Content-Length`
+  校验、流式写盘；只接受 IPv4 字面量。
+- `scripts/wget_acceptance.py`：宿主 ThreadingHTTPServer + QMP 注入 + 宿主侧 FAT32 解析比对。
+
+### Verification
+- guest：`HTTP 200, content-length=3072` → `wrote 3072 bytes`；文本文件 `cat` 内容一致。
+- 宿主：`DL.BIN` sha256 与服务端文件完全相同；`HELLO2.TXT` 逐字节相同 → **8/8 PASS**。
+- 回归：内核自检 13/14、FAT32 三自检 PASS、终端中文 10/10、GUI 中文 4/4、外观门禁 0 像素。
+
+### Limits
+- 仅 IPv4 字面量；HTTP/1.0 GET only（无 HTTPS/POST/重定向/chunked/续传/代理）；响应头 2 KiB
+  上限；超时 5 秒；无进度显示。USB 存储在独立分支开发中。
+
 ## [v0.21.0-alpha]
 
 **中文从终端走进窗口：GUI 文本绘制支持 UTF-8 与 16×16 点阵（复用 GB2312 子集），图片查看器

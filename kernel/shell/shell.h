@@ -72,6 +72,7 @@ int shell_cmd_cat(int argc, char **argv);
 int shell_cmd_write(int argc, char **argv);
 int shell_cmd_append(int argc, char **argv);
 int shell_cmd_hexdump(int argc, char **argv);
+int shell_cmd_wget(int argc, char **argv);
 int shell_cmd_ps(int argc, char **argv);
 int shell_cmd_kill(int argc, char **argv);
 int shell_cmd_sudo(int argc, char **argv);

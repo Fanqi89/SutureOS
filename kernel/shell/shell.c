@@ -108,6 +108,7 @@ static const struct shell_cmd g_commands[] = {
     {"tcpecho", shell_cmd_tcpecho, "TCP round trip: tcpecho <ipv4> <port> <text>"},
     {"tcpsend", shell_cmd_tcpsend, "TCP one-way send: tcpsend <ipv4> <port> <text>"},
     {"tcpstat", shell_cmd_tcpstat, "Show TCP connection/segment counters"},
+    {"wget",    shell_cmd_wget,    "Download a file over HTTP: wget http://<ipv4>[:port]/<path> [outfile]"},
     {"tcpserve",shell_cmd_tcpserve,"TCP echo server: tcpserve <port>"},
     {"tcpooo",  shell_cmd_tcpooo,  "Self-test: TCP passive open + out-of-order reassembly"},
     {"tcpapi",  shell_cmd_tcpapi,  "TCP echo server over the socket ABI: tcpapi <port>"},
@@ -1505,6 +1506,216 @@ static void tcp_print_payload(const char *tag, const uint8_t *b, uint32_t n)
         shell_putc((ch >= 32u && ch < 127u) ? (char)ch : '.');
     }
     shell_puts("\"\n");
+}
+
+/* ==================== wget (HTTP GET over the kernel TCP client) ==========
+ * `wget http://10.0.2.2:8089/file.bin /mnt/fat/DL.BIN`
+ *
+ * Deliberately small and honest:
+ *   - IP literal only (the stack has DNS, but `nslookup` is a separate command
+ *     and a download tool must not silently depend on the resolver),
+ *   - HTTP/1.0 request with Connection: close, status line + headers parsed
+ *     manually, body streamed to the VFS in recv-sized chunks,
+ *   - Content-Length is honoured when present; otherwise the body ends when the
+ *     peer closes (timeout => reported, partial file kept and named *.part).
+ */
+/* prefix-integer parse for HTTP headers ("200 OK", "3072\r\n") - shell_atoi()
+ * insists on a whole string being digits, which header values never are. */
+static int wget_atoi(const char *s) {
+    int v = 0;
+    if (!s) return -1;
+    while (*s == ' ' || *s == '\t') s++;
+    int neg = 0;
+    if (*s == '-') { neg = 1; s++; }
+    int any = 0;
+    while (*s >= '0' && *s <= '9') { v = v * 10 + (*s - '0'); s++; any = 1; }
+    if (!any) return -1;
+    return neg ? -v : v;
+}
+
+static const char *wget_find(const char *hay, const char *needle) {
+    if (!hay || !needle || !*needle) return NULL;
+    for (const char *p = hay; *p; p++) {
+        const char *a = p, *b = needle;
+        while (*a && *b && *a == *b) { a++; b++; }
+        if (*b == 0) return p;
+    }
+    return NULL;
+}
+
+static int wget_parse_url(const char *url, uint32_t *ip, uint16_t *port,
+                          char *path, uint32_t path_cap, char *host_out,
+                          uint32_t host_cap) {
+    extern int net_ip_from_str(const char *s, uint32_t *out);
+    const char *p = url;
+    if (strncmp(p, "http://", 7) != 0) return -1;
+    p += 7;
+    const char *host = p;
+    while (*p && *p != ':' && *p != '/') p++;
+    uint32_t hlen = (uint32_t)(p - host);
+    if (hlen == 0 || hlen >= host_cap) return -1;
+    memcpy(host_out, host, hlen);
+    host_out[hlen] = '\0';
+
+    uint16_t prt = 80;
+    if (*p == ':') {
+        p++;
+        uint32_t v = 0;
+        while (*p >= '0' && *p <= '9') { v = v * 10u + (uint32_t)(*p - '0'); p++; }
+        if (v == 0 || v > 65535u) return -1;
+        prt = (uint16_t)v;
+    }
+    if (*p != '/') return -1;
+    uint32_t n = 0;
+    while (*p && n + 1u < path_cap) path[n++] = *p++;
+    path[n] = '\0';
+    if (net_ip_from_str(host_out, ip) != 0) return -1;
+    *port = prt;
+    return 0;
+}
+
+int shell_cmd_wget(int argc, char **argv) {
+    extern int net_ready(void);
+    extern int tcp_connect(uint32_t ip, uint16_t port, int timeout_ms);
+    extern int tcp_send(int h, const void *data, uint32_t len);
+    extern int tcp_recv(int h, void *buf, uint32_t cap, int timeout_ms);
+    extern int tcp_close(int h);
+
+    if (argc < 2) {
+        shell_puts("usage: wget http://<ipv4>[:port]/<path> [outfile]\n"
+                   "   e.g. wget http://10.0.2.2:8089/hello.txt /mnt/fat/HELLO.TXT\n");
+        return -1;
+    }
+    if (!net_ready()) {
+        shell_puts("wget: network is not up\n");
+        return -1;
+    }
+
+    uint32_t ip = 0;
+    uint16_t port = 0;
+    char path[192];
+    char host[64];
+    if (wget_parse_url(argv[1], &ip, &port, path, sizeof(path), host, sizeof(host)) != 0) {
+        shell_printf("wget: bad url '%s' (expected http://<ipv4>[:port]/<path>)\n",
+                     argv[1]);
+        return -1;
+    }
+
+    /* Output file: explicit argument, else the URL's basename in the cwd. */
+    char out[256];
+    if (argc >= 3) {
+        shell_abspath(argv[2], out, sizeof(out));
+    } else {
+        const char *base = path;
+        for (const char *q = path; *q; q++)
+            if (*q == '/') base = q + 1;
+        if (*base == '\0') base = "index.html";
+        shell_abspath(base, out, sizeof(out));
+    }
+
+    static char req[512];
+    int rl = snprintf(req, sizeof(req),
+                      "GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: SutureOS-wget/1.0\r\n"
+                      "Connection: close\r\n\r\n", path, host);
+    if (rl <= 0 || (uint32_t)rl >= sizeof(req)) {
+        shell_puts("wget: request too long\n");
+        return -1;
+    }
+
+    shell_printf("wget: connecting to %s:%u\n", host, (unsigned)port);
+    int h = tcp_connect(ip, port, 5000);
+    if (h < 0) {
+        shell_printf("wget: connect FAILED (%d)\n", h);
+        return -1;
+    }
+    if (tcp_send(h, req, (uint32_t)rl) != 0) {
+        shell_puts("wget: send FAILED\n");
+        tcp_close(h);
+        return -1;
+    }
+
+    static uint8_t rx[1460];
+    static uint8_t hdr[2048];
+    uint32_t hdr_len = 0;
+    int header_done = 0;
+    int status = 0;
+    long content_len = -1;
+    uint32_t written = 0;
+
+    int fd = -1;
+    int rc = -1;
+    for (;;) {
+        int n = tcp_recv(h, rx, sizeof(rx), 5000);
+        if (n <= 0) break;
+
+        uint32_t off = 0;
+        if (!header_done) {
+            /* accumulate until the blank line that ends the headers */
+            for (int i = 0; i < n && !header_done; i++) {
+                if (hdr_len + 1u < sizeof(hdr)) hdr[hdr_len++] = rx[i];
+                if (hdr_len >= 4 && hdr[hdr_len - 4] == '\r' && hdr[hdr_len - 3] == '\n' &&
+                    hdr[hdr_len - 2] == '\r' && hdr[hdr_len - 1] == '\n') {
+                    header_done = 1;
+                }
+            }
+            if (!header_done) continue;
+            hdr[hdr_len] = '\0';
+            /* status line: HTTP/1.x NNN ... */
+            if (strncmp((char *)hdr, "HTTP/", 5) == 0) {
+                const char *sp = (const char *)hdr;
+                while (*sp && *sp != ' ') sp++;
+                if (*sp == ' ') status = wget_atoi(sp + 1);
+            }
+            const char *cl = wget_find((const char *)hdr, "Content-Length:");
+            if (cl) content_len = (long)wget_atoi(cl + 15);
+            shell_printf("wget: HTTP %d, content-length=%ld\n", status, content_len);
+            if (status != 200) {
+                shell_printf("wget: server returned %d, nothing written\n", status);
+                tcp_close(h);
+                return -1;
+            }
+            fd = vfs_open(out, VFS_O_WRONLY | VFS_O_CREAT | VFS_O_TRUNC);
+            if (fd < 0) {
+                shell_printf("wget: cannot create %s (%d)\n", out, fd);
+                tcp_close(h);
+                return -1;
+            }
+            /* bytes of this chunk that belong to the body: find the 4-byte
+             * header terminator inside rx */
+            uint32_t body_start = 0;
+            for (uint32_t i = 0; i + 3u < (uint32_t)n; i++) {
+                if (rx[i] == '\r' && rx[i + 1] == '\n' && rx[i + 2] == '\r' &&
+                    rx[i + 3] == '\n') {
+                    body_start = i + 4u;
+                    break;
+                }
+            }
+            off = body_start;
+        }
+
+        if (fd >= 0 && (uint32_t)n > off) {
+            int wr = vfs_write(fd, rx + off, (uint32_t)n - off);
+            if (wr <= 0) {
+                shell_printf("wget: write FAILED (%d)\n", wr);
+                break;
+            }
+            written += (uint32_t)wr;
+        }
+        if (content_len >= 0 && written >= (uint32_t)content_len) break;
+    }
+
+    if (fd >= 0) vfs_close(fd);
+    tcp_close(h);
+
+    if (fd < 0) {
+        shell_puts("wget: no response\n");
+        return -1;
+    }
+    if (content_len >= 0 && written != (uint32_t)content_len)
+        shell_printf("wget: WARNING short read (%u of %ld bytes)\n", (unsigned)written, content_len);
+    shell_printf("wget: wrote %u bytes to %s\n", (unsigned)written, out);
+    rc = ((content_len < 0) || written == (uint32_t)content_len) ? 0 : -1;
+    return rc;
 }
 
 int shell_cmd_tcpecho(int argc, char **argv) {
