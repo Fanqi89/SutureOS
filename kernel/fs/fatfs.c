@@ -70,6 +70,7 @@ struct fat32_vol {
 
 struct fatfs_file {
     int      used;
+    int      vol;
     uint32_t first_cluster;
     uint32_t size;
     char     path[64];
@@ -77,27 +78,35 @@ struct fatfs_file {
 
 struct fatfs_dir {
     int      used;
+    int      vol;
     uint32_t cluster;
     uint32_t entry;
     struct lfn_acc lfn;          /* pending LFN chain for the resumable readdir() */
     char     path[64];
 };
 
-static struct fat32_vol g_vol;
+/* Multi-volume support (v0.24.0): the core keeps one state block per mounted
+ * volume and a "current volume" pointer, so every existing path helper keeps
+ * working unchanged. The VFS adapter selects the volume of the mount the path
+ * belongs to before each call; file/dir handles remember their own volume. */
+#define FATFS_MAX_VOLS 4
+static struct fat32_vol g_vols[FATFS_MAX_VOLS];
+static struct fat32_vol *g_vol = &g_vols[0];
+static int g_cur_vol;
 static struct fatfs_file g_files[MAX_FILES];
 static struct fatfs_dir  g_dirs[MAX_DIRS];
 
 /* ==================== sector I/O ==================== */
 
 static int sec_read(uint32_t lba, uint8_t *buf) {
-    if (blk_read(g_vol.drive, lba, 1, buf) != 0) return FATFS_EIO;
+    if (blk_read(g_vol->drive, lba, 1, buf) != 0) return FATFS_EIO;
     return FATFS_OK;
 }
 
 static int sec_write_checked(uint32_t lba, const uint8_t *buf, uint8_t *vbuf,
                              const char *what, uint32_t at) {
-    if (blk_write(g_vol.drive, lba, 1, buf) != 0) return FATFS_EIO;
-    if (blk_read(g_vol.drive, lba, 1, vbuf) != 0) return FATFS_EIO;
+    if (blk_write(g_vol->drive, lba, 1, buf) != 0) return FATFS_EIO;
+    if (blk_read(g_vol->drive, lba, 1, vbuf) != 0) return FATFS_EIO;
     if (memcmp(buf, vbuf, 512) != 0) {
         for (int i = 0; i < 512; i++) {
             if (buf[i] != vbuf[i]) {
@@ -113,11 +122,11 @@ static int sec_write_checked(uint32_t lba, const uint8_t *buf, uint8_t *vbuf,
 }
 
 static uint32_t cluster_lba(uint32_t cl) {
-    return g_vol.data_lba + (cl - 2) * g_vol.spc;
+    return g_vol->data_lba + (cl - 2) * g_vol->spc;
 }
 
 static int cluster_valid(uint32_t cl) {
-    return cl >= 2 && cl < g_vol.total_clusters + 2;
+    return cl >= 2 && cl < g_vol->total_clusters + 2;
 }
 
 /* ==================== FAT access ==================== */
@@ -125,7 +134,7 @@ static int cluster_valid(uint32_t cl) {
 static int fat_get(uint32_t cl, uint8_t *scratch, uint32_t *out) {
     if (!cluster_valid(cl)) return FATFS_EINVAL;
     uint32_t off = cl * 4;
-    uint32_t lba = g_vol.fat_lba + off / 512;
+    uint32_t lba = g_vol->fat_lba + off / 512;
     int r = sec_read(lba, scratch);
     if (r != FATFS_OK) return r;
     uint32_t v;
@@ -139,8 +148,8 @@ static int fat_set(uint32_t cl, uint32_t value, uint8_t *scratch, uint8_t *vbuf,
                    const char *log) {
     uint32_t off = cl * 4;
     uint32_t rel = off / 512;
-    uint32_t lba1 = g_vol.fat_lba + rel;
-    uint32_t lba2 = g_vol.fat_lba + g_vol.fat_sz + rel;
+    uint32_t lba1 = g_vol->fat_lba + rel;
+    uint32_t lba2 = g_vol->fat_lba + g_vol->fat_sz + rel;
     uint32_t pos = off % 512;
 
     for (uint32_t lba = lba1; ; lba = lba2) {
@@ -158,11 +167,11 @@ static int fat_set(uint32_t cl, uint32_t value, uint8_t *scratch, uint8_t *vbuf,
 }
 
 static void fat_count_update(uint32_t old_val, uint32_t new_val) {
-    if (g_vol.free_clusters == 0xFFFFFFFFu) return;
+    if (g_vol->free_clusters == 0xFFFFFFFFu) return;
     if (old_val == FAT32_ENTRY_FREE && new_val != FAT32_ENTRY_FREE) {
-        if (g_vol.free_clusters > 0) g_vol.free_clusters--;
+        if (g_vol->free_clusters > 0) g_vol->free_clusters--;
     } else if (old_val != FAT32_ENTRY_FREE && new_val == FAT32_ENTRY_FREE) {
-        g_vol.free_clusters++;
+        g_vol->free_clusters++;
     }
 }
 
@@ -199,7 +208,7 @@ static int chain_free(uint32_t first, uint8_t *s, uint8_t *v) {
         if (r != FATFS_OK) return r;
         cl = next;
     }
-    g_vol.fsinfo_dirty = 1;
+    g_vol->fsinfo_dirty = 1;
     return FATFS_OK;
 }
 
@@ -207,12 +216,12 @@ static int chain_free(uint32_t first, uint8_t *s, uint8_t *v) {
  * LAST so a failure leaves a reclaimable prefix chain. */
 static int alloc_run(uint32_t n, uint8_t *s, uint8_t *v, uint32_t *out_first) {
     if (n == 0) { *out_first = FAT32_EOC; return FATFS_OK; }
-    if (g_vol.free_clusters != 0xFFFFFFFFu && g_vol.free_clusters < n) {
+    if (g_vol->free_clusters != 0xFFFFFFFFu && g_vol->free_clusters < n) {
         return FATFS_ENOSPC;
     }
 
     uint32_t run_start = 0, run_len = 0;
-    for (uint32_t cl = 2; cl < g_vol.total_clusters + 2; cl++) {
+    for (uint32_t cl = 2; cl < g_vol->total_clusters + 2; cl++) {
         uint32_t val;
         int r = fat_get(cl, s, &val);
         if (r != FATFS_OK) return r;
@@ -228,7 +237,7 @@ static int alloc_run(uint32_t n, uint8_t *s, uint8_t *v, uint32_t *out_first) {
     memset(v, 0, 512);
     for (uint32_t i = 0; i < n; i++) {
         uint32_t lba = cluster_lba(run_start + i);
-        for (uint32_t k = 0; k < g_vol.spc; k++) {
+        for (uint32_t k = 0; k < g_vol->spc; k++) {
             int r = sec_write_checked(lba + k, v, s, "zero-fill", lba + k);
             if (r != FATFS_OK) {
                 chain_free(run_start, s, v);
@@ -249,7 +258,7 @@ static int alloc_run(uint32_t n, uint8_t *s, uint8_t *v, uint32_t *out_first) {
         chain_free(run_start, s, v);
         return r;
     }
-    g_vol.fsinfo_dirty = 1;
+    g_vol->fsinfo_dirty = 1;
     *out_first = run_start;
     return FATFS_OK;
 }
@@ -442,7 +451,7 @@ static int dir_find_lfn(uint32_t dir_cl, const char *want, uint8_t *s,
     uint32_t cl = dir_cl;
     lfn_reset(&acc);
     while (cl >= 2 && cl < FAT32_EOC) {
-        for (uint32_t k = 0; k < g_vol.spc; k++) {
+        for (uint32_t k = 0; k < g_vol->spc; k++) {
             uint32_t lba = cluster_lba(cl) + k;
             int r = sec_read(lba, s);
             if (r != FATFS_OK) return r;
@@ -658,7 +667,7 @@ static int dir_alloc_run(uint32_t dir_cl, uint32_t count, uint8_t *s, uint8_t *v
     uint32_t cl = dir_cl;
     uint32_t prev_cl = 0;
     while (cl >= 2 && cl < FAT32_EOC) {
-        uint32_t slots = (g_vol.cluster_bytes / DIR_ENTRY_SIZE);
+        uint32_t slots = (g_vol->cluster_bytes / DIR_ENTRY_SIZE);
         uint32_t run = 0, run_start = 0;
         for (uint32_t i = 0; i < slots; i++) {
             uint32_t lba = cluster_lba(cl) + (i * DIR_ENTRY_SIZE) / 512u;
@@ -830,7 +839,7 @@ static int dir_find(uint32_t dir_cl, const char raw[11], uint8_t *s,
                     struct dir_slot *out, uint8_t *out_ent) {
     uint32_t cl = dir_cl;
     while (cl >= 2 && cl < FAT32_EOC) {
-        for (uint32_t k = 0; k < g_vol.spc; k++) {
+        for (uint32_t k = 0; k < g_vol->spc; k++) {
             uint32_t lba = cluster_lba(cl) + k;
             int r = sec_read(lba, s);
             if (r != FATFS_OK) return r;
@@ -894,7 +903,7 @@ static int resolve_component(uint32_t dir, const char *comp, uint8_t *s,
 static int path_resolve(const char *path, uint8_t *s, uint8_t *v,
                         uint32_t *out_parent, char out_raw[11]) {
     if (!path || path[0] != '/') return FATFS_EINVAL;
-    uint32_t dir = g_vol.root_cluster;
+    uint32_t dir = g_vol->root_cluster;
     const char *p = path;
 
     while (*p == '/') p++;
@@ -936,14 +945,14 @@ static int path_resolve(const char *path, uint8_t *s, uint8_t *v,
         if (r != FATFS_OK) return r;
         if (!(ent[11] & ATTR_DIR)) return FATFS_ENOTDIR;
         dir = ((uint32_t)ent[20] << 16) | ent[26];
-        if (dir == 0) dir = g_vol.root_cluster;
+        if (dir == 0) dir = g_vol->root_cluster;
     }
     (void)v;
     return FATFS_EINVAL;
 }
 
 int fatfs_stat(const char *path, uint32_t *size, int *is_dir) {
-    if (!g_vol.mounted) return FATFS_EBUSY;
+    if (!g_vol->mounted) return FATFS_EBUSY;
     uint8_t *s = lemis_heap_alloc(512);
     if (!s) return FATFS_ERR;
     uint8_t *v = lemis_heap_alloc(512);
@@ -978,10 +987,42 @@ int fatfs_stat(const char *path, uint32_t *size, int *is_dir) {
 
 static int is_pow2(uint32_t x) { return x && !(x & (x - 1)); }
 
+int fatfs_volume_count(void) {
+    int n = 0;
+    for (int i = 0; i < FATFS_MAX_VOLS; i++)
+        if (g_vols[i].mounted) n++;
+    return n;
+}
+
+/* Switch the current volume. Returns FATFS_OK when the slot is mounted. */
+int fatfs_select_volume(int slot) {
+    if (slot < 0 || slot >= FATFS_MAX_VOLS) return FATFS_EINVAL;
+    if (!g_vols[slot].mounted) return FATFS_EINVAL;
+    g_cur_vol = slot;
+    g_vol = &g_vols[slot];
+    return FATFS_OK;
+}
+
+int fatfs_current_volume(void) { return g_cur_vol; }
+
+/* Mount `drv` into the first free slot and return that slot (>= 0), or a
+ * negative fatfs error. Slot 0 doubles as the "first volume" for callers that
+ * only care about success - see fatfs_vfs.c. */
 int fatfs_mount(uint8_t drv, void *fs) {
     (void)fs;
-    if (g_vol.mounted && g_vol.drive == (int)drv) return FATFS_OK;
-    if (g_vol.mounted) return FATFS_EBUSY;
+    for (int i = 0; i < FATFS_MAX_VOLS; i++) {
+        if (g_vols[i].mounted && g_vols[i].drive == (int)drv) {
+            (void)fatfs_select_volume(i);
+            return i;
+        }
+    }
+    int slot = -1;
+    for (int i = 0; i < FATFS_MAX_VOLS; i++) {
+        if (!g_vols[i].mounted) { slot = i; break; }
+    }
+    if (slot < 0) return FATFS_EBUSY;
+    (void)fatfs_select_volume(slot);      /* not mounted yet: the fields below */
+    g_vol = &g_vols[slot];                /* are filled in directly */
 
     uint8_t *s = lemis_heap_alloc(512);
     if (!s) return FATFS_ERR;
@@ -1035,63 +1076,76 @@ int fatfs_mount(uint8_t drv, void *fs) {
         return FATFS_EINVAL;
     }
 
-    memset(&g_vol, 0, sizeof(g_vol));
-    g_vol.drive = (int)drv;
-    g_vol.fat_lba = reserved;
-    g_vol.fat_sz = fatsz32;
-    g_vol.data_lba = reserved + (uint32_t)nfats * fatsz32;
-    g_vol.root_cluster = root_clus;
-    g_vol.spc = spc;
-    g_vol.cluster_bytes = spc * 512;
-    g_vol.total_sectors = tot32;
-    g_vol.total_clusters = (uint32_t)clusters;
-    g_vol.fsinfo_lba = (fsinfo < tot32 && fsinfo != 0) ? fsinfo : 0;
-    g_vol.mounted = 1;
+    memset(g_vol, 0, sizeof(*g_vol));
+    g_vol->drive = (int)drv;
+    g_vol->fat_lba = reserved;
+    g_vol->fat_sz = fatsz32;
+    g_vol->data_lba = reserved + (uint32_t)nfats * fatsz32;
+    g_vol->root_cluster = root_clus;
+    g_vol->spc = spc;
+    g_vol->cluster_bytes = spc * 512;
+    g_vol->total_sectors = tot32;
+    g_vol->total_clusters = (uint32_t)clusters;
+    g_vol->fsinfo_lba = (fsinfo < tot32 && fsinfo != 0) ? fsinfo : 0;
+    g_vol->mounted = 1;
 
-    g_vol.free_clusters = 0xFFFFFFFFu;
-    if (g_vol.fsinfo_lba) {
-        if (sec_read(g_vol.fsinfo_lba, s) == FATFS_OK) {
+    g_vol->free_clusters = 0xFFFFFFFFu;
+    if (g_vol->fsinfo_lba) {
+        if (sec_read(g_vol->fsinfo_lba, s) == FATFS_OK) {
             uint32_t m1, m2, trail, free_cnt;
             memcpy(&m1, s + 0, 4);
             memcpy(&m2, s + 484, 4);
             memcpy(&trail, s + 508, 4);
             memcpy(&free_cnt, s + 488, 4);
             if (m1 == 0x41615252u && m2 == 0x61417272u && trail == 0xAA5555AAu) {
-                g_vol.free_clusters = free_cnt;
+                g_vol->free_clusters = free_cnt;
             }
         }
     }
-    if (g_vol.free_clusters == 0xFFFFFFFFu) {
+    if (g_vol->free_clusters == 0xFFFFFFFFu) {
         uint32_t cnt = 0;
-        for (uint32_t cl = 2; cl < g_vol.total_clusters + 2; cl++) {
+        for (uint32_t cl = 2; cl < g_vol->total_clusters + 2; cl++) {
             uint32_t val;
             if (fat_get(cl, s, &val) != FATFS_OK) { cnt = 0; break; }
             if (val == FAT32_ENTRY_FREE) cnt++;
         }
-        g_vol.free_clusters = cnt;
+        g_vol->free_clusters = cnt;
     }
 
     console_printf("[fat32] mount drive=%u lba0=0x%x spc=%u clusters=%u fat_lba=%u fat_sz=%u root=%u free=%u\n",
                    (uint64_t)drv, (uint64_t)lba0, (uint64_t)spc,
-                   (uint64_t)g_vol.total_clusters, (uint64_t)g_vol.fat_lba,
-                   (uint64_t)g_vol.fat_sz, (uint64_t)g_vol.root_cluster,
-                   (uint64_t)g_vol.free_clusters);
+                   (uint64_t)g_vol->total_clusters, (uint64_t)g_vol->fat_lba,
+                   (uint64_t)g_vol->fat_sz, (uint64_t)g_vol->root_cluster,
+                   (uint64_t)g_vol->free_clusters);
     lemis_heap_free(s);
-    return FATFS_OK;
+    return slot;
 }
 
 int fatfs_unmount(int drv) {
-    if (!g_vol.mounted || g_vol.drive != drv) return FATFS_EBUSY;
+    int slot = -1;
+    for (int i = 0; i < FATFS_MAX_VOLS; i++)
+        if (g_vols[i].mounted && g_vols[i].drive == drv) { slot = i; break; }
+    if (slot < 0) return FATFS_EBUSY;
+
+    (void)fatfs_select_volume(slot);
     fatfs_sync();
-    memset(&g_vol, 0, sizeof(g_vol));
-    memset(g_files, 0, sizeof(g_files));
-    memset(g_dirs, 0, sizeof(g_dirs));
-    console_printf("[fat32] unmounted drive=%u\n", (uint64_t)drv);
+    /* close handles that belong to this volume, then clear the state block */
+    for (int i = 0; i < MAX_FILES; i++)
+        if (g_files[i].used && g_files[i].vol == slot) g_files[i].used = 0;
+    for (int i = 0; i < MAX_DIRS; i++)
+        if (g_dirs[i].used && g_dirs[i].vol == slot) g_dirs[i].used = 0;
+    memset(&g_vols[slot], 0, sizeof(g_vols[slot]));
+    g_vol = &g_vols[0];
+    g_cur_vol = 0;
+    console_printf("[fat32] unmounted drive=%u (volumes left=%d)\n",
+                   (uint64_t)drv, (int64_t)fatfs_volume_count());
     return FATFS_OK;
 }
 
 int fatfs_vfs_init(void) {
-    memset(&g_vol, 0, sizeof(g_vol));
+    memset(g_vols, 0, sizeof(g_vols));
+    g_vol = &g_vols[0];
+    g_cur_vol = 0;
     memset(g_files, 0, sizeof(g_files));
     memset(g_dirs, 0, sizeof(g_dirs));
     return FATFS_OK;
@@ -1100,19 +1154,19 @@ int fatfs_vfs_init(void) {
 /* ==================== FSInfo ==================== */
 
 static int fsinfo_flush(uint8_t *s, uint8_t *v) {
-    if (!g_vol.fsinfo_dirty || !g_vol.fsinfo_lba) return FATFS_OK;
-    int r = sec_read(g_vol.fsinfo_lba, s);
+    if (!g_vol->fsinfo_dirty || !g_vol->fsinfo_lba) return FATFS_OK;
+    int r = sec_read(g_vol->fsinfo_lba, s);
     if (r != FATFS_OK) return r;
-    memcpy(s + 488, &g_vol.free_clusters, 4);
-    r = sec_write_checked(g_vol.fsinfo_lba, s, v, "fsinfo", 488);
-    if (r == FATFS_OK) g_vol.fsinfo_dirty = 0;
+    memcpy(s + 488, &g_vol->free_clusters, 4);
+    r = sec_write_checked(g_vol->fsinfo_lba, s, v, "fsinfo", 488);
+    if (r == FATFS_OK) g_vol->fsinfo_dirty = 0;
     return r;
 }
 
 /* ==================== file operations ==================== */
 
 int fatfs_open(const char *path, int create, fatfs_file_t **out) {
-    if (!g_vol.mounted) return FATFS_EBUSY;
+    if (!g_vol->mounted) return FATFS_EBUSY;
     if (!path || !out) return FATFS_EINVAL;
 
     struct fatfs_file *fh = NULL;
@@ -1168,6 +1222,7 @@ int fatfs_open(const char *path, int create, fatfs_file_t **out) {
     }
 
     fh->used = 1;
+    fh->vol = g_cur_vol;
     fh->first_cluster = ((uint32_t)ent[20] << 16) | ent[26];
     if (fh->first_cluster == 0) fh->first_cluster = FAT32_EOC;
     memcpy(&fh->size, ent + 28, 4);
@@ -1183,6 +1238,7 @@ out:
 }
 
 int fatfs_close(fatfs_file_t *f) {
+    (void)fatfs_select_volume(f->vol);
     if (!f || !f->used) return FATFS_EINVAL;
     f->used = 0;
     return FATFS_OK;
@@ -1211,15 +1267,16 @@ static int dirent_update(fatfs_file_t *f, uint8_t *s, uint8_t *v) {
 }
 
 int fatfs_read(fatfs_file_t *f, uint32_t off, void *buf, uint32_t len) {
+    (void)fatfs_select_volume(f->vol);
     if (!f || !f->used || !buf) return FATFS_EINVAL;
-    if (!g_vol.mounted) return FATFS_EBUSY;
+    if (!g_vol->mounted) return FATFS_EBUSY;
     if (off >= f->size) return 0;
     if (off + len > f->size) len = f->size - off;
 
     uint8_t *s = lemis_heap_alloc(512);
     if (!s) return FATFS_ERR;
 
-    uint32_t cb = g_vol.cluster_bytes;
+    uint32_t cb = g_vol->cluster_bytes;
     uint32_t done = 0;
     uint32_t cl_idx = off / cb;
     uint32_t cl_off = off % cb;
@@ -1247,8 +1304,9 @@ int fatfs_read(fatfs_file_t *f, uint32_t off, void *buf, uint32_t len) {
 }
 
 int fatfs_write(fatfs_file_t *f, uint32_t off, const void *buf, uint32_t len) {
+    (void)fatfs_select_volume(f->vol);
     if (!f || !f->used || !buf) return FATFS_EINVAL;
-    if (!g_vol.mounted) return FATFS_EBUSY;
+    if (!g_vol->mounted) return FATFS_EBUSY;
 
     uint8_t *s = lemis_heap_alloc(512);
     if (!s) return FATFS_ERR;
@@ -1256,7 +1314,7 @@ int fatfs_write(fatfs_file_t *f, uint32_t off, const void *buf, uint32_t len) {
     if (!v) { lemis_heap_free(s); return FATFS_ERR; }
 
     uint32_t end = off + len;
-    uint32_t need_clusters = (end + g_vol.cluster_bytes - 1) / g_vol.cluster_bytes;
+    uint32_t need_clusters = (end + g_vol->cluster_bytes - 1) / g_vol->cluster_bytes;
     if (need_clusters == 0) need_clusters = 1;
 
     uint32_t first = (f->first_cluster >= FAT32_EOC) ? 0 : f->first_cluster;
@@ -1265,7 +1323,7 @@ int fatfs_write(fatfs_file_t *f, uint32_t off, const void *buf, uint32_t len) {
     if (f->first_cluster >= FAT32_EOC) f->first_cluster = first;
 
     if (off > f->size) {
-        uint32_t cb = g_vol.cluster_bytes;
+        uint32_t cb = g_vol->cluster_bytes;
         uint32_t pos = f->size;
         while (pos < off) {
             uint32_t cl_idx = pos / cb;
@@ -1287,7 +1345,7 @@ int fatfs_write(fatfs_file_t *f, uint32_t off, const void *buf, uint32_t len) {
     }
 
     {
-        uint32_t cb = g_vol.cluster_bytes;
+        uint32_t cb = g_vol->cluster_bytes;
         uint32_t done = 0;
         uint32_t pos = off;
         const uint8_t *src = buf;
@@ -1321,8 +1379,9 @@ out:
 }
 
 int fatfs_truncate(fatfs_file_t *f, uint32_t new_size) {
+    (void)fatfs_select_volume(f->vol);
     if (!f || !f->used) return FATFS_EINVAL;
-    if (!g_vol.mounted) return FATFS_EBUSY;
+    if (!g_vol->mounted) return FATFS_EBUSY;
 
     uint8_t *s = lemis_heap_alloc(512);
     if (!s) return FATFS_ERR;
@@ -1337,7 +1396,7 @@ int fatfs_truncate(fatfs_file_t *f, uint32_t new_size) {
         }
         f->size = 0;
     } else if (new_size < f->size) {
-        uint32_t cb = g_vol.cluster_bytes;
+        uint32_t cb = g_vol->cluster_bytes;
         uint32_t keep = (new_size + cb - 1) / cb;
         uint32_t cl_idx = keep - 1;
         uint32_t cl;
@@ -1384,7 +1443,8 @@ int fatfs_truncate(fatfs_file_t *f, uint32_t new_size) {
 /* ==================== directory operations ==================== */
 
 int fatfs_opendir(const char *path, fatfs_dir_t **out) {
-    if (!g_vol.mounted) return FATFS_EBUSY;
+    const int dir_vol = g_cur_vol;   /* record before any switch */
+    if (!g_vol->mounted) return FATFS_EBUSY;
     if (!path || !out) return FATFS_EINVAL;
 
     struct fatfs_dir *d = NULL;
@@ -1394,7 +1454,7 @@ int fatfs_opendir(const char *path, fatfs_dir_t **out) {
     if (!d) return FATFS_ERR;
 
     if (strcmp(path, "/") == 0) {
-        d->cluster = g_vol.root_cluster;
+        d->cluster = g_vol->root_cluster;
     } else {
         uint32_t size;
         int is_dir = 0;
@@ -1417,10 +1477,11 @@ int fatfs_opendir(const char *path, fatfs_dir_t **out) {
         lemis_heap_free(v);
         if (r != FATFS_OK) return r;
         d->cluster = ((uint32_t)ent[20] << 16) | ent[26];
-        if (d->cluster == 0) d->cluster = g_vol.root_cluster;
+        if (d->cluster == 0) d->cluster = g_vol->root_cluster;
     }
 
     d->used = 1;
+    d->vol = dir_vol;
     d->entry = 0;
     strncpy(d->path, path, sizeof(d->path) - 1);
     d->path[sizeof(d->path) - 1] = '\0';
@@ -1430,8 +1491,9 @@ int fatfs_opendir(const char *path, fatfs_dir_t **out) {
 
 int fatfs_readdir(fatfs_dir_t *d, char *name, uint32_t name_cap,
                   uint32_t *size, int *is_dir) {
+    (void)fatfs_select_volume(d->vol);
     if (!d || !d->used || !name) return FATFS_EINVAL;
-    if (!g_vol.mounted) return FATFS_EBUSY;
+    if (!g_vol->mounted) return FATFS_EBUSY;
 
     uint8_t *s = lemis_heap_alloc(512);
     if (!s) return FATFS_ERR;
@@ -1439,7 +1501,7 @@ int fatfs_readdir(fatfs_dir_t *d, char *name, uint32_t name_cap,
     int r = FATFS_ENOTFOUND;
     uint32_t idx = d->entry;
     uint32_t cl = d->cluster;
-    uint32_t per_cl = g_vol.cluster_bytes / DIR_ENTRY_SIZE;
+    uint32_t per_cl = g_vol->cluster_bytes / DIR_ENTRY_SIZE;
 
     while (cl >= 2 && cl < FAT32_EOC) {
         if (idx >= per_cl) {
@@ -1495,13 +1557,14 @@ out:
 }
 
 int fatfs_closedir(fatfs_dir_t *d) {
+    (void)fatfs_select_volume(d->vol);
     if (!d || !d->used) return FATFS_EINVAL;
     d->used = 0;
     return FATFS_OK;
 }
 
 int fatfs_mkdir(const char *path) {
-    if (!g_vol.mounted) return FATFS_EBUSY;
+    if (!g_vol->mounted) return FATFS_EBUSY;
     uint32_t sz;
     int is_dir = 0;
     if (fatfs_stat(path, &sz, &is_dir) == FATFS_OK) return FATFS_EBUSY;
@@ -1536,7 +1599,7 @@ int fatfs_mkdir(const char *path) {
     memset(dotdot, ' ', 11);
     dotdot[0] = '.'; dotdot[1] = '.';
     dotdot[11] = ATTR_DIR;
-    uint32_t p = (parent == g_vol.root_cluster) ? 0 : parent;
+    uint32_t p = (parent == g_vol->root_cluster) ? 0 : parent;
     dotdot[20] = (uint8_t)(p >> 16); dotdot[21] = (uint8_t)(p >> 24);
     dotdot[26] = (uint8_t)p; dotdot[27] = (uint8_t)(p >> 8);
     r = sec_write_checked(cluster_lba(cl), s, v, path, cluster_lba(cl));
@@ -1555,7 +1618,7 @@ out:
 }
 
 int fatfs_rmdir(const char *path) {
-    if (!g_vol.mounted) return FATFS_EBUSY;
+    if (!g_vol->mounted) return FATFS_EBUSY;
     if (strcmp(path, "/") == 0) return FATFS_EINVAL;
 
     uint32_t size;
@@ -1582,7 +1645,7 @@ int fatfs_rmdir(const char *path) {
 
     {
         uint32_t idx = 0;
-        uint32_t per_cl = g_vol.cluster_bytes / DIR_ENTRY_SIZE;
+        uint32_t per_cl = g_vol->cluster_bytes / DIR_ENTRY_SIZE;
         uint32_t dcl = cl;
         r = FATFS_OK;
         while (dcl >= 2 && dcl < FAT32_EOC) {
@@ -1628,7 +1691,7 @@ out:
 }
 
 int fatfs_unlink(const char *path) {
-    if (!g_vol.mounted) return FATFS_EBUSY;
+    if (!g_vol->mounted) return FATFS_EBUSY;
     uint32_t size;
     int is_dir = 0;
     int r = fatfs_stat(path, &size, &is_dir);
@@ -1702,7 +1765,7 @@ static void path_split(const char *path, char *dir, uint32_t cap, const char **b
 
 static int resolve_dir_cluster(const char *dirpath, uint8_t *s, uint8_t *v,
                                uint32_t *out_cl) {
-    if (strcmp(dirpath, "/") == 0) { *out_cl = g_vol.root_cluster; return FATFS_OK; }
+    if (strcmp(dirpath, "/") == 0) { *out_cl = g_vol->root_cluster; return FATFS_OK; }
     uint32_t parent;
     char raw[11];
     int r = path_resolve(dirpath, s, v, &parent, raw);
@@ -1713,12 +1776,12 @@ static int resolve_dir_cluster(const char *dirpath, uint8_t *s, uint8_t *v,
     if (r != FATFS_OK) return r;
     if (!(ent[11] & ATTR_DIR)) return FATFS_ENOTDIR;
     uint32_t cl = ((uint32_t)ent[20] << 16) | ent[26];
-    *out_cl = (cl == 0) ? g_vol.root_cluster : cl;
+    *out_cl = (cl == 0) ? g_vol->root_cluster : cl;
     return FATFS_OK;
 }
 
 int fatfs_rename(const char *old_path, const char *new_path) {
-    if (!g_vol.mounted) return FATFS_EBUSY;
+    if (!g_vol->mounted) return FATFS_EBUSY;
     if (!old_path || !new_path || old_path[0] != '/' || new_path[0] != '/')
         return FATFS_EINVAL;
 
@@ -1762,7 +1825,7 @@ int fatfs_rename(const char *old_path, const char *new_path) {
             /* Collect the chain that sits in front of the short entry: walk the
              * directory again with the same resumable scan readdir uses. */
             uint32_t idx = 0;
-            uint32_t per_cl = g_vol.cluster_bytes / DIR_ENTRY_SIZE;
+            uint32_t per_cl = g_vol->cluster_bytes / DIR_ENTRY_SIZE;
             uint32_t cl = old_cl;
             int done = 0;
             while (!done && cl >= 2 && cl < FAT32_EOC) {
@@ -1819,7 +1882,7 @@ out:
     return r;
 }
 
-int fatfs_sync(void) {    if (!g_vol.mounted) return FATFS_EBUSY;
+int fatfs_sync(void) {    if (!g_vol->mounted) return FATFS_EBUSY;
     uint8_t *s = lemis_heap_alloc(512);
     if (!s) return FATFS_ERR;
     uint8_t *v = lemis_heap_alloc(512);
@@ -1831,14 +1894,14 @@ int fatfs_sync(void) {    if (!g_vol.mounted) return FATFS_EBUSY;
 }
 
 int fatfs_get_free_space(uint64_t *free_bytes, uint64_t *total_bytes) {
-    if (!g_vol.mounted) return FATFS_EBUSY;
+    if (!g_vol->mounted) return FATFS_EBUSY;
     if (free_bytes) {
-        *free_bytes = (g_vol.free_clusters == 0xFFFFFFFFu)
+        *free_bytes = (g_vol->free_clusters == 0xFFFFFFFFu)
                       ? 0
-                      : (uint64_t)g_vol.free_clusters * g_vol.cluster_bytes;
+                      : (uint64_t)g_vol->free_clusters * g_vol->cluster_bytes;
     }
     if (total_bytes) {
-        *total_bytes = (uint64_t)g_vol.total_clusters * g_vol.cluster_bytes;
+        *total_bytes = (uint64_t)g_vol->total_clusters * g_vol->cluster_bytes;
     }
     return FATFS_OK;
 }

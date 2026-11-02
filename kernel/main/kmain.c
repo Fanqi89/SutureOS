@@ -430,9 +430,9 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
 
     /* ---- USB mass storage: FAT32 volume at /mnt/usb ----------------------
      * Only runs when usb_probe() actually registered a device, so a machine
-     * without a stick never reaches this block. fatfs keeps one volume at a
-     * time (its g_vol), so if the disk above already mounted /mnt/fat this
-     * mount reports EBUSY instead of silently stealing the volume. */
+     * without a stick never reaches this block. Since v0.24.0 the FAT32 driver
+     * keeps one state block per mounted volume, so /mnt/usb and /mnt/fat can be
+     * live at the same time (EBUSY would now mean a real resource limit). */
     {
         extern int usb_present(void);
         extern int usb_drive(void);
@@ -447,12 +447,11 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
                 console_printf("[usb] mount /mnt/usb OK (drive %d)\n",
                                (int64_t)ud);
             else if (r == VFS_EBUSY)
-                /* fatfs keeps a single volume (its g_vol): when another FAT32
-                 * disk already mounted /mnt/fat this is a filesystem-layer
-                 * limit, not a USB failure - say so instead of leaving a bare
-                 * error code in the log. */
-                console_printf("[usb] mount /mnt/usb skipped: fatfs keeps one "
-                               "volume and /mnt/fat already owns it (mount=%d)\n",
+                /* Only reachable when the FAT32 volume table is exhausted or the
+                 * same drive is already mounted elsewhere - report it, do not
+                 * pretend the stick mounted. */
+                console_printf("[usb] mount /mnt/usb skipped: filesystem volume "
+                               "table full or drive busy (mount=%d)\n",
                                (int64_t)r);
             else
                 console_printf("[usb] mount /mnt/usb FAILED (mount=%d)\n",

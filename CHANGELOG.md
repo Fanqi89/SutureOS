@@ -6,6 +6,31 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.24.0-alpha]
+
+**FAT32 驱动支持多卷：`/mnt/fat`（IDE）与 `/mnt/usb`（U 盘）同一次启动里同时可读可写，
+移除 v0.23.0 里如实标注的"fatfs 单卷"限制；宿主解析两个镜像证明写入落在正确卷。
+启动呈现与 GUI 外观不变。**
+
+### Changed
+- `kernel/fs/fatfs.c`：单卷 `g_vol` → `g_vols[4]` + 当前卷指针；新增
+  `fatfs_select_volume/fatfs_current_volume/fatfs_volume_count`；`fatfs_mount()` 返回卷槽号；
+  `fatfs_unmount(drive)` 按驱动器清槽并关闭该卷句柄；文件/目录句柄记录所属卷。
+- `kernel/fs/fatfs_vfs.c`：挂载点表 `g_mnts[4]` + 前缀匹配 `vol_path()`，每操作先选卷。
+- `kernel/main/kmain.c`：USB 挂载段的卷限制文案更新。
+
+### Added
+- `scripts/multivol_acceptance.py`：双卷同挂 + 交叉写 + 宿主侧两镜像逐字节校验。
+
+### Verification
+- 双卷同挂并各自 `ls`/`cat` 正确；`/mnt/fat` 挂着时写 `/mnt/usb/mv.txt` 成功 → 宿主
+  U 盘镜像内容逐字节一致、IDE 卷内容不变 → **12/12 PASS**。
+- 单卷回归：FAT32 宿主 21/21、USB 宿主 5/5、内核 13/14、终端中文 10/10、wget 8/8、
+  GUI 外观门禁 0 像素。
+
+### Limits
+- 卷槽上限 4；挂载点不可嵌套；句柄表仍全局 8+8；ext2/squashfs 仍单卷；无新增并发锁。
+
 ## [v0.23.0-alpha]
 
 **第一次把 U 盘当盘用：EHCI（USB 2.0）主控 + 高速枚举 + BOT/SCSI 读写 → 块设备 drive 16 →

@@ -36,8 +36,12 @@ typedef enum fatfs_err {
     FATFS_EEXIST       = -11,  /* rename target already present */
 } fatfs_err_t;
 
-/* Volume lifecycle */
+/* Volume lifecycle. fatfs_mount() returns the volume slot (>= 0) or a negative
+ * error, so several FAT32 volumes can be mounted at once (v0.24.0). */
 int fatfs_mount(uint8_t drv, void *fs);
+int fatfs_select_volume(int slot);
+int fatfs_current_volume(void);
+int fatfs_volume_count(void);
 int fatfs_unmount(int drv);
 int fatfs_vfs_init(void);
 
