@@ -2,7 +2,7 @@
 
 > **一个由 16 个爱好者操作系统项目拼接而成的 x86_64 单内核操作系统**
 > 
-> 当前版本：**v0.28.0-alpha** · 内核编译 **105** 个源文件（源码树约 220 个 C/H/ASM、约 6.0 万行）
+> 当前版本：**v0.29.0-alpha** · 内核编译 **105** 个源文件（源码树约 220 个 C/H/ASM、约 6.0 万行）
 > · 内核 ELF 约 **2.06 MB**（含调试符号）· 可引导 ISO 约 **15.0 MB** · **GPL-3.0** 许可证
 >
 > 移植与许可说明：[`docs/provenance.md`](docs/provenance.md)（模块→上游·文件路径）
@@ -74,6 +74,7 @@ SutureOS（缝合怪系统）是一个实验性的 x86_64 单内核操作系统�
 | v0.26.0 | **命令行文本工具**（wc/head/tail/grep/stat） | SutureOS 自有（GPL-3.0） | `kernel/shell/shell.c`、`scripts/textutils_acceptance.py` | ✅ 造文件+五命令断言+宿主逐字节 7/7 |
 | v0.27.0 | **Intel HDA 音频**（真实出声） | PlantOS（MIT）hda.c 骨架 | `kernel/drivers/hda.c`、`scripts/verify_hda_wav.py` | ✅ 宿主 WAV 48000/2ch/1.002 s/440.01 Hz 6/6 |
 | v0.28.0 | **`sync` 命令**（写盘不再必须 umount） | SutureOS 自有（GPL-3.0） | `kernel/shell/shell.c`、`scripts/sync_acceptance.py` | ✅ 不卸载 + 宿主逐字节 6/6 |
+| v0.29.0 | **EXT2 多卷**（双卷同时挂载 + 跨卷写入修复） | SutureOS 自有（GPL-3.0） | `kernel/fs/ext2.c`、`ext2_vfs.c`、`scripts/multivol_ext2_acceptance.py` | ✅ 宿主双镜像 40/40+35/35 + 无串卷 12/12 |
 
 ---
 

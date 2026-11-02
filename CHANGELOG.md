@@ -6,6 +6,31 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.29.0-alpha]
+
+**EXT2 支持多卷（两个卷同时挂载、独立读写）；同时修掉上一轮暴露的跨卷写入 bug：
+O_CREAT 写句柄漏记所属卷，导致写入落到第一个卷并覆盖其数据块。宿主双镜像验证
+"卷 2 拿到写入、卷 1 一字未变"。启动呈现与 GUI 外观未变。**
+
+### Fixed
+- `kernel/fs/ext2.c`：所有句柄认领点（只读 open / O_CREAT 写 open / opendir）都记录
+  `f->vol = g_cur_ext2_vol`——缺失的那一处让所有写操作都切到卷 0，串卷覆盖卷 0 的数据。
+
+### Added
+- `kernel/fs/ext2.c/.h`：`g_ext2_fss[4]` + 当前卷指针；`ext2_select_volume / current_volume /
+  volume_count / unmount_drive`；`ext2_mount`、`ext2_mount_ramdisk` 返回卷槽号；句柄带 vol。
+- `kernel/fs/ext2_vfs.c`：挂载点表 `g_ext2_mnts[4]` + 每操作选卷；unmount 按挂载点定位；
+  VFS 写自检改用挂载点表。
+- `scripts/multivol_ext2_acceptance.py`：双 ext2 卷 + 交叉写 + 宿主双镜像逐字节（含"卷 1 不得含卷 2 文本"断言）。
+
+### Verification
+- `mount ext2 4 /mnt/e2`（AHCI drive 4）→ 两卷独立 ls/cat → 写卷 2 + umount →
+  宿主卷 1 写验证器 **40/40**、卷 2 fixture **35/35**、卷 2 变化 48 字节、卷 1 无卷 2 文本
+  → **12/12 PASS**；内核 13/14、FAT32 宿主 21/21、GUI 外观门禁 0 像素。
+
+### Limits
+- 卷槽 4；挂载点不可嵌套；句柄表 8+8；仅 ext2；squashfs 仍单卷；第二卷需在 AHCI/NVMe/VirtIO 上。
+
 ## [v0.28.0-alpha]
 
 **新增 `sync`：写盘不再必须 umount（FAT32 FSInfo / ext2 计数是延迟写的）。验收刻意不卸载，

@@ -62,4 +62,5 @@
 | B11 | v0.26.0-alpha | **命令行文本工具**（wc/head/tail/grep/stat） | SutureOS 自有（GPL-3.0） | shell 造多行文件 + 五命令断言 + 宿主 FAT32 逐字节 **7/7** | ✅ 本轮完成 |
 | B9 | v0.27.0-alpha | **Intel HDA 音频**（控制器 + codec 枚举 + BDL 播放） | PlantOS（MIT）hda.c 骨架 | 宿主 WAV 校验 48000 Hz/2ch/16bit/1.002 s/0.5000 FS/440.01 Hz **6/6** | ✅ 本轮完成 |
 | B12 | v0.28.0-alpha（部分） | **`sync` 命令**（多卷挂载表遍历 flush） | SutureOS 自有（GPL-3.0） | 不 umount + 宿主 FAT32 逐字节 **6/6** | ✅ 本轮完成 |
-| B13 | 下一批（未发） | **ext2/squashfs 多卷**（与 FAT32 同款） | SutureOS 自有 | ⚠️ 已实现但回退：宿主写验证器在卷 1 报 `artifact content byte-exact`（/WRT_KEEP.BIN 首字节不符），怀疑多卷切换下写路径串卷；复现：`mkfs_ext2_testimg.py` → QEMU `-hdb build/ext2.img -device ich9-ahci ... -device ide-hd,drive=e2,bus=ahci.0`（4k 卷打到 AHCI drive 4）→ shell `mount ext2 4 /mnt/e2` → `verify_ext2_write.py build/ext2.img --clean <pristine>` 失败 | ⏳ 待查根因 |
+| B13 | v0.29.0-alpha | **EXT2 多卷**（双卷同挂 + 跨卷写入根因修复） | SutureOS 自有 | 卷 1 写验证器 40/40、卷 2 fixture 35/35、卷 2 变化 48B、卷 1 无卷 2 文本 → **12/12** | ✅ 本轮完成 |
+| B14 | 下一批 | **squashfs 多卷**（照 ext2/FAT32 的模式） | SutureOS 自有 | 双 squashfs 镜像同时挂载 + 各自 ls/cat + 读校验 83/83 不回归 | ⏳ 待做 |

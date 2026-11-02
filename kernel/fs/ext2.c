@@ -60,7 +60,27 @@
 
 /* ==================== volume state ==================== */
 
-struct ext2_fs g_ext2_fs = {0};
+#define EXT2_MAX_VOLS 4
+static struct ext2_fs g_ext2_fss[EXT2_MAX_VOLS];
+struct ext2_fs *g_ext2_fs = &g_ext2_fss[0];
+static int g_cur_ext2_vol;
+
+int ext2_select_volume(int slot) {
+    if (slot < 0 || slot >= EXT2_MAX_VOLS) return EXT2_EINVAL;
+    if (!g_ext2_fss[slot].mounted) return EXT2_EBUSY;
+    g_cur_ext2_vol = slot;
+    g_ext2_fs = &g_ext2_fss[slot];
+    return EXT2_OK;
+}
+
+int ext2_current_volume(void) { return g_cur_ext2_vol; }
+
+int ext2_volume_count(void) {
+    int n = 0;
+    for (int i = 0; i < EXT2_MAX_VOLS; i++)
+        if (g_ext2_fss[i].mounted) n++;
+    return n;
+}
 
 /* The registered RAM image survives mount/unmount; it belongs to the caller. */
 static const uint8_t *g_ram_image = NULL;
@@ -171,7 +191,7 @@ uint32_t ext2_crc32(const void *data, uint32_t len) {
 /* One whole filesystem block. The RAM path ignores start_lba (the image IS the
  * volume); the block path reads sector-aligned ranges from the block layer. */
 static int ext2_dev_read_block(uint32_t block, void *buf) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     if (!buf) return EXT2_EINVAL;
     if (fs->ram) {
         uint64_t off = (uint64_t)block * fs->block_size;
@@ -194,7 +214,7 @@ static int ext2_dev_read_block(uint32_t block, void *buf) {
 
 /* The superblock always starts at byte offset 1024. */
 static int ext2_read_superblock_bytes(uint8_t *out) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     if (fs->ram) {
         if (fs->ram_size < EXT2_SUPERBLOCK_OFFSET + EXT2_SUPERBLOCK_SIZE) return EXT2_EIO;
         memcpy(out, fs->ram + EXT2_SUPERBLOCK_OFFSET, EXT2_SUPERBLOCK_SIZE);
@@ -207,7 +227,7 @@ static int ext2_read_superblock_bytes(uint8_t *out) {
 /* ==================== lifecycle ==================== */
 
 static void ext2_teardown(void) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     if (fs->bgdt) {
         lemis_heap_free(fs->bgdt);
         fs->bgdt = NULL;
@@ -249,13 +269,29 @@ int ext2_ramdisk_registered(void) {
 }
 
 int ext2_mount(int drive, uint32_t start_lba) {
+    int slot = -1;
+    for (int i = 0; i < EXT2_MAX_VOLS; i++) {
+        if (g_ext2_fss[i].mounted && g_ext2_fss[i].drive == drive) {
+            (void)ext2_select_volume(i);
+            return i;
+        }
+    }
+    for (int i = 0; i < EXT2_MAX_VOLS; i++) {
+        if (!g_ext2_fss[i].mounted) { slot = i; break; }
+    }
+    if (slot < 0) return EXT2_EBUSY;
+
+    g_cur_ext2_vol = slot;
+    g_ext2_fs = &g_ext2_fss[slot];
     ext2_teardown();
-    g_ext2_fs.drive = drive;
-    g_ext2_fs.start_lba = start_lba;
-    g_ext2_fs.ram = NULL;
-    g_ext2_fs.ram_w = NULL;
-    g_ext2_fs.ram_size = 0;
-    return ext2_mount_current_device();
+    g_ext2_fs->drive = drive;
+    g_ext2_fs->start_lba = start_lba;
+    g_ext2_fs->ram = NULL;
+    g_ext2_fs->ram_w = NULL;
+    g_ext2_fs->ram_size = 0;
+    int r = ext2_mount_current_device();
+    if (r != EXT2_OK) return r;
+    return slot;
 }
 
 /* A RAM image is writable through the const-cast below: the caller handed us a
@@ -264,13 +300,22 @@ int ext2_mount(int drive, uint32_t start_lba) {
  * a caller that needs a read-only RAM volume can simply never mount it rw. */
 int ext2_mount_ramdisk(void) {
     if (!g_ram_image) return ext2_mount_fail("no ramdisk registered");
+    int slot = -1;
+    for (int i = 0; i < EXT2_MAX_VOLS; i++) {
+        if (!g_ext2_fss[i].mounted) { slot = i; break; }
+    }
+    if (slot < 0) return EXT2_EBUSY;
+    g_cur_ext2_vol = slot;
+    g_ext2_fs = &g_ext2_fss[slot];
     ext2_teardown();
-    g_ext2_fs.ram = g_ram_image;
-    g_ext2_fs.ram_w = (uint8_t *)g_ram_image;
-    g_ext2_fs.ram_size = g_ram_image_size;
-    g_ext2_fs.drive = -1;
-    g_ext2_fs.start_lba = 0;
-    return ext2_mount_current_device();
+    g_ext2_fs->ram = g_ram_image;
+    g_ext2_fs->ram_w = (uint8_t *)g_ram_image;
+    g_ext2_fs->ram_size = g_ram_image_size;
+    g_ext2_fs->drive = -1;
+    g_ext2_fs->start_lba = 0;
+    int r = ext2_mount_current_device();
+    if (r != EXT2_OK) return r;
+    return slot;
 }
 
 int ext2_unmount(void) {
@@ -278,11 +323,31 @@ int ext2_unmount(void) {
     return EXT2_OK;
 }
 
-int ext2_is_mounted(void) { return g_ext2_fs.mounted; }
-uint32_t ext2_block_size(void) { return g_ext2_fs.block_size; }
+/* Unmount the volume mounted from `drive` (>= 0) and clear its slot. */
+int ext2_unmount_drive(int drive) {
+    for (int i = 0; i < EXT2_MAX_VOLS; i++) {
+        if (g_ext2_fss[i].mounted && g_ext2_fss[i].drive == drive) {
+            (void)ext2_select_volume(i);
+            ext2_teardown();
+            for (int k = 0; k < EXT2_MAX_OPEN_FILES; k++)
+                if (g_files[k].used && g_files[k].vol == i) g_files[k].used = 0;
+            for (int k = 0; k < EXT2_MAX_OPEN_DIRS; k++)
+                if (g_dirs[k].used && g_dirs[k].vol == i) g_dirs[k].used = 0;
+            g_ext2_fs = &g_ext2_fss[0];
+            g_cur_ext2_vol = 0;
+            console_printf("[ext2] unmounted drive=%d (volumes left=%d)\n",
+                           (int64_t)drive, (int64_t)ext2_volume_count());
+            return EXT2_OK;
+        }
+    }
+    return EXT2_EBUSY;
+}
+
+int ext2_is_mounted(void) { return g_ext2_fs->mounted; }
+uint32_t ext2_block_size(void) { return g_ext2_fs->block_size; }
 
 static int ext2_mount_current_device(void) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     uint8_t *sb_bytes;
     int r;
 
@@ -495,16 +560,16 @@ static int ext2_mount_current_device(void) {
 
 int ext2_read_block_raw(uint32_t block, void *buf) {
     if (!buf) return EXT2_EINVAL;
-    if (!g_ext2_fs.mounted) return EXT2_EBUSY;
-    if (block >= g_ext2_fs.blocks_count) {
-        ext2_warn2("block read out of range", block, g_ext2_fs.blocks_count);
+    if (!g_ext2_fs->mounted) return EXT2_EBUSY;
+    if (block >= g_ext2_fs->blocks_count) {
+        ext2_warn2("block read out of range", block, g_ext2_fs->blocks_count);
         return EXT2_EINVAL;
     }
     return ext2_dev_read_block(block, buf);
 }
 
 static int ext2_read_inode_raw(uint32_t ino, struct ext2_inode *out) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     uint32_t group, index, byte_off, blk, off;
     uint8_t *buf;
     int r;
@@ -546,7 +611,7 @@ static int ext2_read_inode_raw(uint32_t ino, struct ext2_inode *out) {
 }
 
 int ext2_read_inode(uint32_t ino, struct ext2_inode *out) {
-    if (!g_ext2_fs.mounted) return EXT2_EBUSY;
+    if (!g_ext2_fs->mounted) return EXT2_EBUSY;
     return ext2_read_inode_raw(ino, out);
 }
 
@@ -554,9 +619,9 @@ int ext2_read_inode(uint32_t ino, struct ext2_inode *out) {
  * treated as a hole after a warning (never fault, never read block 0). */
 static uint32_t ext2_check_ptr(uint32_t blk) {
     if (blk == 0) return 0;
-    if (blk >= g_ext2_fs.blocks_count) {
+    if (blk >= g_ext2_fs->blocks_count) {
         ext2_warn2("data block pointer out of range, treating as a hole", blk,
-                   g_ext2_fs.blocks_count);
+                   g_ext2_fs->blocks_count);
         return 0;
     }
     return blk;
@@ -566,7 +631,7 @@ static uint32_t ext2_check_ptr(uint32_t blk) {
  * Depth is bounded: direct, one table, two tables, three tables - never
  * recursive, so a corrupt pointer chain cannot loop. */
 static uint32_t ext2_bmap(const struct ext2_inode *in, uint64_t logical, uint8_t *scratch) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     const uint64_t ptrs = fs->ptrs_per_block;
     uint64_t idx;
     uint32_t cur;
@@ -617,7 +682,7 @@ static uint32_t ext2_bmap(const struct ext2_inode *in, uint64_t logical, uint8_t
  * is never read). scratch must hold one filesystem block. */
 static int ext2_inode_read(const struct ext2_inode *in, void *buf, uint32_t offset,
                            uint32_t size, uint8_t *scratch) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     uint8_t *dst = (uint8_t *)buf;
     uint32_t file_size = in->i_size;
     uint32_t done = 0;
@@ -652,7 +717,7 @@ static int ext2_inode_read(const struct ext2_inode *in, void *buf, uint32_t offs
  * Returns EXT2_OK, EXT2_ENOENT (not found) or a negative error. */
 static int ext2_dir_find(const struct ext2_inode *dir, const char *name, uint32_t name_len,
                          uint32_t *out_ino, uint8_t *out_type) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     uint32_t blocks = (dir->i_size + fs->block_size - 1) / fs->block_size;
     uint32_t has_ftype = (fs->sb.s_feature_incompat & EXT2_FEATURE_INCOMPAT_FILETYPE) != 0;
     uint8_t *scratch = (uint8_t *)lemis_heap_alloc(fs->block_size);
@@ -748,7 +813,7 @@ static int ext2_resolve(const char *path, uint32_t *out_ino, struct ext2_inode *
 /* ==================== public file API ==================== */
 
 int ext2_lookup(const char *path, uint32_t *out_ino) {
-    if (!g_ext2_fs.mounted) return EXT2_EBUSY;
+    if (!g_ext2_fs->mounted) return EXT2_EBUSY;
     if (!out_ino) return EXT2_EINVAL;
     return ext2_resolve(path, out_ino, NULL);
 }
@@ -758,7 +823,7 @@ int ext2_stat(const char *path, struct ext2_stat *out) {
     struct ext2_inode in;
     int r;
 
-    if (!g_ext2_fs.mounted) return EXT2_EBUSY;
+    if (!g_ext2_fs->mounted) return EXT2_EBUSY;
     if (!out) return EXT2_EINVAL;
     r = ext2_resolve(path, &ino, &in);
     if (r != EXT2_OK) return r;
@@ -783,7 +848,7 @@ int ext2_stat(const char *path, struct ext2_stat *out) {
 }
 
 int ext2_read_file(uint32_t ino, void *buf, uint32_t offset, uint32_t size) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     struct ext2_inode in;
     uint8_t *scratch;
     int r;
@@ -807,7 +872,7 @@ int ext2_open(const char *path, struct ext2_file **out) {
     struct ext2_file *f = NULL;
     int i, r;
 
-    if (!g_ext2_fs.mounted) return EXT2_EBUSY;
+    if (!g_ext2_fs->mounted) return EXT2_EBUSY;
     if (!out) return EXT2_EINVAL;
     r = ext2_resolve(path, &ino, &in);
     if (r != EXT2_OK) return r;
@@ -821,6 +886,7 @@ int ext2_open(const char *path, struct ext2_file **out) {
     if (!f) return EXT2_EBUSY;
 
     f->used = 1;
+    f->vol = g_cur_ext2_vol;
     f->ino = ino;
     f->size = in.i_size;
     *out = f;
@@ -828,6 +894,7 @@ int ext2_open(const char *path, struct ext2_file **out) {
 }
 
 int ext2_file_read(struct ext2_file *f, void *buf, uint32_t size, uint32_t offset) {
+    (void)ext2_select_volume(f->vol);
     if (!f || !f->used) return EXT2_EINVAL;
     if (offset >= f->size) return 0;                       /* EOF */
     if (size > f->size - offset) size = f->size - offset;
@@ -835,18 +902,20 @@ int ext2_file_read(struct ext2_file *f, void *buf, uint32_t size, uint32_t offse
 }
 
 int ext2_close(struct ext2_file *f) {
+    (void)ext2_select_volume(f->vol);
     if (!f) return EXT2_EINVAL;
     memset(f, 0, sizeof(*f));
     return EXT2_OK;
 }
 
 int ext2_opendir(const char *path, struct ext2_dir **out) {
+    const int dir_vol = g_cur_ext2_vol;
     uint32_t ino;
     struct ext2_inode in;
     struct ext2_dir *d = NULL;
     int i, r;
 
-    if (!g_ext2_fs.mounted) return EXT2_EBUSY;
+    if (!g_ext2_fs->mounted) return EXT2_EBUSY;
     if (!out) return EXT2_EINVAL;
     r = ext2_resolve(path, &ino, &in);
     if (r != EXT2_OK) return r;
@@ -859,6 +928,7 @@ int ext2_opendir(const char *path, struct ext2_dir **out) {
 
     memset(d, 0, sizeof(*d));
     d->used = 1;
+    d->vol = dir_vol;
     d->ino = ino;
     d->size = in.i_size;
     d->block = 0;
@@ -872,7 +942,8 @@ int ext2_opendir(const char *path, struct ext2_dir **out) {
  * "." and ".." are skipped. Names longer than name_cap-1 are truncated. */
 int ext2_readdir(struct ext2_dir *d, char *name, uint32_t name_cap,
                  uint32_t *name_len, int *is_dir) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    (void)ext2_select_volume(d->vol);
+    struct ext2_fs *fs = g_ext2_fs;
     uint32_t has_ftype = (fs->sb.s_feature_incompat & EXT2_FEATURE_INCOMPAT_FILETYPE) != 0;
     uint8_t *scratch;
     int rc = EXT2_ENOENT;
@@ -945,6 +1016,7 @@ out:
 }
 
 int ext2_closedir(struct ext2_dir *d) {
+    (void)ext2_select_volume(d->vol);
     if (!d) return EXT2_EINVAL;
     memset(d, 0, sizeof(*d));
     return EXT2_OK;
@@ -962,7 +1034,7 @@ int ext2_closedir(struct ext2_dir *d) {
 
 /* One whole filesystem block. Mirrors ext2_dev_read_block(). */
 static int ext2_dev_write_block(uint32_t block, const void *buf) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     if (!buf) return EXT2_EINVAL;
     if (fs->ram) {
         uint64_t off = (uint64_t)block * fs->block_size;
@@ -990,7 +1062,7 @@ static int ext2_dev_write_block(uint32_t block, const void *buf) {
 /* Map a block number to (group, bit inside that group's block bitmap).
  * ext2 bit i of group g is the absolute block first_data_block + g*bpg + i. */
 static int ext2_block_bit_of(uint32_t blk, uint32_t *out_group, uint32_t *out_bit) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     uint32_t rel;
     if (!out_group || !out_bit) return EXT2_EINVAL;
     *out_group = 0;
@@ -1005,7 +1077,7 @@ static int ext2_block_bit_of(uint32_t blk, uint32_t *out_group, uint32_t *out_bi
 
 /* Map an inode number to (group, bit inside that group's inode bitmap). */
 static int ext2_inode_bit_of(uint32_t ino, uint32_t *out_group, uint32_t *out_bit) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     uint32_t rel;
     if (!out_group || !out_bit) return EXT2_EINVAL;
     *out_group = 0;
@@ -1020,7 +1092,7 @@ static int ext2_inode_bit_of(uint32_t ino, uint32_t *out_group, uint32_t *out_bi
 
 /* How many blocks the given group really owns (the last group can be short). */
 static uint32_t ext2_group_block_limit(uint32_t group) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     uint64_t first = (uint64_t)fs->first_data_block + (uint64_t)group * fs->blocks_per_group;
     uint64_t left = (first >= fs->blocks_count) ? 0 : ((uint64_t)fs->blocks_count - first);
     if (left > fs->blocks_per_group) left = fs->blocks_per_group;
@@ -1029,7 +1101,7 @@ static uint32_t ext2_group_block_limit(uint32_t group) {
 
 /* How many inodes the given group really owns. */
 static uint32_t ext2_group_inode_limit(uint32_t group) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     uint64_t first = (uint64_t)group * fs->inodes_per_group;
     uint64_t left = (first >= fs->inodes_count) ? 0 : ((uint64_t)fs->inodes_count - first);
     if (left > fs->inodes_per_group) left = fs->inodes_per_group;
@@ -1041,7 +1113,7 @@ static uint32_t ext2_group_inode_limit(uint32_t group) {
  * tables and directory blocks, and a zeroed file tail keeps a short write
  * deterministic. */
 static int ext2_alloc_block_raw(uint32_t *out) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     uint8_t *bm;
     uint32_t g;
     int rc = EXT2_ENOSPC;
@@ -1089,7 +1161,7 @@ static int ext2_alloc_block_raw(uint32_t *out) {
 
 /* Return one block to the bitmap. A double free is reported and refused. */
 static int ext2_free_block_raw(uint32_t blk) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     uint8_t *bm;
     uint32_t group, bit;
     int r;
@@ -1119,7 +1191,7 @@ static int ext2_free_block_raw(uint32_t blk) {
 /* Allocate one inode number (bit set in the inode bitmap, inode itself is
  * written by the caller). */
 static int ext2_alloc_inode_raw(uint32_t *out) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     uint8_t *bm;
     uint32_t g;
     int rc = EXT2_ENOSPC;
@@ -1167,7 +1239,7 @@ static int ext2_alloc_inode_raw(uint32_t *out) {
 /* Free one inode: the on-disk inode is zeroed first (so a stale block pointer
  * can never be followed), then the bitmap bit is cleared. */
 static int ext2_free_inode_raw(uint32_t ino) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     struct ext2_inode zero;
     uint8_t *bm;
     uint32_t group, bit;
@@ -1201,7 +1273,7 @@ static int ext2_free_inode_raw(uint32_t ino) {
 
 /* Read-modify-write one inode inside its inode table block. */
 static int ext2_write_inode_raw(uint32_t ino, const struct ext2_inode *in) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     uint32_t group, index, byte_off, blk, off, copy;
     uint8_t *buf;
     int r;
@@ -1239,7 +1311,7 @@ static int ext2_write_inode_raw(uint32_t ino, const struct ext2_inode *in) {
 /* Write the 1024-byte superblock area (offset 1024) without touching the boot
  * block bytes that share the same filesystem block at 2 KiB / 4 KiB blocks. */
 static int ext2_write_sb(void) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     uint32_t sb_block = EXT2_SUPERBLOCK_OFFSET / fs->block_size;
     uint32_t off = EXT2_SUPERBLOCK_OFFSET % fs->block_size;
     uint8_t *buf;
@@ -1259,7 +1331,7 @@ static int ext2_write_sb(void) {
 /* Write every group descriptor block back (read-modify-write so entries that do
  * not belong to this table - and the slack after the last entry - survive). */
 static int ext2_write_bgdt(void) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     uint32_t per = fs->gdt_entries_per_block;
     uint32_t blocks, i;
     uint8_t *buf;
@@ -1288,7 +1360,7 @@ static int ext2_write_bgdt(void) {
 /* Recount free blocks / free inodes from the bitmaps into the cached superblock
  * and group descriptor table (in memory only; ext2_sync() writes them). */
 static void ext2_recount(void) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     uint8_t *bm;
     uint32_t g, total_b = 0, total_i = 0;
 
@@ -1331,7 +1403,7 @@ static void ext2_recount(void) {
 }
 
 int ext2_count_free(uint32_t *free_blocks, uint32_t *free_inodes) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     uint8_t *bm;
     uint32_t g, total_b = 0, total_i = 0;
 
@@ -1373,7 +1445,7 @@ int ext2_count_free(uint32_t *free_blocks, uint32_t *free_inodes) {
 }
 
 int ext2_bitmaps_consistent(void) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     uint32_t meas_b = 0, meas_i = 0;
     int ok = 1;
 
@@ -1413,7 +1485,7 @@ int ext2_bitmaps_consistent(void) {
 }
 
 int ext2_sync(void) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     if (!fs->mounted) return EXT2_EBUSY;
     ext2_recount();                        /* counters := bitmaps */
     if (ext2_write_bgdt() != EXT2_OK) {
@@ -1445,7 +1517,7 @@ int ext2_sync(void) {
  * `tab` must hold one filesystem block and is clobbered. */
 static int ext2_bmap_alloc(struct ext2_inode *in, uint64_t logical, int create,
                            uint32_t *out_phys, uint32_t *new_blocks, uint8_t *tab) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     const uint64_t ptrs = fs->ptrs_per_block;
     uint64_t idx;
     uint32_t tbl, data;
@@ -1535,7 +1607,7 @@ static int ext2_bmap_alloc(struct ext2_inode *in, uint64_t logical, int create,
  * Returns the number of freed blocks in *freed. */
 static int ext2_truncate_blocks(struct ext2_inode *in, uint32_t keep_blocks,
                                 uint32_t *freed) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     const uint64_t ptrs = fs->ptrs_per_block;
     const uint64_t single_end = EXT2_DIRECT_BLOCKS + ptrs;
     const uint64_t double_end = single_end + ptrs * ptrs;
@@ -1664,7 +1736,7 @@ out:
  * Zero-fills any newly allocated block region (no sparse writes). */
 static int ext2_write_data(uint32_t ino, struct ext2_inode *in, const void *buf,
                            uint32_t offset, uint32_t size) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     const uint8_t *src = (const uint8_t *)buf;
     uint32_t bs = fs->block_size;
     uint32_t done = 0, new_blocks = 0;
@@ -1726,7 +1798,7 @@ static int ext2_write_data(uint32_t ino, struct ext2_inode *in, const void *buf,
 }
 
 int ext2_write_at(uint32_t ino, const void *buf, uint32_t offset, uint32_t size) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     struct ext2_inode in;
     int r;
 
@@ -1739,6 +1811,7 @@ int ext2_write_at(uint32_t ino, const void *buf, uint32_t offset, uint32_t size)
 }
 
 int ext2_file_write(struct ext2_file *f, const void *buf, uint32_t size, uint32_t offset) {
+    (void)ext2_select_volume(f->vol);
     struct ext2_inode in;
     int r;
 
@@ -1753,7 +1826,7 @@ int ext2_file_write(struct ext2_file *f, const void *buf, uint32_t size, uint32_
 }
 
 int ext2_truncate(uint32_t ino, uint32_t new_size) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     struct ext2_inode in;
     uint32_t freed = 0, bs, keep_blocks;
     int r;
@@ -1800,7 +1873,7 @@ int ext2_truncate(uint32_t ino, uint32_t new_size) {
 
 int ext2_file_open(const char *path, int create, int trunc, int append,
                    struct ext2_file **out) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     uint32_t ino = 0;
     struct ext2_inode in;
     struct ext2_file *f = NULL;
@@ -1832,6 +1905,7 @@ int ext2_file_open(const char *path, int create, int trunc, int append,
     }
     if (!f) return EXT2_EBUSY;
     f->used = 1;
+    f->vol = g_cur_ext2_vol;
     f->ino = ino;
     f->size = in.i_size;
     f->append = append ? 1 : 0;
@@ -1853,7 +1927,7 @@ static uint32_t ext2_dirent_need(uint32_t name_len) {
  * EXT2_FEATURE_INCOMPAT_FILETYPE; otherwise it stays 0 (the high byte of a
  * 16-bit name length, which is always 0 because names stop at 255 bytes). */
 static uint8_t ext2_dirent_ftype(uint8_t ftype) {
-    return (g_ext2_fs.sb.s_feature_incompat & EXT2_FEATURE_INCOMPAT_FILETYPE)
+    return (g_ext2_fs->sb.s_feature_incompat & EXT2_FEATURE_INCOMPAT_FILETYPE)
                ? ftype : 0u;
 }
 
@@ -1874,7 +1948,7 @@ static void ext2_dirent_put(uint8_t *blk, uint32_t off, uint32_t rec_len,
  * dir->i_size / dir->i_blocks in memory (the caller flushes the inode). */
 static int ext2_dir_add_entry(struct ext2_inode *dir, const char *name,
                               uint32_t name_len, uint32_t child_ino, uint8_t ftype) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     uint32_t bs = fs->block_size;
     uint32_t need, b, phys = 0;
     uint8_t *blk, *tab;
@@ -1949,7 +2023,7 @@ out:
 static int ext2_dir_remove_entry(struct ext2_inode *dir, const char *name,
                                  uint32_t name_len, uint32_t *out_ino,
                                  uint8_t *out_ftype) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     uint32_t bs = fs->block_size;
     uint32_t b;
     uint8_t *blk, *tab;
@@ -2004,7 +2078,7 @@ out:
 
 /* Point the ".." entry of `dir` at `new_parent` (used by directory renames). */
 static int ext2_dir_set_dotdot(struct ext2_inode *dir, uint32_t new_parent) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     uint32_t bs = fs->block_size;
     uint32_t b;
     uint8_t *blk, *tab;
@@ -2046,7 +2120,7 @@ out:
 
 /* 1 = empty (only "." and ".."), 0 = holds other entries, < 0 = error. */
 static int ext2_dir_is_empty(const struct ext2_inode *dir) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     uint32_t bs = fs->block_size;
     uint32_t b;
     uint8_t *blk, *tab;
@@ -2134,7 +2208,7 @@ static int ext2_split_path(const char *path, uint32_t *out_parent_ino,
 /* Shared body of ext2_create() / ext2_mkdir(). */
 static int ext2_create_or_mkdir(const char *path, uint32_t mode, int is_dir,
                                 uint32_t *out_ino) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     struct ext2_inode parent, in;
     char leaf[EXT2_NAME_MAX + 1];
     uint32_t parent_ino = 0, leaf_len = 0, ino = 0, bs = fs->block_size;
@@ -2217,8 +2291,8 @@ static int ext2_release_inode_blocks(struct ext2_inode *in) {
     int r = ext2_truncate_blocks(in, 0, &freed);
     if (r != EXT2_OK) return r;
     in->i_size = 0;
-    if (in->i_blocks >= freed * (g_ext2_fs.block_size / EXT2_SECTOR_SIZE)) {
-        in->i_blocks -= freed * (g_ext2_fs.block_size / EXT2_SECTOR_SIZE);
+    if (in->i_blocks >= freed * (g_ext2_fs->block_size / EXT2_SECTOR_SIZE)) {
+        in->i_blocks -= freed * (g_ext2_fs->block_size / EXT2_SECTOR_SIZE);
     } else {
         in->i_blocks = 0;
     }
@@ -2233,7 +2307,7 @@ static int ext2_remove_entry_and_unlink(uint32_t parent_ino, struct ext2_inode *
                                         const char *name, uint32_t name_len,
                                         uint32_t child_ino, struct ext2_inode *child,
                                         int remove_inode) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     int r;
 
     (void)parent_ino;
@@ -2264,7 +2338,7 @@ static int ext2_remove_entry_and_unlink(uint32_t parent_ino, struct ext2_inode *
 }
 
 int ext2_unlink(const char *path) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     struct ext2_inode parent, child;
     char leaf[EXT2_NAME_MAX + 1];
     uint32_t parent_ino = 0, leaf_len = 0, child_ino = 0;
@@ -2286,7 +2360,7 @@ int ext2_unlink(const char *path) {
 }
 
 int ext2_rmdir(const char *path) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     struct ext2_inode parent, child;
     char leaf[EXT2_NAME_MAX + 1];
     uint32_t parent_ino = 0, leaf_len = 0, child_ino = 0, group;
@@ -2346,7 +2420,7 @@ static int ext2_is_ancestor(uint32_t ancestor, uint32_t dir_ino) {
 }
 
 int ext2_rename(const char *oldpath, const char *newpath) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     struct ext2_inode old_parent, new_parent_in, src_in, dst_in;
     struct ext2_inode *pn;
     char leaf_old[EXT2_NAME_MAX + 1], leaf_new[EXT2_NAME_MAX + 1];
@@ -2471,7 +2545,7 @@ static uint8_t ext2_st_expected(int kind, uint32_t off, const char *text) {
         case EXT2_ST_BIG:    return (uint8_t)((off * 31u + 7u) & 0xFFu);
         case EXT2_ST_DOUBLE: return (uint8_t)((off * 29u + 11u) & 0xFFu);
         case EXT2_ST_SPARSE:
-            if (off / g_ext2_fs.block_size == 1u) return 0;   /* the hole */
+            if (off / g_ext2_fs->block_size == 1u) return 0;   /* the hole */
             return (uint8_t)((off * 17u + 3u) & 0xFFu);
         default:             return 0;
     }
@@ -2484,7 +2558,7 @@ static int ext2_selftest_fail(const char *reason) {
 
 static int ext2_selftest_file(const char *path, int kind, uint32_t expect_size,
                               const char *text, uint8_t *scratch, uint32_t *out_crc) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     struct ext2_stat st;
     uint32_t offset = 0;
     uint32_t crc = 0xFFFFFFFFu;
@@ -2558,7 +2632,7 @@ static int ext2_selftest_readdir(const char *path, const char *const *want, uint
 }
 
 int ext2_selftest(void) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     uint8_t *scratch;
     uint32_t crc_hello = 0, crc_big = 0, crc_nested = 0, crc_sparse = 0, crc_double = 0;
     uint32_t sparse_size, i;
@@ -2674,7 +2748,7 @@ static int ext2_is_test_image(void) {
 
     if (ext2_stat("/HELLO.TXT", &st) != EXT2_OK) return 0;
     if (!st.is_file || st.size != EXT2_ST_HELLO_SIZE) return 0;
-    buf = (uint8_t *)lemis_heap_alloc(g_ext2_fs.block_size);
+    buf = (uint8_t *)lemis_heap_alloc(g_ext2_fs->block_size);
     if (!buf) return 0;
     r = ext2_read_file(st.ino, buf, 0, EXT2_ST_HELLO_SIZE);
     if (r == (int)EXT2_ST_HELLO_SIZE &&
@@ -2688,7 +2762,7 @@ static int ext2_is_test_image(void) {
 /* Write `blocks` blocks of the given pattern starting at offset 0. */
 static int ext2_wst_write_pattern(uint32_t ino, uint32_t blocks, uint8_t mul,
                                   uint8_t add, uint8_t *buf) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     uint32_t bs = fs->block_size, i, k;
     int r = EXT2_OK;
 
@@ -2705,7 +2779,7 @@ static int ext2_wst_write_pattern(uint32_t ino, uint32_t blocks, uint8_t mul,
 /* Byte-for-byte check of [from_block*bs, bytes) against the same pattern. */
 static int ext2_wst_check_pattern(uint32_t ino, uint32_t from_block, uint32_t bytes,
                                   uint8_t mul, uint8_t add, uint8_t *buf) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     uint32_t bs = fs->block_size, i, k;
     int r;
 
@@ -2727,7 +2801,7 @@ static int ext2_wst_check_pattern(uint32_t ino, uint32_t from_block, uint32_t by
 }
 
 int ext2_write_selftest(void) {
-    struct ext2_fs *fs = &g_ext2_fs;
+    struct ext2_fs *fs = g_ext2_fs;
     struct ext2_inode in;
     struct ext2_stat st;
     uint32_t bs, blocks, total, i, k, ino = 0, keep_ino = 0, artifact_blocks;

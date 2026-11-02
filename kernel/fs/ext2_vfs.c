@@ -18,9 +18,24 @@
 #include "heap.h"
 #include "ext2.h"
 
-/* ---- single mounted volume ---- */
-static char g_mountpoint[VFS_MAX_PATH] = "";
-static int  g_ram = 0;
+/* ---- mount table: one entry per mounted volume (v0.28.0) ---- */
+#define EXT2_VFS_MAX_MOUNTS 4
+struct ext2_mnt {
+    int  used;
+    char mp[VFS_MAX_PATH];
+    int  drive;
+    int  ram;
+    int  vol;
+};
+static struct ext2_mnt g_ext2_mnts[EXT2_VFS_MAX_MOUNTS];
+
+static struct ext2_mnt *ext2_mnt_find_by_point(const char *mountpoint) {
+    if (!mountpoint) return NULL;
+    for (int i = 0; i < EXT2_VFS_MAX_MOUNTS; i++)
+        if (g_ext2_mnts[i].used && strcmp(g_ext2_mnts[i].mp, mountpoint) == 0)
+            return &g_ext2_mnts[i];
+    return NULL;
+}
 
 /* Map core error codes to VFS error codes. */
 static int map_err(int e) {
@@ -86,13 +101,13 @@ static int parse_device(const char *device, int *out_drive, uint32_t *out_lba, i
 }
 
 /* VFS path -> volume-relative path ("/HELLO.TXT"), stripping the mountpoint. */
-static int vol_path(const char *path, char *out, uint32_t cap) {
+static int vol_path(struct ext2_mnt *m, const char *path, char *out, uint32_t cap) {
     if (!path || !out || cap == 0) return VFS_EINVAL;
     const char *rel = path;
-    size_t mplen = strlen(g_mountpoint);
+    size_t mplen = m ? strlen(m->mp) : 0;
 
     if (mplen > 1) {
-        if (strncmp(path, g_mountpoint, mplen) != 0) return VFS_ENOTFOUND;
+        if (strncmp(path, m->mp, mplen) != 0) return VFS_ENOTFOUND;
         rel = path + mplen;
         if (*rel == '\0') rel = "/";
     }
@@ -117,35 +132,50 @@ static int ext2_vfs_mount(const char *device, const char *mountpoint, void **fs_
     r = parse_device(device, &drive, &lba, &ram);
     if (r != VFS_OK) return r;
 
+    struct ext2_mnt *m = NULL;
+    for (int i = 0; i < EXT2_VFS_MAX_MOUNTS; i++)
+        if (!g_ext2_mnts[i].used) { m = &g_ext2_mnts[i]; break; }
+    if (!m) return VFS_ENOSPC;
+
+    int slot;
     if (ram) {
         if (!ext2_ramdisk_registered()) {
             console_puts("[ext2] mount failed: no ramdisk registered "
                          "(call ext2_register_ramdisk first)\n");
             return VFS_EINVAL;
         }
-        r = ext2_mount_ramdisk();
+        slot = ext2_mount_ramdisk();
     } else {
-        r = ext2_mount(drive, lba);
+        slot = ext2_mount(drive, lba);
     }
-    if (r != EXT2_OK) return map_err(r);
+    if (slot < 0) return map_err(slot);
 
-    g_ram = ram;
-    strncpy(g_mountpoint, mountpoint, sizeof(g_mountpoint) - 1);
-    g_mountpoint[sizeof(g_mountpoint) - 1] = '\0';
-    if (fs_data) *fs_data = (void *)(uintptr_t)(ram ? 0x100u : (uint32_t)drive);
+    memset(m, 0, sizeof(*m));
+    m->used = 1;
+    m->drive = drive;
+    m->ram = ram;
+    m->vol = slot;
+    strncpy(m->mp, mountpoint, sizeof(m->mp) - 1);
+    m->mp[sizeof(m->mp) - 1] = '\0';
+    if (fs_data) *fs_data = m;
+    console_printf("[ext2] vfs mount drive=%d at %s (volume slot %d)\n",
+                   (int64_t)drive, m->mp, (int64_t)slot);
     return VFS_OK;
 }
 
 static int ext2_vfs_unmount(const char *mountpoint) {
-    (void)mountpoint;
-    ext2_sync();                     /* push the counters out before leaving */
-    ext2_unmount();
-    g_mountpoint[0] = '\0';
-    g_ram = 0;
+    struct ext2_mnt *m = ext2_mnt_find_by_point(mountpoint);
+    if (!m) return VFS_ENOTFOUND;
+    if (!m->ram && m->drive >= 0) (void)ext2_unmount_drive(m->drive);
+    else                          ext2_unmount();
+    memset(m, 0, sizeof(*m));
     return VFS_OK;
 }
 
 static int ext2_vfs_open(void *fs_data, const char *path, int flags, void **file_handle) {
+    struct ext2_mnt *m = (struct ext2_mnt *)fs_data;
+    if (!m || !m->used) return VFS_EINVAL;
+    (void)ext2_select_volume(m->vol);
     char vp[VFS_MAX_PATH];
     struct ext2_file *fh = NULL;
     int acc = flags & VFS_O_RDWR;      /* 0 = unspecified, 1 RDONLY, 2 WRONLY, 3 RDWR */
@@ -159,7 +189,7 @@ static int ext2_vfs_open(void *fs_data, const char *path, int flags, void **file
     wants_write = (acc == VFS_O_WRONLY || acc == VFS_O_RDWR ||
                    (flags & (VFS_O_CREAT | VFS_O_TRUNC | VFS_O_APPEND)) != 0);
 
-    r = vol_path(path, vp, sizeof(vp));
+    r = vol_path(m, path, vp, sizeof(vp));
     if (r != VFS_OK) return r;
 
     if (wants_write) {
@@ -203,13 +233,16 @@ static int ext2_vfs_seek(void *file_handle, uint32_t offset, int whence) {
 }
 
 static int ext2_vfs_opendir(void *fs_data, const char *path, void **dir_handle) {
+    struct ext2_mnt *m = (struct ext2_mnt *)fs_data;
+    if (!m || !m->used) return VFS_EINVAL;
+    (void)ext2_select_volume(m->vol);
     char vp[VFS_MAX_PATH];
     struct ext2_dir *d = NULL;
     int r;
 
     (void)fs_data;
     if (!dir_handle) return VFS_EINVAL;
-    r = vol_path(path, vp, sizeof(vp));
+    r = vol_path(m, path, vp, sizeof(vp));
     if (r != VFS_OK) return r;
 
     r = ext2_opendir(vp, &d);
@@ -239,13 +272,16 @@ static int ext2_vfs_closedir(void *dir_handle) {
 }
 
 static int ext2_vfs_stat(void *fs_data, const char *path, struct vfs_stat *st) {
+    struct ext2_mnt *m = (struct ext2_mnt *)fs_data;
+    if (!m || !m->used) return VFS_EINVAL;
+    (void)ext2_select_volume(m->vol);
     char vp[VFS_MAX_PATH];
     struct ext2_stat es;
     int r;
 
     (void)fs_data;
     if (!st) return VFS_EINVAL;
-    r = vol_path(path, vp, sizeof(vp));
+    r = vol_path(m, path, vp, sizeof(vp));
     if (r != VFS_OK) return r;
 
     r = ext2_stat(vp, &es);
@@ -270,48 +306,63 @@ static int ext2_vfs_stat(void *fs_data, const char *path, struct vfs_stat *st) {
 }
 
 static int ext2_vfs_mkdir(void *fs_data, const char *path, uint32_t mode) {
+    struct ext2_mnt *m = (struct ext2_mnt *)fs_data;
+    if (!m || !m->used) return VFS_EINVAL;
+    (void)ext2_select_volume(m->vol);
     char vp[VFS_MAX_PATH];
     int r;
 
     (void)fs_data;
-    r = vol_path(path, vp, sizeof(vp));
+    r = vol_path(m, path, vp, sizeof(vp));
     if (r != VFS_OK) return r;
     return map_err(ext2_mkdir(vp, mode & 0xFFFu));
 }
 
 static int ext2_vfs_rmdir(void *fs_data, const char *path) {
+    struct ext2_mnt *m = (struct ext2_mnt *)fs_data;
+    if (!m || !m->used) return VFS_EINVAL;
+    (void)ext2_select_volume(m->vol);
     char vp[VFS_MAX_PATH];
     int r;
 
     (void)fs_data;
-    r = vol_path(path, vp, sizeof(vp));
+    r = vol_path(m, path, vp, sizeof(vp));
     if (r != VFS_OK) return r;
     return map_err(ext2_rmdir(vp));
 }
 
 static int ext2_vfs_unlink(void *fs_data, const char *path) {
+    struct ext2_mnt *m = (struct ext2_mnt *)fs_data;
+    if (!m || !m->used) return VFS_EINVAL;
+    (void)ext2_select_volume(m->vol);
     char vp[VFS_MAX_PATH];
     int r;
 
     (void)fs_data;
-    r = vol_path(path, vp, sizeof(vp));
+    r = vol_path(m, path, vp, sizeof(vp));
     if (r != VFS_OK) return r;
     return map_err(ext2_unlink(vp));
 }
 
 static int ext2_vfs_rename(void *fs_data, const char *oldpath, const char *newpath) {
+    struct ext2_mnt *m = (struct ext2_mnt *)fs_data;
+    if (!m || !m->used) return VFS_EINVAL;
+    (void)ext2_select_volume(m->vol);
     char ovp[VFS_MAX_PATH], nvp[VFS_MAX_PATH];
     int r;
 
     (void)fs_data;
-    r = vol_path(oldpath, ovp, sizeof(ovp));
+    r = vol_path(m, oldpath, ovp, sizeof(ovp));
     if (r != VFS_OK) return r;
-    r = vol_path(newpath, nvp, sizeof(nvp));
+    r = vol_path(m, newpath, nvp, sizeof(nvp));
     if (r != VFS_OK) return r;
     return map_err(ext2_rename(ovp, nvp));
 }
 
 static int ext2_vfs_sync(void *fs_data) {
+    struct ext2_mnt *m = (struct ext2_mnt *)fs_data;
+    if (!m || !m->used) return VFS_EINVAL;
+    (void)ext2_select_volume(m->vol);
     (void)fs_data;
     if (!ext2_is_mounted()) return VFS_EBUSY;
     return map_err(ext2_sync());
@@ -319,17 +370,20 @@ static int ext2_vfs_sync(void *fs_data) {
 
 static int ext2_vfs_get_free_space(void *fs_data, uint64_t *free_bytes,
                                    uint64_t *total_bytes) {
+    struct ext2_mnt *m = (struct ext2_mnt *)fs_data;
+    if (!m || !m->used) return VFS_EINVAL;
+    (void)ext2_select_volume(m->vol);
     uint32_t free_blocks = 0, free_inodes = 0;
     (void)fs_data;
     if (!ext2_is_mounted()) return VFS_EBUSY;
     /* measure instead of trusting the cached counters: df must never lie */
     if (ext2_count_free(&free_blocks, &free_inodes) == EXT2_OK) {
-        if (free_bytes) *free_bytes = (uint64_t)free_blocks * g_ext2_fs.block_size;
+        if (free_bytes) *free_bytes = (uint64_t)free_blocks * g_ext2_fs->block_size;
     } else if (free_bytes) {
-        *free_bytes = (uint64_t)g_ext2_fs.sb.s_free_blocks_count * g_ext2_fs.block_size;
+        *free_bytes = (uint64_t)g_ext2_fs->sb.s_free_blocks_count * g_ext2_fs->block_size;
     }
     if (total_bytes) {
-        *total_bytes = (uint64_t)g_ext2_fs.blocks_count * g_ext2_fs.block_size;
+        *total_bytes = (uint64_t)g_ext2_fs->blocks_count * g_ext2_fs->block_size;
     }
     return VFS_OK;
 }
@@ -341,6 +395,13 @@ static int ext2_vfs_get_free_space(void *fs_data, uint64_t *free_bytes,
 #define EXT2_VFS_PROBE_DIR    "/VFSDIR"
 #define EXT2_VFS_PROBE_MOVED  "/VFSDIR/MOVED.BIN"
 
+/* The write self-test has no fs_data, so it uses the first mounted volume. */
+static struct ext2_mnt *ext2_first_mnt(void) {
+    for (int i = 0; i < EXT2_VFS_MAX_MOUNTS; i++)
+        if (g_ext2_mnts[i].used) return &g_ext2_mnts[i];
+    return NULL;
+}
+
 static int ext2_vfs_probe_fail(const char *what) {
     console_printf("[ext2] vfs write self-test FAIL (%s)\n", what);
     return EXT2_ERR;
@@ -349,11 +410,11 @@ static int ext2_vfs_probe_fail(const char *what) {
 /* Build "<mountpoint><suffix>" into out (the mountpoint is "/mnt/ext2" in the
  * default boot, but never assume it). */
 static int ext2_vfs_probe_path(const char *suffix, char *out, uint32_t cap) {
-    size_t mp = strlen(g_mountpoint);
+    struct ext2_mnt *m = ext2_first_mnt();
+    size_t mp = m ? strlen(m->mp) : 0;
     int n;
-    if (cap == 0) return VFS_EINVAL;
-    if (mp == 0) return VFS_EINVAL;
-    n = snprintf(out, cap, "%s%s", g_mountpoint, suffix);
+    if (cap == 0 || mp == 0) return VFS_EINVAL;
+    n = snprintf(out, cap, "%s%s", m->mp, suffix);
     if (n <= 0 || (uint32_t)n >= cap) return VFS_EINVAL;
     return VFS_OK;
 }
@@ -365,13 +426,14 @@ static int ext2_vfs_probe_path(const char *suffix, char *out, uint32_t cap) {
 int ext2_vfs_selftest(void) {
     char file_p[VFS_MAX_PATH], dir_p[VFS_MAX_PATH], moved_p[VFS_MAX_PATH];
     uint8_t *buf = NULL;
-    uint32_t bs = g_ext2_fs.block_size, total, i, k;
+    uint32_t bs = g_ext2_fs->block_size, total, i, k;
     vfs_stat_t st;
     int open_ok = 0, write_ok = 0, read_ok = 0, truncate_ok = 0;
     int mkdir_ok = 0, rename_ok = 0, unlink_ok = 0, rmdir_ok = 0;
     int fd = -1, r;
 
-    if (!ext2_is_mounted() || g_mountpoint[0] == '\0') {
+    struct ext2_mnt *probe_m = ext2_first_mnt();
+    if (!ext2_is_mounted() || probe_m == NULL || probe_m->mp[0] == '\0') {
         console_puts("[ext2] vfs write self-test skipped (no ext2 mount point)\n");
         return EXT2_OK;
     }
@@ -469,7 +531,7 @@ int ext2_vfs_selftest(void) {
     unlink_ok = 1;
     if (vfs_rmdir(dir_p) != VFS_OK) { ext2_vfs_probe_fail("rmdir failed"); goto done; }
     rmdir_ok = 1;
-    if (vfs_sync(g_mountpoint) != VFS_OK) {
+    if (vfs_sync(probe_m->mp) != VFS_OK) {
         ext2_vfs_probe_fail("sync failed");
         goto done;
     }

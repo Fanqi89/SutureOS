@@ -250,7 +250,16 @@ struct ext2_fs {
     int      mounted;
 };
 
-extern struct ext2_fs g_ext2_fs;
+/* Multi-volume (v0.28.0): the core keeps one state block per mounted volume and
+ * a "current volume" pointer, exactly like the FAT32 driver does. The VFS
+ * adapter selects the volume of the mount a path belongs to before each call;
+ * file/dir handles remember their own volume. */
+#define EXT2_MAX_VOLS 4
+extern struct ext2_fs *g_ext2_fs;
+int ext2_select_volume(int slot);
+int ext2_current_volume(void);
+int ext2_volume_count(void);
+int ext2_unmount_drive(int drive);
 
 /* ==================== stat / handles ==================== */
 
@@ -271,6 +280,7 @@ struct ext2_stat {
 
 struct ext2_file {
     int      used;
+    int      vol;        /* volume slot this handle belongs to */
     uint32_t ino;
     uint32_t size;
     int      append;     /* opened O_APPEND: every write lands at EOF */
@@ -278,6 +288,7 @@ struct ext2_file {
 
 struct ext2_dir {
     int      used;
+    int      vol;        /* volume slot this handle belongs to */
     uint32_t ino;
     uint32_t size;       /* i_size of the directory inode */
     uint32_t block;      /* current logical block index */
@@ -287,7 +298,8 @@ struct ext2_dir {
 
 /* ==================== lifecycle ==================== */
 
-/* Mount the ext2 volume on a block device at start_lba (real partition path). */
+/* Mount the ext2 volume on a block device at start_lba (real partition path).
+ * Returns the volume slot (>= 0) or a negative EXT2_* error. */
 int ext2_mount(int drive, uint32_t start_lba);
 
 /* Mount the RAM image previously handed to ext2_register_ramdisk(). */
