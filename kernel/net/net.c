@@ -27,6 +27,7 @@
 #include "net.h"
 #include "tcp.h"                 /* kernel/net/tcp.c: TCP protocol module     */
 #include "rtl8139.h"
+#include "e1000.h"               /* second link layer: Intel 8254x (Cinux port) */
 
 #include <stitch/types.h>
 #include <stitch/string.h>
@@ -82,6 +83,12 @@ static void udp_rx(const ipv4_header_t *ip, const uint8_t *payload,
                    uint32_t len, uint32_t src);
 static int  net_ip_tx(uint32_t dst_ip, uint8_t proto, uint32_t payload_len);
 static void net_spin_poll(uint32_t budget);
+
+/* Link-layer dispatch (implemented next to net_init; used by every TX/RX path).
+ * Two chips can sit under this stack: Intel e1000 (VMware's virtual NIC) and
+ * RTL8139 (the historical path). The IP stack above never sees which one. */
+static int  ll_send(const void *frame, uint32_t len);
+static void ll_poll_rx(void (*fn)(const uint8_t *frame, uint32_t len));
 
 /* ===================== configuration (slirp defaults) ===================== */
 uint32_t net_local_ip     = 0x0A00020Fu;   /* 10.0.2.15 */
@@ -356,7 +363,7 @@ static int arp_send_request(uint32_t target_ip)
     memset(arp->tha, 0, 6);
     ip_store(target_ip, (uint8_t *)&arp->tpa);
 
-    if (rtl8139_send_frame(g_arp_frame, NET_ETH_HDR_LEN + sizeof(arp_packet_t)) != 0)
+    if (ll_send(g_arp_frame, NET_ETH_HDR_LEN + sizeof(arp_packet_t)) != 0)
         return -1;
     g_arp_tx++;
     g_frames_tx++;
@@ -389,7 +396,7 @@ static void arp_send_reply(uint32_t dst_ip, const uint8_t dst_mac[6])
     memcpy(arp->tha, dst_mac, 6);
     ip_store(dst_ip, (uint8_t *)&arp->tpa);
 
-    if (rtl8139_send_frame(g_arp_frame, NET_ETH_HDR_LEN + sizeof(arp_packet_t)) == 0) {
+    if (ll_send(g_arp_frame, NET_ETH_HDR_LEN + sizeof(arp_packet_t)) == 0) {
         g_arp_tx++;
         g_frames_tx++;
     }
@@ -488,7 +495,7 @@ static int net_eth_send_ip(uint32_t dst_ip, uint32_t len)
     memcpy(eth->src_mac, net_local_mac, 6);
     eth->ethertype = htons(ETH_TYPE_IPV4);
 
-    if (rtl8139_send_frame(g_tx_frame, frame_len) != 0) {
+    if (ll_send(g_tx_frame, frame_len) != 0) {
         g_drops++;
         return -1;
     }
@@ -711,7 +718,7 @@ static void icmp_rx(const ipv4_header_t *ip, const uint8_t *payload,
         }
         oip->header_checksum = htons(net_checksum(oip, 20u));
 
-        if (rtl8139_send_frame(g_tx_frame, frame_len) == 0) {
+        if (ll_send(g_tx_frame, frame_len) == 0) {
             g_frames_tx++;
             g_ip_tx++;
             g_icmp_tx++;
@@ -971,10 +978,80 @@ void net_input(const void *frame, uint32_t len)
 }
 
 /* ===================== bring-up / polling ===================== */
+/* ==================== link-layer dispatch ====================
+ * Two drivers can sit under this stack: Intel e1000 (8254x; VMware's virtual
+ * NIC and QEMU's `-device e1000`) and RTL8139 (the historical path, and what
+ * `-device rtl8139` presents). Everything above goes through ll_send() /
+ * ll_poll_rx(), so the IP stack never learns which chip answered. */
+typedef enum { LL_NONE = 0, LL_RTL8139 = 1, LL_E1000 = 2 } link_layer_t;
+
+static link_layer_t g_ll = LL_NONE;
+static char g_ll_name[16] = "none";
+
+static int ll_send(const void *frame, uint32_t len)
+{
+    if (g_ll == LL_E1000)   return e1000_send_frame(frame, len);
+    if (g_ll == LL_RTL8139) return rtl8139_send_frame(frame, len);
+    return -1;
+}
+
+/* Yield one interrupt so QEMU's device main loop can run and DMA a pending
+ * receive packet into the ring. Polled RX only works if the vCPU traps: a pure
+ * memory spin never lets the e1000 model deliver (that quirk is documented in
+ * e1000.h). Only safe while we are not in an ISR - net_poll() is called from
+ * task context only. */
+static uint64_t g_ll_yields;            /* diagnostics: vCPU yields taken     */
+static void ll_yield_once(void)
+{
+    uint64_t flags;
+    __asm__ volatile("pushfq; popq %0" : "=r"(flags));
+    g_ll_yields++;
+    if ((flags & 0x200u) != 0) {
+        __asm__ volatile("hlt");
+    } else {
+        __asm__ volatile("sti; hlt; cli");
+    }
+}
+
+static void ll_poll_rx(void (*fn)(const uint8_t *frame, uint32_t len))
+{
+    if (g_ll == LL_E1000) {
+        if (e1000_receive(fn) == 0) {
+            /* Nothing in the ring: give the emulator one trap, then look again. */
+            ll_yield_once();
+            (void)e1000_receive(fn);
+        }
+        return;
+    }
+    if (g_ll == LL_RTL8139) {
+        (void)rtl8139_receive(fn);
+    }
+}
+
+const char *net_link_name(void) { return g_ll_name; }
+
+/* rtl8139 bring-up + the human-readable failure reason (kept from the
+ * RTL8139-only era). The reason is only printed when no other NIC works. */
+static int rtl8139_bringup(void)
+{
+    return rtl8139_init();
+}
+
+static const char *rtl8139_why(int r)
+{
+    switch (r) {
+    case RTL8139_ERR_NOT_FOUND: return "rtl8139 not found on PCI";
+    case RTL8139_ERR_BAR:       return "BAR0 is not an I/O BAR";
+    case RTL8139_ERR_RESET:     return "reset timeout";
+    case RTL8139_ERR_IO_BASE:   return "I/O base unusable";
+    case RTL8139_ERR_NO_BUFFERS:return "DMA buffers above 4 GiB";
+    case RTL8139_ERR_CMD:       return "Rx/Tx would not enable";
+    default:                    return "unknown";
+    }
+}
+
 int net_init(void)
 {
-    int r;
-
     if (g_initialized)
         return 0;
 
@@ -990,34 +1067,43 @@ int net_init(void)
     g_clock_last = mbos_pit_counter();
     net_stats_reset();
 
-    r = rtl8139_init();
-    if (r != RTL8139_ERR_NONE) {
-        const char *why = "unknown";
-        switch (r) {
-        case RTL8139_ERR_NOT_FOUND: why = "rtl8139 not found on PCI"; break;
-        case RTL8139_ERR_BAR:       why = "BAR0 is not an I/O BAR";    break;
-        case RTL8139_ERR_RESET:     why = "reset timeout";             break;
-        case RTL8139_ERR_IO_BASE:   why = "I/O base unusable";         break;
-        case RTL8139_ERR_NO_BUFFERS:why = "DMA buffers above 4 GiB";   break;
-        case RTL8139_ERR_CMD:       why = "Rx/Tx would not enable";    break;
-        default: break;
+    /* Link selection order: RTL8139 first (its polled RX works even during the
+     * interrupt-masked boot self test, so the boot log keeps a real PASS), then
+     * Intel e1000 - which is the ONLY NIC VMware offers and therefore the reason
+     * this driver exists. On an e1000-only machine the boot self test cannot
+     * always be serviced by the emulator (see docs/release-notes); the driver is
+     * proven interactively by scripts/nic_acceptance.py. */
+    int rtl_r = rtl8139_bringup();
+    if (rtl_r == RTL8139_ERR_NONE) {
+        g_ll = LL_RTL8139;
+        strncpy(g_ll_name, "rtl8139", sizeof(g_ll_name) - 1);
+        if (rtl8139_get_mac(net_local_mac) != 0) {
+            console_printf("[net] init failed: MAC read failed\n");
+            return -1;
         }
-        console_printf("[net] init failed: %s\n", why);
-        return -1;
-    }
-
-    if (rtl8139_get_mac(net_local_mac) != 0) {
-        console_printf("[net] init failed: MAC read failed\n");
+    } else if (e1000_init() == E1000_ERR_NONE) {
+        g_ll = LL_E1000;
+        strncpy(g_ll_name, "e1000", sizeof(g_ll_name) - 1);
+        if (e1000_get_mac(net_local_mac) != 0) {
+            console_printf("[net] init failed: e1000 MAC read failed\n");
+            return -1;
+        }
+    } else {
+        console_printf("[net] init failed: %s\n", rtl8139_why(rtl_r));
+        console_puts("[net] no supported NIC (e1000 or rtl8139)\n");
         return -1;
     }
 
     g_initialized = 1;
     net_hw_initialized = 1;
 
-    /* The two acceptance-critical log lines. */
-    console_printf("[net] rtl8139 found at 0x%llx, irq=%llu, mac=%02llx:%02llx:%02llx:%02llx:%02llx:%02llx\n",
-                   (uint64_t)rtl8139_io_base(),
-                   (uint64_t)rtl8139_irq(),
+    /* The acceptance-critical log line. It keeps the exact historical shape
+     * ("[net] <chip> found at 0x..., irq=..., mac=...") so an automated check
+     * can assert on it for either chip. */
+    console_printf("[net] %s found at 0x%llx, irq=%llu, mac=%02llx:%02llx:%02llx:%02llx:%02llx:%02llx\n",
+                   g_ll_name,
+                   (uint64_t)((g_ll == LL_RTL8139) ? rtl8139_io_base() : e1000_bar0()),
+                   (uint64_t)((g_ll == LL_RTL8139) ? rtl8139_irq() : 0u),
                    (uint64_t)net_local_mac[0], (uint64_t)net_local_mac[1],
                    (uint64_t)net_local_mac[2], (uint64_t)net_local_mac[3],
                    (uint64_t)net_local_mac[4], (uint64_t)net_local_mac[5]);
@@ -1049,12 +1135,12 @@ void net_poll(void)
         return;                                  /* never re-enter the stack */
     g_poll_busy = 1;
     g_epoch++;
-    /* rtl8139_receive() invokes the callback once per complete frame while the
-     * frame is still in the ring; net_input() counts it and dispatches it. */
-    (void)rtl8139_receive(net_rx_from_driver);
+    /* The active link layer delivers every complete frame through the callback
+     * while the frame is still in the ring; net_input() counts and dispatches. */
+    ll_poll_rx(net_rx_from_driver);
     /* TCP retransmission timers / TIME_WAIT expiry ride on the same tick. */
     tcp_poll();
-    {
+    if (g_ll == LL_RTL8139) {
         /* Keep the drop counters in one place: the driver tracks its own ring
          * drops, the stack counts protocol-level drops. */
         static uint32_t driver_drops_last;
@@ -1267,9 +1353,16 @@ int net_selftest(void)
          * left (tx=0), left but nothing came back (tx>0 rx=0, e.g. slirp not
          * answering), or the ARP next-hop lookup is what failed. */
         console_printf("[net] selftest ping TIMEOUT (frames rx=%llu tx=%llu drops=%llu "
-                       "arp_entries=%llu)\n",
+                       "arp_entries=%llu yields=%llu)\n",
                        (uint64_t)g_frames_rx, (uint64_t)g_frames_tx, (uint64_t)g_drops,
-                       (uint64_t)net_arp_entries());
+                       (uint64_t)net_arp_entries(), (uint64_t)g_ll_yields);
+        if (g_ll == LL_E1000) {
+            uint64_t d[6];
+            e1000_diag(d);
+            console_printf("[net] e1000 diag: GPRC=%llu RDH=%llu RDT=%llu dstat=0x%llx "
+                           "STATUS=0x%llx cur=%llu\n",
+                           d[0], d[1], d[2], d[3], d[4], d[5]);
+        }
     }
 
 #if NET_SELFTEST_UDP
@@ -1335,10 +1428,23 @@ void net_dump_stats(void)
                    (uint64_t)g_stat_udp_rx, (uint64_t)g_stat_udp_tx, (uint64_t)g_udp_drops);
     console_printf("[net] sock dgram rx=%llu staged_drops=%llu\n",
                    (uint64_t)g_dgram_rx, (uint64_t)g_dgram_drops);
-    console_printf("[net] nic io=0x%llx irq=%llu present=%llu isr=0x%llx ring_drops=%llu\n",
-                   (uint64_t)rtl8139_io_base(), (uint64_t)rtl8139_irq(),
-                   (uint64_t)(rtl8139_present() ? 1u : 0u),
-                   (uint64_t)rtl8139_last_isr(), (uint64_t)rtl8139_rx_drops());
+    if (g_ll == LL_E1000) {
+        uint64_t d[6];
+        e1000_diag(d);
+        console_printf("[net] nic %s bar0=0x%llx present=%llu rx_frames=%llu tx_frames=%llu\n",
+                       g_ll_name, (uint64_t)e1000_bar0(),
+                       (uint64_t)(e1000_present() ? 1u : 0u),
+                       (uint64_t)e1000_rx_frames(), (uint64_t)e1000_tx_frames());
+        console_printf("[net] e1000 GPRC=%llu RDH=%llu RDT=%llu dstat=0x%llx STATUS=0x%llx\n",
+                       d[0], d[1], d[2], d[3], d[4]);
+    } else if (g_ll == LL_RTL8139) {
+        console_printf("[net] nic io=0x%llx irq=%llu present=%llu isr=0x%llx ring_drops=%llu\n",
+                       (uint64_t)rtl8139_io_base(), (uint64_t)rtl8139_irq(),
+                       (uint64_t)(rtl8139_present() ? 1u : 0u),
+                       (uint64_t)rtl8139_last_isr(), (uint64_t)rtl8139_rx_drops());
+    } else {
+        console_printf("[net] nic %s (none)\n", g_ll_name);
+    }
 
     if (g_last_valid) {
         net_ip_to_str(g_last_src_ip, b1, sizeof(b1));

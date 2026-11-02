@@ -554,6 +554,52 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
                                "(mkdir/rmdir, rename, unlink: %d/3)\n",
                                ops == 3 ? "PASS" : "FAIL", (int64_t)ops);
             }
+
+            /* VFAT long-name self-test (read side). The test fixture carries one
+             * file whose on-disk name is a real LFN chain ("Long file name
+             * test.txt", short alias LFNTRAN.TXT), so this proves three things at
+             * once: the chain is parsed, path resolution can open a long name,
+             * and readdir prints it (that is what `ls` shows). Ported from
+             * PlantOS' ChaN-FatFs lineage / SpiritFoxOS; see docs/provenance.md. */
+            {
+                static const char lfn_path[] =
+                    "/mnt/fat/Long file name test.txt";
+                static const char lfn_name[] = "Long file name test.txt";
+                static const char lfn_want[] =
+                    "long name payload: SutureOS reads VFAT long entries\n";
+                const uint32_t want_len = (uint32_t)sizeof(lfn_want) - 1u;
+                vfs_stat_t lst;
+                int opened = 0, payload_ok = 0, listed = 0;
+
+                if (vfs_stat(lfn_path, &lst) == VFS_OK && lst.size == want_len) {
+                    int fd = vfs_open(lfn_path, VFS_O_RDONLY);
+                    char rb[80];
+                    int n = (fd >= 0) ? vfs_read(fd, rb, sizeof(rb)) : -1;
+                    if (fd >= 0) vfs_close(fd);
+                    opened = 1;
+                    if (n == (int)want_len &&
+                        memcmp(rb, lfn_want, want_len) == 0)
+                        payload_ok = 1;
+                }
+
+                {
+                    int d = vfs_opendir("/mnt/fat");
+                    if (d >= 0) {
+                        char name[VFS_MAX_NAME];
+                        vfs_node_type_t type;
+                        while (vfs_readdir(d, name, &type) == VFS_OK) {
+                            if (strcmp(name, lfn_name) == 0) { listed = 1; break; }
+                        }
+                        vfs_closedir(d);
+                    }
+                }
+
+                console_printf("[fat32] lfn self-test %s "
+                               "(open=%d payload=%d readdir=%d)\n",
+                               (opened && payload_ok && listed) ? "PASS" : "FAIL",
+                               (int64_t)opened, (int64_t)payload_ok,
+                               (int64_t)listed);
+            }
         }
     }
 

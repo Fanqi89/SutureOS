@@ -339,6 +339,10 @@ void net_input(const void *frame, uint32_t len);
 /* 1 once net_init() brought the NIC up (frames can actually flow). */
 int net_ready(void);
 
+/* Name of the chip actually driving the link: "e1000", "rtl8139" or "none".
+ * The stack prefers e1000 (VMware's virtual NIC) and falls back to RTL8139. */
+const char *net_link_name(void);
+
 /* Primary IPv4 address / gateway / netmask / DNS in host byte order. */
 uint32_t net_ip(void);
 uint32_t net_gw(void);

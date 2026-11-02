@@ -107,6 +107,47 @@ def make_deb() -> bytes:
     )
 
 
+LFN_OFS = (1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30)
+
+
+def lfn_checksum(short11: bytes) -> int:
+    """VFAT long-name checksum over the 11 short-name bytes."""
+    total = 0
+    for b in short11:
+        total = ((total >> 1) + (total << 7) + b) & 0xFF
+    return total
+
+
+def make_lfn_chain(long_name: str, short11: bytes) -> bytes:
+    """On-disk bytes for one VFAT long-name chain.
+
+    Physical order is the reverse of the logical order: the entry at the lowest
+    offset carries ord = N | 0x40 and holds the LAST 13 characters, the entry right
+    before the short entry carries ord = 1 and holds the FIRST 13 characters. All
+    entries carry the checksum of the short name.
+    """
+    units = [ord(c) for c in long_name]
+    n_entries = (len(units) + 12) // 13
+    if n_entries == 0 or n_entries > 20:
+        raise ValueError("long name out of range")
+    padded = units + [0x0000] + [0xFFFF] * (n_entries * 13 - len(units) - 1)
+    chk = lfn_checksum(short11)
+    out = bytearray()
+    for ordn in range(n_entries, 0, -1):
+        ent = bytearray(32)
+        ent[0] = ordn | (0x40 if ordn == n_entries else 0)
+        ent[11] = 0x0F
+        ent[12] = 0x00
+        ent[13] = chk
+        chunk = padded[(ordn - 1) * 13:ordn * 13]
+        for i, off in enumerate(LFN_OFS):
+            c = chunk[i]
+            ent[off] = c & 0xFF
+            ent[off + 1] = (c >> 8) & 0xFF
+        out += ent
+    return bytes(out)
+
+
 def build_image(files: dict) -> bytes:
     """files: {name: bytes} placed in the root directory."""
     # FAT size must cover total clusters; solve iteratively.
@@ -214,6 +255,20 @@ def build_image(files: dict) -> bytes:
         struct.pack_into("<I", ent, 28, len(data))
         root_entries += ent
         write_chain(first, data)
+
+    # One VFAT long-name file so the guest's LFN reader has something real to parse.
+    # Short alias LFNTRAN.TXT; the name ls must show is "Long file name test.txt".
+    lfn_data = b"long name payload: SutureOS reads VFAT long entries\n"
+    lfn_short11 = b"LFNTRAN TXT"
+    lfn_ent = bytearray(32)
+    lfn_ent[0:11] = lfn_short11
+    lfn_ent[11] = 0x20
+    lfn_first = alloc_chain(lfn_data)
+    struct.pack_into("<H", lfn_ent, 20, (lfn_first >> 16) & 0xFFFF)
+    struct.pack_into("<H", lfn_ent, 26, lfn_first & 0xFFFF)
+    struct.pack_into("<I", lfn_ent, 28, len(lfn_data))
+    write_chain(lfn_first, lfn_data)
+    root_entries += make_lfn_chain("Long file name test.txt", lfn_short11) + lfn_ent
 
     # root dir = cluster ROOT_CLUSTER
     put_sector(RESERVED + NUM_FATS * fat_sz, bytes(root_entries))

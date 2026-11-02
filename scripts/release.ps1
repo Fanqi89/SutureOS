@@ -115,10 +115,15 @@ try {
     }
 
     # 3) publish
-    Write-Host "[release] pushing main + tags"
+    #    Push main, then ONLY this release's tag. `git push --tags` would also
+    #    publish local-only tags that were never meant to be released (this repo
+    #    has v0.12/v0.13/v0.14-alpha sitting on the rejected wip/all-ports
+    #    branch); old tags that ARE on the remote are never touched, so versions
+    #    still coexist.
+    Write-Host "[release] pushing main + tag $tag"
     if ((Invoke-Git @('push', 'origin', 'main')) -ne 0) { throw "git push main failed" }
-    if ((Invoke-Git @('push', 'origin', '--tags')) -ne 0) {
-        Write-Host "[release] note: --tags reported an error (an old tag may already exist remotely); checking state"
+    if ((Invoke-Git @('push', 'origin', "refs/tags/$tag")) -ne 0) {
+        Write-Host "[release] note: tag push reported an error (it may already be on the remote); checking state"
     }
     & git.exe -c "http.proxy=$proxyArg" ls-remote --heads --tags origin 2>$null | ForEach-Object { "  $_" }
     Write-Host "[release] done. repository: $repo/tree/main  tags: $repo/tags"

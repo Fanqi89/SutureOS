@@ -69,6 +69,11 @@ def parse(img: bytes):
             break
         if e[0] == 0xE5:
             continue
+        # VFAT long-name entries (attr exactly 0x0F) and the volume label are not
+        # files; their cluster fields are zero, so parsing them as files walks off
+        # the volume and crashes the reader.
+        if e[11] == 0x0F or e[11] == 0x08:
+            continue
         name = e[0:8].decode("latin1").rstrip()
         ext = e[8:11].decode("latin1").rstrip()
         full = f"{name}.{ext}" if ext else name

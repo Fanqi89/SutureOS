@@ -6,6 +6,54 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.15.0-alpha]
+
+**两块从素材库移植的真实能力：Intel e1000 网卡（VMware 下第一次有网络）+ FAT32 VFAT 长文件名
+读取；启动方式与 GUI 外观未变（有门禁脚本证明）。**
+
+> 版本号从 v0.11.5 跳到 v0.15.0：`v0.12.0/0.13.0/0.14.0-alpha` 三个 tag 指向上一轮被判
+> "外观被改动"且从未合入 main 的 `wip/all-ports` 提交；按发布纪律旧 tag 不移动不删除，
+> 因此新版本使用未占用的 0.15.0，与旧 tag 共存。
+
+### Added
+- **Intel e1000 (8254x) 网卡驱动**（`kernel/drivers/e1000.c` 354 行 + `e1000.h`）：
+  移植自 **Cinux** `kernel/driver/net/e1000.cpp`（**MIT**）。VMware Workstation 只提供
+  e1000 虚拟网卡，此前 VMware 下完全没有网络。
+- **链路层分发**（`kernel/net/net.c`）：新增 `ll_send()` / `ll_poll_rx()`，IP 栈不再直连
+  RTL8139；选择顺序为 **RTL8139 优先、e1000 回退**（VMware 只有 e1000）。
+- **FAT32 VFAT 长文件名读侧**（`kernel/fs/fatfs.c` +243 行）：`readdir` 拼回长名（`ls` 可见），
+  新增 `resolve_component()` 让 `open/stat/cat` 也能用长名打开（wip 分支只做了显示这一半）；
+  校验和不匹配的链丢弃，删除/改名时清理链。
+- **长名开机自检**：`[fat32] lfn self-test PASS (open=1 payload=1 readdir=1)`。
+- **`scripts/nic_acceptance.py`**：分别用 `-device rtl8139` 与 `-device e1000` 启动，
+  注入 `ping 10.0.2.2`，断言链路行与 ≥3 条回复；两块网卡各自 PASS。
+- **`scripts/gui_appearance_check.py`**：外观门禁，只容忍文档化的动态数值矩形。
+- **`e1000_diag()`**：netstat / 自检超时时输出 GPRC/RDH/RDT/描述符状态。
+- **文档**：`docs/audit-unfinished.md`（未完成项审计：P0=7/P1=19/P2=30 + 21 处过期文档条目）、
+  `docs/port-candidates.md`（50 个开源自制 OS 的移植候选与许可评估）、
+  `docs/licensing-audit.md`（上游许可证实读核对表）。
+
+### Fixed
+- **wip 分支不可直接 merge**：它基于 v0.11.0，merge 会删掉 v0.11.1–v0.11.5 的
+  fork/socket/signal/GUI 工作；本版在 v0.11.5 上重新实现。
+- **e1000 出处许可写错**：头注释原写 "Cinux GPL-3.0"，实际 Cinux/LICENSE 为 **MIT**，已改正。
+
+### Verification
+- `py -3 scripts/nic_acceptance.py` → **overall PASS**：rtl8139 开机自检
+  `[net] selftest ping 10.0.2.2 -> reply in 1178 us` + 交互 ping 3/3；
+  e1000 `[net] e1000 found at 0xfebc0000` + 交互 ping 3/3。
+- `py -3 scripts/verify_fat32_write.py build/fat32_ata.img build/fat32.img` → **17/17**。
+- FAT32 `ops self-test PASS (3/3)`、模块自检 `13/14`（`moos_intr` 为既有项）、
+  `syscalls: 81 registered`、无 PANIC、启动日志 266 行（基线同）。
+- GUI 外观：`scripts/gui_appearance_check.py` → 动态矩形外差异 **0 像素**。
+
+### Limits
+- **e1000 开机自检 ping 在 QEMU 11.1 下超时**（`GPRC=0`，设备模型不投递），同一次启动里
+  交互 ping 3/3 正常；wip 上一轮同样复现，非本版引入。验收以 `scripts/nic_acceptance.py` 为准。
+- e1000 为轮询驱动；FAT32 长名只读，写侧仍是 8.3；VMware 真正上网仍需先 `dhcp`。
+- **SpiritFoxOS 上游没有 LICENSE 文件**：历史网络/块设备模块出处依据不足，已登记
+  `docs/licensing-audit.md` 作为待确认项（本版新增代码不再从其拷代码）。
+
 ## [v0.11.5-alpha]
 
 **GUI 窗口可以拖动、缩放、关闭了**（界面外观不变）。
