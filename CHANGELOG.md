@@ -6,6 +6,29 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.25.0-alpha]
+
+**第五个桌面应用：Text Editor —— 开始菜单打开、真实键盘输入、回车保存到 /mnt/fat/EDIT.TXT，
+宿主解析 FAT32 镜像逐字节验证。启动呈现与默认桌面外观未变。**
+
+### Added
+- `kernel/gui/apps.c`：`APP_ID_EDT=7` 文本编辑器（加载/插入/退格/换行保存/光标/状态行，
+  1 KiB 缓冲，SutureOS 自绘）；开始菜单新增 `Text Editor`（懒创建，默认桌面不变）。
+- `scripts/editor_acceptance.py`：真实点击 + 键盘注入 + 宿主侧 FAT32 逐字节校验。
+
+### Fixed
+- GUI 的 `q`/`r` 全局快捷键会在文本窗口抢走正文输入（"editor" 丢 r、q 直接退出桌面）：
+  现在只在没有文本输入窗口获得焦点时生效；Ctrl+S(0x13) 也转发给 `on_key`。
+
+### Verification
+- 点菜单 → 窗口创建 → 输入 `hello editor 42` + 回车 → `[edit] saved 17 bytes` →
+  宿主 `EDIT.TXT` = `hello editor 42\n` 逐字节相同 → **5/5 PASS**。
+- 回归：内核 13/14、FAT32 宿主 21/21、图片查看器 + GUI 中文 4/4、外观门禁 0 像素。
+
+### Limits
+- 回车即保存（解码器不报 CTRL）；固定文件路径；无打开/另存为、无方向键编辑、无撤销/粘贴、
+  1 KiB 缓冲、无 CJK 输入。
+
 ## [v0.24.0-alpha]
 
 **FAT32 驱动支持多卷：`/mnt/fat`（IDE）与 `/mnt/usb`（U 盘）同一次启动里同时可读可写，

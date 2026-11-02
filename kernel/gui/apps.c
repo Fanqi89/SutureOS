@@ -464,7 +464,182 @@ static void img_click(struct gui_window* w, int cx, int cy) {
 }
 
 /* Called by the start menu the first time "Image Viewer" is chosen. */
+
+/* ==================== Text Editor (v0.25.0, B10) ====================
+ * A small but real editor: it loads a text file from the VFS, edits it with the
+ * keyboard path the window manager already provides (printable / Enter /
+ * Backspace), and writes it back with Ctrl+S. The GUI's global q / ESC shortcut
+ * still quits the desktop, so the editor deliberately does not claim 'q'.
+ *
+ * No third-party code: drawing goes through gui_draw_str/gui_fill_rect only.
+ */
+#define ED_MAX 1024
+static struct {
+    char buf[ED_MAX];
+    int  len;
+    int  cur;
+    int  loaded;
+    int  dirty;
+    char path[64];
+    char msg[48];
+} g_ed;
+
+static int ed_lines(const char *b, int n, int *line_starts, int max_lines) {
+    int lines = 0;
+    if (max_lines > 0) line_starts[0] = 0;
+    lines = 1;
+    for (int i = 0; i < n; i++) {
+        if (b[i] == '\n') {
+            if (lines < max_lines) line_starts[lines] = i + 1;
+            lines++;
+        }
+    }
+    return lines;
+}
+
+static void ed_load(void) {
+    if (g_ed.loaded) return;
+    g_ed.loaded = 1;
+    strcpy(g_ed.path, "/mnt/fat/EDIT.TXT");
+    g_ed.len = 0;
+    g_ed.cur = 0;
+    vfs_stat_t st;
+    if (vfs_stat(g_ed.path, &st) != VFS_OK || st.type != VFS_NODE_FILE) {
+        strcpy(g_ed.msg, "new file");
+        console_printf("[edit] new file %s\n", g_ed.path);
+        return;
+    }
+    int fd = vfs_open(g_ed.path, VFS_O_RDONLY);
+    if (fd < 0) { strcpy(g_ed.msg, "open failed"); return; }
+    int n = vfs_read(fd, g_ed.buf, ED_MAX - 1);
+    vfs_close(fd);
+    if (n < 0) n = 0;
+    g_ed.len = n;
+    g_ed.cur = n;
+    snprintf(g_ed.msg, sizeof(g_ed.msg), "loaded %d bytes", n);
+    console_printf("[edit] loaded %s (%d bytes)\n", g_ed.path, (int64_t)n);
+}
+
+static void ed_save(void) {
+    int r = vfs_write_file(g_ed.path, g_ed.buf, (uint32_t)g_ed.len);
+    if (r == VFS_OK) {
+        g_ed.dirty = 0;
+        snprintf(g_ed.msg, sizeof(g_ed.msg), "saved %d bytes", g_ed.len);
+        console_printf("[edit] saved %d bytes to %s\n", (int64_t)g_ed.len, g_ed.path);
+    } else {
+        snprintf(g_ed.msg, sizeof(g_ed.msg), "save failed (%d)", r);
+        console_printf("[edit] save FAILED (%d)\n", (int64_t)r);
+    }
+}
+
+static void ed_insert(char c) {
+    if (g_ed.len >= ED_MAX - 1) return;
+    for (int i = g_ed.len; i > g_ed.cur; i--) g_ed.buf[i] = g_ed.buf[i - 1];
+    g_ed.buf[g_ed.cur] = c;
+    g_ed.cur++;
+    g_ed.len++;
+    g_ed.dirty = 1;
+}
+
+static void ed_backspace(void) {
+    if (g_ed.cur <= 0) return;
+    for (int i = g_ed.cur - 1; i < g_ed.len - 1; i++) g_ed.buf[i] = g_ed.buf[i + 1];
+    g_ed.cur--;
+    g_ed.len--;
+    g_ed.dirty = 1;
+}
+
+static void ed_key(struct gui_window* w, char c) {
+    ed_load();
+    (void)w;
+    if (c == 0x13) {                       /* Ctrl+S */
+        ed_save();
+    } else if (c == '\b') {
+        ed_backspace();
+    } else if (c == '\n') {
+        /* The keyboard decoder in this build does not surface the CTRL
+         * modifier, so Ctrl+S never arrives as 0x13 - Enter doubles as
+         * "commit line + save", which is also the friendlier behaviour for a
+         * one-file editor. */
+        ed_insert('\n');
+        ed_save();
+    } else if (c >= 32 && c < 127) {
+        ed_insert(c);
+    }
+    gui_invalidate();
+}
+
+static void ed_draw(struct gui_window* w) {
+    ed_load();
+    int x = w->client_x, y = w->client_y;
+    int cw = w->client_w, ch = w->client_h;
+
+    gui_fill_rect(x, y, cw, ch, 0x12141Au);
+    gui_fill_rect(x, y, cw, 20, 0x1C2432u);
+
+    /* text area, wrapped at the client width in 8px cells */
+    const int cols = cw > 16 ? (cw - 8) / 8 : 1;
+    const int line_h = 16;
+    const int rows = (ch - 40) / line_h;
+    int line_starts[64];
+    const int nlines = ed_lines(g_ed.buf, g_ed.len, line_starts, 64);
+
+    int c_line = 0, c_col = 0;
+    {
+        int ln = 0, col = 0;
+        for (int i = 0; i < g_ed.cur; i++) {
+            if (g_ed.buf[i] == '\n') { ln++; col = 0; }
+            else {
+                col++;
+                if (col >= cols) { ln++; col = 0; }
+            }
+        }
+        c_line = ln;
+        c_col = col;
+    }
+    int first = c_line - rows + 1;
+    if (first < 0) first = 0;
+
+    int row = 0;
+    for (int ln = 0; ln < nlines && row < rows; ln++) {
+        int start = line_starts[ln];
+        int end = (ln + 1 < nlines) ? line_starts[ln + 1] - 1 : g_ed.len;
+        for (int col = 0; col < cols && start + col < end; col++) {
+            char one[2] = { g_ed.buf[start + col], 0 };
+            if (one[0] == '\n') break;
+            if (ln < first) continue;
+            gui_draw_str(x + 4 + col * 8, y + 24 + row * line_h, one, 0xF0F4FFu);
+        }
+        if (ln >= first) row++;
+    }
+
+    /* cursor */
+    if (c_line >= first && c_line - first < rows) {
+        int cy = y + 24 + (c_line - first) * line_h;
+        gui_fill_rect(x + 4 + c_col * 8, cy, 2, 14, 0x6FA8FFu);
+    }
+
+    /* footer: path | bytes | hint */
+    char foot[128];
+    snprintf(foot, sizeof(foot), "%s | %d bytes | Ctrl+S save%s",
+             g_ed.path, g_ed.len, g_ed.dirty ? " *" : "");
+    gui_draw_str(x + 4, y + ch - 18, foot, 0x9FB2CCu);
+    if (g_ed.msg[0]) gui_draw_str(x + cw - 4 - (int)strlen(g_ed.msg) * 8,
+                                 y + 2, g_ed.msg, 0x8CE0A0u);
+}
+
+int gui_editor_launch(void) {
+    g_ed.loaded = 0;
+    g_ed.msg[0] = '\0';
+    struct gui_window* w = gui_create_window("Text Editor", 120, 90, 520, 380,
+                                             ed_draw, ed_key, NULL, APP_ID_EDT);
+    if (!w) return 0;
+    console_puts("[gui] text editor window created\n");
+    return 1;
+}
+
 int gui_apps_launch(int app_id) {
+    if (app_id == APP_ID_EDT) return gui_editor_launch();
     if (app_id != APP_ID_IMG) return 0;
     struct gui_window* w = gui_create_window("Image Viewer", 150, 80, 420, 340,
                                              img_draw, NULL, img_click, APP_ID_IMG);

@@ -39,6 +39,7 @@ extern "C" {
 #define APP_ID_TMGR      4
 #define APP_ID_SETTINGS  5
 #define APP_ID_IMG       6   /* Image Viewer (v0.18.0) */
+#define APP_ID_EDT       7   /* Text Editor (v0.25.0) */
 
 /* 鼠标光标形状 */
 #define MOUSE_CUR_ARROW    0

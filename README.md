@@ -2,7 +2,7 @@
 
 > **一个由 16 个爱好者操作系统项目拼接而成的 x86_64 单内核操作系统**
 > 
-> 当前版本：**v0.24.0-alpha** · 内核编译 **105** 个源文件（源码树约 220 个 C/H/ASM、约 6.0 万行）
+> 当前版本：**v0.25.0-alpha** · 内核编译 **105** 个源文件（源码树约 220 个 C/H/ASM、约 6.0 万行）
 > · 内核 ELF 约 **2.06 MB**（含调试符号）· 可引导 ISO 约 **15.0 MB** · **GPL-3.0** 许可证
 >
 > 移植与许可说明：[`docs/provenance.md`](docs/provenance.md)（模块→上游·文件路径）
@@ -70,6 +70,7 @@ SutureOS（缝合怪系统）是一个实验性的 x86_64 单内核操作系统�
 | v0.22.0 | **HTTP 下载（wget）** | SutureOS 自有实现（GPL-3.0），复用内核 TCP | `kernel/shell/shell.c`、`scripts/wget_acceptance.py` | ✅ 真实 HTTP 服务器 + 宿主逐字节比对 8/8 |
 | v0.23.0 | **USB 2.0 存储（EHCI + BOT/SCSI）** | HanOS EHCI 骨架（MIT）+ HBOS BOT 参考（GPL-3.0） | `kernel/drivers/usb_ehci.c`、`scripts/verify_usb_disk.py` | ✅ 枚举/挂载/读写 + 宿主逐扇区校验 8/8 + 只读整盘 CRC 未变 |
 | v0.24.0 | **FAT32 多卷**（/mnt/fat 与 /mnt/usb 同时可读写） | SutureOS 自有（GPL-3.0） | `kernel/fs/fatfs.c`、`fatfs_vfs.c`、`scripts/multivol_acceptance.py` | ✅ 双卷 + 交叉写 + 宿主双镜像校验 12/12 |
+| v0.25.0 | **文本编辑器**（GUI 第五个应用，回车保存） | SutureOS 自绘（GPL-3.0） | `kernel/gui/apps.c`、`scripts/editor_acceptance.py` | ✅ 真实点击+键盘 → 宿主 FAT32 逐字节 5/5 |
 
 ---
 

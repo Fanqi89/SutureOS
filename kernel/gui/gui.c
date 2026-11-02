@@ -250,6 +250,7 @@ static const struct {
     { "Calculator",     APP_ID_CALC     },
     { "About SutureOS", APP_ID_SETTINGS },
     { "Image Viewer",   APP_ID_IMG      },
+    { "Text Editor",    APP_ID_EDT      },
     { NULL,             START_KIND_SEP  },
     { "Exit to terminal", START_KIND_EXIT },
 };
@@ -939,15 +940,28 @@ static bool gui_handle_keys(void) {
 
         if (ch <= 0) continue;                    /* break/modifier/unmapped */
         if (ch == '\t') { gui_focus_next(); continue; }          /* Tab  */
-        if (ch == 0x1B || ch == 'q' || ch == 'Q') {              /* q / ESC */
+        if (ch == 0x1B) {                                        /* ESC quits */
             quit = true;
             break;
         }
-        if (ch == 'r' || ch == 'R') { gui_invalidate(); continue; }  /* r */
-        /* printable keys (+Enter/Backspace for the terminal app) -> on_key */
-        if (ch == '\n' || ch == '\b' || (ch >= 32 && ch < 127)) {
-            struct gui_window* w = gui_focused();
-            if (w && w->on_key) w->on_key(w, (char)ch);
+        /* 'q' / 'r' are desktop shortcuts only while no text-input window has
+         * focus: otherwise typing an ordinary word like "editor" in the Text
+         * Editor would lose its r (and q would close the whole desktop). */
+        struct gui_window* fw = gui_focused();
+        const bool text_input = (fw != NULL && fw->on_key != NULL);
+        if (!text_input && (ch == 'q' || ch == 'Q')) {
+            quit = true;
+            break;
+        }
+        if (!text_input && (ch == 'r' || ch == 'R')) {
+            gui_invalidate();
+            continue;
+        }
+        /* printable keys + Enter/Backspace (+Ctrl+S when the decoder reports
+         * it) go to the focused window's key handler. */
+        if (ch == '\n' || ch == '\b' || ch == 0x13 ||
+            (ch >= 32 && ch < 127)) {
+            if (text_input) fw->on_key(fw, (char)ch);
         }
     }
     return quit;
