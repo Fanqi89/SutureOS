@@ -6,6 +6,29 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.36.0-alpha]
+
+**系统升级（只做覆盖）+ Rust 系统层第一步。**
+
+### Added
+- `kernel/install/installer.c`：`installer_upgrade()` —— 按内容找装好的系统卷（`/SUTUREOS/INSTALLED`），
+  从 ISO 覆盖 `/kernel.elf`、`/limine-bios.sys`、重新生成 `/limine.conf`，重刷 MBR + Limine stage2，
+  写 `/SUTUREOS/VERSION`；`/etc`、`/home`、`/root`、`/SUTUREOS/PERSIST` 一律不动；复用 bulk 写模式加速。
+- `shell.c`：`upgrade` 命令（root）。
+- `rust/suture-core`（no_std staticlib, `x86_64-unknown-none`）+ `kernel/rust/probe.c`（weak 回退 + 探针）
+  + `scripts/build.py` 提取 ar 成员链接（GNU 长名表 `//` + `/NNN`）。
+- `scripts/upgrade_acceptance.py`（四阶段，11 项）。
+
+### Verification
+- upgrade **11/11**：装 v0.35 → 升级到 v0.36 → 宿主 `/KERNEL.ELF` 与 `build/kernel.elf` 逐字节相同、
+  PERSIST marker 保留 → 只挂盘启动 banner `0.36.0-alpha` 且 marker 仍在、无 PANIC。
+- Rust 核心：`[rust] core v10000 linked, selftest=2171600cbe2b2b8c expected=... PASS`。
+- 回归：内核 13/14、FAT32 21/21、apps_taskbar 9/9、GUI 外观门禁 0 像素。
+
+### Limits
+- 覆盖式升级（无回滚/签名/版本校验）；`/etc` 模板不更新；仅 BIOS/MBR+Limine；需 ISO 启动；
+  Rust 核心只验证链接与 ABI（Slint/Smithay 未接入）；既有 ATA 偶发超时（重跑即过）。
+
 ## [v0.35.0-alpha]
 
 **数据持久化：安装到硬盘后 `/etc`、`/home`、`/root` 双向镜像到系统卷 `/SUTUREOS/PERSIST`，

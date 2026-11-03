@@ -30,6 +30,7 @@
  * License: GPL-3.0（SutureOS 本体）+ BSD-2-Clause（Limine 引导镜像数据）。
  */
 #include "installer.h"
+#include <sutureos/version.h>
 #include <stitch/types.h>
 #include <stitch/string.h>
 #include <stitch/console.h>
@@ -673,6 +674,176 @@ static int inst_install(int drive, const char *root_pw,
 }
 
 /* ---------------- entry point (shell `install`) ---------------- */
+
+/* ==================== system upgrade (overwrite only, v0.36.0) ============
+ * "Upgrade" is deliberately the simple, honest operation the user asked for:
+ * overwrite the SYSTEM files on the installed volume with the ones from the
+ * current install medium (kernel.elf, limine-bios.sys, limine.conf), refresh
+ * the MBR + Limine stage 2, and bump the recorded version. User data -
+ * /etc, /home, /root and the whole /SUTUREOS/PERSIST tree - is never touched.
+ *
+ * The installed volume is found by content (a FAT32 volume carrying
+ * /SUTUREOS/INSTALLED), so this works from a live ISO session where the
+ * installed disk is just another data disk.
+ */
+static int inst_find_installed(char *mount_out, uint32_t mount_cap,
+                               int *drive_out, uint32_t *part_start,
+                               uint32_t *part_sectors) {
+    uint8_t *mbr = lemis_heap_alloc(512);
+    if (!mbr) return -1;
+
+    for (int i = 0; i < g_disk_count; i++) {
+        const int drive = g_disks[i].drive;
+        char dev[8];
+        vfs_stat_t st;
+        snprintf(dev, sizeof(dev), "%d", drive);
+        if (vfs_mount(dev, "/mnt/upg", "fat32") != VFS_OK) continue;
+        if (vfs_stat("/mnt/upg/SUTUREOS/INSTALLED", &st) != VFS_OK) {
+            vfs_unmount("/mnt/upg");
+            continue;
+        }
+        /* read the MBR to recover the partition geometry for the boot area */
+        if (blk_read(drive, 0, 1, mbr) != 0) {
+            vfs_unmount("/mnt/upg");
+            continue;
+        }
+        int found = 0;
+        for (int part = 0; part < 4; part++) {
+            const uint8_t *e = mbr + 446 + part * 16;
+            const uint8_t type = e[4];
+            if (type != 0x0B && type != 0x0C && type != 0x0E) continue;
+            const uint32_t lba = (uint32_t)e[8] | ((uint32_t)e[9] << 8) |
+                                 ((uint32_t)e[10] << 16) | ((uint32_t)e[11] << 24);
+            const uint32_t secs = (uint32_t)e[12] | ((uint32_t)e[13] << 8) |
+                                  ((uint32_t)e[14] << 16) | ((uint32_t)e[15] << 24);
+            if (secs < INST_MIN_SECTORS) continue;
+            *drive_out = drive;
+            *part_start = lba;
+            *part_sectors = secs;
+            found = 1;
+            break;
+        }
+        if (!found) {
+            vfs_unmount("/mnt/upg");
+            continue;
+        }
+        if (mount_out && mount_cap > 1) {
+            strncpy(mount_out, "/mnt/upg", mount_cap - 1);
+            mount_out[mount_cap - 1] = '\0';
+        }
+        lemis_heap_free(mbr);
+        return 0;
+    }
+    lemis_heap_free(mbr);
+    return -1;
+}
+
+static int inst_write_version(const char *mount, const char *extra) {
+    char buf[256];
+    int n = snprintf(buf, sizeof(buf),
+                     "sutureos-installed 1\nversion=%s\nupgraded=1\n%s",
+                     SUTUREOS_VERSION, extra ? extra : "");
+    if (n < 0 || n >= (int)sizeof(buf)) return -1;
+    return inst_write_text("/mnt/upg/SUTUREOS/VERSION", buf);
+}
+
+int installer_upgrade(void) {
+    char iso_mount[16];
+    int iso_drive;
+    char mount[16];
+    int drive = -1;
+    uint32_t part_start = 0, part_sectors = 0;
+    const char *const kernel_names[] = {"boot/kernel.elf", "kernel.elf",
+                                        "KERNEL.ELF"};
+    const char *const limine_names[] = {"boot/limine/limine-bios.sys",
+                                        "limine-bios.sys", "LIMINE_B.SYS",
+                                        "LIMINE_BIOS.SYS"};
+    const char *const conf_names[] = {"boot/limine.conf", "limine.conf",
+                                      "LIMINE.CONF"};
+    char src[VFS_MAX_PATH];
+
+    if (g_disk_count == 0) inst_collect_disks();
+
+    iso_drive = inst_find_iso(iso_mount, sizeof(iso_mount));
+    if (iso_drive < 0) {
+        inst_puts("[upgrade] no install medium found (boot the ISO to upgrade)\n");
+        return -1;
+    }
+
+    if (inst_find_installed(mount, sizeof(mount), &drive, &part_start,
+                            &part_sectors) != 0) {
+        inst_puts("[upgrade] no installed SutureOS volume found on any disk\n");
+        vfs_unmount(iso_mount);
+        return -1;
+    }
+    console_printf("[upgrade] installed system on drive %d (partition LBA %u..%u)\n",
+                   (int64_t)drive, (uint64_t)part_start,
+                   (uint64_t)(part_start + part_sectors - 1u));
+    console_printf("[upgrade] upgrade medium: drive %d, target version %s\n",
+                   (int64_t)iso_drive, SUTUREOS_VERSION);
+    fatfs_set_bulk_mode(1);   /* same acceleration the installer uses */
+
+    /* 1) kernel.elf - the actual new system */
+    if (inst_find_source(iso_mount, kernel_names,
+                         (uint32_t)(sizeof(kernel_names) / sizeof(kernel_names[0])),
+                         src, sizeof(src)) != 0) {
+        inst_puts("[upgrade] kernel.elf not found on the medium\n");
+        goto fail;
+    }
+    {
+        uint64_t bytes = 0;
+        if (inst_copy_file(src, "/mnt/upg/kernel.elf", &bytes) != 0) goto fail;
+        console_printf("[upgrade]   /kernel.elf <- %s (%llu bytes)\n",
+                       src, bytes);
+    }
+
+    /* 2) limine-bios.sys (stage 2 payload) */
+    if (inst_find_source(iso_mount, limine_names,
+                         (uint32_t)(sizeof(limine_names) / sizeof(limine_names[0])),
+                         src, sizeof(src)) == 0) {
+        uint64_t bytes = 0;
+        if (inst_copy_file(src, "/mnt/upg/limine-bios.sys", &bytes) != 0) goto fail;
+        console_printf("[upgrade]   /limine-bios.sys <- %s (%llu bytes)\n",
+                       src, bytes);
+    } else {
+        inst_puts("[upgrade]   limine-bios.sys not on the medium (kept the old one)\n");
+    }
+
+    /* 3) limine.conf - regenerate so the boot entry is always the current one */
+    {
+        int out = vfs_open("/mnt/upg/limine.conf",
+                           VFS_O_CREAT | VFS_O_WRONLY | VFS_O_TRUNC);
+        if (out < 0) {
+            inst_puts("[upgrade] cannot write limine.conf\n");
+            goto fail;
+        }
+        vfs_write(out, (const void *)k_limine_conf,
+                  (uint32_t)strlen(k_limine_conf));
+        vfs_close(out);
+    }
+
+    /* 4) refresh MBR + Limine stage 2 on the installed disk */
+    if (inst_write_boot_area(drive, part_start, part_sectors) != 0) goto fail;
+
+    /* 5) record the new version (PERSIST and /etc are left untouched) */
+    (void)inst_write_version(mount, "");
+
+    vfs_sync(mount);
+    fatfs_set_bulk_mode(0);
+    vfs_unmount(mount);
+    vfs_unmount(iso_mount);
+    console_printf("[upgrade] done (drive %d, system files overwritten,"
+                   " user data kept)\n", (int64_t)drive);
+    return 0;
+
+fail:
+    fatfs_set_bulk_mode(0);
+    vfs_unmount(mount);
+    vfs_unmount(iso_mount);
+    inst_puts("[upgrade] FAILED - the installed system was not upgraded\n");
+    return -1;
+}
+
 
 int installer_run(void) {
     char root_pw[64], root_pw2[64];

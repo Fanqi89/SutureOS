@@ -139,6 +139,7 @@ static const struct shell_cmd g_commands[] = {
     {"ushell",  shell_cmd_ushell,  "Enter the ring-3 user shell (exit comes back here)"},
     {"mount",   shell_cmd_mount,   "Mount filesystem"},
     {"install", shell_cmd_install, "Install SutureOS onto a hard disk (terminal wizard)"},
+    {"upgrade", shell_cmd_upgrade, "Overwrite the installed system files from this ISO (keeps user data)"},
     {"umount",  shell_cmd_umount,  "Unmount filesystem"},
     {"df",      shell_cmd_df,      "Show disk usage"},
     {"cpus",    shell_cmd_cpus,    "Show per-CPU state (jiffies, IPIs, work done)"},
@@ -1824,6 +1825,15 @@ int shell_cmd_install(int argc, char **argv) {
     if (!require_root("install")) return 1;
     extern int installer_run(void);
     return installer_run() == 0 ? 0 : 1;
+}
+
+/* Overwrite-only upgrade from the current install medium. Non-destructive to
+ * user data by design (kernel/install/installer.c: installer_upgrade). */
+int shell_cmd_upgrade(int argc, char **argv) {
+    (void)argc; (void)argv;
+    if (!require_root("upgrade")) return 1;
+    extern int installer_upgrade(void);
+    return installer_upgrade() == 0 ? 0 : 1;
 }
 
 int shell_cmd_mount(int argc, char **argv) {

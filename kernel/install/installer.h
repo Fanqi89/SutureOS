@@ -19,6 +19,10 @@ extern "C" {
  * cancelled or an error was reported (each failure prints its reason). */
 int installer_run(void);
 
+/* Overwrite-only system upgrade from the current install medium.
+ * Keeps /etc, /home, /root and /SUTUREOS/PERSIST untouched. */
+int installer_upgrade(void);
+
 #ifdef __cplusplus
 }
 #endif
