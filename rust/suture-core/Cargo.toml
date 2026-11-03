@@ -1,0 +1,14 @@
+[package]
+name = "suture-core"
+version = "0.1.0"
+edition = "2021"
+description = "SutureOS Rust system-layer core (no_std, freestanding x86_64)"
+
+[lib]
+crate-type = ["staticlib"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+panic = "abort"
+codegen-units = 1

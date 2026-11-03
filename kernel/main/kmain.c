@@ -172,6 +172,14 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
      * (flanterm) allocates its grid/queue/map from this heap, and several
      * module self-tests call malloc() as well. */
     suture_mem_bringup(mbi, "init");
+    /* Rust system-layer core (v0.36.0): proves the no_std staticlib really is
+     * linked into the kernel image and its C ABI works. Prints
+     * "[rust] core v10000 linked, selftest=... expected=... PASS", or the honest
+     * "not linked (C fallback)" line on a machine without a Rust toolchain. */
+    {
+        extern void suture_rust_probe(void);
+        suture_rust_probe();
+    }
 
     /* Initialize syscall subsystem */
     /* The per-task fd table defaults to zeros, which looks like

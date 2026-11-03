@@ -381,15 +381,81 @@ def main():
     objs.extend(user_embed_objs)
     print(f"Compiled {len(objs)-3} source files + trampoline + font + user blob")
     
+    # ---- Rust system-layer core (v0.36.0) -------------------------------
+    # rust/suture-core is a no_std staticlib for x86_64-unknown-none. It is
+    # optional: without the toolchain/target the kernel still links because
+    # kernel/rust/probe.c carries weak fallbacks and reports "not linked".
+    #
+    # GNU ld never replaces a weak definition with an archive member it did not
+    # pull, and pulling the whole staticlib would drag in compiler_builtins
+    # (duplicate memcpy/memset with kernel/lib/string.c). So the crate object is
+    # extracted from the archive and linked as a plain object - deterministic.
+    rust_obj = None
+    rust_manifest = ROOT / "rust" / "suture-core" / "Cargo.toml"
+    if rust_manifest.exists():
+        rustup_cargo = Path(os.environ.get("USERPROFILE", "")) / ".cargo" / "bin" / "cargo.exe"
+        cargo = str(rustup_cargo) if rustup_cargo.exists() else "cargo"
+        rust_target = "x86_64-unknown-none"
+        print("Building Rust core (%s)..." % rust_target)
+        r = subprocess.run(
+            [cargo, "build", "--release", "--target", rust_target,
+             "--manifest-path", str(rust_manifest)],
+            cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        lib = ROOT / "rust" / "suture-core" / "target" / rust_target / "release" / "libsuture_core.a"
+        if r.returncode != 0 or not lib.exists():
+            print("Rust core build FAILED (kernel keeps the C fallback):")
+            sys.stdout.write(r.stdout.decode("utf-8", "replace")[-2000:])
+        else:
+            print("Rust core: %s (%d bytes)" % (lib.name, lib.stat().st_size))
+            try:
+                data = lib.read_bytes()
+                if not data.startswith(b"!<arch>\n"):
+                    raise ValueError("not an ar archive")
+                # First pass: collect the GNU long-name table (member "//").
+                members = []
+                longnames = b""
+                pos = 8
+                while pos + 60 <= len(data):
+                    hdr = data[pos:pos + 60]
+                    name = hdr[0:16].decode("ascii", "replace").strip()
+                    size_field = hdr[48:58].decode("ascii", "replace").strip()
+                    if not size_field.isdigit():
+                        break
+                    size = int(size_field)
+                    body = data[pos + 60:pos + 60 + size]
+                    if name == "//":
+                        longnames = body
+                    else:
+                        members.append((name, body))
+                    pos += 60 + size + (size & 1)
+                # Second pass: resolve "/<offset>" names through the table.
+                for name, body in members:
+                    real = name
+                    if name.startswith("/") and name[1:].strip().isdigit():
+                        off = int(name[1:].strip())
+                        tail = longnames[off:]
+                        real = tail.split(b"/\n", 1)[0].split(b"\n", 1)[0].decode(
+                            "ascii", "replace")
+                    if real.endswith(".o") and "suture_core-" in real:
+                        rust_obj = BUILD / "rust_core.o"
+                        rust_obj.write_bytes(body)
+                        print("Rust core object: %s (%d bytes) from %s"
+                              % (rust_obj.name, len(body), real))
+            except Exception as exc:                 # noqa: BLE001
+                print("Rust core extraction failed: %r" % exc)
+                rust_obj = None
+
     # Link
     elf = BUILD / "kernel.elf"
+    if rust_obj is not None:
+        objs.append(str(rust_obj))
     ld_args = [str(LD), "-T", str(ROOT / "boot" / "linker.ld"), "-o", str(elf)] + objs
     print("Linking...")
     result = subprocess.run(ld_args)
     if result.returncode != 0:
         print("link failed")
         return 1
-    
+
     print(f"BUILD OK -> {elf}")
     subprocess.run([str(LD), "--version"])
     print(f"kernel.elf: {elf.stat().st_size} bytes")
