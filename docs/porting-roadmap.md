@@ -74,5 +74,5 @@
 
 两项都保留了调研结论与参考出处（见 `docs/provenance.md` 的 collection 清单），下一轮可直接接着做。
 | B17 | v0.31.0-alpha | **GUI 任务栏增强 + Windows 键快捷键**（窗口按钮/时钟/当前用户） | SutureOS 自绘（用户 2026-11-03 要求，外观基线已更新） | 真 QMP 注入 + 截图断言 **7/7** | ✅ 本轮完成 |
-| B18 | 进行中 | **ISO 系统安装盘**（真实写盘/分区/引导/系统文件/可选密码） | 队友 worktree port-installer | 待：宿主解析装好的镜像 + 从硬盘启动 | ⏳ |
+| B18 | v0.33.0-alpha | **ISO 系统安装盘**（真实写盘/分区/Limine 引导/FAT32 格式化/系统文件//etc 播种） | SutureOS 自有 + Limine 布局 | 三阶段宿主验收 **56/56**（含无 ISO 从硬盘启动 + su alice + 空密码路径） | ✅ 本轮完成 |
 | B19 | v0.32.0-alpha | **多用户**（useradd/userdel/users/passwd/login/su + GUI Switch User） | SutureOS 自有（GPL-3.0） | 多用户 54/54 + GUI 切换 13/13 + 宿主 PBKDF2 重算校验 | ✅ 本轮完成 |

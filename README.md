@@ -2,7 +2,7 @@
 
 > **一个由 16 个爱好者操作系统项目拼接而成的 x86_64 单内核操作系统**
 > 
-> 当前版本：**v0.32.0-alpha** · 内核编译 **105** 个源文件（源码树约 220 个 C/H/ASM、约 6.0 万行）
+> 当前版本：**v0.33.0-alpha** · 内核编译 **105** 个源文件（源码树约 220 个 C/H/ASM、约 6.0 万行）
 > · 内核 ELF 约 **2.06 MB**（含调试符号）· 可引导 ISO 约 **15.0 MB** · **GPL-3.0** 许可证
 >
 > 移植与许可说明：[`docs/provenance.md`](docs/provenance.md)（模块→上游·文件路径）
@@ -12,6 +12,17 @@
 > · [`docs/porting-roadmap.md`](docs/porting-roadmap.md)（**分批移植路线图：B1..B10**）
 
 ---
+
+
+### 安装到硬盘
+
+1. 用 `sutureos.iso` 启动，进入终端；
+2. 以 root 运行 **`install`**；
+3. 向导会让你选目标盘（**默认不选第一块盘**）、输入 `yes` 二次确认、设置 root 密码（**可直接回车留空**）、
+   可选创建一个普通用户；
+4. 安装完成后重启，BIOS 从硬盘启动即可（Limine → kernel → 终端），安装时设的密码/用户在重启后仍然有效。
+
+细节（分区布局、`/etc/shadow` 空密码语义、`/etc` 播种规则、限制）见 [docs/INSTALLER.md](docs/INSTALLER.md)。
 
 ## 🎯 项目简介
 
@@ -78,6 +89,7 @@ SutureOS（缝合怪系统）是一个实验性的 x86_64 单内核操作系统�
 | v0.30.0 | **SquashFS 多卷**（三种文件系统都支持多卷） | SutureOS 自有（GPL-3.0） | `kernel/fs/squashfs.c`、`squashfs_vfs.c`、`scripts/multivol_squashfs_acceptance.py` | ✅ 双卷 + 宿主双镜像 83/83，全量回归通过 |
 | v0.31.0 | **任务栏增强 + Win 键**（窗口按钮/时钟/当前用户） | SutureOS 自绘（GPL-3.0） | `kernel/gui/gui.c`、`scripts/taskbar_acceptance.py` | ✅ 7/7 + 外观门禁 0 像素（基线按要求更新） |
 | v0.32.0 | **多用户体系**（useradd/userdel/login/su + GUI 切换 + 密码三态） | SutureOS 自有（GPL-3.0） | `kernel/security/login.c`、`userdb.c`、`shell.c`、`scripts/multiuser_acceptance.py` | ✅ 54/54 + 13/13 + 宿主 PBKDF2 重算校验 |
+| v0.33.0 | **ISO 安装盘**（真实写盘 + 从硬盘启动 + /etc 播种） | SutureOS 自有；Limine 引导布局（BSD-2 工具链头） | `kernel/install/installer.c`、`kernel/fs/fatfs_format.c`、`scripts/installer_acceptance.py` | ✅ 三阶段 56/56（含无 ISO 从硬盘启动 + su alice） |
 
 ---
 

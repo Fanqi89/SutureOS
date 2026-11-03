@@ -28,9 +28,18 @@ static struct fat_mnt *mnt_find_by_point(const char *mountpoint) {
 
 /* Parse a block drive number from the device string:
  * whole-string decimal ("0"), else the last digit anywhere ("ata0",
- * "/dev/sda"->0), else 0. */
+ * "/dev/sda"->0), else 0. Only the part before an optional ":<offset>" is
+ * considered, so "0:2048" means drive 0 at partition offset 2048. */
 static int parse_drive(const char *device) {
+    char head[64];
+    uint32_t n = 0;
     if (!device) return 0;
+    while (device[n] && device[n] != ':' && n + 1 < sizeof(head)) {
+        head[n] = device[n];
+        n++;
+    }
+    head[n] = '\0';
+    device = head;
     uint32_t i = 0;
     int all_digits = 1;
     for (const char *p = device; *p; p++) {
@@ -94,16 +103,36 @@ static int vol_path(struct fat_mnt *m, const char *path, char *out, uint32_t cap
     return VFS_OK;
 }
 
+/* Optional explicit partition offset in the device string: "0:2048" (or
+ * "ata0:2048") means "the FAT32 partition that starts at LBA 2048". Without it
+ * the driver auto-detects: LBA 0 (superfloppy) first, then the MBR partitions. */
+static int parse_offset(const char *device, uint32_t *out) {
+    if (!device || !out) return 0;
+    const char *p = device;
+    while (*p && *p != ':') p++;
+    if (*p != ':') return 0;
+    p++;
+    if (*p < '0' || *p > '9') return 0;
+    uint32_t v = 0;
+    while (*p >= '0' && *p <= '9') { v = v * 10u + (uint32_t)(*p - '0'); p++; }
+    *out = v;
+    return 1;
+}
+
 static int fatfs_vfs_mount(const char *device, const char *mountpoint, void **fs_data) {
     if (!mountpoint) return VFS_EINVAL;
     int drv = parse_drive(device);
+    uint32_t start_lba = 0;
+    const int explicit_offset = parse_offset(device, &start_lba);
 
     struct fat_mnt *m = NULL;
     for (int i = 0; i < FATFS_VFS_MAX_MOUNTS; i++)
         if (!g_mnts[i].used) { m = &g_mnts[i]; break; }
     if (!m) return VFS_ENOSPC;
 
-    int slot = fatfs_mount((uint8_t)drv, NULL);
+    int slot = explicit_offset
+             ? fatfs_mount_at((uint8_t)drv, NULL, start_lba)
+             : fatfs_mount_auto((uint8_t)drv);
     if (slot < 0) return map_err(slot);        /* mount returns the volume slot */
 
     memset(m, 0, sizeof(*m));

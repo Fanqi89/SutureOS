@@ -101,6 +101,30 @@ static void suture_mem_bringup(uint32_t mbi, const char *tag)
     }
 }
 
+/* Copy one /etc file from the installed system volume (/mnt/sys/etc) into the
+ * ramfs /etc. Returns 1 when a file was seeded. Only small text files are
+ * expected here (/etc/passwd, /etc/shadow, /etc/group, /etc/sudoers, /etc/motd),
+ * so a fixed 2 KiB buffer keeps this off the heap and out of the way. */
+static int sys_seed_etc_file(const char *name) {
+    static uint8_t buf[2048];
+    char src[64];
+    char dst[64];
+    int fd, n, total = 0;
+
+    if (!name || !name[0]) return 0;
+    snprintf(src, sizeof(src), "/mnt/sys/etc/%s", name);
+    fd = vfs_open(src, VFS_O_RDONLY);
+    if (fd < 0) return 0;
+    while (total < (int)sizeof(buf) &&
+           (n = vfs_read(fd, buf + total, (uint32_t)(sizeof(buf) - (size_t)total))) > 0) {
+        total += n;
+    }
+    vfs_close(fd);
+    if (total <= 0) return 0;
+    snprintf(dst, sizeof(dst), "/etc/%s", name);
+    return (vfs_write_file(dst, buf, (uint32_t)total) == VFS_OK) ? 1 : 0;
+}
+
 void kernel_main(uint32_t magic, uint32_t mbi) {
     /* NOTE: BSS is already cleared by boot.S *before* the page tables (which
      * live in .bss) are built. Clearing it again here would zero PML4 and
@@ -313,6 +337,7 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
     vfs_init();          /* registers ext2/fat32/squashfs/xj_vfs drivers */
     /* Mount the in-memory ramfs as root filesystem */
     int r = vfs_mount("ram", "/", "xj_vfs");
+    int fat_drive = -1;          /* drive the FAT32 volume was mounted from */
     if (r != VFS_OK) {
         console_printf("[init] WARNING: ramfs root mount failed (%d)\n", r);
     } else {
@@ -418,6 +443,7 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
             snprintf(src, sizeof(src), "%d", d);
             r = vfs_mount(src, "/mnt/fat", "fat32");
             if (r == VFS_OK) {
+                fat_drive = d;
                 console_printf("[init] FAT32 volume auto-mounted at /mnt/fat (drive %d)\n",
                                (int64_t)d);
                 break;
@@ -426,6 +452,40 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
                            (int64_t)d, (int64_t)r);
         }
         if (r != VFS_OK) console_puts("[init] no FAT32 volume on any block device\n");
+    }
+
+    /* ---- installed system volume (written by the shell `install` command) ----
+     * A FAT32 volume that carries /SUTUREOS/INSTALLED is the system disk the
+     * installer created. Mount the same volume at /mnt/sys and seed the ramfs
+     * /etc from it, then re-parse the user database: that is what makes the
+     * accounts / password hashes / sudo policy chosen during installation
+     * survive the reboot. A plain FAT32 data disk has no marker, so this block
+     * does nothing at all for it (no extra mounts, no extra log lines). */
+    if (fat_drive >= 0) {
+        vfs_stat_t marker;
+        if (vfs_stat("/mnt/fat/SUTUREOS/INSTALLED", &marker) == VFS_OK) {
+            char src[8];
+            int seeded = 0;
+            snprintf(src, sizeof(src), "%d", fat_drive);
+            if (vfs_mount(src, "/mnt/sys", "fat32") == VFS_OK) {
+                static const char *const etc_files[] = {
+                    "passwd", "shadow", "group", "sudoers", "motd"
+                };
+                for (unsigned i = 0;
+                     i < sizeof(etc_files) / sizeof(etc_files[0]); i++) {
+                    if (sys_seed_etc_file(etc_files[i])) seeded++;
+                }
+                if (seeded > 0) {
+                    extern int userdb_init(void);
+                    extern int sudo_init(void);
+                    (void)userdb_init();
+                    (void)sudo_init();
+                }
+                console_printf("[sys] installed system volume (drive %d): seeded %d file(s)"
+                               " from /mnt/sys/etc\n",
+                               (int64_t)fat_drive, (int64_t)seeded);
+            }
+        }
     }
 
     /* ---- USB mass storage: FAT32 volume at /mnt/usb ----------------------

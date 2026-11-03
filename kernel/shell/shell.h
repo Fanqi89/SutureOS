@@ -108,6 +108,7 @@ int shell_cmd_ring3test(int argc, char **argv);
 int shell_cmd_run(int argc, char **argv);
 int shell_cmd_ushell(int argc, char **argv);
 int shell_cmd_mount(int argc, char **argv);
+int shell_cmd_install(int argc, char **argv);
 int shell_cmd_umount(int argc, char **argv);
 int shell_cmd_df(int argc, char **argv);
 int shell_cmd_cpus(int argc, char **argv);

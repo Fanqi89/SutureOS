@@ -6,6 +6,38 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.33.0-alpha]
+
+**ISO 变成真正的系统安装盘：`install` 终端向导真实写盘（MBR + Limine BIOS 引导 + FAT32 + 系统文件），
+装完只用硬盘即可启动，安装时设的密码/用户重启后仍有效。三阶段宿主侧验收 56/56。
+顺带修掉既有 FAT32「目录项首簇丢失高字节」的 bug。**
+
+### Added
+- `kernel/install/installer.c/.h`：终端安装向导（选盘/`yes` 二次确认/root 密码可空/可选普通用户）+ 真实写盘。
+- `kernel/fs/fatfs_format.c`：最小 FAT32 格式化器（引导扇区/备份/FSInfo/双 FAT/根簇清零/读回校验）。
+- `kernel/fs/fatfs.c`：分区偏移 `start_lba`、`fatfs_mount_auto()`（超软盘优先再扫 MBR 0x0B/0x0C/0x0E）、
+  安装写盘加速（FAT 链游标/整簇写/bulk 模式）。
+- `kernel/main/kmain.c`：`/SUTUREOS/INSTALLED` 标记 → 同卷挂 `/mnt/sys` 并播种 `/etc`、重跑 userdb/sudo。
+- `kernel/shell/shell.c`：`install` 命令（root）。
+- `scripts/installer_acceptance.py`（三阶段）：ISO 安装 → 宿主解析镜像 → 无 ISO 从硬盘启动 + `su alice`。
+- `docs/INSTALLER.md`：磁盘布局、shadow 空密码语义、`/etc` 播种、限制。
+
+### Fixed
+- FAT32 目录项首簇只解析 `ent[26]`（丢 `ent[27]<<8`）→ 首簇 ≥256 的文件读错数据；装真系统才暴露
+  （`/etc/passwd` 读成内核机器码）。改为 4 字节解析。
+
+### Verification
+- 安装器 **56/56**（MBR/分区/FAT32 几何/引导区与 `limine-bios-hdd.h` 逐字节/kernel sha256/limine.conf/
+  `/etc` 哈希 `hashlib.pbkdf2_hmac` 重验/`/SUTUREOS/INSTALLED`）；空密码路径 `root:!:0` 亦验。
+- 阶段 3 只挂硬盘启动：`[sys] installed system volume ... seeded 5 file(s)` → `su alice` 成功、`whoami`=alice。
+- 回归：内核 13/14、FAT32 21/21、多用户 54/54、GUI 切换 13/13、任务栏 7/7、图查看器/编辑器 PASS、
+  外观门禁 0 像素、启动呈现前 286 行逐字节相同。
+
+### Limits
+- 仅 BIOS/MBR + Limine（无 UEFI/GRUB）；单 FAT32 分区；无 LUKS/LVM/swap/包选择/网络安装；
+  最小盘 35 MiB；安装 60–90 s；终端向导；无日志落盘/进度百分比；多系统共存未做；
+  装到已有数据的盘会覆盖分区表（默认不选第一块盘 + `yes` 确认）。
+
 ## [v0.32.0-alpha]
 
 **多用户：`useradd`/`userdel`/`users`/`passwd -l/-u/-d`/`login`/`su -` + GUI Switch User 对话框；

@@ -137,6 +137,7 @@ static const struct shell_cmd g_commands[] = {
     {"run",     shell_cmd_run,     "Run a built-in ring-3 user program: run <name>"},
     {"ushell",  shell_cmd_ushell,  "Enter the ring-3 user shell (exit comes back here)"},
     {"mount",   shell_cmd_mount,   "Mount filesystem"},
+    {"install", shell_cmd_install, "Install SutureOS onto a hard disk (terminal wizard)"},
     {"umount",  shell_cmd_umount,  "Unmount filesystem"},
     {"df",      shell_cmd_df,      "Show disk usage"},
     {"cpus",    shell_cmd_cpus,    "Show per-CPU state (jiffies, IPIs, work done)"},
@@ -1744,6 +1745,15 @@ static int require_root(const char *cmd) {
     if (cred_is_root()) return 1;
     shell_printf("%s: permission denied (are you root? try 'sudo %s')\n", cmd, cmd);
     return 0;
+}
+
+/* Terminal installer (kernel/install/installer.c). Destructive by design, so it
+ * carries its own confirmations; root is required like mount/umount. */
+int shell_cmd_install(int argc, char **argv) {
+    (void)argc; (void)argv;
+    if (!require_root("install")) return 1;
+    extern int installer_run(void);
+    return installer_run() == 0 ? 0 : 1;
 }
 
 int shell_cmd_mount(int argc, char **argv) {

@@ -54,6 +54,7 @@ struct lfn_acc {
 
 struct fat32_vol {
     int      drive;
+    uint32_t start_lba;       /* partition offset in 512-byte sectors (0 = superfloppy) */
     uint32_t fat_lba;
     uint32_t fat_sz;
     uint32_t data_lba;
@@ -73,6 +74,11 @@ struct fatfs_file {
     int      vol;
     uint32_t first_cluster;
     uint32_t size;
+    /* Chain cursor: sequential I/O advances one cluster at a time instead of
+     * re-walking the FAT from the head for every 512-byte sector (that made
+     * writing a multi-MiB file quadratic - the installer copies kernel.elf). */
+    uint32_t walk_index;
+    uint32_t walk_cluster;
     char     path[64];
 };
 
@@ -93,20 +99,29 @@ struct fatfs_dir {
 static struct fat32_vol g_vols[FATFS_MAX_VOLS];
 static struct fat32_vol *g_vol = &g_vols[0];
 static int g_cur_vol;
+
+/* Bulk-write mode (installer only): skip the per-sector read-back verify that
+ * sec_write_checked() normally does. The write itself is unchanged and still
+ * checked by the FAT-level verify plus the final sync; it exists because
+ * copying a 2.5 MiB kernel sector-by-sector with a verify read doubles the I/O
+ * and made installation take minutes instead of a minute. Off by default, so
+ * every other path keeps full verification. */
+static int g_bulk_write;
 static struct fatfs_file g_files[MAX_FILES];
 static struct fatfs_dir  g_dirs[MAX_DIRS];
 
 /* ==================== sector I/O ==================== */
 
 static int sec_read(uint32_t lba, uint8_t *buf) {
-    if (blk_read(g_vol->drive, lba, 1, buf) != 0) return FATFS_EIO;
+    if (blk_read(g_vol->drive, (uint64_t)g_vol->start_lba + lba, 1, buf) != 0) return FATFS_EIO;
     return FATFS_OK;
 }
 
 static int sec_write_checked(uint32_t lba, const uint8_t *buf, uint8_t *vbuf,
                              const char *what, uint32_t at) {
-    if (blk_write(g_vol->drive, lba, 1, buf) != 0) return FATFS_EIO;
-    if (blk_read(g_vol->drive, lba, 1, vbuf) != 0) return FATFS_EIO;
+    if (blk_write(g_vol->drive, (uint64_t)g_vol->start_lba + lba, 1, buf) != 0) return FATFS_EIO;
+    if (g_bulk_write) return FATFS_OK;   /* bulk mode: skip the read-back verify */
+    if (blk_read(g_vol->drive, (uint64_t)g_vol->start_lba + lba, 1, vbuf) != 0) return FATFS_EIO;
     if (memcmp(buf, vbuf, 512) != 0) {
         for (int i = 0; i < 512; i++) {
             if (buf[i] != vbuf[i]) {
@@ -127,6 +142,17 @@ static uint32_t cluster_lba(uint32_t cl) {
 
 static int cluster_valid(uint32_t cl) {
     return cl >= 2 && cl < g_vol->total_clusters + 2;
+}
+
+/* First cluster of a 32-byte directory entry. FAT32 stores it as a broken-in-two
+ * value: high word at offset 20, low word at offset 26. Reading only ent[26]
+ * (as this driver used to) silently truncates the low word to 8 bits, so every
+ * file or directory whose first cluster is >= 256 read the wrong data - found
+ * while installing a real system onto a 128 MiB FAT32 volume (the installer's
+ * files start at cluster 2866). */
+static uint32_t dirent_first_cluster(const uint8_t *ent) {
+    return ((uint32_t)ent[20] << 16) | ((uint32_t)ent[21] << 24) |
+           (uint32_t)ent[26] | ((uint32_t)ent[27] << 8);
 }
 
 /* ==================== FAT access ==================== */
@@ -194,6 +220,35 @@ static int chain_locate(uint32_t first, uint32_t index, uint8_t *scratch,
         if (r != FATFS_OK) return r;
     }
     if (cl < 2 || cl >= FAT32_EOC) return FATFS_ENOENT;
+    *out = cl;
+    return FATFS_OK;
+}
+
+/* chain_locate() with a per-file cursor. Sequential writes advance one cluster
+ * at a time (one FAT read per cluster) instead of re-walking the chain from the
+ * head for every sector, which is what made a multi-MiB file write quadratic.
+ * A stale/backwards index simply restarts the walk, so random I/O stays correct. */
+static int chain_locate_cached(struct fatfs_file *f, uint32_t index,
+                               uint8_t *scratch, uint32_t *out) {
+    uint32_t cl, i;
+
+    if (f->walk_cluster >= 2 && f->walk_cluster < FAT32_EOC &&
+        index >= f->walk_index) {
+        cl = f->walk_cluster;
+        i = f->walk_index;
+    } else {
+        cl = f->first_cluster;
+        i = 0;
+    }
+    for (; i < index; i++) {
+        int r;
+        if (cl < 2 || cl >= FAT32_EOC) return FATFS_ENOENT;
+        r = fat_get(cl, scratch, &cl);
+        if (r != FATFS_OK) return r;
+    }
+    if (cl < 2 || cl >= FAT32_EOC) return FATFS_ENOENT;
+    f->walk_index = index;
+    f->walk_cluster = cl;
     *out = cl;
     return FATFS_OK;
 }
@@ -944,7 +999,7 @@ static int path_resolve(const char *path, uint8_t *s, uint8_t *v,
         int r = resolve_component(dir, comp, s, &slot, ent, raw);
         if (r != FATFS_OK) return r;
         if (!(ent[11] & ATTR_DIR)) return FATFS_ENOTDIR;
-        dir = ((uint32_t)ent[20] << 16) | ent[26];
+        dir = dirent_first_cluster(ent);
         if (dir == 0) dir = g_vol->root_cluster;
     }
     (void)v;
@@ -1005,13 +1060,24 @@ int fatfs_select_volume(int slot) {
 
 int fatfs_current_volume(void) { return g_cur_vol; }
 
+/* Installer speedup hook: with bulk mode on, sector writes skip the read-back
+ * verification (see g_bulk_write). Turn it off again before unmounting. */
+void fatfs_set_bulk_mode(int on) { g_bulk_write = on ? 1 : 0; }
+
 /* Mount `drv` into the first free slot and return that slot (>= 0), or a
  * negative fatfs error. Slot 0 doubles as the "first volume" for callers that
- * only care about success - see fatfs_vfs.c. */
-int fatfs_mount(uint8_t drv, void *fs) {
-    (void)fs;
+ * only care about success - see fatfs_vfs.c.
+ *
+ * start_lba is the partition offset in 512-byte sectors (0 = superfloppy, i.e.
+ * the BPB sits at device LBA 0 - the historical layout). All LBAs the driver
+ * computes from the BPB stay partition-relative; sec_read()/sec_write_checked()
+ * add the offset, so a FAT32 partition on a partitioned disk (the installed
+ * system volume written by the installer) works without touching anything else.
+ * quiet = 1 suppresses the "mount FAIL" diagnostics (used while auto-probing). */
+static int fatfs_mount_impl(uint8_t drv, uint32_t start_lba, int quiet) {
     for (int i = 0; i < FATFS_MAX_VOLS; i++) {
-        if (g_vols[i].mounted && g_vols[i].drive == (int)drv) {
+        if (g_vols[i].mounted && g_vols[i].drive == (int)drv &&
+            g_vols[i].start_lba == start_lba) {
             (void)fatfs_select_volume(i);
             return i;
         }
@@ -1026,8 +1092,8 @@ int fatfs_mount(uint8_t drv, void *fs) {
 
     uint8_t *s = lemis_heap_alloc(512);
     if (!s) return FATFS_ERR;
-    if (blk_read((int)drv, 0, 1, s) != 0) {
-        console_printf("[fat32] mount FAIL drive=%u reason=io\n", (uint64_t)drv);
+    if (blk_read((int)drv, start_lba, 1, s) != 0) {
+        if (!quiet) console_printf("[fat32] mount FAIL drive=%u reason=io\n", (uint64_t)drv);
         lemis_heap_free(s);
         return FATFS_EIO;
     }
@@ -1070,14 +1136,15 @@ int fatfs_mount(uint8_t drv, void *fs) {
         if (clusters < 65525) why = "cluster count < 65525 (not FAT32)";
     }
     if (why) {
-        console_printf("[fat32] mount FAIL drive=%u reason=%s\n",
-                       (uint64_t)drv, why);
+        if (!quiet) console_printf("[fat32] mount FAIL drive=%u reason=%s\n",
+                                   (uint64_t)drv, why);
         lemis_heap_free(s);
         return FATFS_EINVAL;
     }
 
     memset(g_vol, 0, sizeof(*g_vol));
     g_vol->drive = (int)drv;
+    g_vol->start_lba = start_lba;
     g_vol->fat_lba = reserved;
     g_vol->fat_sz = fatsz32;
     g_vol->data_lba = reserved + (uint32_t)nfats * fatsz32;
@@ -1119,6 +1186,55 @@ int fatfs_mount(uint8_t drv, void *fs) {
                    (uint64_t)g_vol->free_clusters);
     lemis_heap_free(s);
     return slot;
+}
+
+/* Superfloppy mount (BPB at device LBA 0): the historical behaviour, still used
+ * by the FAT32 test images and by `mount fat32 0 /mnt/x`. */
+int fatfs_mount(uint8_t drv, void *fs) {
+    (void)fs;
+    return fatfs_mount_impl(drv, 0, 0);
+}
+
+/* Mount a FAT32 partition that starts at `start_lba` (512-byte sectors). */
+int fatfs_mount_at(uint8_t drv, void *fs, uint32_t start_lba) {
+    (void)fs;
+    return fatfs_mount_impl(drv, start_lba, 0);
+}
+
+/* Auto-detect the layout: try the superfloppy first (so every existing test
+ * image and every plain FAT32 disk behaves exactly as before), then scan the MBR
+ * partition table for a FAT32-typed partition (0x0B/0x0C/0x0E). This is what
+ * lets the kernel mount the system volume the installer writes onto a
+ * partitioned disk. Probes are quiet; only the volume that really mounts logs. */
+int fatfs_mount_auto(uint8_t drv) {
+    int slot = fatfs_mount_impl(drv, 0, 1);
+    if (slot >= 0) return slot;
+
+    uint8_t *mbr = lemis_heap_alloc(512);
+    if (!mbr) return FATFS_ERR;
+    if (blk_read((int)drv, 0, 1, mbr) != 0 || mbr[510] != 0x55 || mbr[511] != 0xAA) {
+        lemis_heap_free(mbr);
+        console_printf("[fat32] mount FAIL drive=%u reason=no FAT32 volume\n",
+                       (uint64_t)drv);
+        return FATFS_EINVAL;
+    }
+    int result = FATFS_EINVAL;
+    for (int i = 0; i < 4; i++) {
+        const uint8_t *e = mbr + 446 + i * 16;
+        const uint8_t type = e[4];
+        const uint32_t lba = (uint32_t)e[8] | ((uint32_t)e[9] << 8) |
+                             ((uint32_t)e[10] << 16) | ((uint32_t)e[11] << 24);
+        if (type != 0x0B && type != 0x0C && type != 0x0E) continue;
+        if (lba < 63) continue;
+        slot = fatfs_mount_impl(drv, lba, 1);
+        if (slot >= 0) { result = slot; break; }
+    }
+    lemis_heap_free(mbr);
+    if (result < 0) {
+        console_printf("[fat32] mount FAIL drive=%u reason=no FAT32 volume "
+                       "(LBA0 or MBR partition)\n", (uint64_t)drv);
+    }
+    return result;
 }
 
 int fatfs_unmount(int drv) {
@@ -1223,9 +1339,11 @@ int fatfs_open(const char *path, int create, fatfs_file_t **out) {
 
     fh->used = 1;
     fh->vol = g_cur_vol;
-    fh->first_cluster = ((uint32_t)ent[20] << 16) | ent[26];
+    fh->first_cluster = dirent_first_cluster(ent);
     if (fh->first_cluster == 0) fh->first_cluster = FAT32_EOC;
     memcpy(&fh->size, ent + 28, 4);
+    fh->walk_index = 0;
+    fh->walk_cluster = 0;                 /* 0 = cursor empty */
     strncpy(fh->path, path, sizeof(fh->path) - 1);
     fh->path[sizeof(fh->path) - 1] = '\0';
     *out = fh;
@@ -1353,7 +1471,24 @@ int fatfs_write(fatfs_file_t *f, uint32_t off, const void *buf, uint32_t len) {
             uint32_t cl_idx = pos / cb;
             uint32_t cl_off = pos % cb;
             uint32_t cl;
-            r = chain_locate(f->first_cluster, cl_idx, s, &cl);
+            /* Fast path for whole clusters (the installer copies multi-MiB files
+             * through this): one blk_write for the whole cluster instead of
+             * spc read-modify-write-verify cycles. Only the full-cluster case is
+             * short-cut; partial clusters keep the careful path below. */
+            if (cl_off == 0 && (len - done) >= cb) {
+                r = chain_locate_cached(f, cl_idx, s, &cl);
+                if (r != FATFS_OK) goto out;
+                if (blk_write(g_vol->drive,
+                              (uint64_t)g_vol->start_lba + cluster_lba(cl),
+                              g_vol->spc, src + done) != 0) {
+                    r = FATFS_EIO;
+                    goto out;
+                }
+                done += cb;
+                pos += cb;
+                continue;
+            }
+            r = chain_locate_cached(f, cl_idx, s, &cl);
             if (r != FATFS_OK) goto out;
             uint32_t lba = cluster_lba(cl) + (cl_off / 512);
             uint32_t sec_off = cl_off % 512;
@@ -1476,7 +1611,7 @@ int fatfs_opendir(const char *path, fatfs_dir_t **out) {
         lemis_heap_free(s);
         lemis_heap_free(v);
         if (r != FATFS_OK) return r;
-        d->cluster = ((uint32_t)ent[20] << 16) | ent[26];
+        d->cluster = dirent_first_cluster(ent);
         if (d->cluster == 0) d->cluster = g_vol->root_cluster;
     }
 
@@ -1641,7 +1776,7 @@ int fatfs_rmdir(const char *path) {
     uint8_t ent[DIR_ENTRY_SIZE];
     r = dir_find(parent, raw, s, &slot, ent);
     if (r != FATFS_OK) goto out;
-    uint32_t cl = ((uint32_t)ent[20] << 16) | ent[26];
+    uint32_t cl = dirent_first_cluster(ent);
 
     {
         uint32_t idx = 0;
@@ -1713,7 +1848,7 @@ int fatfs_unlink(const char *path) {
     r = dir_find(parent, raw, s, &slot, ent);
     if (r != FATFS_OK) goto out;
 
-    uint32_t cl = ((uint32_t)ent[20] << 16) | ent[26];
+    uint32_t cl = dirent_first_cluster(ent);
     if (cl >= 2) {
         r = chain_free(cl, s, v);
         if (r != FATFS_OK) goto out;
@@ -1775,7 +1910,7 @@ static int resolve_dir_cluster(const char *dirpath, uint8_t *s, uint8_t *v,
     r = dir_find(parent, raw, s, &slot, ent);
     if (r != FATFS_OK) return r;
     if (!(ent[11] & ATTR_DIR)) return FATFS_ENOTDIR;
-    uint32_t cl = ((uint32_t)ent[20] << 16) | ent[26];
+    uint32_t cl = dirent_first_cluster(ent);
     *out_cl = (cl == 0) ? g_vol->root_cluster : cl;
     return FATFS_OK;
 }
@@ -1857,7 +1992,7 @@ int fatfs_rename(const char *old_path, const char *new_path) {
         if (cur[0] && name_eq_ci(cur, nbase)) { r = FATFS_OK; goto out; }
     }
 
-    uint32_t first_cl = ((uint32_t)oent[20] << 16) | oent[26];
+    uint32_t first_cl = dirent_first_cluster(oent);
     uint32_t fsize = 0;
     memcpy(&fsize, oent + 28, 4);
 
