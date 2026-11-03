@@ -790,6 +790,26 @@ int gui_apps_launch(int app_id) {
 
 /* ==================== bring-up ==================== */
 
+/* ---- application registry (v0.34.0) ----
+ * This is the single place that decides what the desktop offers:
+ *   - every row is listed in the start menu (built from here at run time),
+ *   - rows with pinned=1 are always visible on the taskbar's left side,
+ *   - gui_apps_launch() below creates the window for the app_id.
+ * Add one row to add an app; nothing else needs to change. */
+static const gui_app_reg_t g_app_registry[] = {
+    { APP_ID_TMGR,     "Task Manager",   1 },
+    { APP_ID_CALC,     "Calculator",     1 },
+    { APP_ID_SETTINGS, "About SutureOS", 0 },
+    { APP_ID_IMG,      "Image Viewer",   1 },
+    { APP_ID_EDT,      "Text Editor",    1 },
+    { APP_ID_USR,      "Switch User",    0 },
+};
+
+const gui_app_reg_t* gui_app_registry(int* count) {
+    if (count) *count = (int)(sizeof(g_app_registry) / sizeof(g_app_registry[0]));
+    return g_app_registry;
+}
+
 void gui_apps_init(void) {
     static int created = 0;
     if (created) return;

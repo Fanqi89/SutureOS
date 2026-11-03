@@ -6,6 +6,28 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.34.0-alpha]
+
+**桌面外壳第一批：应用注册表（开始菜单运行时生成）+ 固定任务栏应用 + 窗口最小化/最大化完整可用
+（点任务栏按钮在还原↔最小化间切换、最大化真正改几何、m/n 快捷键）。**
+
+### Added
+- `kernel/gui/apps.c`：`g_app_registry[]`（app_id/label/pinned）+ `gui_app_registry()`。
+- `kernel/gui/gui.c`：`gui_start_menu_build()` 从注册表生成菜单（运行时项数决定高度与命中）；
+  任务栏改为「开始 → 固定应用（≤4）→ 运行窗口（≤6）→ 时钟/用户/FPS」，`gui_taskbar_layout()` 统一几何；
+  固定按钮点击 `gui_activate_app()`；窗口按钮点击在还原↔最小化间切换。
+- `gui_flip_window()` 真正实现最大化/还原（`norm_x/y/w/h` → 1024×728）；双击标题栏、标题栏按钮、`m` 共用。
+- 快捷键 `m`（最大化/还原）、`n`（最小化焦点窗口）。
+- `scripts/apps_taskbar_acceptance.py`（9/9）。
+
+### Verification
+- apps_taskbar **9/9**、外观门禁 0 像素（基线按要求更新）、图片查看器 PASS、编辑器 5/5、
+  切换用户 13/13、任务栏旧用例 7/7、内核 13/14、FAT32 21/21。
+
+### Limits
+- 固定 ≤4、窗口按钮 ≤6、标题截断；无任务栏右键菜单；最大化纯几何；菜单最多 18 项无分页；
+  GUI 大改按用户要求暂缓。
+
 ## [v0.33.0-alpha]
 
 **ISO 变成真正的系统安装盘：`install` 终端向导真实写盘（MBR + Limine BIOS 引导 + FAT32 + 系统文件），

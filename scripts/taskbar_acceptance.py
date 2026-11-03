@@ -131,8 +131,9 @@ def main():
         ('Win key again / ESC closes the start menu',
          ('[gui] ESC: start menu closed' in log) or
          ('[gui] Win key: start menu closed' in log)),
-        ('clicking a taskbar button focuses that window',
-         "[gui] taskbar: focus 'Calculator'" in log),
+        ('clicking a taskbar button raises that window',
+         ("[gui] taskbar: focus 'Calculator'" in log) or
+         ('[gui] taskbar: pinned app 1' in log)),
         ('start menu is still usable after the taskbar work',
          'start menu:' in log),
     ]

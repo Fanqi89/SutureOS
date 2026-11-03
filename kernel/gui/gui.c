@@ -22,11 +22,23 @@
 /* Taskbar helpers (defined further below; the taskbar click handler needs them
  * before their definitions). */
 #define TASKBAR_MAX_BTNS 6
+#define TASKBAR_MAX_PINNED 4
 #define TASKBAR_BTN_MAX_CHARS 14
-static int gui_taskbar_windows(struct gui_window** out, int max);
-static int gui_taskbar_btn_rect(struct gui_window** wins, int idx,
-                                int* bx, int* bw);
+#define TASKBAR_PIN_MAX_CHARS 10
+struct gui_tb_layout {
+    int pinned_app[TASKBAR_MAX_PINNED];
+    int pinned_x[TASKBAR_MAX_PINNED];
+    int pinned_w[TASKBAR_MAX_PINNED];
+    int pinned_n;
+    struct gui_window* win[TASKBAR_MAX_BTNS];
+    int win_x[TASKBAR_MAX_BTNS];
+    int win_w[TASKBAR_MAX_BTNS];
+    int win_n;
+};
+
+static void gui_taskbar_layout(struct gui_tb_layout* L);
 static const char* gui_current_user_name(void);
+static void gui_activate_app(int app_id);
 
 /* 全局状态 */
 static struct gui_window g_wins[GUI_MAX_WINDOWS];
@@ -252,20 +264,39 @@ static void gui_activate_app(int app_id);
 
 /* Items in the start menu. NULL = separator line. */
 enum { START_KIND_SEP = -1, START_KIND_EXIT = -2 };
-static const struct {
+/* The menu is built from the application registry (see apps.c), so a new
+ * program appears here automatically instead of needing a second edit. */
+#define START_MAX_ITEMS 20
+static struct {
     const char* label;
     int         app_id;      /* APP_ID_* or START_KIND_* */
-} g_start_items[] = {
-    { "Task Manager",   APP_ID_TMGR     },
-    { "Calculator",     APP_ID_CALC     },
-    { "About SutureOS", APP_ID_SETTINGS },
-    { "Image Viewer",   APP_ID_IMG      },
-    { "Text Editor",    APP_ID_EDT      },
-    { "Switch User",    APP_ID_USR      },   /* v0.31.0 multiuser (lazily created) */
-    { NULL,             START_KIND_SEP  },
-    { "Exit to terminal", START_KIND_EXIT },
-};
-#define START_ITEM_COUNT ((int)(sizeof(g_start_items) / sizeof(g_start_items[0])))
+} g_start_items[START_MAX_ITEMS];
+static int g_start_item_count;   /* 0 = not built yet (lazy) */
+
+static void gui_start_menu_build(void) {
+    extern const gui_app_reg_t* gui_app_registry(int* count);
+    int count = 0;
+    const gui_app_reg_t* reg = gui_app_registry(&count);
+    int n = 0;
+    for (int i = 0; i < count && n < START_MAX_ITEMS - 2; i++) {
+        g_start_items[n].label = reg[i].label;
+        g_start_items[n].app_id = reg[i].app_id;
+        n++;
+    }
+    g_start_items[n].label = NULL;
+    g_start_items[n].app_id = START_KIND_SEP;
+    n++;
+    g_start_items[n].label = "Exit to terminal";
+    g_start_items[n].app_id = START_KIND_EXIT;
+    n++;
+    g_start_item_count = n;
+    console_printf("[gui] start menu: %d items from app registry\n", (int64_t)n);
+}
+
+static void gui_ensure_menu(void) {
+    if (g_start_item_count == 0) gui_start_menu_build();
+}
+#define START_ITEM_COUNT (g_start_item_count)
 
 static int g_mx, g_my;                  /* pointer position (clamped)      */
 static int g_mprev_x, g_mprev_y, g_mprev_w, g_mprev_h;   /* last drawn rect  */
@@ -375,6 +406,7 @@ static void gui_selftest_frame(void)
 }
 static int start_menu_height(void)
 {
+    gui_ensure_menu();
     return START_ITEM_COUNT * START_MENU_ITEM_H + START_MENU_PAD * 2;
 }
 
@@ -752,19 +784,34 @@ static void gui_click_at(int cx, int cy, int button)
             gui_invalidate();
             return;
         }
-        /* window buttons: raise + focus (+ un-minimise) the clicked window */
+        /* pinned app buttons: launch the app, or raise/restore its window */
         {
-            struct gui_window* tbw[TASKBAR_MAX_BTNS];
-            const int tbn = gui_taskbar_windows(tbw, TASKBAR_MAX_BTNS);
-            for (int i = 0; i < tbn; i++) {
-                int bx = 0, bw = 0;
-                if (!gui_taskbar_btn_rect(tbw, i, &bx, &bw)) break;
-                if (cx >= bx && cx < bx + bw) {
-                    console_printf("[gui] taskbar: focus '%s'\n", tbw[i]->title);
-                    gui_set_active(tbw[i]);
-                    gui_invalidate();
-                    return;
+            struct gui_tb_layout L;
+            gui_taskbar_layout(&L);
+            for (int i = 0; i < L.pinned_n; i++) {
+                if (cx < L.pinned_x[i] || cx >= L.pinned_x[i] + L.pinned_w[i]) continue;
+                console_printf("[gui] taskbar: pinned app %d (click %d,%d)\n",
+                               (int64_t)L.pinned_app[i], (int64_t)cx, (int64_t)cy);
+                gui_activate_app(L.pinned_app[i]);
+                gui_invalidate();
+                return;
+            }
+            /* window buttons: click toggles restore <-> minimise (as asked) */
+            for (int i = 0; i < L.win_n; i++) {
+                if (cx < L.win_x[i] || cx >= L.win_x[i] + L.win_w[i]) continue;
+                struct gui_window* w = L.win[i];
+                if (w->active && !w->minimized) {
+                    console_printf("[gui] taskbar: minimize '%s'\n", w->title);
+                    w->minimized = true;
+                    w->active = false;
+                    gui_dirty_win(w);
+                    gui_focus_topmost_visible();
+                } else {
+                    console_printf("[gui] taskbar: restore '%s'\n", w->title);
+                    gui_set_active(w);
                 }
+                gui_invalidate();
+                return;
             }
         }
         return;
@@ -813,6 +860,18 @@ static void gui_click_at(int cx, int cy, int button)
                 gui_invalidate();
             }
             return;
+        }
+        /* double click on the title bar toggles maximise (same as the button) */
+        {
+            static struct gui_window* last_win;
+            static uint64_t last_tick;
+            if (last_win == hit && (g_tick_count - last_tick) <= 40) {  /* ~400ms */
+                last_win = NULL;
+                gui_flip_window(hit);
+                return;
+            }
+            last_win = hit;
+            last_tick = g_tick_count;
         }
         /* empty title-bar space: start a move drag. gui_set_active() above has
          * already raised and focused this window, so dragging an unfocused
@@ -1011,6 +1070,25 @@ static bool gui_handle_keys(void) {
          * Editor would lose its r (and q would close the whole desktop). */
         struct gui_window* fw = gui_focused();
         const bool text_input = (fw != NULL && fw->on_key != NULL);
+        /* window shortcuts (v0.34.0): m = maximise/restore, n = minimise the
+         * focused window - only when no text field has focus, like q/r. */
+        if (!text_input && (ch == 'm' || ch == 'M')) {
+            struct gui_window* f = gui_focused();
+            if (f) gui_flip_window(f);
+            continue;
+        }
+        if (!text_input && (ch == 'n' || ch == 'N')) {
+            struct gui_window* f = gui_focused();
+            if (f) {
+                console_printf("[gui] key n: minimize '%s'\n", f->title);
+                f->minimized = true;
+                f->active = false;
+                gui_dirty_win(f);
+                gui_focus_topmost_visible();
+                gui_invalidate();
+            }
+            continue;
+        }
         if (!text_input && (ch == 'q' || ch == 'Q')) {
             quit = true;
             break;
@@ -1046,44 +1124,75 @@ static void gui_draw_desktop(int x0, int y0, int x1, int y1) {
     }
 }
 
-/* ==================== taskbar helpers (window buttons / clock / user) ======
- * The taskbar shows one button per open window (click = raise+focus, also
- * un-minimises), the wall clock from the CMOS RTC and the current user name.
- * Everything is drawn with SutureOS' own primitives - no foreign UI.
+/* ==================== taskbar layout (pinned apps / window buttons) =======
+ * The left side shows the start button, then one permanent button per pinned
+ * registry entry, then one button per running window that is not already
+ * represented by a pinned button. Clicking a window button toggles
+ * restore<->minimise for that window (the behaviour the user asked for), and
+ * clicking a pinned button launches or raises that app.
  */
-static int gui_taskbar_windows(struct gui_window** out, int max) {
-    struct gui_window* arr[24];
-    int n = 0;
-    for (struct gui_window* w = g_z; w && n < 24; w = w->next) arr[n++] = w;
-    /* g_z is topmost-first; show oldest-first so buttons keep their place */
-    for (int i = 0; i < n / 2; i++) {
-        struct gui_window* t = arr[i];
-        arr[i] = arr[n - 1 - i];
-        arr[n - 1 - i] = t;
-    }
-    int cnt = 0;
-    for (int i = 0; i < n && cnt < max; i++)
-        if (arr[i]->visible) out[cnt++] = arr[i];
-    return cnt;
+static int gui_taskbar_right_limit(void) {
+    return g_gui_screen_w - 8 - 8 * 24;      /* clock + user + FPS reserve */
 }
 
-static int gui_taskbar_btn_rect(struct gui_window** wins, int idx,
-                                int* bx, int* bw) {
+static int gui_tb_is_pinned_app(int app_id) {
+    extern const gui_app_reg_t* gui_app_registry(int* count);
+    int count = 0;
+    const gui_app_reg_t* reg = gui_app_registry(&count);
+    for (int i = 0; i < count; i++)
+        if (reg[i].pinned && reg[i].app_id == app_id) return 1;
+    return 0;
+}
+
+static void gui_taskbar_layout(struct gui_tb_layout* L) {
+    extern const gui_app_reg_t* gui_app_registry(int* count);
+    int count = 0;
+    const gui_app_reg_t* reg = gui_app_registry(&count);
     int x = START_BTN_X + START_BTN_W + 12;
-    for (int i = 0; i < idx; i++) {
-        int len = (int)strlen(wins[i]->title);
-        if (len > TASKBAR_BTN_MAX_CHARS) len = TASKBAR_BTN_MAX_CHARS;
-        x += 8 * len + 16 + 4;
+    const int limit = gui_taskbar_right_limit();
+    L->pinned_n = 0;
+    L->win_n = 0;
+
+    /* pinned app buttons (always visible, left-most after the start button) */
+    for (int i = 0; i < count && L->pinned_n < TASKBAR_MAX_PINNED; i++) {
+        if (!reg[i].pinned) continue;
+        int len = (int)strlen(reg[i].label);
+        if (len > TASKBAR_PIN_MAX_CHARS) len = TASKBAR_PIN_MAX_CHARS;
+        const int w = 8 * len + 14;
+        if (x + w > limit) break;
+        L->pinned_app[L->pinned_n] = reg[i].app_id;
+        L->pinned_x[L->pinned_n] = x;
+        L->pinned_w[L->pinned_n] = w;
+        L->pinned_n++;
+        x += w + 4;
     }
-    int len = (int)strlen(wins[idx]->title);
-    if (len > TASKBAR_BTN_MAX_CHARS) len = TASKBAR_BTN_MAX_CHARS;
-    int w = 8 * len + 16;
-    /* keep the right side free for clock + user + FPS */
-    const int right_limit = g_gui_screen_w - 8 - 8 * 24;
-    if (x + w > right_limit) return 0;
-    *bx = x;
-    *bw = w;
-    return 1;
+    x += 4;                                  /* small gap before window buttons */
+
+    /* window buttons: oldest window first so they keep their place */
+    {
+        struct gui_window* arr[24];
+        int n = 0;
+        for (struct gui_window* w = g_z; w && n < 24; w = w->next) arr[n++] = w;
+        for (int i = 0; i < n / 2; i++) {
+            struct gui_window* t = arr[i];
+            arr[i] = arr[n - 1 - i];
+            arr[n - 1 - i] = t;
+        }
+        for (int i = 0; i < n && L->win_n < TASKBAR_MAX_BTNS; i++) {
+            struct gui_window* w = arr[i];
+            if (!w->visible) continue;
+            if (gui_tb_is_pinned_app((int)w->app_id)) continue;   /* shown as pinned */
+            int len = (int)strlen(w->title);
+            if (len > TASKBAR_BTN_MAX_CHARS) len = TASKBAR_BTN_MAX_CHARS;
+            const int bw = 8 * len + 16;
+            if (x + bw > limit) break;
+            L->win[L->win_n] = w;
+            L->win_x[L->win_n] = x;
+            L->win_w[L->win_n] = bw;
+            L->win_n++;
+            x += bw + 4;
+        }
+    }
 }
 
 static const char* gui_current_user_name(void) {
@@ -1105,13 +1214,38 @@ static void gui_draw_taskbar(void) {
     /* the system name is the start button (click = menu opens upwards) */
     gui_draw_start_button();
 
-    /* ---- window buttons (one per open window) ---- */
-    struct gui_window* tbw[TASKBAR_MAX_BTNS];
-    const int tbn = gui_taskbar_windows(tbw, TASKBAR_MAX_BTNS);
-    for (int i = 0; i < tbn; i++) {
-        int bx = 0, bw = 0;
-        if (!gui_taskbar_btn_rect(tbw, i, &bx, &bw)) break;
-        const int active = tbw[i]->active && !tbw[i]->minimized;
+    /* ---- pinned app buttons (registry, always visible) ---- */
+    struct gui_tb_layout L;
+    gui_taskbar_layout(&L);
+    for (int i = 0; i < L.pinned_n; i++) {
+        struct gui_window* w = gui_find_app_window(L.pinned_app[i]);
+        const int active = (w != NULL) && w->active && !w->minimized && w->visible;
+        const int bx = L.pinned_x[i], bw = L.pinned_w[i];
+        gui_fill(bx, y0 + 5, bw, GUI_TASKBAR_H - 10,
+                 active ? 0x2E5A9Eu : 0x1F2433u);
+        gui_fill(bx, y0 + 5, 2, GUI_TASKBAR_H - 10,
+                 active ? 0x6E9BE0u : 0x3C4454u);
+        {
+            extern const gui_app_reg_t* gui_app_registry(int* count);
+            int count = 0;
+            const gui_app_reg_t* reg = gui_app_registry(&count);
+            const char* label = "";
+            for (int k = 0; k < count; k++)
+                if (reg[k].app_id == L.pinned_app[i]) { label = reg[k].label; break; }
+            const int sx0 = g_clip_x0, sy0 = g_clip_y0;
+            const int sx1 = g_clip_x1, sy1 = g_clip_y1;
+            g_clip_x0 = bx + 2; g_clip_y0 = y0;
+            g_clip_x1 = bx + bw - 1; g_clip_y1 = y0 + GUI_TASKBAR_H;
+            gui_draw_text(bx + 6, ty, label, active ? 0xFFFFFFu : 0xC6D2E4u);
+            g_clip_x0 = sx0; g_clip_y0 = sy0; g_clip_x1 = sx1; g_clip_y1 = sy1;
+        }
+    }
+
+    /* ---- buttons for running windows that are not pinned ---- */
+    for (int i = 0; i < L.win_n; i++) {
+        struct gui_window* w = L.win[i];
+        const int active = w->active && !w->minimized;
+        const int bx = L.win_x[i], bw = L.win_w[i];
         gui_fill(bx, y0 + 5, bw, GUI_TASKBAR_H - 10,
                  active ? 0x2E5A9Eu : 0x24293Au);
         gui_fill(bx, y0 + 5, 1, GUI_TASKBAR_H - 10, 0x3C4454u);
@@ -1120,11 +1254,10 @@ static void gui_draw_taskbar(void) {
             const int sx1 = g_clip_x1, sy1 = g_clip_y1;
             g_clip_x0 = bx + 1; g_clip_y0 = y0;
             g_clip_x1 = bx + bw - 1; g_clip_y1 = y0 + GUI_TASKBAR_H;
-            gui_draw_text(bx + 8, ty, tbw[i]->title,
-                          active ? 0xFFFFFFu : 0x9FB2CCu);
+            gui_draw_text(bx + 8, ty, w->title, active ? 0xFFFFFFu : 0x9FB2CCu);
             g_clip_x0 = sx0; g_clip_y0 = sy0; g_clip_x1 = sx1; g_clip_y1 = sy1;
         }
-        if (tbw[i]->minimized) gui_fill(bx, y0 + 5, bw, 2, 0x6B7890u);
+        if (w->minimized) gui_fill(bx, y0 + 5, bw, 2, 0x6B7890u);
     }
 
     /* ---- right side: clock, current user, measured fps ---- */
@@ -1373,6 +1506,7 @@ int gui_run(void) {
     {
         extern void gui_apps_init(void);
         gui_apps_init();
+        gui_start_menu_build();          /* registry -> start menu (v0.34.0) */
         gui_invalidate();             /* their windows must appear in frame 1 */
     }
 
@@ -1644,9 +1778,32 @@ void gui_invalidate_window(struct gui_window* w) {
 }
 
 void gui_flip_window(struct gui_window* w) {
-    /* single-buffered direct fb: nothing to flush - just make sure the next
-     * frame repaints this window's rect */
-    if (w) gui_dirty(w->x, w->y, w->w, w->h);
+    if (!w) return;
+    if (w->maximized) {
+        w->x = w->norm_x;
+        w->y = w->norm_y;
+        w->w = w->norm_w;
+        w->h = w->norm_h;
+        w->maximized = false;
+        console_printf("[gui] window '%s' restored to %d,%d %dx%d\n",
+                       w->title, (int64_t)w->x, (int64_t)w->y,
+                       (int64_t)w->w, (int64_t)w->h);
+    } else {
+        w->norm_x = w->x;
+        w->norm_y = w->y;
+        w->norm_w = w->w;
+        w->norm_h = w->h;
+        w->x = 0;
+        w->y = 0;
+        w->w = g_gui_screen_w;
+        w->h = g_gui_screen_h - GUI_TASKBAR_H;
+        w->maximized = true;
+        console_printf("[gui] window '%s' maximized to %dx%d\n",
+                       w->title, (int64_t)w->w, (int64_t)w->h);
+    }
+    gui_sync_client(w);
+    gui_dirty(0, 0, g_gui_screen_w, g_gui_screen_h);
+    gui_invalidate();
 }
 
 int gui_screen_w(void) { return g_gui_screen_w; }

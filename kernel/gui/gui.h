@@ -147,6 +147,20 @@ int gui_close_app(int app_id);
  * window for `app_id` now exists. */
 int gui_apps_launch(int app_id);
 
+/* ---- application registry (v0.34.0) ----
+ * One table decides three things at once: every entry shows up in the start
+ * menu, pinned entries also get a permanent button on the left side of the
+ * taskbar, and the entry's app_id is what gui_apps_launch() dispatches on.
+ * Adding a new program therefore means adding one row here - the menu is built
+ * from the registry at run time instead of a hand-maintained array. */
+typedef struct gui_app_reg {
+    int         app_id;
+    const char* label;
+    int         pinned;      /* 1 = pinned to the taskbar's left side */
+} gui_app_reg_t;
+
+const gui_app_reg_t* gui_app_registry(int* count);
+
 /* 语言 */
 bool gui_lang_zh(void);
 void gui_set_lang_zh(bool zh);
