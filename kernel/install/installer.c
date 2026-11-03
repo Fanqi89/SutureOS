@@ -380,6 +380,66 @@ static int inst_write_accounts(const char *root_pw, const char *user_name,
     return 0;
 }
 
+/* ---------------- persistent user-data skeleton ---------------- */
+
+/* Format version of /SUTUREOS/PERSIST (kernel/fs/persist.c reads the digits). */
+#define INST_PERSIST_ROOT "/mnt/target/SUTUREOS/PERSIST"
+#define INST_PERSIST_VERSION_TEXT "sutureos-persist 1\n"
+
+/* Copy one file inside the freshly formatted volume (source and destination are
+ * both VFS paths under /mnt/target). Small /etc files only. */
+static int inst_copy_in_volume(const char *src, const char *dst) {
+    static uint8_t buf[2048];
+    int in = vfs_open(src, VFS_O_RDONLY);
+    int out, n;
+
+    if (in < 0) return -1;
+    out = vfs_open(dst, VFS_O_CREAT | VFS_O_WRONLY | VFS_O_TRUNC);
+    if (out < 0) { vfs_close(in); return -1; }
+    while ((n = vfs_read(in, buf, (uint32_t)sizeof(buf))) > 0) {
+        if (vfs_write(out, buf, (uint32_t)n) != n) { vfs_close(in); vfs_close(out); return -1; }
+    }
+    vfs_close(in);
+    vfs_close(out);
+    return (n < 0) ? -1 : 0;
+}
+
+/* The persistent user-data tree the kernel uses to survive reboots:
+ *   /SUTUREOS/PERSIST/VERSION
+ *   /SUTUREOS/PERSIST/etc/{passwd,shadow,group,sudoers,motd}
+ *   /SUTUREOS/PERSIST/home/   (per-user homes are mirrored here at runtime)
+ *   /SUTUREOS/PERSIST/root/
+ * The installer seeds etc from the /etc it just wrote, so the first boot already
+ * finds accounts in PERSIST and later changes are flushed back into it. */
+static int inst_write_persist(const char *root_pw, const char *user_name) {
+    static const char *const etc_files[] = {
+        "passwd", "shadow", "group", "sudoers", "motd"
+    };
+    char src[128];
+    char dst[128];
+    int copied = 0;
+
+    (void)root_pw; (void)user_name;
+    if (vfs_mkdir_p(INST_PERSIST_ROOT) != VFS_OK) return -1;
+    if (vfs_mkdir_p(INST_PERSIST_ROOT "/etc") != VFS_OK) return -1;
+    if (vfs_mkdir_p(INST_PERSIST_ROOT "/home") != VFS_OK) return -1;
+    if (vfs_mkdir_p(INST_PERSIST_ROOT "/root") != VFS_OK) return -1;
+    if (inst_write_text(INST_PERSIST_ROOT "/VERSION",
+                        INST_PERSIST_VERSION_TEXT) != 0) return -1;
+    for (unsigned i = 0; i < sizeof(etc_files) / sizeof(etc_files[0]); i++) {
+        snprintf(src, sizeof(src), "/mnt/target/etc/%s", etc_files[i]);
+        snprintf(dst, sizeof(dst), INST_PERSIST_ROOT "/etc/%s", etc_files[i]);
+        if (inst_copy_in_volume(src, dst) != 0) {
+            console_printf("[install] could not seed PERSIST/etc/%s\n", etc_files[i]);
+            return -1;
+        }
+        copied++;
+    }
+    console_printf("[install]   " INST_PERSIST_ROOT
+                   " = VERSION + etc/(%d files) + home/ + root/\n", (int64_t)copied);
+    return 0;
+}
+
 /* ---------------- the destructive part ---------------- */
 
 static int inst_write_boot_area(int drive, uint32_t part_start, uint32_t part_sectors) {
@@ -567,6 +627,15 @@ static int inst_install(int drive, const char *root_pw,
     inst_puts("[install] writing /etc (passwd, shadow, group, sudoers, motd) ...\n");
     if (inst_write_accounts(root_pw, user_name, user_pw) != 0) return -1;
 
+    /* 5b. persistent user-data skeleton (kernel/fs/persist.c, format v1):
+     *     /SUTUREOS/PERSIST/{VERSION,etc/{passwd,shadow,group,sudoers,motd},
+     *     home/,root/}. The installer seeds it with the same /etc files it just
+     *     wrote, so the very first boot restores them from PERSIST and later
+     *     runtime changes (useradd, /etc/motd, /home files) are flushed back
+     *     into the same tree on `sync` / `shutdown`. */
+    inst_puts("[install] writing /SUTUREOS/PERSIST skeleton ...\n");
+    if (inst_write_persist(root_pw, user_name) != 0) return -1;
+
     /* 6. flush and unmount: the volume must be consistent on disk */
     fatfs_set_bulk_mode(0);
     (void)vfs_sync("/mnt/target");
@@ -574,6 +643,25 @@ static int inst_install(int drive, const char *root_pw,
         inst_puts("[install] warning: unmount of the new volume failed\n");
     }
     (void)blk_flush(d->drive);
+
+    /* 7. hand the new system volume to this live session's persistence layer:
+     *    mount it at /mnt/sys (the mountpoint kernel/fs/persist.c expects) and
+     *    arm the mirror, so `sync` / `shutdown` in this same session already
+     *    write /etc, /home and /root onto the fresh disk. Without this the very
+     *    first session after installation would still be volatile. */
+    {
+        char src[8];
+        snprintf(src, sizeof(src), "%d", d->drive);
+        if (vfs_mount(src, "/mnt/sys", "fat32") == VFS_OK) {
+            extern int persist_detect(void);
+            (void)persist_detect();
+            console_printf("[install] system volume mounted at /mnt/sys, "
+                           "persistence active for this session\n");
+        } else {
+            inst_puts("[install] warning: could not mount the new system volume "
+                      "at /mnt/sys (persistence in this session is off)\n");
+        }
+    }
 
     console_printf("[install] done (drive %d, partition LBA %u, root_password=%s"
                    ", user=%s)\n",

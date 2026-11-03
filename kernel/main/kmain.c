@@ -16,6 +16,7 @@
 #include "block.h"
 #include "ahci.h"    /* blk_ahci_device_count() (block.h only has init/probe) */
 #include "sutureos/version.h"   /* SUTUREOS_VERSION */
+#include "userdb.h"             /* accounts for the /home skeleton */
 #include "nvme.h"    /* blk_nvme_present()/mmio_base()/version() diagnostics */
 
 /* Module self-test declarations */
@@ -123,6 +124,28 @@ static int sys_seed_etc_file(const char *name) {
     if (total <= 0) return 0;
     snprintf(dst, sizeof(dst), "/etc/%s", name);
     return (vfs_write_file(dst, buf, (uint32_t)total) == VFS_OK) ? 1 : 0;
+}
+
+/* Home directories for the installed system: /home, /root and one
+ * /home/<name> per account with uid >= 1000. The persistence mirror creates the
+ * directories that had files; this also covers accounts that never wrote
+ * anything, so `su user` always lands in an existing home. */
+static void sys_seed_home_dirs(void) {
+    extern uint32_t userdb_count(void);
+    extern const userdb_user_t *userdb_at(uint32_t index);
+    vfs_stat_t st;
+
+    if (vfs_stat("/home", &st) != VFS_OK || st.type != VFS_NODE_DIR)
+        (void)vfs_mkdir("/home", 0755);
+    if (vfs_stat("/root", &st) != VFS_OK || st.type != VFS_NODE_DIR)
+        (void)vfs_mkdir("/root", 0700);
+    for (uint32_t i = 0; i < userdb_count(); i++) {
+        const userdb_user_t *u = userdb_at(i);
+        char path[96];
+        if (!u || u->name[0] == '\0' || u->uid < 1000) continue;
+        snprintf(path, sizeof(path), "/home/%s", u->name);
+        if (vfs_stat(path, &st) != VFS_OK) (void)vfs_mkdir(path, 0755);
+    }
 }
 
 void kernel_main(uint32_t magic, uint32_t mbi) {
@@ -468,22 +491,44 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
             int seeded = 0;
             snprintf(src, sizeof(src), "%d", fat_drive);
             if (vfs_mount(src, "/mnt/sys", "fat32") == VFS_OK) {
-                static const char *const etc_files[] = {
-                    "passwd", "shadow", "group", "sudoers", "motd"
-                };
-                for (unsigned i = 0;
-                     i < sizeof(etc_files) / sizeof(etc_files[0]); i++) {
-                    if (sys_seed_etc_file(etc_files[i])) seeded++;
+                extern int persist_detect(void);
+                extern int persist_restore(void);
+                const int persist_on = persist_detect();
+                int restored = 0;
+
+                /* /SUTUREOS/PERSIST is the newest mirror (format v1): it holds
+                 * every file the user changed, including /home and /root.
+                 * System volumes written by the first installer only have the
+                 * flat /etc copy, which stays as the compatibility fallback. */
+                if (persist_on) restored = persist_restore();
+                if (restored <= 0) {
+                    static const char *const etc_files[] = {
+                        "passwd", "shadow", "group", "sudoers", "motd"
+                    };
+                    for (unsigned i = 0;
+                         i < sizeof(etc_files) / sizeof(etc_files[0]); i++) {
+                        if (sys_seed_etc_file(etc_files[i])) seeded++;
+                    }
                 }
-                if (seeded > 0) {
+                if (seeded > 0 || restored > 0) {
                     extern int userdb_init(void);
                     extern int sudo_init(void);
                     (void)userdb_init();
                     (void)sudo_init();
                 }
-                console_printf("[sys] installed system volume (drive %d): seeded %d file(s)"
-                               " from /mnt/sys/etc\n",
-                               (int64_t)fat_drive, (int64_t)seeded);
+                if (restored > 0) {
+                    console_printf("[sys] installed system volume (drive %d): "
+                                   "restored %d file(s) from /mnt/sys/SUTUREOS/PERSIST\n",
+                                   (int64_t)fat_drive, (int64_t)restored);
+                } else {
+                    console_printf("[sys] installed system volume (drive %d): seeded %d file(s)"
+                                   " from /mnt/sys/etc\n",
+                                   (int64_t)fat_drive, (int64_t)seeded);
+                }
+                /* Home directories: the mirror brings the ones that have files,
+                 * and every account (uid >= 1000) gets /home/<name> even when it
+                 * has not written anything yet. */
+                sys_seed_home_dirs();
             }
         }
     }

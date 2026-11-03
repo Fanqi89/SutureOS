@@ -484,9 +484,12 @@ def phase3_boot_from_disk(image, serial_log, checker):
         serial.wait_for(r"version 0\.\d+\.\d+-alpha", timeout=120, name="kernel banner")
         checker.check(True, "kernel banner shown (boot presentation intact)")
         m = serial.wait_for(r"^\[sys\] installed system volume \(drive (\d+)\): "
-                            r"seeded (\d+) file\(s\)", timeout=90,
+                            r"(?:seeded|restored) (\d+) file\(s\)", timeout=90,
                             name="[sys] installed system volume")
-        checker.check(int(m.group(2)) == 5, "kernel seeded 5 /etc files from the volume",
+        # v0.34 restores /etc from /SUTUREOS/PERSIST (format v1) and reports
+        # "restored N"; an older volume without PERSIST still reports "seeded N".
+        checker.check(int(m.group(2)) >= 5,
+                      "kernel seeded/restored the /etc files from the volume",
                       m.group(2))
         serial.wait_for(r"sutureos# ", timeout=60, name="shell prompt from the disk boot")
         checker.check(True, "terminal shell prompt reached (booted from hard disk)")

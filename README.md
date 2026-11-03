@@ -2,7 +2,7 @@
 
 > **一个由 16 个爱好者操作系统项目拼接而成的 x86_64 单内核操作系统**
 > 
-> 当前版本：**v0.34.0-alpha** · 内核编译 **105** 个源文件（源码树约 220 个 C/H/ASM、约 6.0 万行）
+> 当前版本：**v0.35.0-alpha** · 内核编译 **105** 个源文件（源码树约 220 个 C/H/ASM、约 6.0 万行）
 > · 内核 ELF 约 **2.06 MB**（含调试符号）· 可引导 ISO 约 **15.0 MB** · **GPL-3.0** 许可证
 >
 > 移植与许可说明：[`docs/provenance.md`](docs/provenance.md)（模块→上游·文件路径）
@@ -91,6 +91,7 @@ SutureOS（缝合怪系统）是一个实验性的 x86_64 单内核操作系统�
 | v0.32.0 | **多用户体系**（useradd/userdel/login/su + GUI 切换 + 密码三态） | SutureOS 自有（GPL-3.0） | `kernel/security/login.c`、`userdb.c`、`shell.c`、`scripts/multiuser_acceptance.py` | ✅ 54/54 + 13/13 + 宿主 PBKDF2 重算校验 |
 | v0.33.0 | **ISO 安装盘**（真实写盘 + 从硬盘启动 + /etc 播种） | SutureOS 自有；Limine 引导布局（BSD-2 工具链头） | `kernel/install/installer.c`、`kernel/fs/fatfs_format.c`、`scripts/installer_acceptance.py` | ✅ 三阶段 56/56（含无 ISO 从硬盘启动 + su alice） |
 | v0.34.0 | **应用注册表 + 固定任务栏 + 窗口最小化/最大化**（m/n 快捷键） | SutureOS 自绘（GPL-3.0） | `kernel/gui/apps.c`、`gui.c`、`scripts/apps_taskbar_acceptance.py` | ✅ 9/9 + 外观门禁 0 像素 |
+| v0.35.0 | **数据持久化**（/etc、/home、/root ↔ 系统卷 PERSIST） | SutureOS 自有（GPL-3.0） | `kernel/fs/persist.c`、`installer.c`、`scripts/persistence_acceptance.py` | ✅ 三阶段 32/32（重启后 su bob 成功） |
 
 ---
 

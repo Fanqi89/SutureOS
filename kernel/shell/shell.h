@@ -79,6 +79,7 @@ int shell_cmd_tail(int argc, char **argv);
 int shell_cmd_grep(int argc, char **argv);
 int shell_cmd_stat(int argc, char **argv);
 int shell_cmd_sync(int argc, char **argv);
+int shell_cmd_persist(int argc, char **argv);
 int shell_cmd_ps(int argc, char **argv);
 int shell_cmd_kill(int argc, char **argv);
 int shell_cmd_sudo(int argc, char **argv);

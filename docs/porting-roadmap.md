@@ -77,5 +77,5 @@
 | B18 | v0.33.0-alpha | **ISO 系统安装盘**（真实写盘/分区/Limine 引导/FAT32 格式化/系统文件//etc 播种） | SutureOS 自有 + Limine 布局 | 三阶段宿主验收 **56/56**（含无 ISO 从硬盘启动 + su alice + 空密码路径） | ✅ 本轮完成 |
 | B19 | v0.32.0-alpha | **多用户**（useradd/userdel/users/passwd/login/su + GUI Switch User） | SutureOS 自有（GPL-3.0） | 多用户 54/54 + GUI 切换 13/13 + 宿主 PBKDF2 重算校验 | ✅ 本轮完成 |
 | B20 | v0.34.0-alpha | **应用注册表 + 固定任务栏 + 窗口最小化/最大化**（m/n 快捷键） | SutureOS 自绘（用户要求，外观基线已更新） | `apps_taskbar_acceptance.py` **9/9** + 外观门禁 0 像素 | ✅ 本轮完成 |
-| B21 | 进行中 | **数据持久化**（安装盘持久卷 + 开机恢复 + 关机落盘） | 队友 worktree port-persist | 待：两阶段重启保留验证 | ⏳ |
+| B21 | v0.35.0-alpha | **数据持久化**（PERSIST 双向镜像、开机恢复、关机落盘） | SutureOS 自有（GPL-3.0） | 三阶段 **32/32**（宿主解析 + 重启后 su bob） | ✅ 本轮完成 |
 | B22 | 待做 | **系统升级（只做覆盖）**（用新 ISO 覆盖系统文件、保留用户数据） | Lead | 待实现 | ⏳ |

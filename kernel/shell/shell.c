@@ -108,6 +108,7 @@ static const struct shell_cmd g_commands[] = {
     {"grep",    shell_cmd_grep,    "Print matching lines: grep <pattern> <file>"},
     {"stat",    shell_cmd_stat,    "Show type/size of a path: stat <path>"},
     {"sync",    shell_cmd_sync,    "Flush every mounted filesystem: sync"},
+    {"persist", shell_cmd_persist, "Persistent user data: persist [flush] (status / force flush)"},
     {"ps",      shell_cmd_ps,      "List processes"},
     {"kill",    shell_cmd_kill,    "Kill a process"},
     {"sudo",    shell_cmd_sudo,    "Execute command as root"},
@@ -500,11 +501,26 @@ int shell_cmd_log(int argc, char **argv) {
     return 0;
 }
 
+/* Flush the ramfs /etc + /home + /root mirror to the installed system volume and
+ * then sync every mounted filesystem. Used before shutdown/reboot so nothing the
+ * user changed at runtime is lost, and by the `sync` command. */
+static void shell_persist_and_sync(void) {
+    extern int persist_present(void);
+    extern int persist_flush(void);
+    vfs_mount_info_t mounts[VFS_MAX_MOUNTS];
+    int n, i;
+
+    if (persist_present()) (void)persist_flush();
+    n = vfs_list_mounts(mounts, VFS_MAX_MOUNTS);
+    for (i = 0; i < n; i++) (void)vfs_sync(mounts[i].mountpoint);
+}
+
 int shell_cmd_reboot(int argc, char **argv) {
     if (!require_root("reboot")) return 1;
     (void)argc; (void)argv;
     shell_puts("Rebooting...\n");
     shell_scroll_message("Rebooting system...");
+    shell_persist_and_sync();
     sys_reboot();
     return 0;
 }
@@ -514,6 +530,7 @@ int shell_cmd_shutdown(int argc, char **argv) {
     (void)argc; (void)argv;
     shell_puts("Shutting down...\n");
     shell_scroll_message("Shutting down system...");
+    shell_persist_and_sync();
     sys_shutdown();
     return 0;
 }
@@ -551,6 +568,13 @@ int shell_cmd_startgui(int argc, char **argv) {
     if (term_available()) term_clear();
     else fbcon_clear();
     shell_puts("GUI exited, returning to terminal\n");
+    /* Leaving the desktop is a natural checkpoint: persist whatever the GUI apps
+     * (editor etc.) wrote, so a following shutdown cannot lose it. */
+    {
+        extern int persist_present(void);
+        extern int persist_flush(void);
+        if (persist_present()) (void)persist_flush();
+    }
     shell_puts(g_shell.prompt);
     return ret;
 }
@@ -1120,6 +1144,16 @@ int shell_cmd_sync(int argc, char **argv) {
     (void)argc; (void)argv;
     vfs_mount_info_t mounts[VFS_MAX_MOUNTS];
     int n = vfs_list_mounts(mounts, VFS_MAX_MOUNTS);
+
+    /* Persistence mirror first: ramfs /etc + /home + /root -> the system volume.
+     * persist_flush() ends with vfs_sync("/mnt/sys"), so the FAT metadata reaches
+     * the disk too and a shutdown right after `sync` cannot lose it. */
+    {
+        extern int persist_present(void);
+        extern int persist_flush(void);
+        if (persist_present()) (void)persist_flush();
+    }
+
     if (n <= 0) {
         shell_puts("sync: no filesystems mounted\n");
         return 0;
@@ -1138,6 +1172,42 @@ int shell_cmd_sync(int argc, char **argv) {
     }
     shell_printf("sync: %d ok, %d failed\n", ok, failed);
     return failed == 0 ? 0 : -1;
+}
+
+/* Persistent user data (kernel/fs/persist.c): status + manual flush. */
+int shell_cmd_persist(int argc, char **argv) {
+    extern int persist_present(void);
+    extern int persist_flush(void);
+    extern int persist_restored_files(void);
+    extern int persist_flushed_files(void);
+    extern int persist_flush_count(void);
+    extern int persist_last_error(void);
+    extern int persist_format_version(void);
+    const char *sub = (argc > 1 && argv[1]) ? argv[1] : NULL;
+
+    if (!persist_present()) {
+        shell_puts("persist: no installed system volume here "
+                   "(live ISO session) - nothing is written\n");
+        return 0;
+    }
+    if (sub && strcmp(sub, "flush") == 0) {
+        int n = persist_flush();
+        if (n < 0) {
+            shell_puts("persist: flush FAILED\n");
+            return -1;
+        }
+        shell_printf("persist: flushed %d file(s)\n", (int64_t)n);
+        return 0;
+    }
+    shell_printf("persist: volume=/mnt/sys/SUTUREOS/PERSIST format=v%d\n",
+                 (int64_t)persist_format_version());
+    shell_printf("persist: restored at boot=%d file(s), last flush=%d file(s), "
+                 "flushes=%d, last_error=%d\n",
+                 (int64_t)persist_restored_files(), (int64_t)persist_flushed_files(),
+                 (int64_t)persist_flush_count(), (int64_t)persist_last_error());
+    shell_puts("persist: mirrors /etc, /home, /root; "
+               "'sync' and shutdown/reboot flush automatically\n");
+    return 0;
 }
 
 int shell_cmd_ps(int argc, char **argv) {

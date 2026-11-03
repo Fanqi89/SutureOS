@@ -6,6 +6,26 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.35.0-alpha]
+
+**数据持久化：安装到硬盘后 `/etc`、`/home`、`/root` 双向镜像到系统卷 `/SUTUREOS/PERSIST`，
+开机恢复、sync/shutdown/reboot/退出 GUI 时落盘，重启不再丢数据。三阶段验收 32/32。**
+
+### Added
+- `kernel/fs/persist.c/.h`：`persist_detect/restore/flush`，VFS 递归双向镜像（有界），flush 末尾 sync 系统卷。
+- `kernel/install/installer.c`：安装时建 PERSIST 骨架并把新卷挂 `/mnt/sys` + `persist_detect()`（同一会话即生效）。
+- `kernel/main/kmain.c`：开机优先从 PERSIST 恢复，旧卷退回 `/mnt/sys/etc` 播种；重建 /home、/root、/home/<user>。
+- `kernel/shell/shell.c`：`sync`/`shutdown`/`reboot`/退出 GUI 前 flush；新增 `persist [flush]` 命令。
+- `scripts/persistence_acceptance.py`（32 项，三阶段）、`docs/PERSISTENCE.md`。
+
+### Verification
+- persistence **32/32**（含宿主解析 PERSIST 文件 + 重启后 `su bob` 成功）；安装器 56/56；内核 13/14；
+  FAT32 21/21；apps_taskbar 9/9；多用户 54/54；GUI 外观门禁 0 像素；启动呈现前 297 行逐字节相同。
+
+### Limits
+- 只复制不删除同步；有界（深≤6/目录≤64/次≤256/文件≤128KiB）；无属主元数据；非原子写；
+  只镜像首个系统卷；每次全量重写；既有 ATA 偶发 flush timeout。
+
 ## [v0.34.0-alpha]
 
 **桌面外壳第一批：应用注册表（开始菜单运行时生成）+ 固定任务栏应用 + 窗口最小化/最大化完整可用
