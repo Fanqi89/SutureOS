@@ -8,6 +8,7 @@
 #include "syscalls2.h"   /* systest: the new syscalls */
 #include "rtc.h"        /* date */        /* sudo/su/passwd (kernel/security) */
 #include "userdb.h"
+#include "login.h"      /* login/su/identity switch (multiuser batch) */
 #include <stitch/types.h>
 #include <stitch/string.h>
 #include <stitch/stdarg.h>
@@ -53,6 +54,36 @@ struct shell_cmd {
 /* defined next to the sudo commands; privileged handlers above use it */
 static int require_root(const char *cmd);
 
+/* ==================== /etc and /root write policy ====================
+ * The VFS has no per-file ownership yet (see the honest boundary note in
+ * kernel/security/creds.h), so the shell enforces the identity rule: only root
+ * may create, change or remove anything under /etc or /root. Reads stay open to
+ * everybody, so `cat /etc/passwd` works for a normal user while
+ * `write /etc/passwd ...` is refused. */
+static int shell_path_root_only(const char *path)
+{
+    if (path == NULL) return 0;
+    if (cred_is_root()) return 0;
+    while (path[0] == '.' && path[1] == '/') path += 2;
+    if (strncmp(path, "/etc", 4) == 0 && (path[4] == '\0' || path[4] == '/')) return 1;
+    if (strncmp(path, "/root", 5) == 0 && (path[5] == '\0' || path[5] == '/')) return 1;
+    return 0;
+}
+
+/* Refuse a mutating command when one of argv[from..argc) targets /etc or /root.
+ * `argc` is capped by the caller, so `cp` can guard only its destination. */
+static int shell_guard_paths(const char *cmd, int argc, char **argv, int from)
+{
+    for (int i = from; i < argc; i++) {
+        if (shell_path_root_only(argv[i])) {
+            shell_printf("%s: %s: Permission denied (only root may modify /etc or /root)\n",
+                         cmd, argv[i]);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static const struct shell_cmd g_commands[] = {
     {"help",    shell_cmd_help,    "Show this help message"},
     {"clear",   shell_cmd_clear,   "Clear the screen"},
@@ -80,10 +111,14 @@ static const struct shell_cmd g_commands[] = {
     {"ps",      shell_cmd_ps,      "List processes"},
     {"kill",    shell_cmd_kill,    "Kill a process"},
     {"sudo",    shell_cmd_sudo,    "Execute command as root"},
-    {"su",      shell_cmd_su,      "Switch user: su [user] (authenticates against /etc/shadow)"},
+    {"login",   shell_cmd_login,   "Log in as another user: login [user] (authenticates against /etc/shadow)"},
+    {"su",      shell_cmd_su,      "Switch user: su [-] [user] (authenticates against /etc/shadow)"},
     {"whoami",  shell_cmd_whoami,  "Print the effective user name"},
     {"id",      shell_cmd_id,      "Print uid/gid/groups of the effective user"},
-    {"passwd",  shell_cmd_passwd,  "Change a password: passwd [user]"},
+    {"passwd",  shell_cmd_passwd,  "Change a password: passwd [-l|-u|-d] [user]"},
+    {"users",   shell_cmd_users,   "List accounts: name uid gid groups password-state ('*' = current)"},
+    {"useradd", shell_cmd_useradd, "Create an account (root only): useradd <name>"},
+    {"userdel", shell_cmd_userdel, "Delete an account (root only): userdel <name>"},
     {"sudotest",shell_cmd_sudotest,"Self-test: SHA-256, /etc/shadow, sudoers, ticket, creds"},
     {"rm",      shell_cmd_rm,      "Remove files: rm <path>..."},
     {"mkdir",   shell_cmd_mkdir,   "Create directories"},
@@ -725,6 +760,11 @@ int shell_cmd_write(int argc, char **argv) {
     }
     char path[256];
     shell_abspath(argv[1], path, sizeof(path));
+    if (shell_path_root_only(path)) {
+        shell_printf("write: %s: Permission denied (only root may modify /etc or /root)\n",
+                     path);
+        return -1;
+    }
     char buf[512];
     const uint32_t n = shell_join_args(argc, argv, buf, sizeof(buf));
     if (n == 0) {
@@ -747,6 +787,11 @@ int shell_cmd_append(int argc, char **argv) {
     }
     char path[256];
     shell_abspath(argv[1], path, sizeof(path));
+    if (shell_path_root_only(path)) {
+        shell_printf("append: %s: Permission denied (only root may modify /etc or /root)\n",
+                     path);
+        return -1;
+    }
 
     static char buf[2048];
     uint32_t n = 0;
@@ -1157,9 +1202,19 @@ int shell_cmd_sudo(int argc, char **argv) {
     return sudo_main(argc, argv);
 }
 
-/* su [user]: authenticate and adopt that identity for this session. */
+/* login [user]: adopt an identity after authenticating (multiuser batch).
+ * `login` with no argument prompts "login: " and then the password. */
+int shell_cmd_login(int argc, char **argv) {
+    return login_main(argc, argv);
+}
+
+/* su [-] [user]: same engine as `login`, with Linux's su rules:
+ *   - root never needs a password,
+ *   - a passwordless target (empty shadow field) is entered without a prompt,
+ *   - a locked target (`!`) is refused,
+ *   - `su -` also switches the working directory to the target's home. */
 int shell_cmd_su(int argc, char **argv) {
-    return sudo_su(argc, argv);
+    return login_su(argc, argv);
 }
 
 int shell_cmd_whoami(int argc, char **argv) {
@@ -1176,15 +1231,162 @@ int shell_cmd_id(int argc, char **argv) {
     return 0;
 }
 
-/* passwd [user]: two hidden prompts, like Linux. */
+/* users: every account with its numeric ids, groups and password state. */
+int shell_cmd_users(int argc, char **argv) {
+    const char *me = cred_username();
+    (void)argc; (void)argv;
+
+    shell_printf("%u account%s in %s\n", (uint64_t)userdb_count(),
+                 (userdb_count() == 1) ? "" : "s", "/etc/passwd");
+    for (uint32_t i = 0; i < userdb_count(); i++) {
+        const userdb_user_t *u = userdb_at(i);
+        char groups[128];
+        if (u == NULL) continue;
+        userdb_format_groups(u->name, groups, sizeof(groups));
+        shell_printf("%s uid=%u gid=%u groups=%s password=%s%s\n", u->name,
+                     (uint64_t)u->uid, (uint64_t)u->gid, groups,
+                     userdb_pwstate_text(u->name),
+                     (strcmp(u->name, me) == 0) ? " current" : "");
+    }
+    return 0;
+}
+
+/* useradd <name> (root only): allocate the next uid >= 1000, create the private
+ * group + home directory and ask for a password. An empty password leaves the
+ * account LOCKED ("留空=禁用密码"), never passwordless. */
+int shell_cmd_useradd(int argc, char **argv) {
+    const char *name;
+    char pw[96], pw2[96];
+    uint32_t uid = 0;
+    int r;
+
+    if (!cred_is_root()) {
+        shell_puts("useradd: permission denied (root only)\n");
+        return 1;
+    }
+    if (argc < 2) {
+        shell_puts("usage: useradd <name>\n");
+        return 1;
+    }
+    name = argv[1];
+    if (!userdb_valid_name(name)) {
+        shell_puts("useradd: invalid name (start with a letter; a-z 0-9 _ -; "
+                   "at most 31 characters; reserved: root/wheel/all/none)\n");
+        return 1;
+    }
+    if (userdb_by_name(name) != NULL) {
+        shell_printf("useradd: user %s already exists\n", name);
+        return 1;
+    }
+
+    pw[0] = '\0';
+    pw2[0] = '\0';
+    shell_puts("New password (empty = leave the account locked): ");
+    if (login_read_line(NULL, pw, sizeof(pw), 1) < 0) {
+        shell_puts("useradd: aborted\n");
+        return 1;
+    }
+    if (pw[0] != '\0') {
+        shell_puts("Retype new password: ");
+        if (login_read_line(NULL, pw2, sizeof(pw2), 1) < 0) {
+            memset(pw, 0, sizeof(pw));
+            shell_puts("useradd: aborted\n");
+            return 1;
+        }
+        if (strcmp(pw, pw2) != 0) {
+            memset(pw, 0, sizeof(pw));
+            memset(pw2, 0, sizeof(pw2));
+            shell_puts("useradd: passwords do not match\n");
+            return 1;
+        }
+    }
+
+    r = userdb_add(name, (pw[0] == '\0') ? NULL : pw, &uid);
+    memset(pw, 0, sizeof(pw));
+    memset(pw2, 0, sizeof(pw2));
+    if (r != 0) {
+        if (r == -2) shell_printf("useradd: user %s already exists\n", name);
+        else shell_puts("useradd: cannot create the account (no free slot)\n");
+        return 1;
+    }
+    if (userdb_save() != 0) {
+        shell_puts("useradd: cannot write /etc/passwd, /etc/shadow, /etc/group\n");
+        return 1;
+    }
+    shell_printf("useradd: created %s uid=%u gid=%u home=/home/%s password=%s\n",
+                 name, (uint64_t)uid, (uint64_t)uid, name,
+                 userdb_pwstate_text(name));
+    console_printf("[user] useradd %s uid=%u password=%s\n", name, (uint64_t)uid,
+                   userdb_pwstate_text(name));
+    return 0;
+}
+
+/* userdel <name> (root only). Refuses root and the current session's user. */
+int shell_cmd_userdel(int argc, char **argv) {
+    const char *name;
+
+    if (!cred_is_root()) {
+        shell_puts("userdel: permission denied (root only)\n");
+        return 1;
+    }
+    if (argc < 2) {
+        shell_puts("usage: userdel <name>\n");
+        return 1;
+    }
+    name = argv[1];
+    if (strcmp(name, "root") == 0) {
+        shell_puts("userdel: refusing to remove root\n");
+        return 1;
+    }
+    if (strcmp(name, cred_username()) == 0) {
+        shell_printf("userdel: cannot remove %s: that is the current user\n", name);
+        return 1;
+    }
+    if (userdb_by_name(name) == NULL) {
+        shell_printf("userdel: user %s does not exist\n", name);
+        return 1;
+    }
+    if (userdb_remove(name) != 0) {
+        shell_printf("userdel: cannot remove %s\n", name);
+        return 1;
+    }
+    if (userdb_save() != 0) {
+        shell_puts("userdel: cannot write /etc/passwd, /etc/shadow, /etc/group\n");
+        return 1;
+    }
+    shell_printf("userdel: removed %s (home directory kept)\n", name);
+    console_printf("[user] userdel %s\n", name);
+    return 0;
+}
+
+/* passwd [-l|-u|-d] [user]: set / lock / unlock / clear a password.
+ * A normal user may only change their own password and must prove the current
+ * one first (Linux behaviour); root may change anyone's without the old one.
+ *   -l  lock (`!` in /etc/shadow)          -u  unlock
+ *   -d  delete the password -> passwordless (empty shadow field) */
 int shell_cmd_passwd(int argc, char **argv) {
+    int mode = 0;                       /* 0 set, 1 lock, 2 unlock, 3 delete */
+    int argi = 1;
     const char *target;
     char first[96];
     char second[96];
+    char old[96];
 
-    if (argc >= 2) {
-        target = argv[1];
-        if (strcmp(cred_username(), target) != 0 && !cred_is_root()) {
+    while (argi < argc && argv[argi][0] == '-' && argv[argi][1] != '\0') {
+        const char *opt = argv[argi];
+        if (strcmp(opt, "-l") == 0) mode = 1;
+        else if (strcmp(opt, "-u") == 0) mode = 2;
+        else if (strcmp(opt, "-d") == 0) mode = 3;
+        else {
+            shell_printf("passwd: invalid option %s (use -l, -u or -d)\n", opt);
+            return 1;
+        }
+        argi++;
+    }
+
+    if (argi < argc) {
+        target = argv[argi];
+        if (!cred_is_root() && strcmp(cred_username(), target) != 0) {
             shell_printf("passwd: you may not change %s's password\n", target);
             return 1;
         }
@@ -1195,21 +1397,84 @@ int shell_cmd_passwd(int argc, char **argv) {
         shell_printf("passwd: user %s does not exist\n", target);
         return 1;
     }
-    if (sudo_prompt_password("New password: ", first, sizeof(first)) < 0) return 1;
+    if (mode != 0 && !cred_is_root()) {
+        shell_puts("passwd: permission denied (root only for -l/-u/-d)\n");
+        return 1;
+    }
+
+    /* Changing a password as a normal user requires the current one first. */
+    if (!cred_is_root()) {
+        old[0] = '\0';
+        shell_puts("Current password: ");
+        if (login_read_line(NULL, old, sizeof(old), 1) < 0) {
+            shell_puts("passwd: aborted\n");
+            return 1;
+        }
+        if (login_authenticate(target, old) != LOGIN_OK) {
+            memset(old, 0, sizeof(old));
+            shell_puts("passwd: Authentication failure\n");
+            return 1;
+        }
+        memset(old, 0, sizeof(old));
+    }
+
+    if (mode == 1) {
+        if (userdb_lock(target) != 0) {
+            shell_puts("passwd: could not write /etc/shadow\n");
+            return 1;
+        }
+        shell_printf("passwd: %s locked (! in /etc/shadow)\n", target);
+        return 0;
+    }
+    if (mode == 2) {
+        if (userdb_unlock(target) != 0) {
+            shell_puts("passwd: could not write /etc/shadow\n");
+            return 1;
+        }
+        shell_printf("passwd: %s unlocked (password=%s)\n", target,
+                     userdb_pwstate_text(target));
+        return 0;
+    }
+    if (mode == 3) {
+        if (userdb_clear_password(target) != 0) {
+            shell_puts("passwd: could not write /etc/shadow\n");
+            return 1;
+        }
+        shell_printf("passwd: %s now has no password (password=%s)\n", target,
+                     userdb_pwstate_text(target));
+        console_printf("[user] passwd -d %s (passwordless)\n", target);
+        return 0;
+    }
+
+    first[0] = '\0';
+    second[0] = '\0';
+    shell_puts("New password: ");
+    if (login_read_line(NULL, first, sizeof(first), 1) < 0) return 1;
     if (first[0] == '\0') {
         shell_puts("passwd: password unchanged\n");
         return 1;
     }
-    if (sudo_prompt_password("Retype new password: ", second, sizeof(second)) < 0) return 1;
+    shell_puts("Retype new password: ");
+    if (login_read_line(NULL, second, sizeof(second), 1) < 0) {
+        memset(first, 0, sizeof(first));
+        return 1;
+    }
     if (strcmp(first, second) != 0) {
+        memset(first, 0, sizeof(first));
+        memset(second, 0, sizeof(second));
         shell_puts("Sorry, passwords do not match.\n");
         return 1;
     }
     if (userdb_set_password(target, first) != 0) {
+        memset(first, 0, sizeof(first));
+        memset(second, 0, sizeof(second));
         shell_puts("passwd: could not write /etc/shadow\n");
         return 1;
     }
+    memset(first, 0, sizeof(first));
+    memset(second, 0, sizeof(second));
     shell_printf("passwd: password updated successfully for %s\n", target);
+    console_printf("[user] passwd set for %s\n", target);
     return 0;
 }
 
@@ -1233,6 +1498,7 @@ static int sh_syscall5(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3,
 }
 
 int shell_cmd_rm(int argc, char **argv) {
+    if (shell_guard_paths("rm", argc, argv, 1)) return 1;
     int rc = 0;
     if (argc < 2) {
         shell_puts("usage: rm <path>...\n");
@@ -1251,6 +1517,7 @@ int shell_cmd_rm(int argc, char **argv) {
 }
 
 int shell_cmd_mkdir(int argc, char **argv) {
+    if (shell_guard_paths("mkdir", argc, argv, 1)) return 1;
     int rc = 0;
     if (argc < 2) {
         shell_puts("usage: mkdir <dir>...\n");
@@ -1268,6 +1535,7 @@ int shell_cmd_mkdir(int argc, char **argv) {
 }
 
 int shell_cmd_rmdir(int argc, char **argv) {
+    if (shell_guard_paths("rmdir", argc, argv, 1)) return 1;
     int rc = 0;
     if (argc < 2) {
         shell_puts("usage: rmdir <dir>...\n");
@@ -1284,6 +1552,7 @@ int shell_cmd_rmdir(int argc, char **argv) {
 }
 
 int shell_cmd_touch(int argc, char **argv) {
+    if (shell_guard_paths("touch", argc, argv, 1)) return 1;
     extern int vfs_write_file(const char *, const void *, uint32_t);
     int rc = 0;
     if (argc < 2) {
@@ -1319,6 +1588,7 @@ int shell_cmd_cp(int argc, char **argv) {
         shell_puts("usage: cp <source> <dest>\n");
         return 1;
     }
+    if (shell_guard_paths("cp", 3, argv, 2)) return 1;
     data = sh_read_file(argv[1], &len);
     if (data == NULL) {
         shell_printf("cp: %s: no such file\n", argv[1]);
@@ -1335,6 +1605,7 @@ int shell_cmd_cp(int argc, char **argv) {
 }
 
 int shell_cmd_mv(int argc, char **argv) {
+    if (shell_guard_paths("mv", argc, argv, 1)) return 1;
     if (argc < 3) {
         shell_puts("usage: mv <source> <dest>\n");
         return 1;

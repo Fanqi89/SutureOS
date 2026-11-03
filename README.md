@@ -2,7 +2,7 @@
 
 > **一个由 16 个爱好者操作系统项目拼接而成的 x86_64 单内核操作系统**
 > 
-> 当前版本：**v0.31.0-alpha** · 内核编译 **105** 个源文件（源码树约 220 个 C/H/ASM、约 6.0 万行）
+> 当前版本：**v0.32.0-alpha** · 内核编译 **105** 个源文件（源码树约 220 个 C/H/ASM、约 6.0 万行）
 > · 内核 ELF 约 **2.06 MB**（含调试符号）· 可引导 ISO 约 **15.0 MB** · **GPL-3.0** 许可证
 >
 > 移植与许可说明：[`docs/provenance.md`](docs/provenance.md)（模块→上游·文件路径）
@@ -77,6 +77,7 @@ SutureOS（缝合怪系统）是一个实验性的 x86_64 单内核操作系统�
 | v0.29.0 | **EXT2 多卷**（双卷同时挂载 + 跨卷写入修复） | SutureOS 自有（GPL-3.0） | `kernel/fs/ext2.c`、`ext2_vfs.c`、`scripts/multivol_ext2_acceptance.py` | ✅ 宿主双镜像 40/40+35/35 + 无串卷 12/12 |
 | v0.30.0 | **SquashFS 多卷**（三种文件系统都支持多卷） | SutureOS 自有（GPL-3.0） | `kernel/fs/squashfs.c`、`squashfs_vfs.c`、`scripts/multivol_squashfs_acceptance.py` | ✅ 双卷 + 宿主双镜像 83/83，全量回归通过 |
 | v0.31.0 | **任务栏增强 + Win 键**（窗口按钮/时钟/当前用户） | SutureOS 自绘（GPL-3.0） | `kernel/gui/gui.c`、`scripts/taskbar_acceptance.py` | ✅ 7/7 + 外观门禁 0 像素（基线按要求更新） |
+| v0.32.0 | **多用户体系**（useradd/userdel/login/su + GUI 切换 + 密码三态） | SutureOS 自有（GPL-3.0） | `kernel/security/login.c`、`userdb.c`、`shell.c`、`scripts/multiuser_acceptance.py` | ✅ 54/54 + 13/13 + 宿主 PBKDF2 重算校验 |
 
 ---
 

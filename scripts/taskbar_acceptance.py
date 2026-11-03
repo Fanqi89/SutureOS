@@ -109,7 +109,7 @@ def main():
         # 4) open the start menu again with the Win key and click its first item
         key('meta_l', 0.5)
         time.sleep(0.6)
-        move_to(104, SCREEN_H - 40 - (7 * 24 + 12) - 2 + 6 + 12)
+        move_to(104, SCREEN_H - 40 - (8 * 24 + 12) - 2 + 6 + 12)
         click()
         time.sleep(0.8)
     finally:

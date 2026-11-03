@@ -28,7 +28,7 @@ SAVED = TEXT + '\n'
 KEYMAP = {' ': 'spc', '.': 'dot', '/': 'slash', '-': 'minus', '_': 'shift-minus'}
 
 # start menu: 7 entries (TM/CALC/ABOUT/IMG/EDITOR/SEP/EXIT), grows upward
-MENU_TOP = SCREEN_H - 40 - (6 + 7 * 24) - 2   # menu_rect = y0 - h - 2
+MENU_TOP = SCREEN_H - 40 - (6 + 8 * 24) - 2   # menu_rect = y0 - h - 2
 EDITOR_ITEM = (104, MENU_TOP + 6 + 4 * 24 + 12)
 
 

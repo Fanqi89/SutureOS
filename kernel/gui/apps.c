@@ -12,12 +12,19 @@
  * Drawing contract (see gui.c's gui_draw_window): the compositor already clipped
  * the callback to the window's client rectangle, so apps draw with absolute
  * screen coordinates starting at w->client_x / w->client_y.
+ *
+ * v0.31.0 multiuser batch adds a fourth, lazily created app:
+ *   - Switch User  : authenticate another account and adopt its identity
+ *                    (kernel/security/login.c). Self-drawn, like the others;
+ *                    the frozen default desktop still shows the original three.
  */
 #include "sutureos/version.h"
 #include "gui.h"
 #include "imgdecode.h"
 #include "heap.h"
 #include "vfs.h"
+#include "login.h"      /* Switch User: authenticate + adopt an identity */
+#include "userdb.h"
 #include <stitch/types.h>
 #include <stitch/string.h>
 #include <stitch/console.h>
@@ -638,8 +645,141 @@ int gui_editor_launch(void) {
     return 1;
 }
 
+/* ==================== Switch User (multiuser batch, v0.31.0) ====================
+ * Keyboard driven (the frozen desktop has no text-input framework): type the
+ * account name, press Enter, type the password, press Enter again. The dialog is
+ * self-drawn with the same primitives as the other apps, and it is only created
+ * when the start menu asks for it, so the default desktop is unchanged. */
+static struct {
+    char user[USERDB_NAME_LEN];
+    char pass[64];
+    int  field;                 /* 0 = user name, 1 = password            */
+    char msg[96];
+    int  msg_ok;
+} g_usr;
+
+static void usr_submit(void) {
+    int rc;
+
+    if (g_usr.user[0] == '\0') {
+        snprintf(g_usr.msg, sizeof(g_usr.msg), "type an account name first");
+        g_usr.msg_ok = 0;
+        return;
+    }
+    rc = login_switch_authenticated(g_usr.user, g_usr.pass);
+    memset(g_usr.pass, 0, sizeof(g_usr.pass));
+    if (rc == LOGIN_OK) {
+        snprintf(g_usr.msg, sizeof(g_usr.msg), "signed in as %s (uid=%u)",
+                 login_current_user(), (unsigned)login_current_uid());
+        g_usr.msg_ok = 1;
+        g_usr.field = 0;
+        console_printf("[login] gui switch -> %s (uid=%u)\n", login_current_user(),
+                       (uint64_t)login_current_uid());
+    } else {
+        snprintf(g_usr.msg, sizeof(g_usr.msg), "login failed: %s",
+                 login_error_text(rc));
+        g_usr.msg_ok = 0;
+        g_usr.field = 1;                 /* keep the name, retry the password */
+        console_printf("[login] gui switch to '%s' failed (%s)\n", g_usr.user,
+                       login_error_text(rc));
+    }
+}
+
+static void usr_key(struct gui_window* w, char c) {
+    (void)w;
+    if (c == '\n') {
+        if (g_usr.field == 0) {
+            g_usr.field = 1;
+            g_usr.msg[0] = '\0';
+        } else {
+            usr_submit();
+        }
+    } else if (c == '\b') {
+        char* dst = (g_usr.field == 0) ? g_usr.user : g_usr.pass;
+        const size_t len = strlen(dst);
+        if (len > 0) dst[len - 1] = '\0';
+    } else if (c >= 32 && c < 127) {
+        char* dst = (g_usr.field == 0) ? g_usr.user : g_usr.pass;
+        const size_t cap = (g_usr.field == 0) ? sizeof(g_usr.user) : sizeof(g_usr.pass);
+        const size_t len = strlen(dst);
+        if (len + 1 < cap) {
+            dst[len] = c;
+            dst[len + 1] = '\0';
+        }
+    }
+    gui_invalidate();
+}
+
+static void usr_draw(struct gui_window* w) {
+    const int x = w->client_x + 10;
+    int y = w->client_y + 8;
+    const int cw = w->client_w;
+    char line[128];
+    char mask[64];
+    size_t n, i;
+
+    gui_fill_rect(w->client_x, w->client_y, cw, w->client_h, 0x12141Au);
+
+    snprintf(line, sizeof(line), "signed in as %s (uid=%u)", login_current_user(),
+             (unsigned)login_current_uid());
+    gui_draw_str(x, y, line, 0x8CE0A0u);
+    y += 26;
+
+    /* user name row */
+    gui_draw_str(x, y + 4, "User:", 0xCFE0FFu);
+    gui_fill_rect(x + 64, y, cw - 84, 20, 0x0A1220u);
+    if (g_usr.user[0] != '\0') {
+        gui_draw_str(x + 68, y + 3, g_usr.user, 0xF0F4FFu);
+    } else {
+        gui_draw_str(x + 68, y + 3, "<account name>", 0x607080u);
+    }
+    if (g_usr.field == 0) {
+        const int cx = x + 68 + (int)strlen(g_usr.user) * 8;
+        gui_fill_rect(cx, y + 2, 2, 16, 0x6FA8FFu);
+    }
+    y += 30;
+
+    /* password row (masked) */
+    gui_draw_str(x, y + 4, "Password:", 0xCFE0FFu);
+    gui_fill_rect(x + 64, y, cw - 84, 20, 0x0A1220u);
+    n = strlen(g_usr.pass);
+    if (n > sizeof(mask) - 1) n = sizeof(mask) - 1;
+    for (i = 0; i < n; i++) mask[i] = '*';
+    mask[n] = '\0';
+    if (n > 0) {
+        gui_draw_str(x + 68, y + 3, mask, 0xF0F4FFu);
+    } else {
+        gui_draw_str(x + 68, y + 3, "<password, empty if none>", 0x607080u);
+    }
+    if (g_usr.field == 1) {
+        const int cx = x + 68 + (int)n * 8;
+        gui_fill_rect(cx, y + 2, 2, 16, 0x6FA8FFu);
+    }
+    y += 32;
+
+    if (g_usr.msg[0] != '\0') {
+        gui_draw_str(x, y, g_usr.msg, g_usr.msg_ok ? 0x8CE0A0u : 0xFF9090u);
+    }
+    gui_draw_str(x, w->client_y + w->client_h - 18,
+                 "Enter: next field / sign in    Backspace: edit", 0x9FB2CCu);
+}
+
+int gui_switch_user_launch(void) {
+    memset(&g_usr, 0, sizeof(g_usr));
+    snprintf(g_usr.msg, sizeof(g_usr.msg), "type the account, Enter, then the password");
+    g_usr.msg_ok = 1;
+    {
+        struct gui_window* w = gui_create_window("Switch User", 300, 180, 420, 210,
+                                                usr_draw, usr_key, NULL, APP_ID_USR);
+        if (!w) return 0;
+    }
+    console_puts("[gui] switch user window created\n");
+    return 1;
+}
+
 int gui_apps_launch(int app_id) {
     if (app_id == APP_ID_EDT) return gui_editor_launch();
+    if (app_id == APP_ID_USR) return gui_switch_user_launch();
     if (app_id != APP_ID_IMG) return 0;
     struct gui_window* w = gui_create_window("Image Viewer", 150, 80, 420, 340,
                                              img_draw, NULL, img_click, APP_ID_IMG);

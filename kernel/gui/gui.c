@@ -261,6 +261,7 @@ static const struct {
     { "About SutureOS", APP_ID_SETTINGS },
     { "Image Viewer",   APP_ID_IMG      },
     { "Text Editor",    APP_ID_EDT      },
+    { "Switch User",    APP_ID_USR      },   /* v0.31.0 multiuser (lazily created) */
     { NULL,             START_KIND_SEP  },
     { "Exit to terminal", START_KIND_EXIT },
 };
@@ -1086,10 +1087,11 @@ static int gui_taskbar_btn_rect(struct gui_window** wins, int idx,
 }
 
 static const char* gui_current_user_name(void) {
-    extern uint32_t cred_euid(void);
-    extern const userdb_user_t* userdb_by_uid(uint32_t uid);
-    const userdb_user_t* u = userdb_by_uid(cred_euid());
-    return (u != NULL && u->name[0]) ? u->name : "root";
+    /* login_switch() is the only path that changes identity, so reading the
+     * login engine's current user each frame follows a GUI "Switch User". */
+    extern const char* login_current_user(void);
+    const char* n = login_current_user();
+    return (n != NULL && n[0]) ? n : "root";
 }
 
 static void gui_draw_taskbar(void) {

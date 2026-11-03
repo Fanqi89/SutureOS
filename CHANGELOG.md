@@ -6,6 +6,29 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.32.0-alpha]
+
+**多用户：`useradd`/`userdel`/`users`/`passwd -l/-u/-d`/`login`/`su -` + GUI Switch User 对话框；
+`/etc/shadow` 密码三态（哈希/空=免密/`!`=锁定）有唯一判定入口；非 root 写 `/etc`、`/root` 被拒绝。
+验收 54/54（shell）+ 13/13（GUI 切换），宿主用 hashlib 重算 PBKDF2 验证哈希。**
+
+### Added
+- `kernel/security/login.c/.h`：统一认证/切换引擎（失败不改身份、清 sudo 票据、刷新提示符、
+  `su -` 切 home、root 免密）；`login`/`su` 走同一实现。
+- `kernel/security/userdb.c/.h`：add/remove/save（三文件重写）、uid≥1000、锁定/免密/清密码、
+  密码状态 API、组表访问器。
+- `kernel/shell/shell.c`：useradd/userdel/users/passwd/login 命令；`/etc`、`/root` 写保护。
+- `kernel/gui/apps.c`：懒创建 Switch User 对话框；开始菜单 8 项；任务栏用户改用 `login_current_user()`。
+- `scripts/multiuser_acceptance.py`、`scripts/switch_user_acceptance.py`、`docs/multiuser.md`。
+
+### Verification
+- multiuser **54/54**、switch user **13/13**、FAT32 宿主 **21/21**、sudotest **23/23**、
+  任务栏 7/7、图片查看器 PASS、编辑器 5/5、内核 13/14。
+
+### Limits
+- 无 PAM/login.defs/groupadd/usermod；userdel 不删 home；上限 16；盐非 CSPRNG；
+  `/etc` 保护是 shell 策略层；GUI 对话框仅键盘；开始菜单 7→8 项（GUI 测试几何已同步）。
+
 ## [v0.31.0-alpha]
 
 **任务栏增强 + 快捷键（用户 2026-11-03 要求的界面更新）：每个窗口一个任务栏按钮（点击置顶/聚焦、

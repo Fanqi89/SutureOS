@@ -105,32 +105,34 @@ const char *cred_username(void)
 void cred_format_id(char *out, size_t outlen)
 {
     const userdb_user_t *u = userdb_by_uid(cred_euid());
-    const userdb_user_t *g = userdb_by_uid(cred_egid());
+    const char *const uname = cred_username();
+    const char *gname = userdb_group_name(cred_egid());
+    size_t off;
     int n;
+    int first = 1;
 
-    n = snprintf(out, outlen, "uid=%u(%s) gid=%u(%s)",
+    n = snprintf(out, outlen, "uid=%u(%s) gid=%u(%s) groups=",
                  (unsigned)cred_euid(), (u != NULL) ? u->name : "-",
-                 (unsigned)cred_egid(), (g != NULL) ? g->name : "-");
+                 (unsigned)cred_egid(), gname);
     if (n < 0) return;
+    off = (size_t)n;
 
-    /* groups = primary + supplementary from /etc/group */
-    {
-        size_t off = (size_t)n;
-        int first = 1;
-        n = snprintf(out + off, outlen - off, " groups=%u(%s)",
-                     (unsigned)cred_egid(), (g != NULL) ? g->name : "-");
-        if (n > 0) off += (size_t)n;
-        for (uint32_t i = 0; i < userdb_count() && off + 32 < outlen; i++) {
-            const userdb_user_t *cand = userdb_at(i);
-            if (cand == NULL) continue;
-            if (userdb_in_group(cred_username(), cand->name)) {
-                n = snprintf(out + off, outlen - off, ",%s",
-                             cand->name);
-                if (n < 0) break;
-                off += (size_t)n;
-                first = 0;
-            }
-        }
-        (void)first;
+    /* groups = primary gid first, then every supplementary group from
+     * /etc/group the account belongs to (v0.31.0: walk the GROUP table - the
+     * old code walked the user table and only looked right by accident). */
+    for (uint32_t i = 0; i < userdb_group_count() && off + 32 < outlen; i++) {
+        const userdb_group_t *g = userdb_group_at(i);
+        int member;
+        if (g == NULL) continue;
+        member = (g->gid == cred_egid()) || userdb_in_group(uname, g->name);
+        if (!member) continue;
+        n = snprintf(out + off, outlen - off, "%s%u(%s)", first ? "" : ",",
+                     (unsigned)g->gid, g->name);
+        if (n < 0) break;
+        off += (size_t)n;
+        first = 0;
+    }
+    if (first) {
+        snprintf(out + off, outlen - off, "%u(%s)", (unsigned)cred_egid(), gname);
     }
 }

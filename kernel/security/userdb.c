@@ -263,21 +263,28 @@ static userdb_user_t *find_mut(const char *name)
 
 static int write_shadow_file(void)
 {
-    char buf[1024];
+    char buf[1600];
     size_t off = 0;
     int n;
 
     n = snprintf(buf, sizeof(buf),
                  "# /etc/shadow - SutureOS password hashes\n"
-                 "# name:$sutureos$pbkdf2-sha256$<iters>$<salt>$<hash>:<flags>\n");
+                 "# name:$sutureos$pbkdf2-sha256$<iters>$<salt>$<hash>:<flags>\n"
+                 "# empty password field = no password required; '!' = locked\n");
     if (n < 0) return -1;
     off = (size_t)n;
 
-    for (uint32_t i = 0; i < g_user_count && off + 200 < sizeof(buf); i++) {
+    for (uint32_t i = 0; i < g_user_count && off + 220 < sizeof(buf); i++) {
         char spec[192];
-        if (!g_users[i].has_password) {
-            n = snprintf(buf + off, sizeof(buf) - off, "%s:!:%u\n",
-                         g_users[i].name, (unsigned)g_users[i].locked);
+        if (g_users[i].locked || !g_users[i].has_password) {
+            if (g_users[i].passwordless) {
+                /* empty password field: explicit "no password required" state */
+                n = snprintf(buf + off, sizeof(buf) - off, "%s::%u\n",
+                             g_users[i].name, (unsigned)g_users[i].locked);
+            } else {
+                n = snprintf(buf + off, sizeof(buf) - off, "%s:!:%u\n",
+                             g_users[i].name, (unsigned)g_users[i].locked);
+            }
         } else {
             format_hash_string(&g_users[i], spec, sizeof(spec));
             n = snprintf(buf + off, sizeof(buf) - off, "%s:%s:%u\n",
@@ -415,9 +422,19 @@ static void parse_shadow(void)
         u = find_mut(name);
         if (u == NULL) continue;
 
+        if (spec[0] == '\0') {
+            /* Empty password field = an explicit "no password required"
+             * account (see userdb.h). Not a hole: it never matches a password
+             * check, it only skips the prompt. */
+            u->has_password = 0;
+            u->locked = 0;
+            u->passwordless = 1;
+            continue;
+        }
         if (spec[0] == '!' || spec[0] == '*') {
             u->has_password = 0;         /* locked account, like Linux `!` */
             u->locked = 1;
+            u->passwordless = 0;
             continue;
         }
         if (parse_hash_string(spec, u) != 0) {
@@ -430,6 +447,7 @@ static void parse_shadow(void)
                            spec);
             continue;
         }
+        u->passwordless = 0;
         u->locked = (flags != NULL) ? (int)parse_u32(flags, 0) : 0;
     }
     free(buf);
@@ -552,7 +570,343 @@ int userdb_set_password(const char *name, const char *password)
     userdb_hash_password(password, u->salt, u->iterations, u->hash);
     u->has_password = 1;
     u->locked = 0;
+    u->passwordless = 0;
     return write_shadow_file();
+}
+
+/* ============================ account management ============================ */
+
+static int find_index(const char *name, uint32_t *out)
+{
+    if (name == NULL) return -1;
+    for (uint32_t i = 0; i < g_user_count; i++) {
+        if (strcmp(g_users[i].name, name) == 0) {
+            if (out != NULL) *out = i;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+int userdb_valid_name(const char *name)
+{
+    size_t n;
+    if (name == NULL) return 0;
+    n = strlen(name);
+    if (n == 0 || n + 1 >= USERDB_NAME_LEN) return 0;
+    /* Linux useradd's default NAME_REGEX: must start with a letter, then
+     * lower case letters, digits, '_' and '-'. Upper case is rejected so the
+     * account name always compares byte-wise the same way on both sides. */
+    if (name[0] < 'a' || name[0] > 'z') return 0;
+    for (size_t i = 0; i < n; i++) {
+        const char c = name[i];
+        const int ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                       c == '_' || c == '-';
+        if (!ok) return 0;
+    }
+    /* words that carry meaning in the account/policy files */
+    if (strcmp(name, "root") == 0 || strcmp(name, "all") == 0 ||
+        strcmp(name, "none") == 0 || strcmp(name, "wheel") == 0 ||
+        strcmp(name, "default") == 0) {
+        return 0;
+    }
+    return 1;
+}
+
+uint32_t userdb_next_uid(void)
+{
+    /* Lowest free id >= 1000 that is not a group id either: useradd also creates
+     * a private group with the same number (Linux's default), so both tables
+     * have to be free. */
+    for (uint32_t candidate = USERDB_UID_MIN; candidate < 60000u; candidate++) {
+        int used = 0;
+        for (uint32_t i = 0; i < g_user_count && !used; i++) {
+            if (g_users[i].uid == candidate) used = 1;
+        }
+        for (uint32_t i = 0; i < g_group_count && !used; i++) {
+            if (g_groups[i].gid == candidate) used = 1;
+        }
+        if (!used) return candidate;
+    }
+    return 0;
+}
+
+int userdb_add(const char *name, const char *password, uint32_t *out_uid)
+{
+    userdb_user_t *u;
+    userdb_group_t *g;
+    uint32_t uid;
+
+    if (!userdb_valid_name(name)) return -1;
+    if (find_mut(name) != NULL) return -2;
+    if (g_user_count >= USERDB_MAX_USERS) return -3;
+    if (g_group_count >= USERDB_MAX_GROUPS) return -3;
+    uid = userdb_next_uid();
+    if (uid == 0) return -3;
+
+    u = &g_users[g_user_count];
+    memset(u, 0, sizeof(*u));
+    copy_str(u->name, USERDB_NAME_LEN, name);
+    u->uid = uid;
+    u->gid = uid;                       /* private group, Linux useradd default */
+    copy_str(u->gecos, USERDB_PATH_LEN, name);
+    snprintf(u->home, USERDB_PATH_LEN, "/home/%s", name);
+    copy_str(u->shell, USERDB_PATH_LEN, "/bin/sh");
+    u->iterations = USERDB_ITERATIONS;
+
+    if (password != NULL && password[0] != '\0') {
+        userdb_new_salt(name, u->salt);
+        userdb_hash_password(password, u->salt, u->iterations, u->hash);
+        u->has_password = 1;
+        u->locked = 0;
+        u->passwordless = 0;
+    } else if (password != NULL) {
+        u->has_password = 0;            /* empty field: no password required */
+        u->locked = 0;
+        u->passwordless = 1;
+    } else {
+        u->has_password = 0;            /* `!`: disabled until passwd sets one */
+        u->locked = 1;
+        u->passwordless = 0;
+    }
+    g_user_count++;
+
+    g = &g_groups[g_group_count];
+    memset(g, 0, sizeof(*g));
+    copy_str(g->name, USERDB_NAME_LEN, name);
+    g->gid = uid;
+    g->members[0] = '\0';
+    g_group_count++;
+
+    (void)vfs_mkdir_p(u->home);
+    if (out_uid != NULL) *out_uid = uid;
+    return 0;
+}
+
+/* Drop `name` from a comma separated group member list (in place). */
+static void members_remove(userdb_group_t *g, const char *name)
+{
+    char out[sizeof(g->members)];
+    size_t off = 0;
+    const char *m = g->members;
+    const size_t namelen = strlen(name);
+
+    out[0] = '\0';
+    while (*m != '\0') {
+        const char *start = m;
+        size_t n;
+        while (*m != '\0' && *m != ',') m++;
+        n = (size_t)(m - start);
+        if (!(n == namelen && strncmp(start, name, n) == 0)) {
+            if (off + n + 2 < sizeof(out)) {
+                if (off > 0) out[off++] = ',';
+                memcpy(out + off, start, n);
+                off += n;
+                out[off] = '\0';
+            }
+        }
+        if (*m == ',') m++;
+    }
+    copy_str(g->members, sizeof(g->members), out);
+}
+
+int userdb_remove(const char *name)
+{
+    uint32_t idx;
+    uint32_t uid;
+
+    if (find_index(name, &idx) != 0) return -1;
+    uid = g_users[idx].uid;
+
+    /* private group (same name and same gid) */
+    for (uint32_t i = 0; i < g_group_count;) {
+        if (g_groups[i].gid == uid && strcmp(g_groups[i].name, name) == 0) {
+            for (uint32_t j = i + 1; j < g_group_count; j++) {
+                g_groups[j - 1] = g_groups[j];
+            }
+            g_group_count--;
+            memset(&g_groups[g_group_count], 0, sizeof(g_groups[0]));
+        } else {
+            i++;
+        }
+    }
+    /* supplementary memberships (wheel, ...) */
+    for (uint32_t i = 0; i < g_group_count; i++) members_remove(&g_groups[i], name);
+
+    for (uint32_t j = idx + 1; j < g_user_count; j++) g_users[j - 1] = g_users[j];
+    g_user_count--;
+    memset(&g_users[g_user_count], 0, sizeof(g_users[0]));
+    return 0;
+}
+
+int userdb_save(void)
+{
+    char *buf = (char *)lemis_heap_alloc(8192);
+    size_t off;
+    int n, rc;
+
+    if (buf == NULL) return -1;
+
+    /* ---- /etc/passwd ---- */
+    n = snprintf(buf, 8192,
+                 "# /etc/passwd - SutureOS user database\n"
+                 "# name:passwd:uid:gid:gecos:home:shell   (passwd field is always\n"
+                 "# 'x': the hash lives in /etc/shadow, exactly like Linux)\n");
+    if (n < 0) { free(buf); return -1; }
+    off = (size_t)n;
+    for (uint32_t i = 0; i < g_user_count; i++) {
+        n = snprintf(buf + off, 8192 - off, "%s:x:%u:%u:%s:%s:%s\n",
+                     g_users[i].name, (unsigned)g_users[i].uid,
+                     (unsigned)g_users[i].gid, g_users[i].gecos,
+                     g_users[i].home, g_users[i].shell);
+        if (n < 0 || off + (size_t)n >= 8192) { free(buf); return -1; }
+        off += (size_t)n;
+    }
+    rc = vfs_write_file(PASSWD_PATH, buf, (uint32_t)off);
+
+    /* ---- /etc/group ---- */
+    if (rc == 0) {
+        n = snprintf(buf, 8192,
+                     "# /etc/group - SutureOS groups\n"
+                     "# name:passwd:gid:members\n");
+        off = (n > 0) ? (size_t)n : 0;
+        for (uint32_t i = 0; i < g_group_count; i++) {
+            n = snprintf(buf + off, 8192 - off, "%s:x:%u:%s\n", g_groups[i].name,
+                         (unsigned)g_groups[i].gid, g_groups[i].members);
+            if (n < 0 || off + (size_t)n >= 8192) { rc = -1; break; }
+            off += (size_t)n;
+        }
+        if (rc == 0) rc = vfs_write_file(GROUP_PATH, buf, (uint32_t)off);
+    }
+
+    free(buf);
+    /* ---- /etc/shadow (reuses the canonical writer) ---- */
+    if (rc == 0) rc = write_shadow_file();
+    if (rc == 0) {
+        console_printf("[userdb] saved %u users / %u groups to %s, %s, %s\n",
+                       (unsigned)g_user_count, (unsigned)g_group_count,
+                       PASSWD_PATH, SHADOW_PATH, GROUP_PATH);
+    }
+    return rc;
+}
+
+int userdb_lock(const char *name)
+{
+    userdb_user_t *u = find_mut(name);
+    if (u == NULL) return -1;
+    u->locked = 1;
+    u->passwordless = 0;
+    return write_shadow_file();
+}
+
+int userdb_unlock(const char *name)
+{
+    userdb_user_t *u = find_mut(name);
+    if (u == NULL) return -1;
+    u->locked = 0;
+    if (!u->has_password) {
+        /* `passwd -u` on an account without a hash leaves it passwordless in
+         * Linux too; keep the explicit state so it is visible in /etc/shadow. */
+        u->passwordless = 1;
+    }
+    return write_shadow_file();
+}
+
+int userdb_clear_password(const char *name)
+{
+    userdb_user_t *u = find_mut(name);
+    if (u == NULL) return -1;
+    memset(u->salt, 0, sizeof(u->salt));
+    memset(u->hash, 0, sizeof(u->hash));
+    u->has_password = 0;
+    u->locked = 0;
+    u->passwordless = 1;
+    return write_shadow_file();
+}
+
+userdb_pwstate_t userdb_pwstate(const char *name)
+{
+    const userdb_user_t *u = userdb_by_name(name);
+    if (u == NULL) return USERDB_PW_NOUSER;
+    if (u->locked) return USERDB_PW_LOCKED;
+    if (u->passwordless) return USERDB_PW_NONE;
+    if (u->has_password) return USERDB_PW_PASSWORD;
+    return USERDB_PW_LOCKED;            /* no hash and not passwordless */
+}
+
+int userdb_is_passwordless(const char *name)
+{
+    return userdb_pwstate(name) == USERDB_PW_NONE;
+}
+
+int userdb_is_locked(const char *name)
+{
+    return userdb_pwstate(name) == USERDB_PW_LOCKED;
+}
+
+const char *userdb_pwstate_text(const char *name)
+{
+    switch (userdb_pwstate(name)) {
+        case USERDB_PW_PASSWORD: return "password";
+        case USERDB_PW_NONE:     return "none";
+        case USERDB_PW_LOCKED:   return "locked";
+        default:                 return "unknown";
+    }
+}
+
+void userdb_format_groups(const char *name, char *out, size_t outlen)
+{
+    const userdb_user_t *u = userdb_by_name(name);
+    size_t off = 0;
+
+    if (out == NULL || outlen == 0) return;
+    out[0] = '\0';
+    if (u == NULL) return;
+    for (uint32_t i = 0; i < g_group_count && off + 2 < outlen; i++) {
+        const userdb_group_t *g = &g_groups[i];
+        int member = 0;
+        if (g->gid == u->gid) {
+            member = 1;
+        } else {
+            const char *m = g->members;
+            while (*m != '\0') {
+                const char *start = m;
+                while (*m != '\0' && *m != ',') m++;
+                if ((size_t)(m - start) == strlen(u->name) &&
+                    strncmp(start, u->name, (size_t)(m - start)) == 0) {
+                    member = 1;
+                    break;
+                }
+                if (*m == ',') m++;
+            }
+        }
+        if (!member) continue;
+        if (off > 0 && off + 2 < outlen) out[off++] = ',';
+        {
+            const size_t gnamelen = strlen(g->name);
+            size_t room = outlen - off - 1;
+            size_t copy = (gnamelen < room) ? gnamelen : room;
+            memcpy(out + off, g->name, copy);
+            off += copy;
+            out[off] = '\0';
+        }
+    }
+    if (off == 0) copy_str(out, outlen, "-");
+}
+
+uint32_t userdb_group_count(void) { return g_group_count; }
+
+const userdb_group_t *userdb_group_at(uint32_t index)
+{
+    return (index < g_group_count) ? &g_groups[index] : NULL;
+}
+
+const char *userdb_group_name(uint32_t gid)
+{
+    for (uint32_t i = 0; i < g_group_count; i++) {
+        if (g_groups[i].gid == gid) return g_groups[i].name;
+    }
+    return "-";
 }
 
 int userdb_in_group(const char *user, const char *group)

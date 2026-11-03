@@ -1,4 +1,4 @@
-/* SutureOS module: GUI framework - 移植自 VimtuOS gui64
+﻿/* SutureOS module: GUI framework - 移植自 VimtuOS gui64
  * Source: C:\Users\fanqi\Desktop\自研操作系统\VimtuOS\kernel\gui64.h/cpp
  * Original license: GPL-3.0
  * Changes: Adapted to SutureOS; prefix gui_; stub implementation for compilation
@@ -40,6 +40,7 @@ extern "C" {
 #define APP_ID_SETTINGS  5
 #define APP_ID_IMG       6   /* Image Viewer (v0.18.0) */
 #define APP_ID_EDT       7   /* Text Editor (v0.25.0) */
+#define APP_ID_USR       8   /* Switch User (v0.31.0) */
 
 /* 鼠标光标形状 */
 #define MOUSE_CUR_ARROW    0

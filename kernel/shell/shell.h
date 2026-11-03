@@ -82,10 +82,14 @@ int shell_cmd_sync(int argc, char **argv);
 int shell_cmd_ps(int argc, char **argv);
 int shell_cmd_kill(int argc, char **argv);
 int shell_cmd_sudo(int argc, char **argv);
+int shell_cmd_login(int argc, char **argv);   /* multiuser: login [user]      */
 int shell_cmd_su(int argc, char **argv);
 int shell_cmd_whoami(int argc, char **argv);
 int shell_cmd_id(int argc, char **argv);
 int shell_cmd_passwd(int argc, char **argv);
+int shell_cmd_users(int argc, char **argv);   /* multiuser: list accounts     */
+int shell_cmd_useradd(int argc, char **argv); /* multiuser: create an account */
+int shell_cmd_userdel(int argc, char **argv); /* multiuser: delete an account */
 int shell_cmd_sudotest(int argc, char **argv);
 int shell_cmd_rm(int argc, char **argv);
 int shell_cmd_mkdir(int argc, char **argv);
