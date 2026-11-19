@@ -231,6 +231,15 @@ int slint_gui_run_interactive(void)
  * button (or a double click on the taskbar button), start menu on the start
  * button. ESC leaves.
  * =========================================================================== */
+/* v0.48.0: local wall clock for the taskbar (RTC is UTC, fixed +08:00 offset
+ * until SutureOS grows a timezone database). */
+static int clock_local_from_utc(int utc_hhmm)
+{
+    int total = (utc_hhmm / 100) * 60 + (utc_hhmm % 100) + 8 * 60;
+    total %= 24 * 60;
+    return (total / 60) * 100 + (total % 60);
+}
+
 int slint_gui_run_shell(void)
 {
     extern int mbos_mouse_present(void);
@@ -255,10 +264,13 @@ int slint_gui_run_shell(void)
     extern void rtc_format_epoch(uint64_t epoch, char *out, unsigned long outlen);
     char clockbuf[32];
     clockbuf[0] = 0;
-    rtc_format_epoch(rtc_now_epoch(), clockbuf, sizeof clockbuf);
+    const uint64_t boot_epoch = rtc_now_epoch();
+    rtc_format_epoch(boot_epoch, clockbuf, sizeof clockbuf);
     int clock_hhmm = 0;
+    int clock_utc_hhmm = 0;
+    uint64_t clock_refresh_tick = 0;
     {
-        /* "YYYY-MM-DD HH:MM:SS" -> HH*100+MM */
+        /* "YYYY-MM-DD HH:MM:SS" -> HH*100+MM (UTC) */
         const char *sp = clockbuf;
         while (*sp && *sp != ' ') sp++;
         if (*sp == ' ') sp++;
@@ -268,8 +280,11 @@ int slint_gui_run_shell(void)
             hh = (sp[0] - '0') * 10 + (sp[1] - '0');
             mm = (sp[3] - '0') * 10 + (sp[4] - '0');
         }
-        clock_hhmm = hh * 100 + mm;
-        console_printf("[gui-shell] clock=%02d:%02d\n", hh, mm);
+        clock_utc_hhmm = hh * 100 + mm;
+        clock_hhmm = clock_local_from_utc(clock_utc_hhmm);
+        console_printf("[gui-shell] clock utc=%02d:%02d local=%02d:%02d (+08:00)\n",
+                       clock_utc_hhmm / 100, clock_utc_hhmm % 100,
+                       clock_hhmm / 100, clock_hhmm % 100);
     }
 
     const int mouse = mbos_mouse_present();
@@ -304,6 +319,16 @@ int slint_gui_run_shell(void)
             } else if ((sc & 0x80) == 0) {  /* make code only */
                 key = sc;
             }
+        }
+
+        /* refresh the wall clock once a minute (6000 ticks at 100 Hz) */
+        if ((g_tick_count - clock_refresh_tick) >= 6000u) {
+            clock_refresh_tick = g_tick_count;
+            const uint64_t abs = boot_epoch + (g_tick_count - start) / 100u;
+            clock_utc_hhmm = (int)((abs / 3600u) % 24u) * 100 + (int)((abs / 60u) % 60u);
+            clock_hhmm = clock_local_from_utc(clock_utc_hhmm);
+            console_printf("[gui-shell] clock update local=%02d:%02d\n",
+                           clock_hhmm / 100, clock_hhmm % 100);
         }
 
         const uint32_t now_ms = (uint32_t)((g_tick_count - start) * 10u);

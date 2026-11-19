@@ -87,6 +87,9 @@ struct Shell {
     hover_ctl: i32,    /* hovered title-bar control (0 min,1 max,2 close) */
     hover_win: i32,
     menu_sel: i32,
+    /* v0.48.0: window open fade-in (frames left) + which window */
+    intro_frames: u32,
+    intro_idx: i32,
     started: bool,
     frame_ms: u32,
     prof_frames: u32,
@@ -116,6 +119,8 @@ static mut SHELL: Shell = Shell {
     hover_ctl: -1,
     hover_win: -1,
     menu_sel: 0,
+    intro_frames: 0,
+    intro_idx: -1,
     started: false,
     frame_ms: 0,
     prof_frames: 0,
@@ -394,6 +399,8 @@ fn launch_window(sh: &mut Shell, idx: usize) {
     sh.wins[idx].z = next_z(sh);
     sh.focus = idx;
     sh.menu_open = false;
+    sh.intro_frames = 3;
+    sh.intro_idx = idx as i32;
     log2(c"menu launch", idx as i32, 0);
 }
 
@@ -689,7 +696,7 @@ pub unsafe fn shell_step(
                          ((w.z & 0xff) << 8);
     }
     let last = unsafe { &*core::ptr::addr_of!(LAST_STATE) };
-    if *last == st {
+    if *last == st && sh.intro_frames == 0 {
         IDLE_FRAMES += 1;
         if IDLE_FRAMES == 1 {
             log0(c"idle: frame skipped (nothing changed)");
@@ -793,6 +800,23 @@ pub unsafe fn shell_step(
                 WIN_KEY[i] = key;
             }
         }
+    }
+
+    /* v0.48.0: 3-frame open fade. Dimming the freshly opened window for a few
+     * frames reads as a soft appear and costs one rect fill (~17 ms). */
+    if sh.intro_frames > 0 {
+        let idx = sh.intro_idx;
+        if idx >= 0 && idx < 4 && sh.wins[idx as usize].open {
+            let w = sh.wins[idx as usize];
+            let a = match sh.intro_frames {
+                3 => 0x58u32,
+                2 => 0x2cu32,
+                _ => 0x12u32,
+            };
+            s.rect_fill(w.x, w.y, w.x + w.w, w.y + w.h, 0x000000, a);
+            log2(c"intro fade", sh.intro_frames as i32, idx);
+        }
+        sh.intro_frames -= 1;
     }
 
     let t_win = ticks() - t_win0;
@@ -1088,7 +1112,7 @@ fn draw_window(s: &mut Surface<'_>, w: &Win) {
     s.rect_fill(w.x + 16, cy, w.x + w.w - 16, cy + 56, 0xffffff, 0x12);
     s.text(w.x + 28, cy + 12, "圆角 + 轻亚克力 + 微透叠层", 0xcfe0ff, 0xc0, 1);
     s.text(w.x + 28, cy + 32, "窗口可拖动 / 最小化 / 最大化", 0x9fb2cc, 0xb0, 1);
-    s.text(w.x + 18, (w.y + w.h - 26) as i32, "窗口管理原型 v0.47", 0x8fa3bd, 0x90, 1);
+    s.text(w.x + 18, (w.y + w.h - 26) as i32, "窗口管理原型 v0.48", 0x8fa3bd, 0x90, 1);
     unsafe {
         let d = &mut *core::ptr::addr_of_mut!(WSPLIT);
         d.0 += t_shadow;

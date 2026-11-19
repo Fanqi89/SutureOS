@@ -2,7 +2,7 @@
 
 > **一个由 16 个爱好者操作系统项目拼接而成的 x86_64 单内核操作系统**
 > 
-> 当前版本：**v0.47.0-alpha** · 内核编译 **105** 个源文件（源码树约 220 个 C/H/ASM、约 6.0 万行）
+> 当前版本：**v0.48.0-alpha** · 内核编译 **105** 个源文件（源码树约 220 个 C/H/ASM、约 6.0 万行）
 > · 内核 ELF 约 **2.06 MB**（含调试符号）· 可引导 ISO 约 **15.0 MB** · **GPL-3.0** 许可证
 >
 > 移植与许可说明：[`docs/provenance.md`](docs/provenance.md)（模块→上游·文件路径）
@@ -104,6 +104,7 @@ SutureOS（缝合怪系统）是一个实验性的 x86_64 单内核操作系统�
 | v0.45.0 | **光标快路径**（光标与场景缓存分离，指针移动 13–14 fps） | SutureOS 自有（GPL-3.0） | `rust/suture-gui/src/shell.rs`、`scripts/slint_gui_shell_acceptance.py` | ✅ 34/34 |
 | v0.46.0 | **窗口层缓存**（几何键，含阴影；窗口阶段 −35%）+ 循环上限/断言纠错 | SutureOS 自有（GPL-3.0） | `rust/suture-gui/src/shell.rs`、`scripts/slint_gui_shell_acceptance.py` | ✅ 35/35 |
 | v0.47.0 | **圆角覆盖率查表**（掐掉 per-pixel 软浮点 sqrt；窗口阶段 −80%） | SutureOS 自有（GPL-3.0） | `rust/suture-gui/src/shell.rs` | ✅ 35/35 |
+| v0.48.0 | **窗口打开淡入** + **任务栏本地时钟**（UTC+08:00，每分钟刷新） | SutureOS 自有（GPL-3.0） | `rust/suture-gui/src/shell.rs`、`kernel/gui/slint_bridge.c` | ✅ 37/37 |
 
 ---
 

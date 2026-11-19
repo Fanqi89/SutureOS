@@ -24,6 +24,7 @@ import socket
 import subprocess
 import sys
 import time
+import re
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 QEMU = r'C:\Program Files\qemu\qemu-system-x86_64.exe'
@@ -210,9 +211,16 @@ def main():
         base_img = dump_until('base', lambda px: mean_brightness(px, 235, 490, 1000, 700) > 20)
         base_mean = mean_brightness(base_img.load(), WIN2[0] + 30, WIN2[1] + 60,
                                     WIN2[0] + 250, WIN2[1] + 180) if base_img is not None else 0.0
-        check('taskbar clock comes from the RTC (not the old hardcoded 12:00)',
-              wait_for('[gui-shell] clock=', 30),
-              'log line "[gui-shell] clock=HH:MM"')
+        check('taskbar clock shows local time from the RTC (+08:00)',
+              wait_for('[gui-shell] clock utc=', 30),
+              'log line "[gui-shell] clock utc=HH:MM local=HH:MM (+08:00)"')
+        _m = re.search(r'clock utc=(\d\d):(\d\d) local=(\d\d):(\d\d)', log_text())
+        _ok = False
+        if _m:
+            _u = int(_m.group(1)) * 60 + int(_m.group(2))
+            _l = int(_m.group(3)) * 60 + int(_m.group(4))
+            _ok = ((_u + 8 * 60) % (24 * 60)) == _l
+        check('local clock is UTC+08:00', _ok, _m.group(0) if _m else 'no clock line')
         check('wallpaper + window caches built', wait_for('[gui-shell] caches built', 150))
         # wait for one full frame: the heartbeat is printed after the frame was
         # presented, so the screen behind it is complete
@@ -359,6 +367,9 @@ def main():
                                                 WIN2[0] + 250, WIN2[1] + 180))
             check('menu closed after launching', 'menu closed' in log_text() or
                   '[gui-shell] menu launch 2' in log_text())
+            check('opened window fades in over 3 frames',
+                  log_text().count('[gui-shell] intro fade') >= 2,
+                  'intro fade lines: %d' % log_text().count('[gui-shell] intro fade'))
 
         # ---- (7) close button removes the window ------------------------------
         # close is the third title-bar control: bx = x + w - 77, each 22 wide + 4 gap

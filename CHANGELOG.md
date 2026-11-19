@@ -6,6 +6,24 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.48.0-alpha]
+
+**窗口打开 3 帧淡入 + 任务栏本地时钟（UTC+08:00，每分钟刷新）；验收 37/37。**
+
+### Added
+- `rust/suture-gui/src/shell.rs`：`intro_frames/intro_idx` + 窗口打开淡入（淡入期间不跳过空闲帧）。
+- `kernel/gui/slint_bridge.c`：`clock_local_from_utc()`（固定 +08:00）、启动日志
+  `clock utc=.. local=.. (+08:00)`、每 6000 tick 刷新 `clock update local=..`。
+- `scripts/slint_gui_shell_acceptance.py`：扩到 37 项。
+
+### Verification
+- 外壳 **37/37**；`profile/30 ... win=213`（v0.47 280，未回退）；
+  回归：静态 21/21、交互 13/13、C 桌面 9/9、外观 0 像素、内核 13/14。
+
+### Limits
+- 只有打开窗口有淡入；关闭/最小化/最大化无动画；淡入是整块压暗；时区写死 +08:00；
+  拖动仍重建窗口缓存（图层合成器未开始）。
+
 ## [v0.47.0-alpha]
 
 **掐掉圆角 AA 的软浮点 `sqrt`（覆盖率查表）：frosted 165→17 ticks/4 次绘制，窗口阶段 916→280 ticks/30 帧，整屏重绘 ≈330→117 ms；验收 35/35。**
