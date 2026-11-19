@@ -45,6 +45,8 @@ extern int squashfs_mount(int drive, uint32_t start_lba);
 static struct shell_state g_shell = {0};
 
 /* Command table */
+
+int shell_cmd_unixtest(int argc, char **argv);   /* v0.53.0 */
 struct shell_cmd {
     const char *name;
     int (*func)(int argc, char **argv);
@@ -137,6 +139,7 @@ static const struct shell_cmd g_commands[] = {
     {"rtctest", shell_cmd_rtctest, "Self-test: CMOS RTC decoding (BCD/12h/leap/format)"},
     {"ring3",   shell_cmd_ring3,  "Ring-3 status (the boot-time user program)"},
     {"ring3test",shell_cmd_ring3test,"Self-test: U/S page bits, SSE, GS base, exit code"},
+    {"unixtest",shell_cmd_unixtest,"Self-test: AF_UNIX socketpair + poll (Wayland prereq)"},
     {"run",     shell_cmd_run,     "Run a built-in ring-3 user program: run <name>"},
     {"ushell",  shell_cmd_ushell,  "Enter the ring-3 user shell (exit comes back here)"},
     {"mount",   shell_cmd_mount,   "Mount filesystem"},
@@ -266,6 +269,17 @@ void shell_refresh_prompt(void) {
         snprintf(g_shell.prompt, sizeof(g_shell.prompt), "%s@sutureos$ ",
                  cred_username());
     }
+}
+
+/* v0.53.0: kernel self-test for the AF_UNIX socketpair + poll capability
+ * (the first Wayland prerequisite). Prints one line per check. */
+int shell_cmd_unixtest(int argc, char **argv)
+{
+    extern int unix_selftest(void);
+    (void)argc; (void)argv;
+    const int rc = unix_selftest();
+    shell_printf("unixtest: %s\n", rc == 0 ? "PASS" : "FAIL");
+    return rc;
 }
 
 void shell_init(void) {

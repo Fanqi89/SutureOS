@@ -2,7 +2,7 @@
 
 > **一个由 16 个爱好者操作系统项目拼接而成的 x86_64 单内核操作系统**
 > 
-> 当前版本：**v0.52.0-alpha** · 内核编译 **105** 个源文件（源码树约 220 个 C/H/ASM、约 6.0 万行）
+> 当前版本：**v0.53.0-alpha** · 内核编译 **105** 个源文件（源码树约 220 个 C/H/ASM、约 6.0 万行）
 > · 内核 ELF 约 **2.06 MB**（含调试符号）· 可引导 ISO 约 **15.0 MB** · **GPL-3.0** 许可证
 >
 > 移植与许可说明：[`docs/provenance.md`](docs/provenance.md)（模块→上游·文件路径）
@@ -109,6 +109,7 @@ SutureOS（缝合怪系统）是一个实验性的 x86_64 单内核操作系统�
 | v0.50.0 | **图层合成器第一刀**（拖动复用窗口层 + 任务栏缓存，拖动重绘 60–80 ms） | SutureOS 自有（GPL-3.0） | `rust/suture-gui/src/shell.rs`、`scripts/slint_gui_shell_acceptance.py` | ✅ 40/40 |
 | v0.51.0 | **窗口层与位置解耦**（拖动=纯 blit，5–7 ticks / 50–70 ms） | SutureOS 自有（GPL-3.0） | `rust/suture-gui/src/shell.rs` | ✅ 40/40 |
 | v0.52.0 | **过渡动画补齐**（菜单 2 帧、最大化/还原 3 帧淡入；拖动锚点固定） | SutureOS 自有（GPL-3.0） | `rust/suture-gui/src/shell.rs` | ✅ 42/42 |
+| v0.53.0 | **Wayland 前置**：AF_UNIX socketpair + poll(2)（`unixtest` 18/18） | SutureOS 自有（GPL-3.0） | `kernel/ipc/unix_socket.c`、`kernel/syscall/syscalls.c`、`scripts/unix_acceptance.py` | ✅ 18/18 |
 
 ---
 

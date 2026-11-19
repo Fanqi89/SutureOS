@@ -23,6 +23,15 @@ _Static_assert(sizeof(struct linux_statx) == 256, "statx must keep its Linux x86
 _Static_assert(sizeof(struct termios) == 60, "termios must keep its Linux x86-64 size");
 _Static_assert(sizeof(struct winsize) == 8, "winsize must keep its Linux x86-64 size");
 
+/* The descriptor table lives in syscalls.c; these helpers are its public edge. */
+extern int fd_alloc(void);
+extern int fd_set_pipe(int fd, int pipe_fd);
+extern int fd_close_slot(int fd);
+extern int fd_pipe_end(int fd);
+extern int copy_to_user(void *dst, const void *src, uint64_t n);
+extern int copy_from_user(void *dst, const void *src, uint64_t n);
+extern volatile uint64_t g_tick_count;
+
 /* errno values (Linux numbering, which the compat layer shares) */
 #define EPERM_   1
 #define ENOENT_  2

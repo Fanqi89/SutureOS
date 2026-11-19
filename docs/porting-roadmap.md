@@ -96,4 +96,5 @@
 | B37 | v0.50.0 | **图层合成器第一刀**：拖动复用窗口层 + 任务栏层缓存 + 部分呈现 + 采样校验和 | SutureOS 自有 | 外壳 **40/40**、拖动重绘 60–80 ms（原 117 ms） | ✅ 完成 |
 | B38 | v0.51.0 | **合成器第二刀**：窗口层与位置解耦（home 锚点 + 行 memcpy 合成），拖动 5–7 ticks | SutureOS 自有 | 外壳 **40/40**、win 205 ticks | ✅ 完成 |
 | B39 | v0.52.0 | **过渡动画**：菜单 2 帧淡入 + 最大化/还原 3 帧淡入；拖动锚点固定 | SutureOS 自有 | 外壳 **42/42**、拖动 4–9 ticks | ✅ 完成 |
-| B40 | 待做 | 合成器收尾：RGBA 层（重叠正确合成）/vsync 交换链、真正的缩放过渡；**Wayland 前置**（AF_UNIX socketpair/SCM_RIGHTS、poll、memfd/MAP_SHARED）+ 最小 wl server；替换 C 桌面 startgui（重建外观基线） | SutureOS 自有 | 待实现 | ⏳ |
+| B40 | v0.53.0 | **AF_UNIX socketpair + poll(2)**（Wayland 第一块前置） | SutureOS 自有 | `unix_acceptance` **18/18**、内核自检 15 项 | ✅ 完成 |
+| B41 | 待做 | Wayland 前置续：**SCM_RIGHTS（sendmsg/recvmsg fd 传递）**、memfd_create + MAP_SHARED、bind/listen/accept、ring-3 socketpair 夹具；然后最小 wl server（wl_compositor/wl_shm/wl_seat）；最后替换 C 桌面 startgui | SutureOS 自有 | 待实现 | ⏳ |

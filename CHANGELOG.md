@@ -6,6 +6,24 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.53.0-alpha]
+
+**Wayland 前置第一步：AF_UNIX socketpair + poll(2)（内核自检 15 项、宿主验收 18/18）。**
+
+### Added
+- `kernel/ipc/unix_socket.c/.h`：socketpair（双向环形缓冲、EOF/EPIPE/EAGAIN 语义）与 poll 就绪查询。
+- `kernel/syscall/syscalls.c`：Linux 号 `socketpair=53`、`poll=7` 注册 + fd 表接入 + 用户指针校验。
+- `kernel/main/kmain.c`：启动日志 `[syscall] AF_UNIX socketpair + poll registered (2)`。
+- `kernel/shell/shell.c`：`unixtest` 命令；`scripts/unix_acceptance.py` 宿主验收。
+
+### Verification
+- `unix_acceptance.py` **18/18**；回归：外壳 42/42、静态 21/21、交互 13/13、C 桌面 9/9、
+  FAT32 宿主 20/20、内核 13/14、rust core PASS。
+
+### Limits
+- 无 SCM_RIGHTS / memfd / MAP_SHARED / bind-listen-accept；poll 非真阻塞；仅 AF_UNIX stream；
+  无 ring-3 夹具；最小 wl server 未开始；C 桌面仍是 startgui。
+
 ## [v0.52.0-alpha]
 
 **过渡动画补齐：开始菜单 2 帧淡入、最大化/还原 3 帧淡入；拖动底纹锚点固定（落点校准一次）；验收 42/42。**

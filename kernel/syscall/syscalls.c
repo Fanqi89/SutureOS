@@ -8,6 +8,8 @@
 #include "pipe.h"        /* pipe fds are not VFS fds (kernel/ipc) */
 #include "process.h"     /* PROC_SLOT_BASE: a ring-3 process gets a private fd row */
 #include "el0_validate.h"
+#include "syscall.h"
+#include "../ipc/unix_socket.h"
 #include "mmu.h"
 #include "heap.h"
 
@@ -336,6 +338,10 @@ uint64_t sys_read(uint64_t fd, uint64_t buf, uint64_t len,
         const int pfd = fd_pipe_end((int)fd);
         if (pfd >= 0) {
             EL0_CHECK(buf, len);
+            if (unix_is_fd(pfd)) {
+                return (uint64_t)(int64_t)unix_read_fd(pfd, (void *)(uintptr_t)buf,
+                                                       (uint32_t)len);
+            }
             return (uint64_t)(int64_t)pipe_read_fd(pfd, (void *)(uintptr_t)buf,
                                                   (uint32_t)len);
         }
@@ -367,6 +373,10 @@ uint64_t sys_write(uint64_t fd, uint64_t buf, uint64_t len,
         const int pfd = fd_pipe_end((int)fd);
         if (pfd >= 0) {
             EL0_CHECK(buf, len);
+            if (unix_is_fd(pfd)) {
+                return (uint64_t)(int64_t)unix_write_fd(pfd, (const void *)(uintptr_t)buf,
+                                                        (uint32_t)len);
+            }
             return (uint64_t)(int64_t)pipe_write_fd(pfd, (const void *)(uintptr_t)buf,
                                                    (uint32_t)len);
         }
@@ -465,7 +475,7 @@ uint64_t sys_close(uint64_t fd, uint64_t a2, uint64_t a3,
     {
         const int pfd = fd_pipe_end((int)fd);
         if (pfd >= 0) {
-            const int r = pipe_close_fd(pfd);
+            const int r = unix_is_fd(pfd) ? unix_close_fd(pfd) : pipe_close_fd(pfd);
             /* a slot-held pipe end (dup of a pipe) also frees its descriptor */
             if (fd < MAX_FDS && !pipe_is_fd((int)fd) &&
                 tid >= 0 && tid < SCHED_MAX_TASKS) {
@@ -748,4 +758,108 @@ uint64_t sys_exit_group(uint64_t code, uint64_t a2, uint64_t a3,
     sched_cpu.tasks[tid].state = SCHED_TASK_ZOMBIE;
     sched_cpu.shutdown = true;
     return code;
+}
+
+/* ---- v0.53.0: AF_UNIX socketpair(53) + poll(7), the first Wayland pieces -----
+ * Implemented here (not in syscalls2.c) because the descriptor table and its
+ * static helpers live in this file. User buffers are validated with the same
+ * EL0_CHECK the other fd syscalls use. */
+#define AF_UNIX_    1
+#define SOCKSTREAM_ 1
+#define SOCKSEQPKT_ 5
+#define EOPNOTSUPP_ 95
+
+struct pollfd_abi { int32_t fd; int16_t events; int16_t revents; };
+extern volatile uint64_t g_tick_count;
+
+static uint64_t sys_unix_socketpair(uint64_t domain, uint64_t type, uint64_t proto,
+                                    uint64_t sv_out, uint64_t a5, uint64_t a6)
+{
+    extern sched_cpu_t sched_cpu;
+    const int tid = fd_slot();
+    int fds[2];
+    int fd0, fd1;
+    int32_t pair[2];
+
+    (void)proto; (void)a5; (void)a6;
+    if (tid < 0 || tid >= SCHED_MAX_TASKS) return (uint64_t)(int64_t)-9;
+    if (domain != AF_UNIX_) return (uint64_t)(int64_t)-EOPNOTSUPP_;
+    if (type != SOCKSTREAM_ && type != SOCKSEQPKT_) return (uint64_t)(int64_t)-EOPNOTSUPP_;
+    if (sv_out == 0) return (uint64_t)(int64_t)-22;
+    EL0_CHECK(sv_out, sizeof pair);
+
+    if (unix_socketpair(fds) != 0) return (uint64_t)(int64_t)-24;
+    fd0 = fd_alloc(tid);
+    fd1 = fd_alloc(tid);
+    if (fd0 < 0 || fd1 < 0) {
+        if (fd0 >= 0) fd_close_slot(tid, fd0);
+        if (fd1 >= 0) fd_close_slot(tid, fd1);
+        (void)unix_close_fd(fds[0]);
+        (void)unix_close_fd(fds[1]);
+        return (uint64_t)(int64_t)-24;
+    }
+    fd_tables[tid][fd0].vfs_fd = -1;
+    fd_tables[tid][fd0].pipe_fd = fds[0];
+    fd_tables[tid][fd0].sock_fd = -1;
+    fd_tables[tid][fd0].flags = 0;
+    fd_tables[tid][fd1].vfs_fd = -1;
+    fd_tables[tid][fd1].pipe_fd = fds[1];
+    fd_tables[tid][fd1].sock_fd = -1;
+    fd_tables[tid][fd1].flags = 0;
+
+    pair[0] = fd0;
+    pair[1] = fd1;
+    memcpy((void *)(uintptr_t)sv_out, pair, sizeof pair);
+    return 0;
+}
+
+static uint64_t sys_unix_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms,
+                              uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    struct pollfd_abi pfd[16];
+    int ready = 0;
+    int n = (int)nfds;
+
+    (void)a4; (void)a5; (void)a6;
+    if (nfds == 0 || fds_ptr == 0) return 0;
+    if (n < 0) return (uint64_t)(int64_t)-22;
+    if (n > 16) n = 16;
+    EL0_CHECK(fds_ptr, (uint64_t)n * sizeof pfd[0]);
+    memcpy(pfd, (const void *)(uintptr_t)fds_ptr, (uint64_t)n * sizeof pfd[0]);
+
+    for (int i = 0; i < n; i++) {
+        const int fd = pfd[i].fd;
+        int ev = 0;
+
+        if (fd >= 0) {
+            const int ipc = unix_is_fd(fd) ? fd : fd_pipe_end(fd);
+            if (ipc >= 0 && unix_is_fd(ipc)) {
+                ev = unix_poll_fd(ipc);
+            } else if (ipc >= 0) {
+                ev = UNIX_POLLIN | UNIX_POLLOUT;
+            } else if (fd == 0) {
+                ev = UNIX_POLLIN;
+            } else {
+                ev = UNIX_POLLOUT;
+            }
+        }
+        pfd[i].revents = (int16_t)(ev & (int)pfd[i].events);
+        if (pfd[i].revents) ready++;
+    }
+    memcpy((void *)(uintptr_t)fds_ptr, pfd, (uint64_t)n * sizeof pfd[0]);
+    if (ready == 0 && timeout_ms > 0) {
+        const uint64_t until = g_tick_count + (timeout_ms + 9u) / 10u;
+        while (g_tick_count < until) {
+            __asm__ volatile("pause");
+        }
+    }
+    return (uint64_t)(int64_t)ready;
+}
+
+/* Called from kmain after syscalls2_register(). */
+int syscall_unix_register(void)
+{
+    syscall_register(7, sys_unix_poll);       /* poll(2) */
+    syscall_register(53, sys_unix_socketpair); /* socketpair(AF_UNIX) */
+    return 2;
 }

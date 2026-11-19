@@ -408,6 +408,11 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
                            "(22 base + stat/lseek/pipe/getpid/chdir/mkdir/...)\n",
                            (int64_t)syscalls2_register());
             (void)pipe_selftest();
+            {
+                extern int syscall_unix_register(void);
+                const int un = syscall_unix_register();
+                console_printf("[syscall] AF_UNIX socketpair + poll registered (%d)\n", un);
+            }
             (void)rtc_selftest();
         }
 
