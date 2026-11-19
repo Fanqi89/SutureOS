@@ -29,7 +29,8 @@ extern uint32_t suture_gui_shell_step(uint32_t *fb, int32_t w, int32_t h,
                                       int32_t pitch_px, int32_t mx, int32_t my,
                                       int32_t buttons, int32_t click_x,
                                       int32_t click_y, int32_t click_btn,
-                                      uint32_t now_ms, int32_t key);
+                                      uint32_t now_ms, int32_t key,
+                                      int32_t clock_hhmm);
 extern uint32_t suture_gui_interactive_step(uint32_t *fb, int32_t w, int32_t h,
                                             int32_t pitch_px, int32_t mx,
                                             int32_t my, int32_t buttons,
@@ -249,6 +250,28 @@ int slint_gui_run_shell(void)
     if (pitch_px < w) return -3;
     uint32_t *fb = (uint32_t *)(uintptr_t)limine_fb_addr;
 
+    /* real wall clock for the taskbar (was hardcoded 12:00 until v0.44.0) */
+    extern uint64_t rtc_now_epoch(void);
+    extern void rtc_format_epoch(uint64_t epoch, char *out, unsigned long outlen);
+    char clockbuf[32];
+    clockbuf[0] = 0;
+    rtc_format_epoch(rtc_now_epoch(), clockbuf, sizeof clockbuf);
+    int clock_hhmm = 0;
+    {
+        /* "YYYY-MM-DD HH:MM:SS" -> HH*100+MM */
+        const char *sp = clockbuf;
+        while (*sp && *sp != ' ') sp++;
+        if (*sp == ' ') sp++;
+        int hh = 0, mm = 0;
+        if (sp[0] >= '0' && sp[0] <= '9' && sp[1] >= '0' && sp[1] <= '9' &&
+            sp[3] >= '0' && sp[3] <= '9' && sp[4] >= '0' && sp[4] <= '9') {
+            hh = (sp[0] - '0') * 10 + (sp[1] - '0');
+            mm = (sp[3] - '0') * 10 + (sp[4] - '0');
+        }
+        clock_hhmm = hh * 100 + mm;
+        console_printf("[gui-shell] clock=%02d:%02d\n", hh, mm);
+    }
+
     const int mouse = mbos_mouse_present();
     if (mouse) mbos_mouse_move_to((int)w / 2, (int)h - 120);
     console_printf("[gui-shell] shell: loop (mouse=%d), ESC exits\n", mouse);
@@ -282,7 +305,8 @@ int slint_gui_run_shell(void)
 
         const uint32_t now_ms = (uint32_t)((g_tick_count - start) * 10u);
         (void)suture_gui_shell_step(fb, (int32_t)w, (int32_t)h, (int32_t)pitch_px,
-                                    mx, my, buttons, cx, cy, cb, now_ms, key);
+                                    mx, my, buttons, cx, cy, cb, now_ms, key,
+                                    clock_hhmm);
         frames++;
         if ((frames % 30) == 0) {
             console_printf("[gui-shell] frame %d ms=%u pointer=%d,%d\n",

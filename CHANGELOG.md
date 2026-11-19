@@ -6,6 +6,23 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.44.0-alpha]
+
+**任务栏真实 RTC 时钟（UTC，内核点阵绘制；原写死 12:00）；外壳验收 33/33。**
+
+### Added
+- `kernel/gui/slint_bridge.c`：从 `rtc_now_epoch()`/`rtc_format_epoch()` 解析 `HH:MM`，日志
+  `[gui-shell] clock=HH:MM`，经新参数 `clock_hhmm` 传给 Rust。
+- `rust/suture-gui/src/shell.rs`：用 `font8x16` 逐字符绘制真实时间；页脚版本 v0.44。
+- `scripts/slint_gui_shell_acceptance.py`：扩到 33 项。
+
+### Verification
+- 外壳 **33/33**（clock=11:09 UTC）；回归：静态 21/21、交互 13/13、C 桌面 9/9、外观 0 像素、内核 13/14。
+
+### Limits
+- 时钟 UTC、只读一次；交互仍整屏重绘 ~2 fps；键盘只在菜单内；无过渡动画。
+- **失败并回退**：脏矩形局部重绘（菜单区域变黑）、软件光标快路径（拖拽/点击失效）——根因见路线图 B30。
+
 ## [v0.43.0-alpha]
 
 **开始菜单可用键盘：↑/↓ 选择、Enter 启动（与鼠标共用 launch 路径）；外壳验收 32/32。**

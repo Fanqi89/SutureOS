@@ -204,6 +204,9 @@ def main():
         typ('guishell')
         key('ret')
         check('shell loop started', wait_for('[gui-shell] shell: loop', 150))
+        check('taskbar clock comes from the RTC (not the old hardcoded 12:00)',
+              wait_for('[gui-shell] clock=', 30),
+              'log line "[gui-shell] clock=HH:MM"')
         check('wallpaper + window caches built', wait_for('[gui-shell] caches built', 150))
         # wait for one full frame: the heartbeat is printed after the frame was
         # presented, so the screen behind it is complete

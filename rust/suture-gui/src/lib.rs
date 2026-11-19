@@ -664,9 +664,10 @@ pub unsafe extern "C" fn suture_gui_shell_step(
     click_btn: i32,
     now_ms: u32,
     key: i32,
+    clock_hhmm: i32,
 ) -> u32 {
     shell::shell_step(fb, w, h, pitch_px, mx, my, buttons, click_x, click_y,
-                      click_btn, now_ms, key)
+                      click_btn, now_ms, key, clock_hhmm)
 }
 
 /// Kernel tick counter (~100 Hz), exposed for the shell frame profiler.

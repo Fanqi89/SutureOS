@@ -335,6 +335,7 @@ pub unsafe fn shell_step(
     _click_btn: i32,
     now_ms: u32,
     key: i32,
+    clock_hhmm: i32,
 ) -> u32 {
     if fb.is_null() || w <= 0 || h <= 0 || pitch_px < w {
         return 0;
@@ -665,8 +666,20 @@ pub unsafe fn shell_step(
                    if sh.wins[i].minimized { 0x90 } else { 0xf0 }, 1);
         }
     }
-    /* clock on the right */
-    s.text(SCREEN_W - 96, TASKBAR_Y + 12, "12:00", 0xd6e2f5, 0xd0, 1);
+    /* clock on the right: real wall time from the RTC (v0.44.0) */
+    {
+        let hh = (clock_hhmm / 100) % 24;
+        let mm = clock_hhmm % 100;
+        let digits = [b'0' + (hh / 10) as u8, b'0' + (hh % 10) as u8,
+                      b':',
+                      b'0' + (mm / 10) as u8, b'0' + (mm % 10) as u8];
+        let chars = [digits[0] as char, digits[1] as char, digits[2] as char,
+                     digits[3] as char, digits[4] as char];
+        let mut x = SCREEN_W - 96;
+        for ch in chars.iter() {
+            x += s.char_ascii(x, TASKBAR_Y + 12, *ch, 0xd6e2f5, 0xd0, 1);
+        }
+    }
 
     let t_bar = ticks() - t_bar0;
     // 6. start menu
@@ -780,5 +793,5 @@ fn draw_window(s: &mut Surface<'_>, w: &Win) {
     s.rect_fill(w.x + 16, cy, w.x + w.w - 16, cy + 56, 0xffffff, 0x12);
     s.text(w.x + 28, cy + 12, "圆角 + 轻亚克力 + 微透叠层", 0xcfe0ff, 0xc0, 1);
     s.text(w.x + 28, cy + 32, "窗口可拖动 / 最小化 / 最大化", 0x9fb2cc, 0xb0, 1);
-    s.text(w.x + 18, (w.y + w.h - 26) as i32, "窗口管理原型 v0.42", 0x8fa3bd, 0x90, 1);
+    s.text(w.x + 18, (w.y + w.h - 26) as i32, "窗口管理原型 v0.44", 0x8fa3bd, 0x90, 1);
 }
