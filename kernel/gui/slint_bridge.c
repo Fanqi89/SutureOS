@@ -29,7 +29,7 @@ extern uint32_t suture_gui_shell_step(uint32_t *fb, int32_t w, int32_t h,
                                       int32_t pitch_px, int32_t mx, int32_t my,
                                       int32_t buttons, int32_t click_x,
                                       int32_t click_y, int32_t click_btn,
-                                      uint32_t now_ms);
+                                      uint32_t now_ms, int32_t key);
 extern uint32_t suture_gui_interactive_step(uint32_t *fb, int32_t w, int32_t h,
                                             int32_t pitch_px, int32_t mx,
                                             int32_t my, int32_t buttons,
@@ -191,8 +191,13 @@ int slint_gui_run_interactive(void)
 
         /* keyboard: ESC (make code 0x01) leaves; drain everything else */
         int sc;
+        int key = -1;                      /* last pressed key this frame */
         while ((sc = mbos_kbd_poll()) >= 0) {
-            if ((uint32_t)sc == 0x01u) quit = 1;
+            if ((uint32_t)sc == 0x01u) {
+                quit = 1;
+            } else if ((sc & 0x80) == 0) {  /* make code only */
+                key = sc;
+            }
         }
 
         const uint32_t now_ms = (uint32_t)((g_tick_count - start) * 10u);
@@ -266,13 +271,18 @@ int slint_gui_run_shell(void)
         if (mouse) (void)mbos_mouse_take_click(&cx, &cy, &cb);
 
         int sc;
+        int key = -1;                      /* last pressed key this frame */
         while ((sc = mbos_kbd_poll()) >= 0) {
-            if ((uint32_t)sc == 0x01u) quit = 1;
+            if ((uint32_t)sc == 0x01u) {
+                quit = 1;
+            } else if ((sc & 0x80) == 0) {  /* make code only */
+                key = sc;
+            }
         }
 
         const uint32_t now_ms = (uint32_t)((g_tick_count - start) * 10u);
         (void)suture_gui_shell_step(fb, (int32_t)w, (int32_t)h, (int32_t)pitch_px,
-                                    mx, my, buttons, cx, cy, cb, now_ms);
+                                    mx, my, buttons, cx, cy, cb, now_ms, key);
         frames++;
         if ((frames % 30) == 0) {
             console_printf("[gui-shell] frame %d ms=%u pointer=%d,%d\n",

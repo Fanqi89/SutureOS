@@ -310,6 +310,22 @@ def main():
                                                      MENU[1] + 40, MENU[0] + 200,
                                                      MENU[1] + 120))
 
+        # ---- (5b) keyboard menu navigation (v0.43.0) --------------------------
+        # the menu is open from the previous step: Down, Down, Enter -> 图片查看器
+        key('down')
+        time.sleep(0.6)
+        key('down')          # selection 0 -> 1 -> 2
+        time.sleep(0.6)
+        check('keyboard moves the menu selection',
+              '[gui-shell] menu sel 1' in log_text() and
+              '[gui-shell] menu sel 2' in log_text())
+        key('ret')
+        check('Enter launches the selected menu item',
+              wait_for('[gui-shell] menu enter 2', 60) and
+              wait_for('[gui-shell] menu launch 2', 60))
+        # close it again so the mouse-driven tests below start from a clean slate
+        time.sleep(0.8)
+
         # ---- (6) start menu launches a real window (v0.42.0) -------------------
         # menu is open from the previous step; click "图片查看器" (third row)
         move_to(MENU[0] + 80, MENU_ITEM0_Y + 2 * MENU_ITEM_H + 19)

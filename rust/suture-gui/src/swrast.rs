@@ -81,6 +81,17 @@ pub struct Surface<'a> {
     pub w: usize,
     pub h: usize,
     pub stride: usize,
+    /// Dirty-rect clipping (v0.43.0): inclusive-exclusive bounds that every
+    /// pixel write must respect. Defaults to the whole surface; the shell sets
+    /// it per dirty rectangle so a repaint only touches changed pixels.
+    pub clip: (i32, i32, i32, i32),
+}
+
+impl<'a> Surface<'a> {
+    /// Full-surface clip covering this buffer.
+    pub fn full_clip(w: usize, h: usize) -> (i32, i32, i32, i32) {
+        (0, 0, w as i32, h as i32)
+    }
 }
 
 impl<'a> Surface<'a> {
@@ -93,15 +104,21 @@ impl<'a> Surface<'a> {
     }
 
     #[inline]
+    pub fn in_clip(&self, x: i32, y: i32) -> bool {
+        x >= self.clip.0 && x < self.clip.2 && y >= self.clip.1 && y < self.clip.3
+    }
+
+    #[inline]
     pub fn put(&mut self, x: usize, y: usize, c: u32) {
-        if x < self.w && y < self.h {
+        let (xi, yi) = (x as i32, y as i32);
+        if x < self.w && y < self.h && self.in_clip(xi, yi) {
             self.px[y * self.stride + x] = c & 0x00ff_ffff;
         }
     }
 
     #[inline]
     pub fn blend_px(&mut self, x: usize, y: usize, c: u32, a: u32) {
-        if x < self.w && y < self.h && a > 0 {
+        if x < self.w && y < self.h && a > 0 && self.in_clip(x as i32, y as i32) {
             let i = y * self.stride + x;
             let d = self.px[i] & 0x00ff_ffff;
             self.px[i] = if a >= 255 { c & 0x00ff_ffff } else { blend(d, c, a) };
@@ -113,11 +130,11 @@ impl<'a> Surface<'a> {
     /// where the analytic rounded-rect pass (one sqrt per pixel) is overkill.
     pub fn rect_fill(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, c: u32,
                      alpha: u32) {
-        let xs = x0.max(0);
-        let xe = x1.min(self.w as i32);
-        let ys = y0.max(0);
-        let ye = y1.min(self.h as i32);
-        if alpha == 0 || xe <= xs {
+        let xs = x0.max(0).max(self.clip.0);
+        let xe = x1.min(self.w as i32).min(self.clip.2);
+        let ys = y0.max(0).max(self.clip.1);
+        let ye = y1.min(self.h as i32).min(self.clip.3);
+        if alpha == 0 || xe <= xs || ye <= ys {
             return;
         }
         for y in ys..ye {
@@ -232,10 +249,10 @@ impl<'a> Surface<'a> {
             return;
         }
         let r = clampf(r, 0.0, fmin((x1 - x0) * 0.5, (y1 - y0) * 0.5));
-        let ys = fmax(ffloor(y0), 0.0) as i32;
-        let ye = fmin(fceil(y1), self.h as f32) as i32;
-        let xs = fmax(ffloor(x0), 0.0) as i32;
-        let xe = fmin(fceil(x1), self.w as f32) as i32;
+        let ys = fmax(ffloor(y0), self.clip.1 as f32) as i32;
+        let ye = fmin(fceil(y1), self.clip.3.min(self.h as i32) as f32) as i32;
+        let xs = fmax(ffloor(x0), self.clip.0 as f32) as i32;
+        let xe = fmin(fceil(x1), self.clip.2.min(self.w as i32) as f32) as i32;
         for y in ys..ye {
             let fy = y as f32 + 0.5;
             if fy < y0 || fy >= y1 {

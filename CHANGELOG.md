@@ -6,6 +6,24 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.43.0-alpha]
+
+**开始菜单可用键盘：↑/↓ 选择、Enter 启动（与鼠标共用 launch 路径）；外壳验收 32/32。**
+
+### Added
+- `kernel/gui/slint_bridge.c`：shell 循环把最后一个 make-code 按键传入 Rust（`shell_step(..., now_ms, key)`）。
+- `rust/suture-gui/src/shell.rs`：菜单键盘导航（↑0x48/↓0x50/Enter0x1C，循环选择、`menu sel N`/`menu enter N`），
+  `launch_window()` 统一鼠标与键盘启动路径，选中项独立底色。
+- `scripts/slint_gui_shell_acceptance.py`：扩到 32 项。
+
+### Verification
+- 外壳 **32/32**（menu sel 1/2、menu enter 2 + launch 2 + 窗口 124.6）；回归：静态 21/21、交互 13/13、
+  C 桌面 9/9、外观 0 像素。
+
+### Limits
+- 键盘只在菜单内；一次只传最后一个按键；无过渡动画；**脏矩形局部重绘尝试失败已回退**（菜单区域变黑），
+  交互帧率仍约 2 fps。
+
 ## [v0.42.0-alpha]
 
 **桌面外壳可用：4 个窗口、开始菜单启动应用、关闭按钮、空闲跳帧；验收 30/30。**

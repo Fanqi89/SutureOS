@@ -301,7 +301,7 @@ unsafe fn ensure_scene_cache(w: usize, h: usize, stride: usize) -> bool {
         return false;                    /* cache shape mismatch: caller falls back */
     }
     let cache = &mut *core::ptr::addr_of_mut!(SCENE_CACHE);
-    let mut cs = swrast::Surface { px: &mut cache[..], w, h, stride };
+    let mut cs = swrast::Surface { px: &mut cache[..], w, h, stride, clip: (0, 0, 1024, 768) };
     draw_scene(&mut cs);
     SCENE_SUM = checksum(&cs.px[..stride * h]);
     SCENE_BUILT = true;
@@ -368,8 +368,7 @@ pub unsafe extern "C" fn suture_gui_interactive_step(
         px: core::slice::from_raw_parts_mut(fb, pu * hu),
         w: wu,
         h: hu,
-        stride: pu,
-    };
+        stride: pu, clip: (0, 0, 1024, 768) };
     let ui = &mut *core::ptr::addr_of_mut!(UI);
     if ui.start_ms == 0 {
         ui.start_ms = now_ms;
@@ -500,8 +499,7 @@ pub unsafe extern "C" fn suture_gui_selftest_render(
             px: pixels,
             w: wu,
             h: hu,
-            stride: pu,
-        };
+            stride: pu, clip: (0, 0, 1024, 768) };
         draw_scene(&mut s);
         checksum(&s.px[..pu * hu])
     }
@@ -665,9 +663,10 @@ pub unsafe extern "C" fn suture_gui_shell_step(
     click_y: i32,
     click_btn: i32,
     now_ms: u32,
+    key: i32,
 ) -> u32 {
     shell::shell_step(fb, w, h, pitch_px, mx, my, buttons, click_x, click_y,
-                      click_btn, now_ms)
+                      click_btn, now_ms, key)
 }
 
 /// Kernel tick counter (~100 Hz), exposed for the shell frame profiler.

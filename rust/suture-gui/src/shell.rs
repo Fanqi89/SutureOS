@@ -85,6 +85,7 @@ struct Shell {
     hover_pin: i32,    /* hovered pinned app */
     hover_ctl: i32,    /* hovered title-bar control (0 min,1 max,2 close) */
     hover_win: i32,
+    menu_sel: i32,
     started: bool,
     frame_ms: u32,
     prof_frames: u32,
@@ -110,6 +111,7 @@ static mut SHELL: Shell = Shell {
     hover_pin: -1,
     hover_ctl: -1,
     hover_win: -1,
+    menu_sel: 0,
     started: false,
     frame_ms: 0,
     prof_frames: 0,
@@ -161,7 +163,7 @@ fn blend_px_raw(dst: u32, src: u32, a: u32) -> u32 {
 unsafe fn build_caches() {
     let wall = &mut *core::ptr::addr_of_mut!(WALL);
     let mut s = Surface { px: &mut wall[..], w: SCREEN_W as usize, h: SCREEN_H as usize,
-                          stride: SCREEN_W as usize };
+                          stride: SCREEN_W as usize, clip: (0, 0, 1024, 768) };
     // wallpaper: 3-stop gradient + two soft colour blobs (the acrylic source)
     s.vgrad3(0, 0, SCREEN_W, SCREEN_H, 0x1b2440, 0x121a2b, 0x090d16, 0.45);
     s.hgrad_round(60.0, 90.0, 500.0, 560.0, 96.0, 0x3f7bff, 0x9a5cff, 0xd0);
@@ -171,7 +173,7 @@ unsafe fn build_caches() {
     // windows/taskbar/menu (sampled with nearest neighbour, looks right for
     // translucent surfaces)
     let small = &mut *core::ptr::addr_of_mut!(SMALL);
-    let mut ss = Surface { px: &mut small[..], w: SMALL_W, h: SMALL_H, stride: SMALL_W };
+    let mut ss = Surface { px: &mut small[..], w: SMALL_W, h: SMALL_H, stride: SMALL_W, clip: (0, 0, 1024, 768) };
     ss.vgrad3(0, 0, SMALL_W as i32, SMALL_H as i32, 0x1b2440, 0x121a2b, 0x090d16, 0.45);
     let sx = SMALL_W as f32 / SCREEN_W as f32;
     let sy = SMALL_H as f32 / SCREEN_H as f32;
@@ -289,6 +291,23 @@ fn next_visible(sh: &Shell, skip: usize) -> Option<usize> {
     None
 }
 
+/// Open / restore / focus window `idx` from the start menu (v0.43.0: shared by
+/// the mouse click path and the new keyboard Enter path).
+fn launch_window(sh: &mut Shell, idx: usize) {
+    if idx >= sh.wins.len() {
+        return;
+    }
+    if !sh.wins[idx].open {
+        sh.wins[idx].open = true;
+        sh.wins[idx].minimized = false;
+    }
+    sh.wins[idx].minimized = false;
+    sh.wins[idx].z = next_z(sh);
+    sh.focus = idx;
+    sh.menu_open = false;
+    log2(c"menu launch", idx as i32, 0);
+}
+
 fn hit_win(wins: &[Win; 4], mx: i32, my: i32) -> i32 {
     let mut best = -1;
     let mut bestz = -1;
@@ -315,6 +334,7 @@ pub unsafe fn shell_step(
     click_y: i32,
     _click_btn: i32,
     now_ms: u32,
+    key: i32,
 ) -> u32 {
     if fb.is_null() || w <= 0 || h <= 0 || pitch_px < w {
         return 0;
@@ -327,7 +347,7 @@ pub unsafe fn shell_step(
     /* render into the back buffer, present once at the end (double buffering:
      * a screendump can otherwise catch the framebuffer half-painted) */
     let frame = &mut *core::ptr::addr_of_mut!(FRAME);
-    let mut s = Surface { px: &mut frame[..], w: wu, h: hu, stride: wu };
+    let mut s = Surface { px: &mut frame[..], w: wu, h: hu, stride: wu, clip: (0, 0, 1024, 768) };
     let sh = &mut *core::ptr::addr_of_mut!(SHELL);
     if !sh.started {
         sh.started = true;
@@ -379,16 +399,7 @@ pub unsafe fn shell_step(
                     let ry = MENU_Y + 46 + k as i32 * 44;
                     if cx >= MENU_X + 10 && cx < MENU_X + MENU_W - 10 &&
                        cy >= ry && cy < ry + 38 {
-                        let idx = k;
-                        if !sh.wins[idx].open {
-                            sh.wins[idx].open = true;
-                            sh.wins[idx].minimized = false;
-                        }
-                        sh.wins[idx].minimized = false;
-                        sh.wins[idx].z = next_z(sh);
-                        sh.focus = idx;
-                        sh.menu_open = false;
-                        log2(c"menu launch", idx as i32, 0);
+                        launch_window(sh, k);
                     }
                 }
             } else {
@@ -519,6 +530,38 @@ pub unsafe fn shell_step(
         }
         sh.press_ms = now;
     }
+    // keyboard: menu navigation (v0.43.0). Scancodes are PS/2 set-1 make codes:
+    // up 0x48, down 0x50, enter 0x1C. The kernel keeps polling and passes the
+    // last pressed key; ESC is handled by the C loop (it leaves the shell).
+    if sh.menu_open {
+        match key {
+            0x48 => {
+                sh.menu_sel -= 1;
+                if sh.menu_sel < 0 {
+                    sh.menu_sel = MENU_ITEMS.len() as i32 - 1;
+                }
+                log2(c"menu sel", sh.menu_sel, 0);
+            }
+            0x50 => {
+                sh.menu_sel += 1;
+                if sh.menu_sel >= MENU_ITEMS.len() as i32 {
+                    sh.menu_sel = 0;
+                }
+                log2(c"menu sel", sh.menu_sel, 0);
+            }
+            0x1C => {
+                let idx = sh.menu_sel.max(0) as usize;
+                if idx < MENU_ITEMS.len() {
+                    launch_window(sh, idx);
+                }
+                log2(c"menu enter", idx as i32, 0);
+            }
+            _ => {}
+        }
+    } else if key == 0x50 || key == 0x48 {
+        // up/down with the menu closed is ignored (keeps the log honest)
+    }
+
     if !left_down && sh.dragging {
         sh.dragging = false;
         log2(c"drag end", sh.wins[sh.drag_idx].x, sh.wins[sh.drag_idx].y);
@@ -645,8 +688,9 @@ pub unsafe fn shell_step(
             let y = MENU_Y + 46 + k as i32 * 44;
             let hovered = mx_c >= MENU_X + 10 && mx_c < MENU_X + MENU_W - 10 &&
                           my_c >= y && my_c < y + 38;
+            let selected = k as i32 == sh.menu_sel;
             s.rect_fill(MENU_X + 10, y, MENU_X + MENU_W - 10, y + 38, 0xffffff,
-                        if hovered { 0x2c } else { 0x12 });
+                        if hovered { 0x2c } else if selected { 0x22 } else { 0x12 });
             s.rect_fill(MENU_X + 18, y + 8, MENU_X + 40, y + 30, 0x8fc2ff, 0xd8);
             s.text(MENU_X + 50, y + 11, name, 0xeef4ff, 0xe8, 1);
         }
