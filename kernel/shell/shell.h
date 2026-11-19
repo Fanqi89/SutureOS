@@ -135,6 +135,9 @@ int shell_cmd_hdatest(int argc, char **argv);
 /* Slint GUI prototype (kernel/gui/slint_bridge.c + rust/suture-gui): draw one
  * static prototype frame with Slint's software renderer into the framebuffer. */
 int shell_cmd_guislint(int argc, char **argv);
+/* Desktop-shell prototype (v0.41.0): windows + taskbar + start menu on the new
+ * renderer. Interactive until ESC. */
+int shell_cmd_guishell(int argc, char **argv);
 
 /* Terminal output helpers */
 void shell_putc(char c);

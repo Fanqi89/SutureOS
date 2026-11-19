@@ -23,6 +23,7 @@
 #[cfg(feature = "slint")]
 extern crate alloc;
 
+pub mod shell;
 pub mod swrast;
 
 use swrast::Surface;
@@ -32,6 +33,7 @@ use swrast::Surface;
 // ---------------------------------------------------------------------------
 extern "C" {
     fn console_printf(fmt: *const u8, ...) -> i32;
+    static g_tick_count: u64;
 }
 
 fn log0(msg: &core::ffi::CStr) {
@@ -644,4 +646,32 @@ mod slint_impl {
         });
         super::checksum(px)
     }
+}
+
+/// Draw one shell frame (windows + taskbar + start menu). Returns checksum.
+///
+/// # Safety
+/// `fb` must be a valid framebuffer of at least `pitch_px * h` u32 pixels.
+#[no_mangle]
+pub unsafe extern "C" fn suture_gui_shell_step(
+    fb: *mut u32,
+    w: i32,
+    h: i32,
+    pitch_px: i32,
+    mx: i32,
+    my: i32,
+    buttons: i32,
+    click_x: i32,
+    click_y: i32,
+    click_btn: i32,
+    now_ms: u32,
+) -> u32 {
+    shell::shell_step(fb, w, h, pitch_px, mx, my, buttons, click_x, click_y,
+                      click_btn, now_ms)
+}
+
+/// Kernel tick counter (~100 Hz), exposed for the shell frame profiler.
+#[no_mangle]
+pub extern "C" fn shell_tick() -> u64 {
+    unsafe { g_tick_count }
 }

@@ -40,11 +40,11 @@ fn fabs(a: f32) -> f32 {
     }
 }
 #[inline]
-fn clampf(v: f32, lo: f32, hi: f32) -> f32 {
+pub fn clampf(v: f32, lo: f32, hi: f32) -> f32 {
     fmin(fmax(v, lo), hi)
 }
 #[inline]
-fn fsqrt(a: f32) -> f32 {
+pub fn fsqrt(a: f32) -> f32 {
     libm::sqrtf(if a > 0.0 { a } else { 0.0 })
 }
 #[inline]
@@ -105,6 +105,36 @@ impl<'a> Surface<'a> {
             let i = y * self.stride + x;
             let d = self.px[i] & 0x00ff_ffff;
             self.px[i] = if a >= 255 { c & 0x00ff_ffff } else { blend(d, c, a) };
+        }
+    }
+
+    /// Opaque/alpha fill of an axis-aligned rect WITHOUT corner AA. Used for
+    /// layers that are cheap by nature (shadows, title strips, taskbar pieces)
+    /// where the analytic rounded-rect pass (one sqrt per pixel) is overkill.
+    pub fn rect_fill(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, c: u32,
+                     alpha: u32) {
+        let xs = x0.max(0);
+        let xe = x1.min(self.w as i32);
+        let ys = y0.max(0);
+        let ye = y1.min(self.h as i32);
+        if alpha == 0 || xe <= xs {
+            return;
+        }
+        for y in ys..ye {
+            let row = y as usize * self.stride;
+            for x in xs..xe {
+                let i = row + x as usize;
+                if alpha >= 255 {
+                    self.px[i] = c & 0x00ff_ffff;
+                } else {
+                    let d = self.px[i] & 0x00ff_ffff;
+                    let inv = 255 - alpha;
+                    let r = (((d >> 16) & 0xff) * inv + ((c >> 16) & 0xff) * alpha) / 255;
+                    let g = (((d >> 8) & 0xff) * inv + ((c >> 8) & 0xff) * alpha) / 255;
+                    let b = ((d & 0xff) * inv + (c & 0xff) * alpha) / 255;
+                    self.px[i] = (r << 16) | (g << 8) | b;
+                }
+            }
         }
     }
 

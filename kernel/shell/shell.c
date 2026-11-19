@@ -96,6 +96,7 @@ static const struct shell_cmd g_commands[] = {
     {"shutdown",shell_cmd_shutdown,"Shutdown the system"},
     {"startgui",shell_cmd_startgui,"Start GUI interface (fallback to terminal on failure)"},
     {"guislint",shell_cmd_guislint,"Render one Slint prototype frame (Stage 0, ESC returns)"},
+    {"guishell",shell_cmd_guishell,"Desktop shell prototype: windows + taskbar + start menu (ESC returns)"},
     {"ls",      shell_cmd_ls,      "List directory contents"},
     {"cd",      shell_cmd_cd,      "Change directory"},
     {"pwd",     shell_cmd_pwd,     "Print working directory"},
@@ -626,6 +627,37 @@ int shell_cmd_guislint(int argc, char **argv) {
     console_screen_enable(1);
     if (term_available()) term_clear();
     shell_puts("guislint: frame shown, back to terminal\n");
+    shell_puts(g_shell.prompt);
+    return 0;
+}
+
+/* Desktop-shell prototype (v0.41.0): the Rust renderer owns two windows, the
+ * taskbar and the start menu; this command hands the screen to that loop and
+ * paints nothing itself (so the existing C desktop stays untouched). */
+int shell_cmd_guishell(int argc, char **argv) {
+    (void)argc; (void)argv;
+    extern int slint_gui_run_shell(void);
+    extern int slint_gui_linked(void);
+    extern void console_screen_enable(int on);
+    extern int term_available(void);
+    extern void term_clear(void);
+    extern void fbcon_clear(void);
+
+    if (!slint_gui_linked()) {
+        shell_puts("guishell: the Rust GUI object is not linked into this image\n");
+        return -1;
+    }
+    shell_scroll_message("Starting desktop shell prototype...");
+    console_screen_enable(0);
+    const int r = slint_gui_run_shell();
+    console_screen_enable(1);
+    if (term_available()) term_clear();
+    else fbcon_clear();
+    if (r != 0) {
+        shell_printf("guishell: shell loop failed (error %d)\n", r);
+        return -1;
+    }
+    shell_puts("guishell: back to terminal\n");
     shell_puts(g_shell.prompt);
     return 0;
 }

@@ -25,6 +25,11 @@ extern uint32_t suture_gui_version(void);
 extern uint32_t suture_gui_selftest_render(uint32_t *fb, int32_t w, int32_t h,
                                            int32_t pitch_px);
 extern uint32_t suture_gui_frames(void);
+extern uint32_t suture_gui_shell_step(uint32_t *fb, int32_t w, int32_t h,
+                                      int32_t pitch_px, int32_t mx, int32_t my,
+                                      int32_t buttons, int32_t click_x,
+                                      int32_t click_y, int32_t click_btn,
+                                      uint32_t now_ms);
 extern uint32_t suture_gui_interactive_step(uint32_t *fb, int32_t w, int32_t h,
                                             int32_t pitch_px, int32_t mx,
                                             int32_t my, int32_t buttons,
@@ -207,6 +212,79 @@ int slint_gui_run_interactive(void)
         }
     }
     console_printf("[gui-slint] interactive: exit after %d frames%s\n", frames,
+                   quit ? "" : " (timeout)");
+    return 0;
+}
+
+/* ===========================================================================
+ * Desktop shell prototype (v0.41.0)
+ * ---------------------------------------------------------------------------
+ * Same polling loop as the interactive prototype, but the Rust side owns the
+ * window state (two windows, taskbar, start menu): click to focus, drag by the
+ * title bar, minimise/restore via the taskbar, maximise via the title-bar
+ * button (or a double click on the taskbar button), start menu on the start
+ * button. ESC leaves.
+ * =========================================================================== */
+int slint_gui_run_shell(void)
+{
+    extern int mbos_mouse_present(void);
+    extern void mbos_mouse_poll(void);
+    extern int mbos_mouse_x(void), mbos_mouse_y(void), mbos_mouse_buttons(void);
+    extern int mbos_mouse_take_click(int *, int *, int *);
+    extern void mbos_mouse_move_to(int x, int y);
+    extern int mbos_kbd_poll(void);
+    extern volatile uint64_t g_tick_count;
+
+    if (!slint_gui_linked()) return -1;
+    if (!limine_fb_addr || !limine_fb_width || !limine_fb_height) return -2;
+    if (limine_fb_bpp != 32) return -3;
+    const uint32_t w = (uint32_t)limine_fb_width;
+    const uint32_t h = (uint32_t)limine_fb_height;
+    const uint32_t pitch_px = (uint32_t)(limine_fb_pitch / 4u);
+    if (pitch_px < w) return -3;
+    uint32_t *fb = (uint32_t *)(uintptr_t)limine_fb_addr;
+
+    const int mouse = mbos_mouse_present();
+    if (mouse) mbos_mouse_move_to((int)w / 2, (int)h - 120);
+    console_printf("[gui-shell] shell: loop (mouse=%d), ESC exits\n", mouse);
+
+    const uint64_t start = g_tick_count;
+    int frames = 0;
+    int quit = 0;
+    while (!quit) {
+        if (frames > 2400) break;          /* frame-count safety net */
+        if (mouse) mbos_mouse_poll();
+        int mx = mouse ? mbos_mouse_x() : (int)w / 2;
+        int my = mouse ? mbos_mouse_y() : (int)h / 2;
+        if (mx < 0) mx = 0;
+        if (my < 0) my = 0;
+        if (mx >= (int)w) mx = (int)w - 1;
+        if (my >= (int)h) my = (int)h - 1;
+        const int buttons = mouse ? mbos_mouse_buttons() : 0;
+
+        int cx = -1, cy = -1, cb = 0;
+        if (mouse) (void)mbos_mouse_take_click(&cx, &cy, &cb);
+
+        int sc;
+        while ((sc = mbos_kbd_poll()) >= 0) {
+            if ((uint32_t)sc == 0x01u) quit = 1;
+        }
+
+        const uint32_t now_ms = (uint32_t)((g_tick_count - start) * 10u);
+        (void)suture_gui_shell_step(fb, (int32_t)w, (int32_t)h, (int32_t)pitch_px,
+                                    mx, my, buttons, cx, cy, cb, now_ms);
+        frames++;
+        if ((frames % 30) == 0) {
+            console_printf("[gui-shell] frame %d ms=%u pointer=%d,%d\n",
+                           frames, now_ms, mx, my);
+        }
+
+        const uint64_t t0 = g_tick_count;
+        while ((g_tick_count - t0) < 3u) {
+            for (volatile int spin = 0; spin < 4000; spin++) { }
+        }
+    }
+    console_printf("[gui-shell] shell: exit after %d frames%s\n", frames,
                    quit ? "" : " (timeout)");
     return 0;
 }

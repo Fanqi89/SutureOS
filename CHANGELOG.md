@@ -6,6 +6,24 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.41.0-alpha]
+
+**新渲染器接管桌面外壳：两个窗口 + 任务栏（开始/窗口按钮/时钟）+ 开始菜单；拖动、最小化/恢复、
+双击最大化全部可用；验收 23/23。**
+
+### Added
+- `rust/suture-gui/src/shell.rs`：窗口状态机、任务栏命中、开始菜单、拖动与双击判定；窗口/任务栏/菜单
+  用 256x192 模糊壁纸做真磨砂（整数坐标映射）；双缓冲呈现；整数 `rect_fill` 快路径。
+- `kernel/gui/slint_bridge.c`：`slint_gui_run_shell()`；shell 命令 `guishell`。
+- `scripts/slint_gui_shell_acceptance.py`（23 项，真 QMP 鼠标/键盘 + 像素断言）。
+
+### Verification
+- 外壳 **23/23**（拖动/最小化/恢复/双击最大化/开始菜单/退出）；回归：静态 21/21、交互 13/13、
+  C 桌面 9/9、外观门禁 0 像素、内核 13/14；帧时间 1.9s → ~0.5s（TCG）。
+
+### Limits
+- 约 2 fps、无脏矩形；窗口内容占位；菜单项不可点；无过渡动画；不与 C 桌面共享状态。
+
 ## [v0.40.0-alpha]
 
 **新渲染器活了：鼠标悬停高亮、点击涟漪、箭头光标、面板淡入；交互验收 13/13。**

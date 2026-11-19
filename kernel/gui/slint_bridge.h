@@ -34,6 +34,11 @@ int slint_gui_render_frame(void);
  * (same codes as slint_gui_render_frame). */
 int slint_gui_run_interactive(void);
 
+/* Desktop-shell prototype (v0.41.0): windows + taskbar + start menu on the new
+ * renderer, interactive until ESC. Returns 0 on a clean exit, negative on
+ * failure (same codes as slint_gui_render_frame). */
+int slint_gui_run_shell(void);
+
 /* 1 when the Rust GUI object is linked into this image. */
 int slint_gui_linked(void);
 
