@@ -46,7 +46,17 @@ static struct shell_state g_shell = {0};
 
 /* Command table */
 
+int shell_cmd_shmtest(int argc, char **argv)
+{
+    extern int memfd_selftest(void);
+    (void)argc; (void)argv;
+    const int rc = memfd_selftest();
+    shell_printf("shmtest: %s\n", rc == 0 ? "PASS" : "FAIL");
+    return rc;
+}
+
 int shell_cmd_unixtest(int argc, char **argv);   /* v0.53.0 */
+int shell_cmd_shmtest(int argc, char **argv);    /* v0.54.0 */
 struct shell_cmd {
     const char *name;
     int (*func)(int argc, char **argv);
@@ -140,6 +150,7 @@ static const struct shell_cmd g_commands[] = {
     {"ring3",   shell_cmd_ring3,  "Ring-3 status (the boot-time user program)"},
     {"ring3test",shell_cmd_ring3test,"Self-test: U/S page bits, SSE, GS base, exit code"},
     {"unixtest",shell_cmd_unixtest,"Self-test: AF_UNIX socketpair + poll (Wayland prereq)"},
+    {"shmtest",shell_cmd_shmtest,"Self-test: memfd + MAP_SHARED (Wayland prereq)"},
     {"run",     shell_cmd_run,     "Run a built-in ring-3 user program: run <name>"},
     {"ushell",  shell_cmd_ushell,  "Enter the ring-3 user shell (exit comes back here)"},
     {"mount",   shell_cmd_mount,   "Mount filesystem"},

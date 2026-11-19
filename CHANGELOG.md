@@ -6,6 +6,24 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.54.0-alpha]
+
+**Wayland 第二块前置：memfd + MAP_SHARED（共享内存自检 18/18）。**
+
+### Added
+- `kernel/ipc/memfd.c/.h`：memfd 对象（号段 300+）、`memfd_resize`、`memfd_map/unmap`（共享物理页）、
+  `memfd_read/write`、`memfd_selftest`。
+- `kernel/syscall/mem.c`：`sys_memfd_create`(319)、`sys_mmap`(9) 的 `MAP_SHARED` + memfd 路径。
+- `kernel/shell/shell.c`：`shmtest` 命令；`scripts/shm_acceptance.py` 宿主验收。
+
+### Verification
+- `shm_acceptance.py` **18/18**（两处映射双向可见、无越界）；回归：`unix_acceptance` 18/18、
+  外壳 42/42、静态 21/21、交互 13/13、C 桌面 9/9、FAT32 宿主 20/20、内核 13/14。
+
+### Limits
+- 无 SCM_RIGHTS；memfd fd 未进描述符表；用户态 ftruncate 未接线；4×64 页上限；
+  自检在 ring 0；最小 wl server 与 ring-3 夹具未开始。
+
 ## [v0.53.0-alpha]
 
 **Wayland 前置第一步：AF_UNIX socketpair + poll(2)（内核自检 15 项、宿主验收 18/18）。**

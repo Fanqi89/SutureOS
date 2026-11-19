@@ -859,7 +859,13 @@ static uint64_t sys_unix_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_
 /* Called from kmain after syscalls2_register(). */
 int syscall_unix_register(void)
 {
-    syscall_register(7, sys_unix_poll);       /* poll(2) */
-    syscall_register(53, sys_unix_socketpair); /* socketpair(AF_UNIX) */
-    return 2;
+    extern uint64_t sys_memfd_create(uint64_t, uint64_t, uint64_t, uint64_t,
+                                     uint64_t, uint64_t);
+    extern uint64_t sys_mmap(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+                             uint64_t);
+    syscall_register(7, sys_unix_poll);          /* poll(2) */
+    syscall_register(53, sys_unix_socketpair);   /* socketpair(AF_UNIX) */
+    syscall_register(319, sys_memfd_create);     /* memfd_create */
+    syscall_register(9, sys_mmap);               /* mmap (re-registered for MAP_SHARED) */
+    return 4;
 }

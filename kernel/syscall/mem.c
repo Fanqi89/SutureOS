@@ -5,6 +5,7 @@
 #include "el0_validate.h"
 #include "mmu.h"
 #include "loader.h"
+#include "../ipc/memfd.h"
 
 #define USER_HEAP_START 0x40000000  /* 1GB */
 #define USER_HEAP_MAX   0x80000000  /* 2GB */
@@ -38,13 +39,45 @@ uint64_t sys_brk(uint64_t addr, uint64_t a2, uint64_t a3,
 #define PROT_WRITE 0x2
 #define PROT_EXEC  0x4
 
+#define MAP_SHARED_ 0x01
+
+/* v0.54.0: memfd + MAP_SHARED — the second Wayland prerequisite. A memfd fd
+ * mapped twice shares the same physical pages, which is what a wl_shm pool needs. */
+uint64_t sys_memfd_create(uint64_t name, uint64_t flags,
+                          uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)flags; (void)a3; (void)a4; (void)a5; (void)a6;
+    if (name == 0) return (uint64_t)-1;
+    {
+        const int fd = memfd_create_obj();
+        return fd < 0 ? (uint64_t)-1 : (uint64_t)(int64_t)fd;
+    }
+}
+
 uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
                   uint64_t flags, uint64_t fd, uint64_t offset)
 {
-    (void)fd; (void)offset;
     extern sched_cpu_t sched_cpu;
     int tid = sched_cpu.current;
-    if (!(flags & MAP_ANONYMOUS) || !(flags & MAP_PRIVATE)) return (uint64_t)-1;
+
+    /* fd-backed shared mapping (memfd) */
+    if (!(flags & MAP_ANONYMOUS)) {
+        if (!(flags & MAP_SHARED_)) return (uint64_t)-1;
+        if (memfd_is_fd((int)fd) && (offset & 0xFFFull) == 0 && len > 0) {
+            const uint64_t nlen = (len + 4095) & ~4095ull;
+            const uint64_t vaddr = addr ? (addr & ~4095ull) : USER_HEAP_MAX - nlen;
+            if (vaddr < USER_HEAP_START || vaddr + nlen > USER_HEAP_MAX) {
+                return (uint64_t)-1;
+            }
+            if (memfd_map(vaddr, (int)fd, nlen, (prot & PROT_WRITE) != 0) != 0) {
+                return (uint64_t)-1;
+            }
+            return vaddr;
+        }
+        return (uint64_t)-1;
+    }
+    (void)offset;
+    if (!(flags & MAP_PRIVATE)) return (uint64_t)-1;
     if (len == 0) return (uint64_t)-1;
     len = (len + 4095) & ~4095;
     uint64_t vaddr = addr ? (addr & ~4095) : USER_HEAP_MAX - len;

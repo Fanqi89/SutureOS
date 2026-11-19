@@ -42,7 +42,8 @@ def main():
 
     checks = [
         ('syscalls 7 (poll) + 53 (socketpair) registered',
-         'AF_UNIX socketpair + poll registered (2)' in log),
+         ('AF_UNIX socketpair + poll registered (2)' in log) or
+         ('AF_UNIX socketpair + poll + memfd registered (4)' in log)),
         ('unixtest command reached the kernel',
          '[unix] socketpair selftest' in log),
         ('socketpair() creates a pair', 'ok   socketpair() creates a pair' in log),
