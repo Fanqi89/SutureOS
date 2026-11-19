@@ -378,6 +378,10 @@ def main():
         move_to(close_x, close_y)
         click()
         check('close button closes the window', wait_for('[gui-shell] close 2', 60))
+        check('close is preceded by a 2-frame fade-out',
+              '[gui-shell] anim close 2' in log_text() and
+              '[gui-shell] anim done 2 2' in log_text(),
+              'anim close / anim done lines present')
         closed = dump_until('closed', lambda px: abs(mean_brightness(px, WIN2[0] + 30, WIN2[1] + 60,
                                                                       WIN2[0] + 250, WIN2[1] + 180)
                                                              - base_mean) < 4)

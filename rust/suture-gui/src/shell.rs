@@ -90,6 +90,10 @@ struct Shell {
     /* v0.48.0: window open fade-in (frames left) + which window */
     intro_frames: u32,
     intro_idx: i32,
+    /* v0.49.0: deferred close/minimize with a 2-frame fade-out */
+    act_frames: u32,
+    act_kind: i32,
+    act_idx: i32,
     started: bool,
     frame_ms: u32,
     prof_frames: u32,
@@ -121,6 +125,9 @@ static mut SHELL: Shell = Shell {
     menu_sel: 0,
     intro_frames: 0,
     intro_idx: -1,
+    act_frames: 0,
+    act_kind: 0,
+    act_idx: -1,
     started: false,
     frame_ms: 0,
     prof_frames: 0,
@@ -387,6 +394,18 @@ fn next_visible(sh: &Shell, skip: usize) -> Option<usize> {
 
 /// Open / restore / focus window `idx` from the start menu (v0.43.0: shared by
 /// the mouse click path and the new keyboard Enter path).
+/// Start the fade-out that precedes a close/minimize (v0.49.0).
+/// kind: 1 = minimize, 2 = close.
+fn begin_act(sh: &mut Shell, kind: i32, idx: usize) {
+    if idx >= sh.wins.len() || !sh.wins[idx].open || sh.wins[idx].minimized {
+        return;
+    }
+    sh.act_frames = 2;
+    sh.act_kind = kind;
+    sh.act_idx = idx as i32;
+    log2(if kind == 1 { c"anim minimize" } else { c"anim close" }, idx as i32, 0);
+}
+
 fn launch_window(sh: &mut Shell, idx: usize) {
     if idx >= sh.wins.len() {
         return;
@@ -548,12 +567,7 @@ pub unsafe fn shell_step(
                                 sh.focus = i;
                                 sh.wins[i].z = next_z(sh);
                             } else if is_focus {
-                                sh.wins[i].minimized = true;
-                                log2(c"minimize", i as i32, 0);
-                                /* focus the other visible window */
-                                if let Some(other) = next_visible(sh, i) {
-                                    sh.focus = other;
-                                }
+                                begin_act(sh, 1, i);
                             } else {
                                 sh.wins[i].minimized = false;
                                 sh.focus = i;
@@ -593,17 +607,9 @@ pub unsafe fn shell_step(
                                     log2(c"maximize", hw, 0);
                                 }
                             } else if idx == 0 {
-                                sh.wins[hw as usize].minimized = true;
-                                log2(c"minimize", hw, 0);
-                                if let Some(other) = next_visible(sh, hw as usize) {
-                                    sh.focus = other;
-                                }
+                                begin_act(sh, 1, hw as usize);
                             } else {
-                                sh.wins[hw as usize].open = false;
-                                log2(c"close", hw, 0);
-                                if let Some(other) = next_visible(sh, hw as usize) {
-                                    sh.focus = other;
-                                }
+                                begin_act(sh, 2, hw as usize);
                             }
                         } else if cy >= wref.y && cy < wref.y + TITLE_H {
                             /* focus + begin drag */
@@ -696,7 +702,7 @@ pub unsafe fn shell_step(
                          ((w.z & 0xff) << 8);
     }
     let last = unsafe { &*core::ptr::addr_of!(LAST_STATE) };
-    if *last == st && sh.intro_frames == 0 {
+    if *last == st && sh.intro_frames == 0 && sh.act_frames == 0 {
         IDLE_FRAMES += 1;
         if IDLE_FRAMES == 1 {
             log0(c"idle: frame skipped (nothing changed)");
@@ -799,6 +805,36 @@ pub unsafe fn shell_step(
             unsafe {
                 WIN_KEY[i] = key;
             }
+        }
+    }
+
+    /* v0.49.0: 2-frame fade-out before a close/minimize actually happens */
+    if sh.act_frames > 0 {
+        let idx = sh.act_idx;
+        if idx >= 0 && idx < 4 && sh.wins[idx as usize].open && !sh.wins[idx as usize].minimized {
+            let w = sh.wins[idx as usize];
+            let a = if sh.act_frames == 2 { 0x2cu32 } else { 0x64u32 };
+            s.rect_fill(w.x, w.y, w.x + w.w, w.y + w.h, 0x000000, a);
+        }
+        sh.act_frames -= 1;
+        if sh.act_frames == 0 && idx >= 0 && idx < 4 {
+            let ui = idx as usize;
+            if sh.act_kind == 1 {
+                sh.wins[ui].minimized = true;
+                log2(c"minimize", idx, 0);
+                if let Some(other) = next_visible(sh, ui) {
+                    sh.focus = other;
+                }
+            } else if sh.act_kind == 2 {
+                sh.wins[ui].open = false;
+                log2(c"close", idx, 0);
+                if let Some(other) = next_visible(sh, ui) {
+                    sh.focus = other;
+                }
+            }
+            log2(c"anim done", sh.act_kind, idx);
+            sh.act_kind = 0;
+            sh.act_idx = -1;
         }
     }
 
@@ -1112,7 +1148,7 @@ fn draw_window(s: &mut Surface<'_>, w: &Win) {
     s.rect_fill(w.x + 16, cy, w.x + w.w - 16, cy + 56, 0xffffff, 0x12);
     s.text(w.x + 28, cy + 12, "圆角 + 轻亚克力 + 微透叠层", 0xcfe0ff, 0xc0, 1);
     s.text(w.x + 28, cy + 32, "窗口可拖动 / 最小化 / 最大化", 0x9fb2cc, 0xb0, 1);
-    s.text(w.x + 18, (w.y + w.h - 26) as i32, "窗口管理原型 v0.48", 0x8fa3bd, 0x90, 1);
+    s.text(w.x + 18, (w.y + w.h - 26) as i32, "窗口管理原型 v0.49", 0x8fa3bd, 0x90, 1);
     unsafe {
         let d = &mut *core::ptr::addr_of_mut!(WSPLIT);
         d.0 += t_shadow;

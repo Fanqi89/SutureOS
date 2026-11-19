@@ -6,6 +6,24 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.49.0-alpha]
+
+**关闭/最小化 2 帧淡出（延迟执行）+ Slint 路线定稿（长期自写渲染器）；验收 38/38。**
+
+### Added
+- `rust/suture-gui/src/shell.rs`：`begin_act()` + 关闭/最小化前 2 帧淡出，动作延迟到动画结束后执行
+  （`anim minimize/close` → `anim done`），动画期间不跳过空闲帧。
+- `docs/slint-route-decision.md`：Slint 卡点证据、软浮点代价、自写渲染器达标数据与重新评估条件。
+- `scripts/slint_gui_shell_acceptance.py`：扩到 38 项。
+
+### Verification
+- 外壳 **38/38**；`profile/30 ... win=282 bar=28`（未回退）；
+  回归：静态 21/21、交互 13/13、C 桌面 9/9、外观 0 像素、内核 13/14。
+
+### Limits
+- 淡出为整块压暗；最大化/还原与菜单无动画；拖动仍重建窗口缓存（图层合成器 B36 待做）；
+  时区写死 +08:00；圆角整数查表；键盘只在菜单内。
+
 ## [v0.48.0-alpha]
 
 **窗口打开 3 帧淡入 + 任务栏本地时钟（UTC+08:00，每分钟刷新）；验收 37/37。**
