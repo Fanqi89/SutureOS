@@ -6,6 +6,23 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.52.0-alpha]
+
+**过渡动画补齐：开始菜单 2 帧淡入、最大化/还原 3 帧淡入；拖动底纹锚点固定（落点校准一次）；验收 42/42。**
+
+### Added
+- `rust/suture-gui/src/shell.rs`：`menu_intro`（菜单淡入 + 空闲判据）、最大化/还原复用 intro 淡入、
+  `Win.ax/ay` 固定玻璃锚点、拖动结束移动到落点并重新栅格化一次。
+- `scripts/slint_gui_shell_acceptance.py`：扩到 42 项。
+
+### Verification
+- 外壳 **42/42**；拖动重绘 4–9 ticks（典型 6）；窗口阶段 205 ticks/30 帧；
+  回归：静态 21/21、交互 13/13、C 桌面 9/9、外观 0 像素、内核 13/14。
+
+### Limits
+- 过渡是整块叠暗（非缩放/滑动）；落点重栅格化一次（~40 ms）；层不透明；无 vsync；
+  时区写死 +08:00；键盘只在菜单内；Wayland 前置与替换 C 桌面未开始。
+
 ## [v0.51.0-alpha]
 
 **窗口层与位置解耦：拖动 = 纯 blit（5–7 ticks / 50–70 ms），窗口阶段 280→205 ticks；验收 40/40。**

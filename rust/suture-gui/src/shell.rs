@@ -56,23 +56,27 @@ struct Win {
      * blitted anywhere without re-rasterising (compositor semantics). */
     sox: i32,
     soy: i32,
+    /* v0.52.0: acrylic sampling anchor, fixed for the window's whole life so the
+     * glass pattern never changes when the window moves (no re-anchor pop). */
+    ax: i32,
+    ay: i32,
 }
 
 const fn win0() -> Win {
     Win { x: 150, y: 120, w: 430, h: 300, nx: 150, ny: 120, nw: 430, nh: 300,
-          minimized: false, maximized: false, z: 1, title: "系统设置", accent: 0x4f8dff, open: true, sox: 0, soy: 0 }
+          minimized: false, maximized: false, z: 1, title: "系统设置", accent: 0x4f8dff, open: true, sox: 0, soy: 0, ax: 150, ay: 120 }
 }
 const fn win1() -> Win {
     Win { x: 470, y: 300, w: 400, h: 260, nx: 470, ny: 300, nw: 400, nh: 260,
-          minimized: false, maximized: false, z: 2, title: "任务管理器", accent: 0x22c1a8, open: true, sox: 0, soy: 0 }
+          minimized: false, maximized: false, z: 2, title: "任务管理器", accent: 0x22c1a8, open: true, sox: 0, soy: 0, ax: 470, ay: 300 }
 }
 const fn win2() -> Win {
     Win { x: 210, y: 430, w: 360, h: 240, nx: 210, ny: 430, nw: 360, nh: 240,
-          minimized: false, maximized: false, z: 3, title: "图片查看器", accent: 0xf5a524, open: false, sox: 0, soy: 0 }
+          minimized: false, maximized: false, z: 3, title: "图片查看器", accent: 0xf5a524, open: false, sox: 0, soy: 0, ax: 210, ay: 430 }
 }
 const fn win3() -> Win {
     Win { x: 560, y: 180, w: 330, h: 230, nx: 560, ny: 180, nw: 330, nh: 230,
-          minimized: false, maximized: false, z: 4, title: "文本编辑器", accent: 0xe05a8a, open: false, sox: 0, soy: 0 }
+          minimized: false, maximized: false, z: 4, title: "文本编辑器", accent: 0xe05a8a, open: false, sox: 0, soy: 0, ax: 560, ay: 180 }
 }
 
 struct Shell {
@@ -95,6 +99,7 @@ struct Shell {
     /* v0.48.0: window open fade-in (frames left) + which window */
     intro_frames: u32,
     intro_idx: i32,
+    menu_intro: u32,
     /* v0.49.0: deferred close/minimize with a 2-frame fade-out */
     act_frames: u32,
     act_kind: i32,
@@ -136,6 +141,7 @@ static mut SHELL: Shell = Shell {
     menu_sel: 0,
     intro_frames: 0,
     intro_idx: -1,
+    menu_intro: 0,
     act_frames: 0,
     act_kind: 0,
     act_idx: -1,
@@ -561,6 +567,9 @@ pub unsafe fn shell_step(
                cy >= start_btn.1 && cy < start_btn.1 + start_btn.3 {
                 sh.menu_open = !sh.menu_open;
                 log0(if sh.menu_open { c"menu open" } else { c"menu closed" });
+                if sh.menu_open {
+                    sh.menu_intro = 2;
+                }
             } else {
                 /* taskbar window buttons */
                 let mut handled = false;
@@ -583,6 +592,8 @@ pub unsafe fn shell_step(
                                     sh.wins[i].w = sh.wins[i].nw;
                                     sh.wins[i].h = sh.wins[i].nh;
                                     log2(c"restore", i as i32, 0);
+                                    sh.intro_frames = 3;
+                                    sh.intro_idx = i as i32;
                                 } else {
                                     sh.wins[i].nx = sh.wins[i].x;
                                     sh.wins[i].ny = sh.wins[i].y;
@@ -594,6 +605,8 @@ pub unsafe fn shell_step(
                                     sh.wins[i].w = SCREEN_W;
                                     sh.wins[i].h = TASKBAR_Y;
                                     log2(c"maximize", i as i32, 0);
+                                    sh.intro_frames = 3;
+                                    sh.intro_idx = i as i32;
                                 }
                                 sh.wins[i].minimized = false;
                                 sh.focus = i;
@@ -625,6 +638,8 @@ pub unsafe fn shell_step(
                                     ww.w = ww.nw;
                                     ww.h = ww.nh;
                                     log2(c"restore", hw, 0);
+                                    sh.intro_frames = 3;
+                                    sh.intro_idx = hw;
                                 } else {
                                     let ww = &mut sh.wins[hw as usize];
                                     ww.nx = ww.x;
@@ -637,6 +652,8 @@ pub unsafe fn shell_step(
                                     ww.w = SCREEN_W;
                                     ww.h = TASKBAR_Y;
                                     log2(c"maximize", hw, 0);
+                                    sh.intro_frames = 3;
+                                    sh.intro_idx = hw;
                                 }
                             } else if idx == 0 {
                                 begin_act(sh, 1, hw as usize);
@@ -698,12 +715,19 @@ pub unsafe fn shell_step(
     }
 
     if !left_down && sh.dragging {
-        // v0.51.0: while dragging the layer keeps the appearance it had at the
-        // drag start (compositor semantics). Once the drag ends we re-anchor it:
-        // the layer is re-rendered with the acrylic sampled at the new position.
-        unsafe {
-            WIN_KEY[sh.drag_idx] = i32::MIN;
+        // v0.52.0: while dragging the layer keeps its glass pattern (anchored),
+        // so the drag itself is a pure blit. At the drop we move the anchor to the
+        // final position and re-rasterise once, so the acrylic matches the
+        // wallpaper the window now sits on.
+        {
+            let di = sh.drag_idx;
+            sh.wins[di].ax = sh.wins[di].nx;
+            sh.wins[di].ay = sh.wins[di].ny;
+            unsafe {
+                WIN_KEY[di] = i32::MIN;
+            }
         }
+        log2(c"drag end: layer re-anchored", sh.drag_idx as i32, 0);
         sh.dragging = false;
         log2(c"drag end", sh.wins[sh.drag_idx].x, sh.wins[sh.drag_idx].y);
     }
@@ -744,7 +768,7 @@ pub unsafe fn shell_step(
                          ((w.z & 0xff) << 8);
     }
     let last = unsafe { &*core::ptr::addr_of!(LAST_STATE) };
-    if *last == st && sh.intro_frames == 0 && sh.act_frames == 0 {
+    if *last == st && sh.intro_frames == 0 && sh.act_frames == 0 && sh.menu_intro == 0 {
         IDLE_FRAMES += 1;
         if IDLE_FRAMES == 1 {
             log0(c"idle: frame skipped (nothing changed)");
@@ -993,6 +1017,14 @@ for i in 0..4 {
             TASKBAR_KEY = tb_key;
         }
     }
+    /* v0.52.0: 2-frame fade-in for the start menu (dim -> clear) */
+    if sh.menu_intro > 0 {
+        let a = if sh.menu_intro == 2 { 0x50u32 } else { 0x24u32 };
+        s.rect_fill(MENU_X, MENU_Y, MENU_X + MENU_W, MENU_Y + MENU_H + 8, 0x000000, a);
+        log2(c"menu fade", sh.menu_intro as i32, 0);
+        sh.menu_intro -= 1;
+    }
+
     let t_bar = ticks() - t_bar0;
     if sh.dragging {
         let total = ticks() - t_frame0;
@@ -1176,8 +1208,8 @@ fn render_window_layer(slot: usize, w: &Win) -> bool {
     let mut wc = *w;
     wc.x = WC_MARGIN_L;
     wc.y = WC_MARGIN_T;
-    wc.sox = w.nx - WC_MARGIN_L;
-    wc.soy = w.ny - WC_MARGIN_T;
+    wc.sox = w.ax - WC_MARGIN_L;
+    wc.soy = w.ay - WC_MARGIN_T;
     draw_window(&mut cs, &wc, true);
     true
 }
@@ -1309,7 +1341,7 @@ fn draw_window(s: &mut Surface<'_>, w: &Win, with_shadow: bool) {
     s.rect_fill(w.x + 16, cy, w.x + w.w - 16, cy + 56, 0xffffff, 0x12);
     s.text(w.x + 28, cy + 12, "圆角 + 轻亚克力 + 微透叠层", 0xcfe0ff, 0xc0, 1);
     s.text(w.x + 28, cy + 32, "窗口可拖动 / 最小化 / 最大化", 0x9fb2cc, 0xb0, 1);
-    s.text(w.x + 18, (w.y + w.h - 26) as i32, "窗口管理原型 v0.51", 0x8fa3bd, 0x90, 1);
+    s.text(w.x + 18, (w.y + w.h - 26) as i32, "窗口管理原型 v0.52", 0x8fa3bd, 0x90, 1);
     unsafe {
         let d = &mut *core::ptr::addr_of_mut!(WSPLIT);
         d.0 += t_shadow;

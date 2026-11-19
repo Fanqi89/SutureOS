@@ -329,11 +329,17 @@ def main():
         fast_click()
         check('double click again restored the maximised window',
               wait_for('[gui-shell] restore 1', 60))
+        check('maximise/restore fades the window in',
+              log_text().count('[gui-shell] intro fade') >= 5,
+              'intro fade lines: %d' % log_text().count('[gui-shell] intro fade'))
 
         # ---- (5) start menu ---------------------------------------------------
         move_to(START_BTN[0] + START_BTN[2] // 2, START_BTN[1] + START_BTN[3] // 2)
         click()
         check('start button opened the start menu', wait_for('[gui-shell] menu open', 40))
+        check('start menu fades in over 2 frames',
+              '[gui-shell] menu fade' in log_text(),
+              'log line "[gui-shell] menu fade N 0"')
         menu = dump_until('menu', lambda px: mean_brightness(px, MENU[0] + 20, MENU[1] + 40,
                                                              MENU[0] + 200, MENU[1] + 120) > 60)
         if menu is not None:
