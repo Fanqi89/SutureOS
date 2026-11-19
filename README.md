@@ -2,7 +2,7 @@
 
 > **一个由 16 个爱好者操作系统项目拼接而成的 x86_64 单内核操作系统**
 > 
-> 当前版本：**v0.55.0-alpha** · 内核编译 **105** 个源文件（源码树约 220 个 C/H/ASM、约 6.0 万行）
+> 当前版本：**v0.56.0-alpha** · 内核编译 **105** 个源文件（源码树约 220 个 C/H/ASM、约 6.0 万行）
 > · 内核 ELF 约 **2.06 MB**（含调试符号）· 可引导 ISO 约 **15.0 MB** · **GPL-3.0** 许可证
 >
 > 移植与许可说明：[`docs/provenance.md`](docs/provenance.md)（模块→上游·文件路径）
@@ -112,6 +112,7 @@ SutureOS（缝合怪系统）是一个实验性的 x86_64 单内核操作系统�
 | v0.53.0 | **Wayland 前置**：AF_UNIX socketpair + poll(2)（`unixtest` 18/18） | SutureOS 自有（GPL-3.0） | `kernel/ipc/unix_socket.c`、`kernel/syscall/syscalls.c`、`scripts/unix_acceptance.py` | ✅ 18/18 |
 | v0.54.0 | **Wayland 前置**：memfd + MAP_SHARED 共享内存（`shmtest` 18/18） | SutureOS 自有（GPL-3.0） | `kernel/ipc/memfd.c`、`kernel/syscall/mem.c`、`scripts/shm_acceptance.py` | ✅ 18/18 |
 | v0.55.0 | **Wayland 前置**：SCM_RIGHTS 传 fd（`fdpass` 21/21；四大前置齐） | SutureOS 自有（GPL-3.0） | `kernel/ipc/scm_fd.c`、`kernel/syscall/syscalls.c`、`scripts/fdpass_acceptance.py` | ✅ 21/21 |
+| v0.56.0 | **ring-3 Wayland 前置探针**（`run wlprobe`：socketpair+memfd+MAP_SHARED+SCM_RIGHTS，14/14） | SutureOS 自有（GPL-3.0） | `user/apps/wlprobe.c`、`kernel/syscall/int80.c`、`scripts/wlprobe_acceptance.py` | ✅ 14/14 |
 
 ---
 

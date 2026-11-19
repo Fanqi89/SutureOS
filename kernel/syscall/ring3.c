@@ -361,6 +361,11 @@ extern const uint8_t _binary_rtouch_bin_size[];
 extern const uint8_t _binary_rdf_bin_start[];
 extern const uint8_t _binary_rdf_bin_end[];
 extern const uint8_t _binary_rdf_bin_size[];
+/* v0.56.0: ring-3 probe for the Wayland prerequisites (socketpair + memfd +
+ * MAP_SHARED + SCM_RIGHTS), driven through the int 0x80 probe ABI. */
+extern const uint8_t _binary_wlprobe_bin_start[];
+extern const uint8_t _binary_wlprobe_bin_end[];
+extern const uint8_t _binary_wlprobe_bin_size[];
 
 typedef struct {
     const char *name;
@@ -388,6 +393,7 @@ static const user_program_t g_programs[] = {
     { "rmkdir", _binary_rmkdir_bin_start, _binary_rmkdir_bin_size },
     { "rtouch", _binary_rtouch_bin_start, _binary_rtouch_bin_size },
     { "rdf", _binary_rdf_bin_start, _binary_rdf_bin_size },
+    { "wlprobe", _binary_wlprobe_bin_start, _binary_wlprobe_bin_size },
 };
 
 /* ---- execve support ----

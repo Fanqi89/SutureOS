@@ -6,6 +6,23 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.56.0-alpha]
+
+**四个 Wayland 前置能力首次从 ring 3 跑通：wlprobe 探针（14/14）。**
+
+### Added
+- `user/apps/wlprobe.c`：ring-3 探针（socketpair → memfd → MAP_SHARED → SCM_RIGHTS）。
+- `kernel/syscall/int80.c`：探针 ABI 号 10..14（socketpair/memfd/map_shared/send_fd/recv_fd）。
+- `kernel/syscall/ring3.c`：登记 `wlprobe` blob；`scripts/wlprobe_acceptance.py` 验收。
+
+### Verification
+- `wlprobe` **14/14**；回归：unix 18/18、shm 18/18、fdpass 21/21、外壳 42/42、静态 21/21、
+  交互 13/13、C 桌面 9/9、FAT32 宿主 20/20、内核 13/14。
+
+### Limits
+- 探针 ABI 而非 POSIX（无 sockaddr/bind/listen/accept/完整 msghdr）；长度打包、单次 ≤4 KiB/≤1 fd；
+  描述符无 refcount；VFS fd 不可传；最小 wl server 与替换 C 桌面未开始。
+
 ## [v0.55.0-alpha]
 
 **Wayland 第三块前置：SCM_RIGHTS（socket 上传 fd，验收 21/21）——四个内核前置至此全部落地。**

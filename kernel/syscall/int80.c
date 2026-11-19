@@ -45,6 +45,14 @@
 #define V64_NR_READ     7
 #define V64_NR_CLOSE    8
 #define V64_NR_EXEC     9               /* own ABI: execve(path) */
+/* v0.56.0: probe ABI for the Wayland prerequisites (NOT POSIX numbers). It lets
+ * a ring-3 fixture drive socketpair/memfd/MAP_SHARED/SCM_RIGHTS without either
+ * porting a full libc socket layer or pretending the Vimtu ABI is POSIX. */
+#define V64_NR_SOCKETPAIR 10            /* int[2] out                        */
+#define V64_NR_MEMFD      11            /* size -> fd                        */
+#define V64_NR_MAP_SHARED 12            /* (fd, len) -> vaddr                */
+#define V64_NR_SEND_FD    13            /* (sockfd, fd, buf, len) -> bytes   */
+#define V64_NR_RECV_FD    14            /* (sockfd, int*outfd, buf, len)     */
 
 #define V64_WRITE_MAX 1024u
 
@@ -154,6 +162,78 @@ static void int80_handler(struct moos_regs *f)
         }
         ret = 0;
         break;
+    case V64_NR_SOCKETPAIR:
+    {
+        extern int unix_socketpair(int fds[2]);
+        int fds[2];
+        const uint64_t out = frame_get(f, FRAME_RDI);
+        if (out == 0) { ret = (uint64_t)-22; break; }
+        if (unix_socketpair(fds) != 0) { ret = (uint64_t)-24; break; }
+        memcpy((void *)(uintptr_t)out, fds, sizeof fds);
+        ret = 0;
+        break;
+    }
+    case V64_NR_MEMFD:
+    {
+        extern int memfd_create_obj(void);
+        extern int memfd_resize(int fd, uint64_t bytes);
+        const uint64_t size = frame_get(f, FRAME_RDI);
+        int fd = memfd_create_obj();
+        if (fd < 0) { ret = (uint64_t)-24; break; }
+        if (memfd_resize(fd, size ? size : 4096) != 0) { ret = (uint64_t)-12; break; }
+        ret = (uint64_t)(int64_t)fd;
+        break;
+    }
+    case V64_NR_MAP_SHARED:
+    {
+        extern int memfd_is_fd(int fd);
+        extern int memfd_map(uint64_t vaddr, int fd, uint64_t len, int writable);
+        extern uint64_t sys_mmap(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+        const int fd = (int)frame_get(f, FRAME_RDI);
+        const uint64_t len = frame_get(f, FRAME_RSI);
+        if (!memfd_is_fd(fd) || len == 0) { ret = (uint64_t)-22; break; }
+        /* 0x01 = MAP_SHARED, 0x02 = PROT_WRITE, addr 0 -> kernel picks */
+        ret = sys_mmap(0, len, 0x2, 0x1, (uint64_t)fd, 0);
+        break;
+    }
+    case V64_NR_SEND_FD:
+    {
+        extern int unix_write_fd(int fd, const void *buf, uint32_t len);
+        extern int unix_send_fds(int fd, const int *fds, int n);
+        /* The stub only carries rdi/rsi/rdx, so the length travels packed in the
+         * second argument: (len << 16) | fd. Documented as probe ABI. */
+        const int sock = (int)frame_get(f, FRAME_RDI);
+        const uint64_t packed = frame_get(f, FRAME_RSI);
+        const int pass = (int)(packed & 0xFFFFu);
+        const uint32_t len = (uint32_t)(packed >> 16);
+        const uint64_t buf = frame_get(f, FRAME_RDX);
+        int w;
+        if (len == 0 || len > 4096 || buf == 0) { ret = (uint64_t)-22; break; }
+        w = unix_write_fd(sock, (const void *)(uintptr_t)buf, len);
+        if (w < 0) { ret = (uint64_t)(int64_t)w; break; }
+        if (unix_send_fds(sock, &pass, 1) != 0) { ret = (uint64_t)-22; break; }
+        ret = (uint64_t)(int64_t)w;
+        break;
+    }
+    case V64_NR_RECV_FD:
+    {
+        extern int unix_read_fd(int fd, void *buf, uint32_t len);
+        extern int unix_recv_fds(int fd, int *out, int max);
+        const int sock = (int)frame_get(f, FRAME_RDI);
+        const uint64_t outfd = frame_get(f, FRAME_RSI);
+        const uint64_t buf = frame_get(f, FRAME_RDX);
+        int r;
+        if (buf == 0) { ret = (uint64_t)-22; break; }
+        r = unix_read_fd(sock, (void *)(uintptr_t)buf, 4096u);
+        if (r < 0) { ret = (uint64_t)(int64_t)r; break; }
+        {
+            int fd = -1;
+            if (unix_recv_fds(sock, &fd, 1) != 1) { ret = (uint64_t)-11; break; }
+            if (outfd) memcpy((void *)(uintptr_t)outfd, &fd, sizeof fd);
+        }
+        ret = (uint64_t)(int64_t)r;
+        break;
+    }
     default:
         g_denied++;
         ret = (uint64_t)-38;                /* -ENOSYS */
