@@ -6,6 +6,24 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.50.0-alpha]
+
+**图层合成器第一刀：拖动复用窗口层 + 任务栏层缓存 + 部分呈现 + 采样校验和；拖动重绘 ≈117 ms → 60–80 ms；验收 40/40。**
+
+### Added
+- `rust/suture-gui/src/shell.rs`：`drag_reuse`（拖动中 blit 窗口层，拖动结束强制终点重绘）、
+  `taskbar_key()/blit_taskbar()/save_taskbar()`（任务栏整条缓存）、拖动时只呈现旧/新矩形、
+  校验和每 8 像素采样、`drag repaint` 分段日志。
+- `scripts/slint_gui_shell_acceptance.py`：扩到 40 项。
+
+### Verification
+- 外壳 **40/40**；拖动重绘稳态 **6–8 ticks（60–80 ms）**，任务栏 38→20 ticks/30 帧；
+  回归：静态 21/21、交互 13/13、C 桌面 9/9、外观 0 像素、内核 13/14。
+
+### Limits
+- 拖动中磨砂底纹停在起点（合成器语义，松手后校准）；无 vsync，仍有滞后；任务栏缓存键未含标题；
+  最大化/还原与菜单无动画；时区写死 +08:00；Wayland 前置与替换 C 桌面未开始。
+
 ## [v0.49.0-alpha]
 
 **关闭/最小化 2 帧淡出（延迟执行）+ Slint 路线定稿（长期自写渲染器）；验收 38/38。**

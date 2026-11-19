@@ -99,6 +99,12 @@ struct Shell {
     prof_frames: u32,
     prof_full: u32,
     prof_cache_hit: u32,
+    prof_taskbar_hit: u32,
+    prof_drag_reuse: u32,
+    drag_frames_logged: u32,
+    /* v0.50.0: previous dragged-window position (for partial present) */
+    drag_last_x: i32,
+    drag_last_y: i32,
     prof_cache_miss: u32,
     prof_copy: u64,
     prof_win: u64,
@@ -133,6 +139,11 @@ static mut SHELL: Shell = Shell {
     prof_frames: 0,
     prof_full: 0,
     prof_cache_hit: 0,
+    prof_taskbar_hit: 0,
+    prof_drag_reuse: 0,
+    drag_frames_logged: 0,
+    drag_last_x: -1,
+    drag_last_y: -1,
     prof_cache_miss: 0,
     prof_copy: 0,
     prof_win: 0,
@@ -162,6 +173,12 @@ const WC_MARGIN_R: i32 = 12;
 const WC_MARGIN_B: i32 = 16;
 static mut WIN_CACHE: [[u32; WC_STRIDE * WC_H]; 4] = [[0; WC_STRIDE * WC_H]; 4];
 static mut WIN_KEY: [i32; 4] = [i32::MIN; 4];
+/* v0.50.0: the taskbar strip (frosted band + buttons + clock) only changes when a
+ * window opens/closes/minimises, focus moves, the pointer hovers a button, or the
+ * clock ticks. Cache it so a drag repaint is a blit instead of a re-render. */
+const TB_H: usize = 38;
+static mut TASKBAR_CACHE: [u32; 1024 * TB_H] = [0; 1024 * TB_H];
+static mut TASKBAR_KEY: i32 = i32::MIN;
 static mut WSPLIT: (u64, u64, u64, u32) = (0, 0, 0, 0);
 /* v0.47.0: rounded-corner coverage LUT. The analytic path called the
  * soft-float sqrt once per corner pixel; on this no-SSE target that made a
@@ -472,6 +489,7 @@ pub unsafe fn shell_step(
     }
 
     // 1. wallpaper from cache
+    let t_frame0 = ticks();
     let t_copy0 = ticks();
     let wall = &*core::ptr::addr_of!(WALL);
     for y in 0..hu.min(SCREEN_H as usize) {
@@ -666,11 +684,19 @@ pub unsafe fn shell_step(
     }
 
     if !left_down && sh.dragging {
+        // the layer captured at drag start is stale now: force a re-rasterise
+        unsafe {
+            WIN_KEY[sh.drag_idx] = i32::MIN;
+        }
         sh.dragging = false;
         log2(c"drag end", sh.wins[sh.drag_idx].x, sh.wins[sh.drag_idx].y);
     }
     if sh.dragging {
         let bidx = sh.drag_idx;
+        if sh.drag_last_x < 0 {
+            sh.drag_last_x = sh.wins[bidx].x;
+            sh.drag_last_y = sh.wins[bidx].y;
+        }
         let nxp = (mx_c - sh.drag_dx).clamp(0, SCREEN_W - 200);
         let nyp = (my_c - sh.drag_dy).clamp(0, TASKBAR_Y - 80);
         sh.wins[bidx].x = nxp;
@@ -768,7 +794,20 @@ pub unsafe fn shell_step(
             continue;
         }
         let key = win_key(&win, i);
-        let hit = unsafe { WIN_KEY[i] == key };
+        let mut hit = unsafe { WIN_KEY[i] == key };
+        // v0.50.0 compositor behaviour: while a window is being dragged its
+        // geometry changes every frame, but its CONTENT does not. Reuse the layer
+        // captured at the moment the drag started instead of re-rasterising the
+        // frosted body; the key is invalidated when the drag ends so the next
+        // repaint re-renders it at the final position.
+        let drag_reuse = sh.dragging && sh.drag_idx == i && unsafe { WIN_KEY[i] != i32::MIN };
+        if drag_reuse && !hit {
+            hit = true;
+            sh.prof_drag_reuse += 1;
+            if sh.prof_drag_reuse == 1 {
+                log0(c"drag: reusing window layer (no re-rasterise)");
+            }
+        }
         // Only reuse a cached layer when no lower window overlaps it: the shadow
         // in the cache was composited against wallpaper alone.
         let mut overlaps = false;
@@ -785,7 +824,7 @@ pub unsafe fn shell_step(
             }
         }
         let frame = &mut *core::ptr::addr_of_mut!(FRAME);
-        if hit && !overlaps {
+        if hit && (!overlaps || drag_reuse) {
             if blit_window_cache(frame, wu, i, &win) {
                 sh.prof_cache_hit += 1;
                 continue;
@@ -858,54 +897,124 @@ pub unsafe fn shell_step(
     let t_win = ticks() - t_win0;
     // 5. taskbar (acrylic strip sampled from the frosted source)
     let t_bar0 = ticks();
+    let tb_key = taskbar_key(sh, clock_hhmm);
+    let tb_hit = unsafe { TASKBAR_KEY == tb_key };
+    if tb_hit {
+        let frame = &mut *core::ptr::addr_of_mut!(FRAME);
+        if !blit_taskbar(frame, wu) {
+            // strip cache unreadable: fall back to a real render
+            frosted(&mut s, 0, TASKBAR_Y, SCREEN_W, SCREEN_H, 0.0, 0x30);
+s.rect_fill(0, TASKBAR_Y, SCREEN_W, SCREEN_H, 0xffffff, 0x08);
+/* start button: rounded tile + the same pseudo-3D plate glyph as the icon */
+let hover_start = mx_c >= start_btn.0 && mx_c < start_btn.0 + start_btn.2 &&
+                  my_c >= start_btn.1 && my_c < start_btn.1 + start_btn.3;
+s.rect_fill(start_btn.0, start_btn.1, start_btn.0 + start_btn.2,
+            start_btn.1 + start_btn.3, 0xffffff,
+            if hover_start { 0x2c } else { 0x16 });
+s.rect_fill(start_btn.0 + 10, start_btn.1 + 7, start_btn.0 + 24,
+            start_btn.1 + 21, 0x9fd0ff, 0xe0);
+s.rect_fill(start_btn.0 + 12, start_btn.1 + 9, start_btn.0 + 22,
+            start_btn.1 + 14, 0xffffff, 0xd0);
+
+/* window buttons */
+sh.hover_wb = -1;
+for i in 0..4 {
+    if let Some((bx, bw)) = wb_rect(&sh.wins, i) {
+        let hovered = mx_c >= bx && mx_c < bx + bw && my_c >= TASKBAR_Y + 5 &&
+                      my_c < TASKBAR_Y + TASKBAR_H - 5;
+        if hovered { sh.hover_wb = i as i32; }
+        let active = sh.focus == i && !sh.wins[i].minimized;
+        s.rect_fill(bx, TASKBAR_Y + 6, bx + bw, TASKBAR_Y + TASKBAR_H - 6,
+                    0xffffff,
+                    if active { 0x30 } else if hovered { 0x20 } else { 0x12 });
+        if active {
+            s.rect_fill(bx + 14, TASKBAR_Y + TASKBAR_H - 9, bx + bw - 14,
+                        TASKBAR_Y + TASKBAR_H - 7, 0x4f8dff, 255);
+        }
+        s.text(bx + 10, TASKBAR_Y + 12, sh.wins[i].title, 0xe8eefb,
+               if sh.wins[i].minimized { 0x90 } else { 0xf0 }, 1);
+    }
+}
+/* clock on the right: real wall time from the RTC (v0.44.0) */
+{
+    let hh = (clock_hhmm / 100) % 24;
+    let mm = clock_hhmm % 100;
+    let digits = [b'0' + (hh / 10) as u8, b'0' + (hh % 10) as u8,
+                  b':',
+                  b'0' + (mm / 10) as u8, b'0' + (mm % 10) as u8];
+    let chars = [digits[0] as char, digits[1] as char, digits[2] as char,
+                 digits[3] as char, digits[4] as char];
+    let mut x = SCREEN_W - 96;
+    for ch in chars.iter() {
+        x += s.char_ascii(x, TASKBAR_Y + 12, *ch, 0xd6e2f5, 0xd0, 1);
+    }
+}
+        } else {
+            sh.prof_taskbar_hit += 1;
+        }
+    } else {
     frosted(&mut s, 0, TASKBAR_Y, SCREEN_W, SCREEN_H, 0.0, 0x30);
-    s.rect_fill(0, TASKBAR_Y, SCREEN_W, SCREEN_H, 0xffffff, 0x08);
-    /* start button: rounded tile + the same pseudo-3D plate glyph as the icon */
-    let hover_start = mx_c >= start_btn.0 && mx_c < start_btn.0 + start_btn.2 &&
-                      my_c >= start_btn.1 && my_c < start_btn.1 + start_btn.3;
-    s.rect_fill(start_btn.0, start_btn.1, start_btn.0 + start_btn.2,
-                start_btn.1 + start_btn.3, 0xffffff,
-                if hover_start { 0x2c } else { 0x16 });
-    s.rect_fill(start_btn.0 + 10, start_btn.1 + 7, start_btn.0 + 24,
-                start_btn.1 + 21, 0x9fd0ff, 0xe0);
-    s.rect_fill(start_btn.0 + 12, start_btn.1 + 9, start_btn.0 + 22,
-                start_btn.1 + 14, 0xffffff, 0xd0);
+s.rect_fill(0, TASKBAR_Y, SCREEN_W, SCREEN_H, 0xffffff, 0x08);
+/* start button: rounded tile + the same pseudo-3D plate glyph as the icon */
+let hover_start = mx_c >= start_btn.0 && mx_c < start_btn.0 + start_btn.2 &&
+                  my_c >= start_btn.1 && my_c < start_btn.1 + start_btn.3;
+s.rect_fill(start_btn.0, start_btn.1, start_btn.0 + start_btn.2,
+            start_btn.1 + start_btn.3, 0xffffff,
+            if hover_start { 0x2c } else { 0x16 });
+s.rect_fill(start_btn.0 + 10, start_btn.1 + 7, start_btn.0 + 24,
+            start_btn.1 + 21, 0x9fd0ff, 0xe0);
+s.rect_fill(start_btn.0 + 12, start_btn.1 + 9, start_btn.0 + 22,
+            start_btn.1 + 14, 0xffffff, 0xd0);
 
-    /* window buttons */
-    sh.hover_wb = -1;
-    for i in 0..4 {
-        if let Some((bx, bw)) = wb_rect(&sh.wins, i) {
-            let hovered = mx_c >= bx && mx_c < bx + bw && my_c >= TASKBAR_Y + 5 &&
-                          my_c < TASKBAR_Y + TASKBAR_H - 5;
-            if hovered { sh.hover_wb = i as i32; }
-            let active = sh.focus == i && !sh.wins[i].minimized;
-            s.rect_fill(bx, TASKBAR_Y + 6, bx + bw, TASKBAR_Y + TASKBAR_H - 6,
-                        0xffffff,
-                        if active { 0x30 } else if hovered { 0x20 } else { 0x12 });
-            if active {
-                s.rect_fill(bx + 14, TASKBAR_Y + TASKBAR_H - 9, bx + bw - 14,
-                            TASKBAR_Y + TASKBAR_H - 7, 0x4f8dff, 255);
-            }
-            s.text(bx + 10, TASKBAR_Y + 12, sh.wins[i].title, 0xe8eefb,
-                   if sh.wins[i].minimized { 0x90 } else { 0xf0 }, 1);
+/* window buttons */
+sh.hover_wb = -1;
+for i in 0..4 {
+    if let Some((bx, bw)) = wb_rect(&sh.wins, i) {
+        let hovered = mx_c >= bx && mx_c < bx + bw && my_c >= TASKBAR_Y + 5 &&
+                      my_c < TASKBAR_Y + TASKBAR_H - 5;
+        if hovered { sh.hover_wb = i as i32; }
+        let active = sh.focus == i && !sh.wins[i].minimized;
+        s.rect_fill(bx, TASKBAR_Y + 6, bx + bw, TASKBAR_Y + TASKBAR_H - 6,
+                    0xffffff,
+                    if active { 0x30 } else if hovered { 0x20 } else { 0x12 });
+        if active {
+            s.rect_fill(bx + 14, TASKBAR_Y + TASKBAR_H - 9, bx + bw - 14,
+                        TASKBAR_Y + TASKBAR_H - 7, 0x4f8dff, 255);
+        }
+        s.text(bx + 10, TASKBAR_Y + 12, sh.wins[i].title, 0xe8eefb,
+               if sh.wins[i].minimized { 0x90 } else { 0xf0 }, 1);
+    }
+}
+/* clock on the right: real wall time from the RTC (v0.44.0) */
+{
+    let hh = (clock_hhmm / 100) % 24;
+    let mm = clock_hhmm % 100;
+    let digits = [b'0' + (hh / 10) as u8, b'0' + (hh % 10) as u8,
+                  b':',
+                  b'0' + (mm / 10) as u8, b'0' + (mm % 10) as u8];
+    let chars = [digits[0] as char, digits[1] as char, digits[2] as char,
+                 digits[3] as char, digits[4] as char];
+    let mut x = SCREEN_W - 96;
+    for ch in chars.iter() {
+        x += s.char_ascii(x, TASKBAR_Y + 12, *ch, 0xd6e2f5, 0xd0, 1);
+    }
+}
+        let frame = &*core::ptr::addr_of!(FRAME);
+        save_taskbar(frame, wu);
+        unsafe {
+            TASKBAR_KEY = tb_key;
         }
     }
-    /* clock on the right: real wall time from the RTC (v0.44.0) */
-    {
-        let hh = (clock_hhmm / 100) % 24;
-        let mm = clock_hhmm % 100;
-        let digits = [b'0' + (hh / 10) as u8, b'0' + (hh % 10) as u8,
-                      b':',
-                      b'0' + (mm / 10) as u8, b'0' + (mm % 10) as u8];
-        let chars = [digits[0] as char, digits[1] as char, digits[2] as char,
-                     digits[3] as char, digits[4] as char];
-        let mut x = SCREEN_W - 96;
-        for ch in chars.iter() {
-            x += s.char_ascii(x, TASKBAR_Y + 12, *ch, 0xd6e2f5, 0xd0, 1);
-        }
-    }
-
     let t_bar = ticks() - t_bar0;
+    if sh.dragging {
+        let total = ticks() - t_frame0;
+        if sh.drag_frames_logged < 20 {
+            sh.drag_frames_logged += 1;
+            console_printf(b"[gui-shell] drag repaint %d ticks (copy %d win %d bar %d)\n\0".as_ptr(),
+                           total as i32, t_copy as i32, t_win as i32, t_bar as i32);
+        }
+    }
+
     // 6. start menu
     if sh.menu_open {
         s.rect_fill(MENU_X + 3, MENU_Y + 10, MENU_X + MENU_W + 3,
@@ -956,7 +1065,22 @@ pub unsafe fn shell_step(
     // 7. present the scene (no cursor in FRAME), then composite the cursor
     {
         let frame = &*core::ptr::addr_of!(FRAME);
-        blit_rect(frame, wu, fb, pitch_px as usize, (0, 0, SCREEN_W, SCREEN_H));
+        // v0.50.0: while dragging, only the window's old and new rectangles can
+        // differ from what is already on screen — present just those two.
+        if sh.dragging {
+            let w = sh.wins[sh.drag_idx];
+            let old_rect = (sh.drag_last_x - 20, sh.drag_last_y - 20,
+                            sh.drag_last_x + w.w + 40, sh.drag_last_y + w.h + 40);
+            let new_rect = (w.x - 20, w.y - 20, w.x + w.w + 40, w.y + w.h + 40);
+            blit_rect(frame, wu, fb, pitch_px as usize, old_rect);
+            blit_rect(frame, wu, fb, pitch_px as usize, new_rect);
+            sh.drag_last_x = w.x;
+            sh.drag_last_y = w.y;
+        } else {
+            blit_rect(frame, wu, fb, pitch_px as usize, (0, 0, SCREEN_W, SCREEN_H));
+            sh.drag_last_x = -1;
+            sh.drag_last_y = -1;
+        }
         draw_cursor(fb, pitch_px as usize, wu, hu, mx_c, my_c);
         unsafe {
             CUR_SEEN = true;
@@ -967,10 +1091,15 @@ pub unsafe fn shell_step(
         }
     }
 
+    /* v0.50.0: sampled checksum. The old loop hashed all 786k pixels after every
+     * repaint (~2-3 ticks = 20-30 ms) — a real cost inside a drag. Every 8th
+     * pixel is enough to tell frames apart for the idle-skip bookkeeping. */
     let mut hash: u32 = 0x811c9dc5;
-    for v in s.px.iter() {
-        hash ^= v & 0x00ff_ffff;
+    let mut k = 0usize;
+    while k < s.px.len() {
+        hash ^= s.px[k] & 0x00ff_ffff;
         hash = hash.wrapping_mul(0x0100_0193);
+        k += 8;
     }
     LAST_SUM = hash;
     hash
@@ -1098,6 +1227,50 @@ fn save_window_cache(scene: &[u32], stride: usize, slot: usize, w: &Win) {
     }
 }
 
+/// Cache key for the taskbar strip: everything that changes its pixels.
+fn taskbar_key(sh: &Shell, clock_hhmm: i32) -> i32 {
+    let mut k = clock_hhmm
+        .wrapping_mul(31)
+        .wrapping_add((sh.focus as i32).wrapping_mul(977))
+        .wrapping_add((sh.hover_wb + 1).wrapping_mul(131))
+        .wrapping_add((sh.hover_pin + 1).wrapping_mul(67));
+    for i in 0..4 {
+        let w = sh.wins[i];
+        k = k.wrapping_add((w.open as i32) * (7 + i as i32))
+             .wrapping_add((w.minimized as i32) * (101 + i as i32))
+             .wrapping_add((w.z & 0xff) * (13 + i as i32));
+    }
+    k
+}
+
+/// Blit the cached taskbar strip into the scene (returns false on a miss).
+fn blit_taskbar(scene: &mut [u32], stride: usize) -> bool {
+    if unsafe { TASKBAR_KEY } == i32::MIN {
+        return false;
+    }
+    let cache = unsafe { &*core::ptr::addr_of!(TASKBAR_CACHE) };
+    let y0 = TASKBAR_Y as usize;
+    let n = SCREEN_W as usize;
+    for row in 0..TB_H {
+        let d = (y0 + row) * stride;
+        let src = row * n;
+        scene[d..d + n].copy_from_slice(&cache[src..src + n]);
+    }
+    true
+}
+
+/// Save the just-rendered taskbar strip.
+fn save_taskbar(scene: &[u32], stride: usize) {
+    let cache = unsafe { &mut *core::ptr::addr_of_mut!(TASKBAR_CACHE) };
+    let y0 = TASKBAR_Y as usize;
+    let n = SCREEN_W as usize;
+    for row in 0..TB_H {
+        let s = (y0 + row) * stride;
+        let dst = row * n;
+        cache[dst..dst + n].copy_from_slice(&scene[s..s + n]);
+    }
+}
+
 fn draw_window(s: &mut Surface<'_>, w: &Win) {
     let t_all = ticks();
     /* two-layer soft shadow: plain rect fills (no AA, no sqrt) */
@@ -1148,7 +1321,7 @@ fn draw_window(s: &mut Surface<'_>, w: &Win) {
     s.rect_fill(w.x + 16, cy, w.x + w.w - 16, cy + 56, 0xffffff, 0x12);
     s.text(w.x + 28, cy + 12, "圆角 + 轻亚克力 + 微透叠层", 0xcfe0ff, 0xc0, 1);
     s.text(w.x + 28, cy + 32, "窗口可拖动 / 最小化 / 最大化", 0x9fb2cc, 0xb0, 1);
-    s.text(w.x + 18, (w.y + w.h - 26) as i32, "窗口管理原型 v0.49", 0x8fa3bd, 0x90, 1);
+    s.text(w.x + 18, (w.y + w.h - 26) as i32, "窗口管理原型 v0.50", 0x8fa3bd, 0x90, 1);
     unsafe {
         let d = &mut *core::ptr::addr_of_mut!(WSPLIT);
         d.0 += t_shadow;

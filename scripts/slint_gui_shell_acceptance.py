@@ -261,6 +261,14 @@ def main():
             pos[0] += dx
         release()
         check('drag ends', wait_for('[gui-shell] drag end', 40))
+        check('drag reuses the window layer instead of re-rasterising',
+              '[gui-shell] drag: reusing window layer' in log_text(),
+              'log line "[gui-shell] drag: reusing window layer"')
+        _drag = [int(v) for v in re.findall(r'drag repaint (\d+) ticks', log_text())]
+        _steady = _drag[1:]          # the first frame still builds caches
+        check('drag repaint stays under 12 ticks (120 ms)',
+              bool(_steady) and max(_steady) <= 12,
+              'drag repaint ticks: %s' % (_steady[:8],))
         DRAG_REGION = (620, 150, 720, 280)      # wallpaper before, window after
         dragged = dump_until('drag', lambda px: mean_brightness(px, *DRAG_REGION) > 90)
         if base is not None and dragged is not None:
