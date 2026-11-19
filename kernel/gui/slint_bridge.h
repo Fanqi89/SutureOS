@@ -32,4 +32,20 @@ int slint_gui_render_frame(void);
 /* 1 when the Rust GUI object is linked into this image. */
 int slint_gui_linked(void);
 
+/* ---- glyph access for the Rust renderer (v0.38.0 text support) ----
+ * The kernel already owns two bitmap fonts; the Rust rasteriser must draw with
+ * the SAME assets rather than ship a second copy (and the CJK blob is 238 KiB):
+ *
+ *   slint_bridge_ascii(ch, out)   font8x16 (ASCII 32..126), 16 bytes, 8x16,
+ *                                one byte per row, MSB = leftmost pixel.
+ *   slint_bridge_cjk(cp, out)     cjk16 (GB2312 subset), 32 bytes, 16x16,
+ *                                two bytes per row, MSB = leftmost pixel.
+ *
+ * Both return 1 on success, 0 when the codepoint is not covered. */
+int slint_bridge_ascii(uint32_t ch, uint8_t *out16);
+int slint_bridge_cjk(uint32_t codepoint, uint8_t *out32);
+
+/* 1 when the CJK blob was initialised and has glyphs. */
+int slint_bridge_cjk_ready(void);
+
 #endif

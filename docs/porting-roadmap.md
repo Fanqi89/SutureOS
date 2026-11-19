@@ -80,4 +80,5 @@
 | B21 | v0.35.0-alpha | **数据持久化**（PERSIST 双向镜像、开机恢复、关机落盘） | SutureOS 自有（GPL-3.0） | 三阶段 **32/32**（宿主解析 + 重启后 su bob） | ✅ 本轮完成 |
 | B22 | v0.36.0-alpha | **系统升级（只做覆盖）** | SutureOS 自有 | 四阶段 **11/11**（装 v0.35 → 升级 → 宿主 kernel 逐字节 → 无 ISO 启动 0.36） | ✅ 本轮完成 |
 | B23 | v0.36.0-alpha | **Rust 系统层第一步**（no_std staticlib 链接进内核 + 开机自检） | Rust（core） | `[rust] core v10000 linked, selftest=... PASS` | ✅ 完成 |
-| B24 | v0.37.0-alpha | **GUI 重做第一步**：新风格第一帧原型（Rust 软光栅器）合入主仓 + `--gc-sections` | SutureOS 自有 | 帧缓冲像素 **13/13**、kernel 4.96MB→3.36MB、C 桌面回归 9/9 | ✅ 完成 |
+| B24 | v0.37.0 / v0.38.0 | **GUI 重做**：新风格第一帧原型（Rust 软光栅器）→ 文字（GB2312+ASCII） | SutureOS 自有 | 像素 13/13 → **18/18**（字形精确匹配）；kernel 4.96MB→3.36MB | ✅ 已完成两步，下一步真亚克力/输入/动效 |
+| B25 | 待做 | **真亚克力**（静态模糊壁纸 + 面板区离屏 box-blur）、输入事件、动效、窗口管理迁移 | SutureOS 自有 | 待实现 | ⏳ |

@@ -92,6 +92,93 @@ def luminance(rgb):
     return 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
 
 
+
+# ---------------------------------------------------------------------------
+# Text checks (v0.38.0): the renderer draws with the kernel's own bitmap fonts,
+# so acceptance reads the GB2312 blob embedded at build time and pixel-matches
+# whole glyphs at the exact pen positions mirrored from
+# rust/suture-gui/src/lib.rs (keep the two in sync).
+# ---------------------------------------------------------------------------
+CJK_BLOB = os.path.join(ROOT, 'build', 'font_cjk.bin')
+
+TITLE_X, TITLE_Y = 262, 200
+SUBTITLE_X, SUBTITLE_Y = 262, 246
+ROW1_X, ROW1_Y = 166, 396
+CARD_X, CARD_Y = 786, 548
+TITLE_FG = (0xff, 0xff, 0xff)
+SUB_FG = (0xcf, 0xe0, 0xff)
+ROW_FG = (0xe8, 0xee, 0xfb)
+
+
+def load_cjk_glyphs():
+    with open(CJK_BLOB, 'rb') as fh:
+        blob = fh.read()
+    if blob[:4] != b'SFCJ':
+        raise RuntimeError('font blob magic missing')
+    count = int.from_bytes(blob[4:8], 'little')
+    table = {}
+    off = 8
+    for _ in range(count):
+        cp = int.from_bytes(blob[off:off + 4], 'little')
+        table[cp] = blob[off + 4:off + 36]
+        off += 36
+    return table
+
+
+def glyph_matches(img, glyph, x, y, fg, scale, tol=6):
+    """Every set bit must be `fg` at its scaled position, and at least 60% of
+    the unset bits must NOT be fg - i.e. the glyph is really there and is not
+    just a solid block."""
+    px = img.load()
+    w, h = img.size
+    hit = miss = clear_ok = clear_total = 0
+    for r in range(16):
+        row = (glyph[r * 2] << 8) | glyph[r * 2 + 1]
+        for c in range(16):
+            bit = (row >> (15 - c)) & 1
+            for dy in range(scale):
+                for dx in range(scale):
+                    sx, sy = x + c * scale + dx, y + r * scale + dy
+                    if sx < 0 or sy < 0 or sx >= w or sy >= h:
+                        continue
+                    p = px[sx, sy]
+                    is_fg = all(abs(p[i] - fg[i]) <= tol for i in range(3))
+                    if bit:
+                        if is_fg:
+                            hit += 1
+                        else:
+                            miss += 1
+                    else:
+                        clear_total += 1
+                        if not is_fg:
+                            clear_ok += 1
+    if hit == 0:
+        return False, 'no foreground pixels'
+    ok = (miss <= max(2, hit // 50)) and (clear_total == 0 or
+                                          clear_ok >= clear_total * 0.6)
+    return ok, 'hit=%d miss=%d clear_ok=%d/%d' % (hit, miss, clear_ok, clear_total)
+
+
+def text_checks(img, check):
+    glyphs = load_cjk_glyphs()
+    check('cjk blob loaded (kernel GB2312 font)', len(glyphs) > 7000,
+          '%d glyphs' % len(glyphs))
+
+    # title "SutureOS 设置": 9 ASCII cells (10 px * scale 2) precede the first CJK
+    ok, detail = glyph_matches(img, glyphs[0x8BBE], TITLE_X + 9 * 10 * 2, TITLE_Y,
+                               TITLE_FG, 2)
+    check('title draws the CJK glyph 设 (scale 2) exactly', ok, detail)
+
+    ok, detail = glyph_matches(img, glyphs[0x5706], SUBTITLE_X, SUBTITLE_Y, SUB_FG, 1)
+    check('subtitle draws the CJK glyph 圆 (scale 1) exactly', ok, detail)
+
+    ok, detail = glyph_matches(img, glyphs[0x8D26], ROW1_X, ROW1_Y, ROW_FG, 1)
+    check('list row draws the CJK glyph 账 (scale 1) exactly', ok, detail)
+
+    ok, detail = glyph_matches(img, glyphs[0x4E2A], CARD_X, CARD_Y, ROW_FG, 1)
+    check('card draws the CJK glyph 个 (scale 1) exactly', ok, detail)
+
+
 def main():
     do_assert = '--no-assert' not in sys.argv
     log_abs = os.path.join(ROOT, SERIAL)
@@ -259,6 +346,12 @@ def main():
     check('pseudo-3D icon highlight is brighter than the panel behind it',
           max(rows) > luminance(edge_ref) + 20,
           'icon max %.1f vs panel %.1f' % (max(rows), luminance(edge_ref)))
+
+    # ---- (5) text: whole glyphs pixel-matched against the embedded font ----
+    try:
+        text_checks(im, check)
+    except Exception as exc:                       # noqa: BLE001
+        check('text checks', False, repr(exc))
 
     passed = sum(1 for _, ok, _ in checks if ok)
     failed = len(checks) - passed

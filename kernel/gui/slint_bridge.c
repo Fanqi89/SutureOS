@@ -40,6 +40,38 @@ __attribute__((weak)) uint32_t suture_gui_frames(void) { return 0; }
 
 int slint_gui_linked(void) { return suture_gui_version() != 0; }
 
+/* ---- glyph access (v0.38.0) -------------------------------------------------
+ * font8x16 lives in kernel/drivers/font.c, the CJK blob in kernel/term/cjk16.c.
+ * Both are the assets the terminal/C desktop already render with, so the new
+ * renderer stays visually consistent with them and adds no font data to the
+ * image. The Rust side copies the glyph bytes into its own buffer and does the
+ * alpha blending (it needs sub-pixel coverage for its own text alpha). */
+extern const uint8_t font8x16[95 * 16];
+extern const uint8_t *cjk16_lookup(uint32_t codepoint);
+extern int cjk16_init(void);
+extern int cjk16_count(void);
+
+int slint_bridge_ascii(uint32_t ch, uint8_t *out16) {
+    if (!out16 || ch < 32 || ch > 126) return 0;
+    const uint8_t *glyph = font8x16 + (ch - 32) * 16;
+    for (int i = 0; i < 16; i++) out16[i] = glyph[i];
+    return 1;
+}
+
+int slint_bridge_cjk(uint32_t codepoint, uint8_t *out32) {
+    if (!out32) return 0;
+    if (cjk16_count() == 0) (void)cjk16_init();
+    const uint8_t *glyph = cjk16_lookup(codepoint);
+    if (!glyph) return 0;
+    for (int i = 0; i < 32; i++) out32[i] = glyph[i];
+    return 1;
+}
+
+int slint_bridge_cjk_ready(void) {
+    if (cjk16_count() == 0) (void)cjk16_init();
+    return cjk16_count() > 0 ? 1 : 0;
+}
+
 int slint_gui_render_frame(void) {
     if (!slint_gui_linked()) {
         console_printf("[gui-slint] not linked (install the Rust toolchain + "

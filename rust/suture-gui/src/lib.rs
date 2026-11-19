@@ -70,6 +70,18 @@ const ICON_S: f32 = 72.0;
 const ICON1_X: f32 = PANEL_X + 28.0;
 const ICON1_Y: f32 = PANEL_Y + 28.0;
 const ICON2_X: f32 = CARD_X + 69.0;
+
+/* Text layout (v0.38.0). scripts/slint_gui_acceptance.py mirrors these exact
+ * numbers to pixel-match the glyphs, so keep the two in sync. */
+const TITLE_X: i32 = 262;                 /* PANEL_X + 112 */
+const TITLE_Y: i32 = 200;                 /* PANEL_Y + 30  */
+const SUBTITLE_X: i32 = 262;
+const SUBTITLE_Y: i32 = 246;              /* PANEL_Y + 76  */
+const ROW_TEXT_DX: i32 = 166;             /* PANEL_X + 28 + 16 (= lx + 16) */
+const ROW1_Y: i32 = 396;                  /* PANEL_Y + 220 + 7  */
+const ROW2_Y: i32 = 434;                  /* + 38               */
+const CARD_TEXT_X: i32 = 786;             /* CARD_X + 26        */
+const CARD_TEXT_Y: i32 = 548;             /* CARD_Y + 128       */
 const ICON2_Y: f32 = CARD_Y + 40.0;
 
 /// Draw the whole prototype frame into the framebuffer.
@@ -143,9 +155,18 @@ pub fn draw_scene(s: &mut Surface) {
     }
     s.round_rect_stroke(CARD_X, CARD_Y, CARD_X + CARD_W, CARD_Y + CARD_H, CARD_R, 0xffffff, 0x3a);
     s.icon(ICON2_X, ICON2_Y, ICON_S);
-    // two text-placeholder bars
-    s.round_rect(CARD_X + 40.0, CARD_Y + 132.0, CARD_X + 170.0, CARD_Y + 142.0, 5.0, 0xffffff, 0x7a);
-    s.round_rect(CARD_X + 55.0, CARD_Y + 152.0, CARD_X + 155.0, CARD_Y + 160.0, 4.0, 0xffffff, 0x4a);
+    // the card's copy is real text now (see the text block below), so the
+    // placeholder bars that used to sit here were removed.
+
+    // 10. text (v0.38.0): ASCII from font8x16, Chinese from the kernel's GB2312
+    //     16x16 blob, both fetched through the C bridge (no second font copy).
+    //     Headings use alpha 255 so acceptance can pixel-match the glyphs.
+    s.text(TITLE_X, TITLE_Y, "SutureOS 设置", 0xffffff, 255, 2);
+    s.text(SUBTITLE_X, SUBTITLE_Y, "圆角 + 轻亚克力 + 微透叠层", 0xcfe0ff, 255, 1);
+    s.text(ROW_TEXT_DX, ROW1_Y, "账户与登录", 0xe8eefb, 255, 1);
+    s.text(ROW_TEXT_DX, ROW2_Y, "显示与外观", 0xe8eefb, 255, 1);
+    s.text(CARD_TEXT_X, CARD_TEXT_Y, "个性化", 0xe8eefb, 255, 1);
+    s.text(CARD_TEXT_X, CARD_TEXT_Y + 26, "控制面板", 0x9fb2cc, 255, 1);
 }
 
 /// FNV-1a over the framebuffer's RGB bits — the kernel prints this so "a frame
@@ -166,7 +187,7 @@ fn checksum(px: &[u32]) -> u32 {
 /// Non-zero when the Rust GUI object is really linked into the image.
 #[no_mangle]
 pub extern "C" fn suture_gui_version() -> u32 {
-    0x0002_0000 // v2 = hand-written rasteriser (v1 was the Slint build)
+    0x0003_0000 // v3 = hand-written rasteriser + text (v1 = Slint build, v2 = shapes only)
 }
 
 /// Which renderer backs this build: 2 = hand-written rasteriser, 1 = Slint.

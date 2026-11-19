@@ -352,3 +352,119 @@ impl<'a> Surface<'a> {
         );
     }
 }
+
+// ===========================================================================
+// Text (v0.38.0)
+// ---------------------------------------------------------------------------
+// The kernel already carries two bitmap fonts and the new renderer draws with
+// the SAME assets instead of shipping a second copy (the GB2312 blob is 238 KiB):
+//
+//   * ASCII 32..126 -> font8x16  (8x16, one byte per row, MSB = left pixel)
+//   * GB2312 subset -> cjk16     (16x16, two bytes per row, MSB = left pixel)
+//
+// Both are fetched through kernel/gui/slint_bridge.c. Alpha 255 is used for
+// headings so acceptance can pixel-match the glyphs exactly; lower alphas are
+// blended over whatever is behind the text.
+extern "C" {
+    fn slint_bridge_ascii(ch: u32, out: *mut u8) -> i32;
+    fn slint_bridge_cjk(codepoint: u32, out: *mut u8) -> i32;
+}
+
+/// Advance of one ASCII cell at `scale` (glyph width + 2 px side bearing).
+#[inline]
+pub fn advance_ascii(scale: i32) -> i32 {
+    10 * scale
+}
+
+/// Advance of one wide (CJK) cell at `scale`.
+#[inline]
+pub fn advance_cjk(scale: i32) -> i32 {
+    18 * scale
+}
+
+impl<'a> Surface<'a> {
+    /// Blit a 1-bit glyph mask scaled by `scale` (nearest neighbour), blended
+    /// with `alpha` over the destination.
+    fn glyph_mask(&mut self, x: i32, y: i32, w: i32, h: i32, rows: &[u8],
+                  row_bytes: usize, fg: u32, alpha: u32, scale: i32) {
+        for r in 0..h {
+            for c in 0..w {
+                let byte = rows[(r as usize) * row_bytes + (c as usize) / 8];
+                let bit = (byte >> (7 - (c % 8))) & 1;
+                if bit == 0 {
+                    continue;
+                }
+                for dy in 0..scale {
+                    for dx in 0..scale {
+                        let px = x + c * scale + dx;
+                        let py = y + r * scale + dy;
+                        if px >= 0 && py >= 0 {
+                            self.blend_px(px as usize, py as usize, fg, alpha);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Draw one ASCII character; returns the advance in pixels (0 if unsupported).
+    pub fn char_ascii(&mut self, x: i32, y: i32, ch: char, fg: u32, alpha: u32,
+                      scale: i32) -> i32 {
+        let mut g = [0u8; 16];
+        let ok = unsafe { slint_bridge_ascii(ch as u32, g.as_mut_ptr()) };
+        if ok == 0 {
+            return advance_ascii(scale);
+        }
+        self.glyph_mask(x, y, 8, 16, &g, 1, fg, alpha, scale);
+        advance_ascii(scale)
+    }
+
+    /// Draw one wide (CJK) character; returns the advance in pixels.
+    pub fn char_cjk(&mut self, x: i32, y: i32, cp: u32, fg: u32, alpha: u32,
+                    scale: i32) -> i32 {
+        let mut g = [0u8; 32];
+        let ok = unsafe { slint_bridge_cjk(cp, g.as_mut_ptr()) };
+        if ok == 0 {
+            return advance_cjk(scale);
+        }
+        self.glyph_mask(x, y, 16, 16, &g, 2, fg, alpha, scale);
+        advance_cjk(scale)
+    }
+
+    /// Draw a UTF-8 string (ASCII + GB2312 CJK). Returns the total advance.
+    pub fn text(&mut self, x: i32, y: i32, text: &str, fg: u32, alpha: u32,
+                scale: i32) -> i32 {
+        let mut pen = x;
+        let bytes = text.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            let (cp, len) = if b < 0x80 {
+                (b as u32, 1)
+            } else if b & 0xE0 == 0xC0 && i + 1 < bytes.len() {
+                ((((b & 0x1F) as u32) << 6) | ((bytes[i + 1] & 0x3F) as u32), 2)
+            } else if b & 0xF0 == 0xE0 && i + 2 < bytes.len() {
+                ((((b & 0x0F) as u32) << 12)
+                    | (((bytes[i + 1] & 0x3F) as u32) << 6)
+                    | ((bytes[i + 2] & 0x3F) as u32), 3)
+            } else if b & 0xF8 == 0xF0 && i + 3 < bytes.len() {
+                ((((b & 0x07) as u32) << 18)
+                    | (((bytes[i + 1] & 0x3F) as u32) << 12)
+                    | (((bytes[i + 2] & 0x3F) as u32) << 6)
+                    | ((bytes[i + 3] & 0x3F) as u32), 4)
+            } else {
+                (b as u32, 1)
+            };
+            i += len;
+            if cp < 0x80 {
+                pen += self.char_ascii(pen, y, core::char::from_u32(cp).unwrap_or('?'),
+                                       fg, alpha, scale);
+            } else if self.char_cjk(pen, y, cp, fg, alpha, scale) == 0 {
+                pen += advance_cjk(scale);
+            } else {
+                pen += advance_cjk(scale);
+            }
+        }
+        pen
+    }
+}

@@ -6,6 +6,24 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.38.0-alpha]
+
+**新渲染器接上文字：中文（GB2312 16×16）与英文（8×16）驱动自内核既有字体资产，
+字形逐像素验收 18/18。**
+
+### Added
+- `rust/suture-gui/src/swrast.rs`：`text()`（UTF-8 解码、逐字符取字形、按 scale 最近邻放大、alpha 合成）。
+- `kernel/gui/slint_bridge.c/.h`：`slint_bridge_ascii/cjk/cjk_ready` 把 `font8x16` 与 cjk16 位图交给 Rust，
+  不做字体复制。
+- 样板场景文字：标题/副标题/两行列表/卡片两行；移除与文字重叠的占位条。
+
+### Verification
+- `scripts/slint_gui_acceptance.py` **18/18**：设 hit=232、圆 hit=83、账 hit=74、个 hit=25（miss 全 0），
+  原 13 项像素检查保持通过；C 桌面 9/9、外观门禁 0 像素、内核 13/14。
+
+### Limits
+- 仅 GB2312 + ASCII 32..126；最近邻放大；无换行/裁剪/排版；仍静态样板帧。
+
 ## [v0.37.0-alpha]
 
 **GUI 重做第一步：新风格第一帧原型合入主仓（Rust 软件光栅器）+ `--gc-sections` 减重。**
