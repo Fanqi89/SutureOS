@@ -615,17 +615,13 @@ int shell_cmd_guislint(int argc, char **argv) {
         return -1;
     }
 
-    /* Hold the frame so a screendump can capture it (bounded pause spin: the
-     * shell loop must never call sched_yield - double-scheduler bug). */
-    {
-        const uint64_t start = g_tick_count;
-        int done = 0;
-        while (!done && (g_tick_count - start) < 1000u) {   /* 1000 ticks = 10 s */
-            const int sc = mbos_kbd_poll();
-            if (sc >= 0 && (uint32_t)sc == 0x01u) done = 1;  /* ESC make code */
-            for (volatile int spin = 0; spin < 20000; spin++) { }
-        }
-    }
+    /* v0.40.0: hand over to the interactive loop (pointer hover, click ripple,
+     * fade-in). The static frame above is kept so deterministic pixel checks
+     * still have an exact image to compare against. ESC exits. */
+    extern int slint_gui_run_interactive(void);
+    (void)g_tick_count;
+    (void)mbos_kbd_poll;
+    (void)slint_gui_run_interactive();
 
     console_screen_enable(1);
     if (term_available()) term_clear();

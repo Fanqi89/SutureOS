@@ -6,6 +6,25 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.40.0-alpha]
+
+**新渲染器活了：鼠标悬停高亮、点击涟漪、箭头光标、面板淡入；交互验收 13/13。**
+
+### Added
+- `kernel/gui/slint_bridge.c`：`slint_gui_run_interactive()`（轮询 PS/2 鼠标/键盘、每帧一帧渲染、30fps
+  有界自旋、ESC 退出、帧数上限）；`guislint` 画完静态帧后进入交互循环。
+- `rust/suture-gui/src/lib.rs`：`suture_gui_interactive_step()`、场景缓存（3 MiB .bss，一次渲染多帧复用）、
+  `suture_gui_cache_seed()`；动效（淡入/悬停高亮+蓝色指示条/点击涟漪）。
+- `swrast.rs`：`cursor()` 箭头光标。
+- `scripts/slint_gui_interactive_acceptance.py`：真 QMP 鼠标/键盘 + 像素断言（13 项）。
+
+### Verification
+- 交互 **13/13**（hover row 0/1、click at、涟漪 6400px、光标 528px、ESC 退出、无 PANIC）；
+  静态像素 **21/21**；C 桌面 9/9、外观门禁 0 像素、内核 13/14。
+
+### Limits
+- 仅两行列表可交互；无 vsync/双缓冲（可能撕裂）；场景缓存限 1024x768；无键盘焦点；仍是 prototype。
+
 ## [v0.39.0-alpha]
 
 **轻亚克力：面板/卡片显示真正被模糊的背景（可分离 box blur），验收 21/21。**

@@ -573,3 +573,30 @@ pub fn acrylic_blur(s: &mut Surface<'_>, x0: i32, y0: i32, x1: i32, y1: i32,
         }
     }
 }
+
+/// Classic arrow cursor: white body with a dark outline so it stays readable on
+/// both light and dark acrylic. `(x,y)` is the hot spot (the arrow tip).
+pub fn cursor(s: &mut Surface<'_>, x: i32, y: i32) {
+    // width of each horizontal run of the arrow (tip at the top)
+    const RUNS: [i32; 17] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 8, 6, 5, 4, 3, 2, 1];
+    for (row, w) in RUNS.iter().enumerate() {
+        let yy = y + row as i32;
+        if yy < 0 || yy >= s.h as i32 {
+            continue;
+        }
+        for dx in -1..=(*w) {
+            let xx = x + dx;
+            if xx < 0 || xx >= s.w as i32 {
+                continue;
+            }
+            let inside = dx >= 0 && dx < *w;
+            let (px, py) = (xx as usize, yy as usize);
+            // outline: one pixel ring around the body
+            if inside {
+                s.put(px, py, 0xffffff);
+            } else if (xx as usize) < s.w && row > 0 && row < 16 {
+                s.put(px, py, 0x101418);
+            }
+        }
+    }
+}

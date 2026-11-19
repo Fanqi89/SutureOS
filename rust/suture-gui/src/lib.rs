@@ -84,12 +84,21 @@ const CARD_TEXT_X: i32 = 786;             /* CARD_X + 26        */
 const CARD_TEXT_Y: i32 = 548;             /* CARD_Y + 128       */
 const ICON2_Y: f32 = CARD_Y + 40.0;
 
-/// Draw the whole prototype frame into the framebuffer.
+/// Draw the whole prototype frame into the framebuffer (static prototype).
 ///
 /// `fb` is the linear framebuffer as u32 pixels (0x00RRGGBB); `stride` is the
 /// pitch in pixels (>= w). No allocation: everything is drawn in place.
 pub fn draw_scene(s: &mut Surface) {
+    draw_scene_ui(s, 1.0, -1, (0, 0, 0, 0));
+}
+
+/// Interactive variant: `fade` 0..1 ramps the panel in, `hover` is the list row
+/// under the pointer (-1 = none) and `ripple` is (x, y, age_ms, duration_ms) of
+/// the last click, drawn as an expanding translucent ring.
+pub fn draw_scene_ui(s: &mut Surface, fade: f32, hover: i32,
+                     ripple: (i32, i32, u32, u32)) {
     let (w, h) = (s.w as i32, s.h as i32);
+    let fa = |a: u32| -> u32 { ((a as f32) * fade) as u32 };
 
     // 1. wallpaper: 3-stop vertical gradient. A gradient on the window
     //    background is impossible in the Slint renderer (TODO there), which is
@@ -122,7 +131,7 @@ pub fn draw_scene(s: &mut Surface) {
         PANEL_Y + PANEL_H,
         PANEL_R,
         0xf4f8ff,
-        0x3a,
+        fa(0x3a),
     );
     s.round_rect_stroke(
         PANEL_X,
@@ -139,14 +148,20 @@ pub fn draw_scene(s: &mut Surface) {
 
     // 6. micro translucent layer stack (light acrylic; no blur yet).
     let (lx, ly, lw) = (PANEL_X + 28.0, PANEL_Y + 128.0, 504.0);
-    s.round_rect(lx, ly, lx + lw, ly + 74.0, 12.0, 0xffffff, 0x12);
-    s.round_rect(lx + 12.0, ly + 14.0, lx + lw - 12.0, ly + 60.0, 10.0, 0xffffff, 0x16);
-    s.round_rect(lx + 24.0, ly + 26.0, lx + lw - 24.0, ly + 48.0, 8.0, 0xffffff, 0x1c);
+    s.round_rect(lx, ly, lx + lw, ly + 74.0, 12.0, 0xffffff, fa(0x12));
+    s.round_rect(lx + 12.0, ly + 14.0, lx + lw - 12.0, ly + 60.0, 10.0, 0xffffff, fa(0x16));
+    s.round_rect(lx + 24.0, ly + 26.0, lx + lw - 24.0, ly + 48.0, 8.0, 0xffffff, fa(0x1c));
 
     // 7. two list rows.
     for row in 0..2 {
         let ry = PANEL_Y + 220.0 + row as f32 * 38.0;
-        s.round_rect(lx, ry, lx + lw, ry + 30.0, 9.0, 0xffffff, 0x10);
+        let hot = hover == row as i32;
+        s.round_rect(lx, ry, lx + lw, ry + 30.0, 9.0, 0xffffff,
+                     fa(if hot { 0x34 } else { 0x10 }));
+        if hot {
+            // left accent bar: the fluent focus/selection indicator
+            s.round_rect(lx + 4.0, ry + 6.0, lx + 7.0, ry + 24.0, 1.5, 0x4f8dff, 255);
+        }
     }
 
     // 8/9. secondary card: shadow + vertical translucent gradient + icon.
@@ -162,7 +177,7 @@ pub fn draw_scene(s: &mut Surface) {
             CARD_Y + row as f32 + 1.0,
             CARD_R,
             0xffffff,
-            a.min(255),
+            fa(a.min(255)),
         );
     }
     s.round_rect_stroke(CARD_X, CARD_Y, CARD_X + CARD_W, CARD_Y + CARD_H, CARD_R, 0xffffff, 0x3a);
@@ -179,6 +194,21 @@ pub fn draw_scene(s: &mut Surface) {
     s.text(ROW_TEXT_DX, ROW2_Y, "显示与外观", 0xe8eefb, 255, 1);
     s.text(CARD_TEXT_X, CARD_TEXT_Y, "个性化", 0xe8eefb, 255, 1);
     s.text(CARD_TEXT_X, CARD_TEXT_Y + 26, "控制面板", 0x9fb2cc, 255, 1);
+
+    // 11. click ripple (v0.40.0): expanding translucent ring, 450 ms
+    let (rx, ry, age, dur) = ripple;
+    if dur > 0 && age < dur {
+        let t = age as f32 / dur as f32;
+        let rad = 6.0 + t * 46.0;
+        let alpha = ((1.0 - t) * 0.42 * 255.0) as u32;
+        let steps = 180;
+        for i in 0..steps {
+            let ang = (i as f32) * 6.2831853 / steps as f32;
+            let px = rx as f32 + libm::cosf(ang) * rad;
+            let py = ry as f32 + libm::sinf(ang) * rad;
+            s.blend_px(px as usize, py as usize, 0x9fc4ff, alpha);
+        }
+    }
 }
 
 /// FNV-1a over the framebuffer's RGB bits — the kernel prints this so "a frame
@@ -210,6 +240,230 @@ pub extern "C" fn suture_gui_renderer() -> u32 {
     } else {
         2
     }
+}
+
+
+// ---------------------------------------------------------------------------
+// Static scene cache (v0.40.0)
+// ---------------------------------------------------------------------------
+// One full-scene render costs ~1.5 s in QEMU TCG (analytic anti-aliased rounded
+// rects + 4-layer shadows do a sqrt per pixel), which is far too slow to redraw
+// at 30 fps. The prototype scene is static though: wallpaper, blobs, acrylic
+// blur, panel, text never change between frames. So the scene is rendered ONCE
+// into this cache and each interactive frame composites the cache + the small
+// dynamic layers (hover highlight, click ripple, cursor).
+const CACHE_W: usize = 1024;
+const CACHE_H: usize = 768;
+static mut SCENE_CACHE: [u32; CACHE_W * CACHE_H] = [0; CACHE_W * CACHE_H];
+static mut SCENE_BUILT: bool = false;
+static mut SCENE_SUM: u32 = 0;
+
+/// Seed the interactive scene cache from an already-rendered framebuffer.
+///
+/// `guislint` draws the static frame first (slow: analytic AA + shadows cost a
+/// sqrt per pixel, ~seconds under TCG), so copying THAT image into the cache
+/// avoids rendering the same scene a second time before the loop can start.
+///
+/// # Safety
+/// `fb` must be a readable framebuffer of at least `pitch_px * h` u32 pixels.
+#[no_mangle]
+pub unsafe extern "C" fn suture_gui_cache_seed(
+    fb: *const u32,
+    w: i32,
+    h: i32,
+    pitch_px: i32,
+) -> u32 {
+    if fb.is_null() || w <= 0 || h <= 0 || pitch_px < w {
+        return 0;
+    }
+    let (wu, hu, pu) = (w as usize, h as usize, pitch_px as usize);
+    if wu > CACHE_W || hu > CACHE_H {
+        return 0;
+    }
+    let cache = &mut *core::ptr::addr_of_mut!(SCENE_CACHE);
+    let src = core::slice::from_raw_parts(fb, pu * hu);
+    for y in 0..hu {
+        cache[y * CACHE_W..y * CACHE_W + wu]
+            .copy_from_slice(&src[y * pu..y * pu + wu]);
+    }
+    SCENE_SUM = checksum(&cache[..CACHE_W * hu]);
+    SCENE_BUILT = true;
+    SCENE_SUM
+}
+
+unsafe fn ensure_scene_cache(w: usize, h: usize, stride: usize) -> bool {
+    if SCENE_BUILT {
+        return true;
+    }
+    if w > CACHE_W || h > CACHE_H {
+        return false;                    /* cache shape mismatch: caller falls back */
+    }
+    let cache = &mut *core::ptr::addr_of_mut!(SCENE_CACHE);
+    let mut cs = swrast::Surface { px: &mut cache[..], w, h, stride };
+    draw_scene(&mut cs);
+    SCENE_SUM = checksum(&cs.px[..stride * h]);
+    SCENE_BUILT = true;
+    true
+}
+
+// ---------------------------------------------------------------------------
+// Interactive mode (v0.40.0)
+// ---------------------------------------------------------------------------
+// The shell command `guislint` first renders the static frame (so the v0.39
+// pixel checks still run against a deterministic image) and then enters this
+// loop: the kernel polls PS/2 mouse + keyboard and calls us once per frame with
+// the pointer position, pressed buttons, click edges and a millisecond clock.
+// Everything animated here is a pure function of that clock, never of a hidden
+// timer, so a screenshot at time T is reproducible.
+struct UiState {
+    start_ms: u32,
+    hover: i32,
+    click_x: i32,
+    click_y: i32,
+    click_ms: u32,
+    have_click: bool,
+}
+
+static mut UI: UiState = UiState {
+    start_ms: 0,
+    hover: -1,
+    click_x: 0,
+    click_y: 0,
+    click_ms: 0,
+    have_click: false,
+};
+
+const FADE_MS: u32 = 450;
+const RIPPLE_MS: u32 = 450;
+
+fn log_i32(msg: &core::ffi::CStr, a: i32, b: i32) {
+    unsafe { console_printf(b"[gui-slint] %s %d %d\n\0".as_ptr(), msg.as_ptr(), a as i32, b as i32) };
+}
+
+/// One interactive frame. Returns the frame checksum (0 = nothing drawn).
+///
+/// # Safety
+/// `fb` must be a valid framebuffer of at least `pitch_px * h` u32 pixels.
+#[no_mangle]
+pub unsafe extern "C" fn suture_gui_interactive_step(
+    fb: *mut u32,
+    w: i32,
+    h: i32,
+    pitch_px: i32,
+    mx: i32,
+    my: i32,
+    buttons: i32,
+    click_x: i32,
+    click_y: i32,
+    click_btn: i32,
+    now_ms: u32,
+) -> u32 {
+    if fb.is_null() || w <= 0 || h <= 0 || pitch_px < w {
+        return 0;
+    }
+    let (wu, hu, pu) = (w as usize, h as usize, pitch_px as usize);
+    let mut s = Surface {
+        px: core::slice::from_raw_parts_mut(fb, pu * hu),
+        w: wu,
+        h: hu,
+        stride: pu,
+    };
+    let ui = &mut *core::ptr::addr_of_mut!(UI);
+    if ui.start_ms == 0 {
+        ui.start_ms = now_ms;
+        log0(c"interactive: start");
+    }
+    let elapsed = now_ms.wrapping_sub(ui.start_ms);
+
+    if !ensure_scene_cache(wu, hu, wu) {
+        /* framebuffer larger than the cache: honest slow path */
+        draw_scene_ui(&mut s, 1.0, -1, (0, 0, 0, 0));
+        swrast::cursor(&mut s, mx.clamp(0, w - 1), my.clamp(0, h - 1));
+        return checksum(s.px);
+    }
+    log0(c"scene cached");
+
+    // 1. composite the static scene (fade-in during the first FADE_MS)
+    let cache = &*core::ptr::addr_of!(SCENE_CACHE);
+    if elapsed < FADE_MS {
+        let a = ((elapsed as f32 / FADE_MS as f32) * 255.0) as u32;
+        for y in 0..hu {
+            let dst = y * pu;
+            let src = y * CACHE_W;
+            for x in 0..wu {
+                let c = cache[src + x];
+                let r = (((c >> 16) & 0xff) * a) / 255;
+                let g = (((c >> 8) & 0xff) * a) / 255;
+                let bl = ((c & 0xff) * a) / 255;
+                s.px[dst + x] = (r << 16) | (g << 8) | bl;
+            }
+        }
+    } else {
+        for y in 0..hu {
+            let dst = y * pu;
+            let src = y * CACHE_W;
+            s.px[dst..dst + wu].copy_from_slice(&cache[src..src + wu]);
+        }
+    }
+
+    // 2. hover highlight for the list rows (the cache holds the idle look)
+    let row0_y = (PANEL_Y as i32) + 220;
+    let row1_y = row0_y + 38;
+    let row_x0 = (PANEL_X as i32) + 28;
+    let row_x1 = row_x0 + 504;
+    let mut hover: i32 = -1;
+    if mx >= row_x0 && mx < row_x1 {
+        if my >= row0_y && my < row0_y + 30 {
+            hover = 0;
+        } else if my >= row1_y && my < row1_y + 30 {
+            hover = 1;
+        }
+    }
+    if hover != ui.hover {
+        ui.hover = hover;
+        log_i32(c"hover row", hover, my);
+    }
+    for row in 0..2 {
+        let ry = row0_y + row * 38;
+        let hot = hover == row;
+        s.round_rect(row_x0 as f32, ry as f32, row_x1 as f32, (ry + 30) as f32, 9.0,
+                     0xffffff, if hot { 0x34 } else { 0x00 });
+        if hot {
+            s.round_rect((row_x0 + 4) as f32, (ry + 6) as f32,
+                         (row_x0 + 7) as f32, (ry + 24) as f32, 1.5, 0x4f8dff, 255);
+        }
+    }
+
+    // 3. click edge -> ripple + log
+    if click_x >= 0 && click_y >= 0 {
+        ui.click_x = click_x;
+        ui.click_y = click_y;
+        ui.click_ms = now_ms;
+        ui.have_click = true;
+        log_i32(c"click at", click_x, click_y);
+        let _ = (click_btn, buttons);
+    }
+    if ui.have_click {
+        let age = now_ms.wrapping_sub(ui.click_ms);
+        if age < RIPPLE_MS {
+            let t = age as f32 / RIPPLE_MS as f32;
+            let rad = 6.0 + t * 46.0;
+            let alpha = ((1.0 - t) * 0.42 * 255.0) as u32;
+            let steps = 180;
+            for i in 0..steps {
+                let ang = (i as f32) * 6.2831853 / steps as f32;
+                let px = ui.click_x as f32 + libm::cosf(ang) * rad;
+                let py = ui.click_y as f32 + libm::sinf(ang) * rad;
+                if px >= 0.0 && py >= 0.0 {
+                    s.blend_px(px as usize, py as usize, 0x9fc4ff, alpha);
+                }
+            }
+        }
+    }
+
+    // 4. cursor on top
+    swrast::cursor(&mut s, mx.clamp(0, w - 1), my.clamp(0, h - 1));
+    checksum(s.px)
 }
 
 /// Draw one static frame straight into the linear framebuffer.

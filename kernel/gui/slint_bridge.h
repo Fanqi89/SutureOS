@@ -29,6 +29,11 @@
  *   -4 the renderer produced no pixels. */
 int slint_gui_render_frame(void);
 
+/* Interactive prototype (v0.40.0): draws frames in a loop while the pointer /
+ * keyboard move, until ESC. Returns 0 on a clean exit, negative on failure
+ * (same codes as slint_gui_render_frame). */
+int slint_gui_run_interactive(void);
+
 /* 1 when the Rust GUI object is linked into this image. */
 int slint_gui_linked(void);
 

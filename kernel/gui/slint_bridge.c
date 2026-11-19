@@ -25,6 +25,11 @@ extern uint32_t suture_gui_version(void);
 extern uint32_t suture_gui_selftest_render(uint32_t *fb, int32_t w, int32_t h,
                                            int32_t pitch_px);
 extern uint32_t suture_gui_frames(void);
+extern uint32_t suture_gui_interactive_step(uint32_t *fb, int32_t w, int32_t h,
+                                            int32_t pitch_px, int32_t mx,
+                                            int32_t my, int32_t buttons,
+                                            int32_t click_x, int32_t click_y,
+                                            int32_t click_btn, uint32_t now_ms);
 
 /* Weak fallbacks: overridden by the Rust staticlib when it is linked in. */
 __attribute__((weak)) uint32_t suture_gui_version(void) { return 0; }
@@ -37,6 +42,16 @@ __attribute__((weak)) uint32_t suture_gui_selftest_render(uint32_t *fb, int32_t 
     return 0;
 }
 __attribute__((weak)) uint32_t suture_gui_frames(void) { return 0; }
+__attribute__((weak)) uint32_t suture_gui_interactive_step(uint32_t *fb, int32_t w,
+                                                           int32_t h, int32_t pitch,
+                                                           int32_t mx, int32_t my,
+                                                           int32_t buttons, int32_t cx,
+                                                           int32_t cy, int32_t cb,
+                                                           uint32_t now) {
+    (void)fb; (void)w; (void)h; (void)pitch; (void)mx; (void)my;
+    (void)buttons; (void)cx; (void)cy; (void)cb; (void)now;
+    return 0;
+}
 
 int slint_gui_linked(void) { return suture_gui_version() != 0; }
 
@@ -99,9 +114,99 @@ int slint_gui_render_frame(void) {
 
     const uint32_t sum = suture_gui_selftest_render((uint32_t *)(uintptr_t)limine_fb_addr,
                                                    (int32_t)w, (int32_t)h, (int32_t)pitch_px);
+    /* v0.40.0: hand the just-rendered static image to the interactive loop as
+     * its scene cache, so the loop starts immediately instead of re-rendering
+     * the same scene (the analytic AA/shadow pass is seconds under TCG). */
+    {
+        extern uint32_t suture_gui_cache_seed(const uint32_t *fb, int32_t w,
+                                              int32_t h, int32_t pitch_px);
+        (void)suture_gui_cache_seed((const uint32_t *)(uintptr_t)limine_fb_addr,
+                                    (int32_t)w, (int32_t)h, (int32_t)pitch_px);
+    }
     console_printf("[gui-slint] frame rendered %llux%llu checksum=%llx frames=%llu %s\n",
                    (uint64_t)w, (uint64_t)h, (uint64_t)sum,
                    (uint64_t)suture_gui_frames(), sum ? "OK" : "EMPTY");
     if (!sum) return -4;
+    return 0;
+}
+
+/* ===========================================================================
+ * Interactive prototype (v0.40.0)
+ * ---------------------------------------------------------------------------
+ * The shell command `guislint` renders the static frame first (that keeps the
+ * deterministic v0.39 pixel acceptance intact) and then calls this loop. It is
+ * the smallest honest "live GUI" step: PS/2 mouse + keyboard are polled by the
+ * kernel, one Rust frame is drawn per iteration, ESC leaves.
+ *
+ * Constraints that must stay: no sched_yield() (double-scheduler bug), bounded
+ * pause spin for pacing, bounded lifetime as a safety net for automated runs.
+ * =========================================================================== */
+int slint_gui_run_interactive(void)
+{
+    extern int mbos_mouse_present(void);
+    extern void mbos_mouse_poll(void);
+    extern int mbos_mouse_x(void), mbos_mouse_y(void), mbos_mouse_buttons(void);
+    extern int mbos_mouse_take_click(int *, int *, int *);
+    extern void mbos_mouse_move_to(int x, int y);
+    extern int mbos_kbd_poll(void);
+    extern volatile uint64_t g_tick_count;
+
+    if (!slint_gui_linked()) return -1;
+    if (!limine_fb_addr || !limine_fb_width || !limine_fb_height) return -2;
+    if (limine_fb_bpp != 32) return -3;
+    const uint32_t w = (uint32_t)limine_fb_width;
+    const uint32_t h = (uint32_t)limine_fb_height;
+    const uint32_t pitch_px = (uint32_t)(limine_fb_pitch / 4u);
+    if (pitch_px < w) return -3;
+    uint32_t *fb = (uint32_t *)(uintptr_t)limine_fb_addr;
+
+    const int mouse = mbos_mouse_present();
+    if (mouse) mbos_mouse_move_to((int)w / 2, (int)h / 2);
+    console_printf("[gui-slint] interactive: loop (mouse=%d), ESC exits\n", mouse);
+
+    const uint64_t start = g_tick_count;
+    int frames = 0;
+    int quit = 0;
+    while (!quit) {
+        /* frame-based safety net: automated runs (and a lost ESC) cannot hang
+         * the box. The tick rate differs per build, so count frames instead. */
+        if (frames > 1800) break;
+
+        if (mouse) mbos_mouse_poll();
+        int mx = mouse ? mbos_mouse_x() : (int)w / 2;
+        int my = mouse ? mbos_mouse_y() : (int)h / 2;
+        if (mx < 0) mx = 0;
+        if (my < 0) my = 0;
+        if (mx >= (int)w) mx = (int)w - 1;
+        if (my >= (int)h) my = (int)h - 1;
+        const int buttons = mouse ? mbos_mouse_buttons() : 0;
+
+        int cx = -1, cy = -1, cb = 0;
+        if (mouse) (void)mbos_mouse_take_click(&cx, &cy, &cb);
+
+        /* keyboard: ESC (make code 0x01) leaves; drain everything else */
+        int sc;
+        while ((sc = mbos_kbd_poll()) >= 0) {
+            if ((uint32_t)sc == 0x01u) quit = 1;
+        }
+
+        const uint32_t now_ms = (uint32_t)((g_tick_count - start) * 10u);
+        (void)suture_gui_interactive_step(fb, (int32_t)w, (int32_t)h,
+                                          (int32_t)pitch_px, mx, my, buttons,
+                                          cx, cy, cb, now_ms);
+        frames++;
+        if ((frames % 120) == 0) {
+            console_printf("[gui-slint] frame %d ms=%u pointer=%d,%d\n",
+                           frames, now_ms, mx, my);
+        }
+
+        /* ~30 fps: bounded pause spin waiting for 3 ticks (100 Hz tick) */
+        const uint64_t t0 = g_tick_count;
+        while ((g_tick_count - t0) < 3u) {
+            for (volatile int spin = 0; spin < 4000; spin++) { }
+        }
+    }
+    console_printf("[gui-slint] interactive: exit after %d frames%s\n", frames,
+                   quit ? "" : " (timeout)");
     return 0;
 }
