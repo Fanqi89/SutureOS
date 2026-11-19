@@ -29,6 +29,8 @@ const MENU_H: i32 = 236;
 const MENU_X: i32 = 12;
 const MENU_Y: i32 = TASKBAR_Y - MENU_H - 8;
 
+const WIN_BODY: &str = "SutureOS 桌面外壳";
+
 const SMALL_W: usize = 256;
 const SMALL_H: usize = 192;
 
@@ -58,9 +60,17 @@ const fn win1() -> Win {
     Win { x: 470, y: 300, w: 400, h: 260, nx: 470, ny: 300, nw: 400, nh: 260,
           minimized: false, maximized: false, z: 2, title: "任务管理器", accent: 0x22c1a8, open: true }
 }
+const fn win2() -> Win {
+    Win { x: 210, y: 430, w: 360, h: 240, nx: 210, ny: 430, nw: 360, nh: 240,
+          minimized: false, maximized: false, z: 3, title: "图片查看器", accent: 0xf5a524, open: false }
+}
+const fn win3() -> Win {
+    Win { x: 560, y: 180, w: 330, h: 230, nx: 560, ny: 180, nw: 330, nh: 230,
+          minimized: false, maximized: false, z: 4, title: "文本编辑器", accent: 0xe05a8a, open: false }
+}
 
 struct Shell {
-    wins: [Win; 2],
+    wins: [Win; 4],
     focus: usize,
     menu_open: bool,
     dragging: bool,
@@ -85,7 +95,7 @@ struct Shell {
 }
 
 static mut SHELL: Shell = Shell {
-    wins: [win0(), win1()],
+    wins: [win0(), win1(), win2(), win3()],
     focus: 1,
     menu_open: false,
     dragging: false,
@@ -118,6 +128,9 @@ static mut FRAME: [u32; (SCREEN_W as usize) * (SCREEN_H as usize)] =
 static mut XMAP: [u16; SCREEN_W as usize] = [0; SCREEN_W as usize];
 static mut YMAP: [u16; SCREEN_H as usize] = [0; SCREEN_H as usize];
 static mut CACHED: bool = false;
+static mut LAST_STATE: [i32; 20] = [-1; 20];
+static mut LAST_SUM: u32 = 0;
+static mut IDLE_FRAMES: u32 = 0;
 
 extern "C" {
     fn console_printf(fmt: *const u8, ...) -> i32;
@@ -245,7 +258,7 @@ fn control_rect(w: &Win) -> (i32, i32, i32, i32) {
 }
 
 /// (x, w) of the taskbar window button `i`, or None when hidden.
-fn wb_rect(wins: &[Win; 2], i: usize) -> Option<(i32, i32)> {
+fn wb_rect(wins: &[Win; 4], i: usize) -> Option<(i32, i32)> {
     let mut x = 118;
     for k in 0..i {
         if wins[k].open { x += 96 + 8; }
@@ -254,7 +267,29 @@ fn wb_rect(wins: &[Win; 2], i: usize) -> Option<(i32, i32)> {
     Some((x, 96))
 }
 
-fn hit_win(wins: &[Win; 2], mx: i32, my: i32) -> i32 {
+const MENU_ITEMS: [&str; 4] =
+    ["系统设置", "任务管理器", "图片查看器", "文本编辑器"];
+
+/// Z above every window: the shell only has 4, so a counter is enough.
+fn next_z(sh: &Shell) -> i32 {
+    let mut m = 0;
+    for w in sh.wins.iter() {
+        if w.z > m { m = w.z; }
+    }
+    m + 1
+}
+
+/// First visible (open, not minimised) window other than `skip`.
+fn next_visible(sh: &Shell, skip: usize) -> Option<usize> {
+    for (i, w) in sh.wins.iter().enumerate() {
+        if i != skip && w.open && !w.minimized {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn hit_win(wins: &[Win; 4], mx: i32, my: i32) -> i32 {
     let mut best = -1;
     let mut bestz = -1;
     for (i, w) in wins.iter().enumerate() {
@@ -339,7 +374,23 @@ pub unsafe fn shell_step(
         if sh.menu_open {
             if cx >= MENU_X && cx < MENU_X + MENU_W && cy >= MENU_Y && cy < MENU_Y + MENU_H {
                 clicked_in_menu = true;
-                /* menu rows are display-only in this slice */
+                /* menu rows launch / focus the matching window (v0.42.0) */
+                for k in 0..MENU_ITEMS.len() {
+                    let ry = MENU_Y + 46 + k as i32 * 44;
+                    if cx >= MENU_X + 10 && cx < MENU_X + MENU_W - 10 &&
+                       cy >= ry && cy < ry + 38 {
+                        let idx = k;
+                        if !sh.wins[idx].open {
+                            sh.wins[idx].open = true;
+                            sh.wins[idx].minimized = false;
+                        }
+                        sh.wins[idx].minimized = false;
+                        sh.wins[idx].z = next_z(sh);
+                        sh.focus = idx;
+                        sh.menu_open = false;
+                        log2(c"menu launch", idx as i32, 0);
+                    }
+                }
             } else {
                 sh.menu_open = false;
                 log0(c"menu closed");
@@ -354,7 +405,7 @@ pub unsafe fn shell_step(
             } else {
                 /* taskbar window buttons */
                 let mut handled = false;
-                for i in 0..2 {
+                for i in 0..4 {
                     if let Some((bx, bw)) = wb_rect(&sh.wins, i) {
                         if cx >= bx && cx < bx + bw && cy >= TASKBAR_Y + 5 &&
                            cy < TASKBAR_Y + TASKBAR_H - 5 {
@@ -387,19 +438,18 @@ pub unsafe fn shell_step(
                                 }
                                 sh.wins[i].minimized = false;
                                 sh.focus = i;
-                                sh.wins[i].z = sh.wins[1 - i].z + 1;
+                                sh.wins[i].z = next_z(sh);
                             } else if is_focus {
                                 sh.wins[i].minimized = true;
                                 log2(c"minimize", i as i32, 0);
                                 /* focus the other visible window */
-                                let other = 1 - i;
-                                if sh.wins[other].open && !sh.wins[other].minimized {
+                                if let Some(other) = next_visible(sh, i) {
                                     sh.focus = other;
                                 }
                             } else {
                                 sh.wins[i].minimized = false;
                                 sh.focus = i;
-                                sh.wins[i].z = sh.wins[1 - i].z + 1;
+                                sh.wins[i].z = next_z(sh);
                                 log2(c"restore focus", i as i32, 0);
                             }
                         }
@@ -437,21 +487,19 @@ pub unsafe fn shell_step(
                             } else if idx == 0 {
                                 sh.wins[hw as usize].minimized = true;
                                 log2(c"minimize", hw, 0);
-                                let other = if hw == 0 { 1 } else { 0 };
-                                if sh.wins[other].open && !sh.wins[other].minimized {
+                                if let Some(other) = next_visible(sh, hw as usize) {
                                     sh.focus = other;
                                 }
                             } else {
                                 sh.wins[hw as usize].open = false;
                                 log2(c"close", hw, 0);
-                                let other = if hw == 0 { 1 } else { 0 };
-                                if sh.wins[other].open && !sh.wins[other].minimized {
+                                if let Some(other) = next_visible(sh, hw as usize) {
                                     sh.focus = other;
                                 }
                             }
                         } else if cy >= wref.y && cy < wref.y + TITLE_H {
                             /* focus + begin drag */
-                            sh.wins[hw as usize].z = sh.wins[1 - hw as usize].z + 1;
+                            sh.wins[hw as usize].z = next_z(sh);
                             sh.focus = hw as usize;
                             sh.dragging = true;
                             sh.drag_idx = hw as usize;
@@ -459,7 +507,7 @@ pub unsafe fn shell_step(
                             sh.drag_dy = cy - wref.y;
                             log2(c"drag begin", hw, cx);
                         } else {
-                            sh.wins[hw as usize].z = sh.wins[1 - hw as usize].z + 1;
+                            sh.wins[hw as usize].z = next_z(sh);
                             sh.focus = hw as usize;
                             log2(c"focus", hw, 0);
                         }
@@ -487,10 +535,50 @@ pub unsafe fn shell_step(
         }
     }
 
+    // 0. idle skip (v0.42.0): if nothing that affects the picture changed (no
+    // pointer move, no click, no drag, no open ripple), do not repaint at all.
+    // At ~2 fps a full repaint is expensive, and re-rendering identical pixels
+    // buys nothing.
+    let mut st = [0i32; 20];
+    st[0] = mx_c;
+    st[1] = my_c;
+    st[2] = buttons;
+    st[3] = click_x;
+    st[4] = click_y;
+    st[5] = sh.dragging as i32;
+    st[6] = sh.menu_open as i32;
+    st[7] = sh.focus as i32;
+    st[8] = sh.dragging as i32;
+    for i in 0..4 {
+        let w = sh.wins[i];
+        st[9 + i * 2] = w.x ^ (w.y << 10) ^ (w.w << 20) ^ (w.open as i32);
+        st[10 + i * 2] = (w.minimized as i32) | ((w.maximized as i32) << 1) |
+                         ((w.z & 0xff) << 8);
+    }
+    let last = unsafe { &*core::ptr::addr_of!(LAST_STATE) };
+    if *last == st {
+        IDLE_FRAMES += 1;
+        if IDLE_FRAMES == 1 {
+            log0(c"idle: frame skipped (nothing changed)");
+        }
+        return LAST_SUM;
+    }
+    unsafe {
+        let l = &mut *core::ptr::addr_of_mut!(LAST_STATE);
+        *l = st;
+        IDLE_FRAMES = 0;
+    }
+
     // 4. draw windows bottom-up
     let t_win0 = ticks();
-    let mut order = [0usize, 1];
-    if sh.wins[0].z > sh.wins[1].z { order = [1, 0]; }
+    let mut order = [0usize, 1, 2, 3];
+    for a in 0..3 {
+        for b in (a + 1)..4 {
+            if sh.wins[order[b]].z < sh.wins[order[a]].z {
+                order.swap(a, b);
+            }
+        }
+    }
     for &i in order.iter() {
         let win = sh.wins[i];
         if !win.open || win.minimized {
@@ -517,7 +605,7 @@ pub unsafe fn shell_step(
 
     /* window buttons */
     sh.hover_wb = -1;
-    for i in 0..2 {
+    for i in 0..4 {
         if let Some((bx, bw)) = wb_rect(&sh.wins, i) {
             let hovered = mx_c >= bx && mx_c < bx + bw && my_c >= TASKBAR_Y + 5 &&
                           my_c < TASKBAR_Y + TASKBAR_H - 5;
@@ -552,7 +640,7 @@ pub unsafe fn shell_step(
         s.rect_fill(MENU_X + MENU_W - 1, MENU_Y + 10, MENU_X + MENU_W,
                     MENU_Y + MENU_H - 10, 0xffffff, 0x3c);
         s.text(MENU_X + 18, MENU_Y + 16, "常用应用", 0xffffff, 0xf0, 1);
-        let items = ["系统设置", "任务管理器", "图片查看器", "文本编辑器"];
+        let items = MENU_ITEMS;
         for (k, name) in items.iter().enumerate() {
             let y = MENU_Y + 46 + k as i32 * 44;
             let hovered = mx_c >= MENU_X + 10 && mx_c < MENU_X + MENU_W - 10 &&
@@ -597,6 +685,7 @@ pub unsafe fn shell_step(
         hash ^= v & 0x00ff_ffff;
         hash = hash.wrapping_mul(0x0100_0193);
     }
+    LAST_SUM = hash;
     hash
 }
 
@@ -642,10 +731,10 @@ fn draw_window(s: &mut Surface<'_>, w: &Win) {
     }
 
     /* body content: a couple of text lines + a small translucent card */
-    s.text(w.x + 18, w.y + TITLE_H + 16, "SutureOS 桌面外壳", 0xdfe7f5, 0xb0, 1);
+    s.text(w.x + 18, w.y + TITLE_H + 16, WIN_BODY, 0xdfe7f5, 0xb0, 1);
     let cy = w.y + TITLE_H + 44;
     s.rect_fill(w.x + 16, cy, w.x + w.w - 16, cy + 56, 0xffffff, 0x12);
     s.text(w.x + 28, cy + 12, "圆角 + 轻亚克力 + 微透叠层", 0xcfe0ff, 0xc0, 1);
     s.text(w.x + 28, cy + 32, "窗口可拖动 / 最小化 / 最大化", 0x9fb2cc, 0xb0, 1);
-    s.text(w.x + 18, (w.y + w.h - 26) as i32, "窗口管理原型 v0.41", 0x8fa3bd, 0x90, 1);
+    s.text(w.x + 18, (w.y + w.h - 26) as i32, "窗口管理原型 v0.42", 0x8fa3bd, 0x90, 1);
 }

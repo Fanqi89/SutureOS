@@ -41,6 +41,10 @@ START_BTN = (8, TASKBAR_Y + 5, 34, 28)
 WB0 = (118, 96)                 # first taskbar window button (x, w)
 WB1 = (222, 96)                 # second one
 MENU = (12, TASKBAR_Y - 236 - 8, 300, 236)
+MENU_ITEM0_Y = MENU[1] + 46
+MENU_ITEM_H = 44
+WIN2 = (210, 430, 360, 240)      # 图片查看器 (opened from the start menu)
+WIN3 = (560, 180, 330, 230)      # 文本编辑器
 
 
 class Qmp:
@@ -285,6 +289,13 @@ def main():
             check('taskbar still on top of the maximised window',
                   maximised.load()[512, TASKBAR_Y + 10] != maximised.load()[512, TASKBAR_Y - 6])
 
+        # double click the same taskbar button again -> restore the normal size
+        move_to(WB1[0] + WB1[1] // 2, TASKBAR_Y + 18)
+        fast_click()
+        fast_click()
+        check('double click again restored the maximised window',
+              wait_for('[gui-shell] restore 1', 60))
+
         # ---- (5) start menu ---------------------------------------------------
         move_to(START_BTN[0] + START_BTN[2] // 2, START_BTN[1] + START_BTN[3] // 2)
         click()
@@ -298,6 +309,44 @@ def main():
                   'menu mean %.1f' % mean_brightness(menu.load(), MENU[0] + 20,
                                                      MENU[1] + 40, MENU[0] + 200,
                                                      MENU[1] + 120))
+
+        # ---- (6) start menu launches a real window (v0.42.0) -------------------
+        # menu is open from the previous step; click "图片查看器" (third row)
+        move_to(MENU[0] + 80, MENU_ITEM0_Y + 2 * MENU_ITEM_H + 19)
+        click()
+        check('menu item launches its app window', wait_for('[gui-shell] menu launch 2', 60))
+        CLOSE_REGION = (WIN2[0] + 30, WIN2[1] + 60, WIN2[0] + 200, WIN2[1] + 180)
+        win2 = dump_until('win2', lambda px: mean_brightness(px, *CLOSE_REGION) > 80)
+        if win2 is not None:
+            check('launched window is painted on the desktop',
+                  mean_brightness(win2.load(), WIN2[0] + 30, WIN2[1] + 60,
+                                  WIN2[0] + 250, WIN2[1] + 180) > 75,
+                  'mean %.1f' % mean_brightness(win2.load(), WIN2[0] + 30, WIN2[1] + 60,
+                                                WIN2[0] + 250, WIN2[1] + 180))
+            check('menu closed after launching', 'menu closed' in log_text() or
+                  '[gui-shell] menu launch 2' in log_text())
+
+        # ---- (7) close button removes the window ------------------------------
+        # close is the third title-bar control: bx = x + w - 77, each 22 wide + 4 gap
+        close_x = WIN2[0] + WIN2[2] - 77 + 2 * 26 + 11
+        close_y = WIN2[1] + 4 + 11
+        move_to(close_x, close_y)
+        click()
+        check('close button closes the window', wait_for('[gui-shell] close 2', 60))
+        closed = dump_until('closed', lambda px: mean_brightness(px, WIN2[0] + 30, WIN2[1] + 60,
+                                                                 WIN2[0] + 250, WIN2[1] + 180) < 80)
+        if closed is not None:
+            check('closed window is gone from the desktop',
+                  mean_brightness(closed.load(), WIN2[0] + 30, WIN2[1] + 60,
+                                  WIN2[0] + 250, WIN2[1] + 180) < 85,
+                  'mean %.1f' % mean_brightness(closed.load(), WIN2[0] + 30, WIN2[1] + 60,
+                                                WIN2[0] + 250, WIN2[1] + 180))
+
+        # ---- (8) idle frames are skipped (no useless repaints) -----------------
+        time.sleep(2.5)
+        idle_ok = wait_for('[gui-shell] idle: frame skipped', 20)
+        check('idle frames skip the repaint', idle_ok,
+              'log line "[gui-shell] idle: frame skipped (nothing changed)"' if idle_ok else 'no idle log')
 
         # ---- (6) exit ---------------------------------------------------------
         key('esc')

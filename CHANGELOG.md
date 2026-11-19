@@ -6,6 +6,22 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.42.0-alpha]
+
+**桌面外壳可用：4 个窗口、开始菜单启动应用、关闭按钮、空闲跳帧；验收 30/30。**
+
+### Added
+- `rust/suture-gui/src/shell.rs`：窗口 2→4；菜单行启动/恢复/聚焦窗口；关闭按钮（任务栏按钮消失、焦点移交）；
+  z 序排序；空闲跳帧（状态指纹不变即跳过整帧）；页脚版本 v0.42。
+- `scripts/slint_gui_shell_acceptance.py`：扩到 30 项（菜单启动、关闭、空闲跳帧、取消最大化）。
+
+### Verification
+- 外壳 **30/30**（启动窗口亮度 124.6、关闭后 0.0、idle 跳帧日志、双击最大化/还原、ESC 退出、无 PANIC）；
+  回归：静态 21/21、交互 13/13、C 桌面 9/9、外观 0 像素、内核 13/14。
+
+### Limits
+- 交互时整屏重绘（~2 fps，脏矩形未做）；菜单启动窗口内容占位；关闭无确认；无过渡动画。
+
 ## [v0.41.0-alpha]
 
 **新渲染器接管桌面外壳：两个窗口 + 任务栏（开始/窗口按钮/时钟）+ 开始菜单；拖动、最小化/恢复、
