@@ -58,7 +58,8 @@ def main():
         ('unmap B succeeds', 'ok   unmap B succeeds'),
     ]
     checks = [('syscalls: socketpair + poll + memfd registered',
-               'AF_UNIX socketpair + poll + memfd registered (4)' in log)]
+               any(int(n) >= 4 for n in
+                   re.findall(r'AF_UNIX socketpair[^\n]*registered \((\d+)\)', log)))]
     checks += [(name, needle in log) for name, needle in want]
     checks.append(('no failed check', fail == 0 and ok >= 14, 'ok=%d fail=%d' % (ok, fail)))
     checks.append(('shmtest reports PASS', 'shmtest: PASS' in log))

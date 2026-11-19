@@ -10,6 +10,7 @@
 #include "el0_validate.h"
 #include "syscall.h"
 #include "../ipc/unix_socket.h"
+#include "../ipc/scm_fd.h"
 #include "mmu.h"
 #include "heap.h"
 
@@ -857,6 +858,9 @@ static uint64_t sys_unix_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_
 }
 
 /* Called from kmain after syscalls2_register(). */
+static uint64_t sys_unix_sendmsg(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+static uint64_t sys_unix_recvmsg(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+
 int syscall_unix_register(void)
 {
     extern uint64_t sys_memfd_create(uint64_t, uint64_t, uint64_t, uint64_t,
@@ -866,6 +870,138 @@ int syscall_unix_register(void)
     syscall_register(7, sys_unix_poll);          /* poll(2) */
     syscall_register(53, sys_unix_socketpair);   /* socketpair(AF_UNIX) */
     syscall_register(319, sys_memfd_create);     /* memfd_create */
+    syscall_register(46, sys_unix_sendmsg);      /* sendmsg (SCM_RIGHTS) */
+    syscall_register(47, sys_unix_recvmsg);      /* recvmsg (SCM_RIGHTS) */
     syscall_register(9, sys_mmap);               /* mmap (re-registered for MAP_SHARED) */
-    return 4;
+    return 6;
+}
+
+/* ---- v0.55.0: sendmsg/recvmsg with SCM_RIGHTS (Wayland prerequisite 3) ------
+ * x86_64 msghdr layout: name(8) namelen(4+4) iov(8) iovlen(8) control(8)
+ * controllen(8) flags(4+4) = 56 bytes. We accept at most 8 iovecs and 4 KiB of
+ * data, and at most 4 passed descriptors per call. */
+struct iovec_abi { uint64_t base; uint64_t len; };
+struct msghdr_abi {
+    uint64_t name; uint32_t namelen; uint32_t pad0;
+    uint64_t iov; uint64_t iovlen;
+    uint64_t control; uint64_t controllen;
+    uint32_t flags; uint32_t pad1;
+};
+struct cmsghdr_abi { uint64_t len; int32_t level; int32_t type; };
+
+static uint64_t sys_unix_sendmsg(uint64_t fd, uint64_t msg_ptr, uint64_t flags,
+                                 uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    struct msghdr_abi mh;
+    struct iovec_abi iov[8];
+    uint8_t buf[4096];
+    uint64_t total = 0;
+    uint32_t n;
+
+    (void)flags; (void)a4; (void)a5; (void)a6;
+    if (msg_ptr == 0) return (uint64_t)(int64_t)-22;
+    EL0_CHECK(msg_ptr, sizeof mh);
+    memcpy(&mh, (const void *)(uintptr_t)msg_ptr, sizeof mh);
+    n = (uint32_t)mh.iovlen;
+    if (n == 0 || n > 8 || mh.iov == 0) return (uint64_t)(int64_t)-22;
+    EL0_CHECK(mh.iov, (uint64_t)n * sizeof iov[0]);
+    memcpy(iov, (const void *)(uintptr_t)mh.iov, (uint64_t)n * sizeof iov[0]);
+
+    for (uint32_t i = 0; i < n && total < sizeof buf; i++) {
+        uint64_t len = iov[i].len;
+        if (len > sizeof buf - total) len = sizeof buf - total;
+        if (len == 0) continue;
+        EL0_CHECK(iov[i].base, len);
+        memcpy(buf + total, (const void *)(uintptr_t)iov[i].base, len);
+        total += len;
+    }
+    if (total > 0) {
+        const int w = unix_is_fd((int)fd) ? unix_write_fd((int)fd, buf, (uint32_t)total)
+                                          : -22;
+        if (w < 0) return (uint64_t)(int64_t)w;
+    }
+    /* ancillary data: walk the control buffer looking for SCM_RIGHTS */
+    if (mh.control != 0 && mh.controllen >= 16) {
+        uint32_t off = 0;
+        EL0_CHECK(mh.control, mh.controllen);
+        while (off + 16 <= mh.controllen) {
+            struct cmsghdr_abi ch;
+            memcpy(&ch, (const void *)(uintptr_t)(mh.control + off), sizeof ch);
+            if (ch.len < 16 || off + ch.len > mh.controllen) break;
+            if (ch.level == SCM_SOL_SOCKET_ && ch.type == SCM_RIGHTS_) {
+                const uint32_t nfd = (uint32_t)((ch.len - 16) / 4);
+                int fds[4];
+                if (nfd > 4) return (uint64_t)(int64_t)-22;
+                memcpy(fds, (const void *)(uintptr_t)(mh.control + off + 16),
+                       (uint64_t)nfd * 4);
+                {
+                    const int r = unix_send_fds((int)fd, fds, (int)nfd);
+                    if (r < 0) return (uint64_t)(int64_t)r;
+                }
+            }
+            off += (uint32_t)((ch.len + 7) & ~7ull);
+        }
+    }
+    return total;
+}
+
+static uint64_t sys_unix_recvmsg(uint64_t fd, uint64_t msg_ptr, uint64_t flags,
+                                 uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    struct msghdr_abi mh;
+    struct iovec_abi iov[8];
+    uint8_t buf[4096];
+    uint32_t n;
+    int got;
+
+    (void)flags; (void)a4; (void)a5; (void)a6;
+    if (msg_ptr == 0 || !unix_is_fd((int)fd)) return (uint64_t)(int64_t)-22;
+    EL0_CHECK(msg_ptr, sizeof mh);
+    memcpy(&mh, (const void *)(uintptr_t)msg_ptr, sizeof mh);
+    n = (uint32_t)mh.iovlen;
+    if (n == 0 || n > 8 || mh.iov == 0) return (uint64_t)(int64_t)-22;
+    EL0_CHECK(mh.iov, (uint64_t)n * sizeof iov[0]);
+    memcpy(iov, (const void *)(uintptr_t)mh.iov, (uint64_t)n * sizeof iov[0]);
+
+    got = unix_read_fd((int)fd, buf, sizeof buf);
+    if (got < 0) return (uint64_t)(int64_t)got;
+
+    {
+        uint64_t left = (uint64_t)got;
+        uint64_t off = 0;
+        for (uint32_t i = 0; i < n && left > 0; i++) {
+            uint64_t len = iov[i].len;
+            if (len > left) len = left;
+            if (len == 0) continue;
+            EL0_CHECK(iov[i].base, len);
+            memcpy((void *)(uintptr_t)iov[i].base, buf + off, len);
+            off += len;
+            left -= len;
+            iov[i].len = len;
+        }
+        EL0_CHECK(mh.iov, (uint64_t)n * sizeof iov[0]);
+        memcpy((void *)(uintptr_t)mh.iov, iov, (uint64_t)n * sizeof iov[0]);
+    }
+
+    /* hand any queued descriptors over in a SCM_RIGHTS cmsg */
+    if (mh.control != 0 && mh.controllen >= 16) {
+        int fds[4];
+        const int nfd = unix_recv_fds((int)fd, fds, 4);
+        if (nfd > 0) {
+            struct cmsghdr_abi ch;
+            const uint64_t clen = 16 + (uint64_t)nfd * 4;
+            ch.len = clen;
+            ch.level = SCM_SOL_SOCKET_;
+            ch.type = SCM_RIGHTS_;
+            EL0_CHECK(mh.control, clen);
+            memcpy((void *)(uintptr_t)mh.control, &ch, sizeof ch);
+            memcpy((void *)(uintptr_t)(mh.control + 16), fds, (uint64_t)nfd * 4);
+            mh.controllen = (uint32_t)((clen + 7) & ~7ull);
+        } else {
+            mh.controllen = 0;
+        }
+        EL0_CHECK(msg_ptr, sizeof mh);
+        memcpy((void *)(uintptr_t)msg_ptr, &mh, sizeof mh);
+    }
+    return (uint64_t)(int64_t)got;
 }

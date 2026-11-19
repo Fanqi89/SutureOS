@@ -6,6 +6,23 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.55.0-alpha]
+
+**Wayland 第三块前置：SCM_RIGHTS（socket 上传 fd，验收 21/21）——四个内核前置至此全部落地。**
+
+### Added
+- `kernel/ipc/scm_fd.c/.h`：描述符队列 + `scmfd_selftest`。
+- `kernel/syscall/syscalls.c`：`sendmsg`(46)/`recvmsg`(47)，解析/回填 SCM_RIGHTS cmsg。
+- `kernel/shell/shell.c`：`fdpass` 命令；`scripts/fdpass_acceptance.py` 宿主验收。
+
+### Verification
+- `fdpass_acceptance` **21/21**；`unix_acceptance` 18/18、`shm_acceptance` 18/18；
+  回归：外壳 42/42、静态 21/21、交互 13/13、C 桌面 9/9、FAT32 宿主 20/20、内核 13/14。
+
+### Limits
+- 描述符沿用编码号、无 refcount、VFS fd 不能传；sendmsg 数据/iovec/fd 数量上限；
+  用户态 ftruncate(memfd) 未接线；自检在 ring 0；ring-3 夹具、最小 wl server、替换 C 桌面未开始。
+
 ## [v0.54.0-alpha]
 
 **Wayland 第二块前置：memfd + MAP_SHARED（共享内存自检 18/18）。**

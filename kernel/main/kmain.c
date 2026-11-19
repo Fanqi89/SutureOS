@@ -411,7 +411,7 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
             {
                 extern int syscall_unix_register(void);
                 const int un = syscall_unix_register();
-                console_printf("[syscall] AF_UNIX socketpair + poll + memfd registered (%d)\n", un);
+                console_printf("[syscall] AF_UNIX socketpair + poll + memfd + SCM_RIGHTS registered (%d)\n", un);
             }
             (void)rtc_selftest();
         }

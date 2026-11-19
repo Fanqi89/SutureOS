@@ -42,8 +42,8 @@ def main():
 
     checks = [
         ('syscalls 7 (poll) + 53 (socketpair) registered',
-         ('AF_UNIX socketpair + poll registered (2)' in log) or
-         ('AF_UNIX socketpair + poll + memfd registered (4)' in log)),
+         any(int(n) >= 2 for n in
+             re.findall(r'AF_UNIX socketpair[^\n]*registered \((\d+)\)', log))),
         ('unixtest command reached the kernel',
          '[unix] socketpair selftest' in log),
         ('socketpair() creates a pair', 'ok   socketpair() creates a pair' in log),

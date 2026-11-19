@@ -98,4 +98,5 @@
 | B39 | v0.52.0 | **过渡动画**：菜单 2 帧淡入 + 最大化/还原 3 帧淡入；拖动锚点固定 | SutureOS 自有 | 外壳 **42/42**、拖动 4–9 ticks | ✅ 完成 |
 | B40 | v0.53.0 | **AF_UNIX socketpair + poll(2)**（Wayland 第一块前置） | SutureOS 自有 | `unix_acceptance` **18/18**、内核自检 15 项 | ✅ 完成 |
 | B41 | v0.54.0 | **memfd + MAP_SHARED**（Wayland 第二块前置） | SutureOS 自有 | `shm_acceptance` **18/18**、内核自检 16 项 | ✅ 完成 |
-| B42 | 待做 | Wayland 前置收尾：**SCM_RIGHTS**（sendmsg/recvmsg 传 fd）、用户态 ftruncate(memfd)、ring-3 socketpair/shm 夹具；然后最小 wl server（wl_compositor/wl_shm/wl_seat）；最后替换 C 桌面 startgui | SutureOS 自有 | 待实现 | ⏳ |
+| B42 | v0.55.0 | **SCM_RIGHTS**（sendmsg/recvmsg 传 fd）——Wayland 四大内核前置齐 | SutureOS 自有 | `fdpass_acceptance` **21/21** | ✅ 完成 |
+| B43 | 待做 | **最小 wl server**（wl_compositor/wl_shm/wl_seat）+ ring-3 夹具；用户态 ftruncate(memfd)；最后用新外壳替换 C 桌面 `startgui` 并重建 GUI 外观基线 | SutureOS 自有 | 待实现 | ⏳ |
