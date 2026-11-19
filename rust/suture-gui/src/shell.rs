@@ -51,23 +51,28 @@ struct Win {
     title: &'static str,
     accent: u32,
     open: bool,
+    /* v0.51.0: where the frosted acrylic samples the blurred wallpaper. Window
+     * layers are rendered at their HOME anchor with this offset, so a layer can be
+     * blitted anywhere without re-rasterising (compositor semantics). */
+    sox: i32,
+    soy: i32,
 }
 
 const fn win0() -> Win {
     Win { x: 150, y: 120, w: 430, h: 300, nx: 150, ny: 120, nw: 430, nh: 300,
-          minimized: false, maximized: false, z: 1, title: "系统设置", accent: 0x4f8dff, open: true }
+          minimized: false, maximized: false, z: 1, title: "系统设置", accent: 0x4f8dff, open: true, sox: 0, soy: 0 }
 }
 const fn win1() -> Win {
     Win { x: 470, y: 300, w: 400, h: 260, nx: 470, ny: 300, nw: 400, nh: 260,
-          minimized: false, maximized: false, z: 2, title: "任务管理器", accent: 0x22c1a8, open: true }
+          minimized: false, maximized: false, z: 2, title: "任务管理器", accent: 0x22c1a8, open: true, sox: 0, soy: 0 }
 }
 const fn win2() -> Win {
     Win { x: 210, y: 430, w: 360, h: 240, nx: 210, ny: 430, nw: 360, nh: 240,
-          minimized: false, maximized: false, z: 3, title: "图片查看器", accent: 0xf5a524, open: false }
+          minimized: false, maximized: false, z: 3, title: "图片查看器", accent: 0xf5a524, open: false, sox: 0, soy: 0 }
 }
 const fn win3() -> Win {
     Win { x: 560, y: 180, w: 330, h: 230, nx: 560, ny: 180, nw: 330, nh: 230,
-          minimized: false, maximized: false, z: 4, title: "文本编辑器", accent: 0xe05a8a, open: false }
+          minimized: false, maximized: false, z: 4, title: "文本编辑器", accent: 0xe05a8a, open: false, sox: 0, soy: 0 }
 }
 
 struct Shell {
@@ -297,6 +302,14 @@ fn small_sample(x: i32, y: i32) -> u32 {
 /// sampled directly (no per-frame blur) plus a translucent white tint.
 fn frosted(s: &mut Surface<'_>, x0: i32, y0: i32, x1: i32, y1: i32, r: f32,
            tint_alpha: u32) {
+    frosted_at(s, x0, y0, x1, y1, r, tint_alpha, 0, 0);
+}
+
+/// `frosted` with an explicit wallpaper sampling anchor `(x + sx, y + sy)`.
+/// A window layer is rendered at its home anchor and later blitted anywhere, so
+/// the sample offset is what keeps the acrylic look stable while dragging.
+fn frosted_at(s: &mut Surface<'_>, x0: i32, y0: i32, x1: i32, y1: i32, r: f32,
+              tint_alpha: u32, sx: i32, sy: i32) {
     // v0.47.0: the interior (full coverage) is an INTEGER-only loop. It used to
     // evaluate f32 comparisons per pixel; on this target every f32 op is a soft
     // float call (compiler_builtins), which made a 430x300 window cost ~250 ms.
@@ -321,19 +334,19 @@ fn frosted(s: &mut Surface<'_>, x0: i32, y0: i32, x1: i32, y1: i32, r: f32,
             let li = xs.max(in_x0.min(xe));
             let ri_end = xe.min(in_x1.max(xs));
             for x in xs..li {
-                frost_edge_px(s, row, x, y, x0, y0, x1, y1, ri, tint_alpha);
+                frost_edge_px(s, row, x, y, x0, y0, x1, y1, ri, tint_alpha, sx, sy);
             }
             for x in li..ri_end {
-                let base = small_sample(x, y);
+                let base = small_sample(x + sx, y + sy);
                 let c = blend_px_raw(base, 0xffffff, tint_alpha);
                 s.px[row + x as usize] = c & 0x00ff_ffff;
             }
             for x in ri_end..xe {
-                frost_edge_px(s, row, x, y, x0, y0, x1, y1, ri, tint_alpha);
+                frost_edge_px(s, row, x, y, x0, y0, x1, y1, ri, tint_alpha, sx, sy);
             }
         } else {
             for x in xs..xe {
-                frost_edge_px(s, row, x, y, x0, y0, x1, y1, ri, tint_alpha);
+                frost_edge_px(s, row, x, y, x0, y0, x1, y1, ri, tint_alpha, sx, sy);
             }
         }
     }
@@ -343,7 +356,8 @@ fn frosted(s: &mut Surface<'_>, x0: i32, y0: i32, x1: i32, y1: i32, r: f32,
 /// per pixel). `ri` is the corner radius in pixels.
 #[inline]
 fn frost_edge_px(s: &mut Surface<'_>, row: usize, x: i32, y: i32,
-                 x0: i32, y0: i32, x1: i32, y1: i32, ri: i32, tint_alpha: u32) {
+                 x0: i32, y0: i32, x1: i32, y1: i32, ri: i32, tint_alpha: u32,
+                 sx: i32, sy: i32) {
     // distance (in whole pixels) from the inner rect, clamped into the LUT
     let dx = if x < x0 + ri {
         x0 + ri - x
@@ -364,7 +378,7 @@ fn frost_edge_px(s: &mut Surface<'_>, row: usize, x: i32, y: i32,
     if cov255 == 0 {
         return;
     }
-    let base = small_sample(x, y);
+    let base = small_sample(x + sx, y + sy);
     let i = y as usize * s.stride + x as usize;
     let dst = s.px[i] & 0x00ff_ffff;
     let c = blend_px_raw(base, 0xffffff, tint_alpha * cov255 / 255);
@@ -684,7 +698,9 @@ pub unsafe fn shell_step(
     }
 
     if !left_down && sh.dragging {
-        // the layer captured at drag start is stale now: force a re-rasterise
+        // v0.51.0: while dragging the layer keeps the appearance it had at the
+        // drag start (compositor semantics). Once the drag ends we re-anchor it:
+        // the layer is re-rendered with the acrylic sampled at the new position.
         unsafe {
             WIN_KEY[sh.drag_idx] = i32::MIN;
         }
@@ -793,56 +809,28 @@ pub unsafe fn shell_step(
             }
             continue;
         }
-        let key = win_key(&win, i);
-        let mut hit = unsafe { WIN_KEY[i] == key };
-        // v0.50.0 compositor behaviour: while a window is being dragged its
-        // geometry changes every frame, but its CONTENT does not. Reuse the layer
-        // captured at the moment the drag started instead of re-rasterising the
-        // frosted body; the key is invalidated when the drag ends so the next
-        // repaint re-renders it at the final position.
-        let drag_reuse = sh.dragging && sh.drag_idx == i && unsafe { WIN_KEY[i] != i32::MIN };
-        if drag_reuse && !hit {
-            hit = true;
-            sh.prof_drag_reuse += 1;
-            if sh.prof_drag_reuse == 1 {
-                log0(c"drag: reusing window layer (no re-rasterise)");
-            }
-        }
-        // Only reuse a cached layer when no lower window overlaps it: the shadow
-        // in the cache was composited against wallpaper alone.
-        let mut overlaps = false;
-        for &j in order.iter() {
-            if j == i || sh.wins[j].z >= win.z || !sh.wins[j].open || sh.wins[j].minimized {
+        let key = layer_key(&win, i);
+        let hit = unsafe { WIN_KEY[i] == key };
+        if !hit {
+            if render_window_layer(i, &win) {
+                unsafe {
+                    WIN_KEY[i] = key;
+                }
+                sh.prof_cache_miss += 1;
+            } else {
+                draw_window(&mut s, &win, true);
                 continue;
             }
-            let a = sh.wins[j];
-            if a.x - WC_MARGIN_L < win.x + win.w + WC_MARGIN_R &&
-               win.x - WC_MARGIN_L < a.x + a.w + WC_MARGIN_R &&
-               a.y - WC_MARGIN_T < win.y + win.h + WC_MARGIN_B &&
-               win.y - WC_MARGIN_T < a.y + a.h + WC_MARGIN_B {
-                overlaps = true;
-            }
+        } else {
+            sh.prof_cache_hit += 1;
         }
         let frame = &mut *core::ptr::addr_of_mut!(FRAME);
-        if hit && (!overlaps || drag_reuse) {
-            if blit_window_cache(frame, wu, i, &win) {
-                sh.prof_cache_hit += 1;
-                continue;
-            }
-        }
-        {
-            let mut cs = Surface {
-                px: &mut *core::ptr::addr_of_mut!(FRAME),
-                w: wu, h: hu, stride: wu, clip: (0, 0, SCREEN_W, SCREEN_H),
-            };
-            draw_window(&mut cs, &win);
-        }
-        sh.prof_cache_miss += 1;
-        if !overlaps {
-            let frame = &*core::ptr::addr_of!(FRAME);
-            save_window_cache(frame, wu, i, &win);
-            unsafe {
-                WIN_KEY[i] = key;
+        if composite_window_layer(frame, wu, i, &win) {
+            if sh.dragging && sh.drag_idx == i {
+                sh.prof_drag_reuse += 1;
+                if sh.prof_drag_reuse == 1 {
+                    log0(c"drag: reusing window layer (composited)");
+                }
             }
         }
     }
@@ -1162,69 +1150,63 @@ fn draw_cursor(fb: *mut u32, pitch_px: usize, w: usize, h: usize, x: i32, y: i32
     swrast::cursor(&mut s, x, y);
 }
 
-/// Cache key for a window layer: only geometry matters (title/accent/body are
-/// static per window index, and focus is not drawn differently).
-fn win_key(w: &Win, slot: usize) -> i32 {
-    w.x.wrapping_mul(7919)
-        .wrapping_add(w.y.wrapping_mul(104_729))
-        .wrapping_add(w.w.wrapping_mul(31))
-        .wrapping_add(w.h.wrapping_mul(17))
-        .wrapping_add(slot as i32)
+/// v0.51.0: a window LAYER is rendered once at its home anchor and then blitted
+/// wherever the window is. The key therefore only covers size + slot (position is
+/// free); dragging never invalidates it.
+fn layer_key(w: &Win, slot: usize) -> i32 {
+    w.w.wrapping_mul(31).wrapping_add(w.h.wrapping_mul(17)).wrapping_add(slot as i32)
 }
 
-/// Blit a cached window layer (body + shadow) into the scene cache.
-fn blit_window_cache(scene: &mut [u32], stride: usize, slot: usize, w: &Win) -> bool {
-    let cw = (w.w + WC_MARGIN_L + WC_MARGIN_R) as usize;
-    let ch = (w.h + WC_MARGIN_T + WC_MARGIN_B) as usize;
-    if cw > WC_STRIDE || ch > WC_H || cw == 0 || ch == 0 {
+/// Render the window layer (body + shadow, margins included) at its HOME anchor.
+/// The result is a plain RGB image that can be blitted anywhere (v0.51.0: this is
+/// what makes dragging a pure blit rather than a re-rasterise).
+fn render_window_layer(slot: usize, w: &Win) -> bool {
+    let lw = (w.w + WC_MARGIN_L + WC_MARGIN_R) as usize;
+    let lh = (w.h + WC_MARGIN_T + WC_MARGIN_B) as usize;
+    if lw == 0 || lh == 0 || lw > WC_STRIDE || lh > WC_H {
         return false;
     }
-    let cache = unsafe { &(&*core::ptr::addr_of!(WIN_CACHE))[slot] };
-    let dx0 = (w.x - WC_MARGIN_L).max(0) as usize;
-    let dy0 = (w.y - WC_MARGIN_T).max(0) as usize;
-    let dx1 = ((w.x - WC_MARGIN_L + cw as i32) as usize).min(SCREEN_W as usize);
-    let dy1 = ((w.y - WC_MARGIN_T + ch as i32) as usize).min(SCREEN_H as usize);
-    if dx1 <= dx0 || dy1 <= dy0 {
-        return true;
+    let cache = unsafe { &mut (&mut *core::ptr::addr_of_mut!(WIN_CACHE))[slot] };
+    // clear so stale pixels of a previous layer cannot leak through the margins
+    for v in cache.iter_mut() {
+        *v = 0;
     }
-    let ox = (dx0 as i32 - (w.x - WC_MARGIN_L)) as usize;
-    let oy = (dy0 as i32 - (w.y - WC_MARGIN_T)) as usize;
-    for y in dy0..dy1 {
-        let d = y * stride + dx0;
-        let srow = (y - dy0 + oy) * WC_STRIDE + ox;
-        let n = dx1 - dx0;
-        scene[d..d + n].copy_from_slice(&cache[srow..srow + n]);
-    }
+    let mut cs = Surface { px: &mut cache[..], w: lw, h: lh, stride: WC_STRIDE,
+                           clip: (0, 0, lw as i32, lh as i32) };
+    let mut wc = *w;
+    wc.x = WC_MARGIN_L;
+    wc.y = WC_MARGIN_T;
+    wc.sox = w.nx - WC_MARGIN_L;
+    wc.soy = w.ny - WC_MARGIN_T;
+    draw_window(&mut cs, &wc, true);
     true
 }
 
-/// Store the just-drawn window layer (body + shadow) into its cache slot.
-fn save_window_cache(scene: &[u32], stride: usize, slot: usize, w: &Win) {
-    let cw = (w.w + WC_MARGIN_L + WC_MARGIN_R) as usize;
-    let ch = (w.h + WC_MARGIN_T + WC_MARGIN_B) as usize;
-    if cw > WC_STRIDE || ch > WC_H || cw == 0 || ch == 0 {
-        return;
+/// Blit the cached layer (body + shadow + margins) at the window's current
+/// position. Rows are memcpy'd; nothing is blended, so this costs ~1 ms/window.
+fn composite_window_layer(scene: &mut [u32], stride: usize, slot: usize, w: &Win) -> bool {
+    let lw = (w.w + WC_MARGIN_L + WC_MARGIN_R) as usize;
+    let lh = (w.h + WC_MARGIN_T + WC_MARGIN_B) as usize;
+    if lw == 0 || lh == 0 || lw > WC_STRIDE || lh > WC_H {
+        return false;
     }
-    let cache = unsafe { &mut (&mut *core::ptr::addr_of_mut!(WIN_CACHE))[slot] };
-    for row in 0..ch {
-        let y = w.y - WC_MARGIN_T + row as i32;
-        let base = row * WC_STRIDE;
-        if y < 0 || y >= SCREEN_H {
-            for col in 0..cw {
-                cache[base + col] = 0;
-            }
-            continue;
-        }
-        let rowbase = y as usize * stride;
-        for col in 0..cw {
-            let x = w.x - WC_MARGIN_L + col as i32;
-            cache[base + col] = if x < 0 || x >= SCREEN_W {
-                0
-            } else {
-                scene[rowbase + x as usize]
-            };
-        }
+    let cache = unsafe { &(&*core::ptr::addr_of!(WIN_CACHE))[slot] };
+    let x0 = w.x - WC_MARGIN_L;
+    let y0 = w.y - WC_MARGIN_T;
+    let sx0 = (-x0).max(0) as usize;
+    let sy0 = (-y0).max(0) as usize;
+    let ex = lw.min((SCREEN_W - x0).max(0) as usize);
+    let ey = lh.min((SCREEN_H - y0).max(0) as usize);
+    if ex <= sx0 || ey <= sy0 {
+        return true;
     }
+    for ly in sy0..ey {
+        let dy = (y0 + ly as i32) as usize;
+        let d = dy * stride + (x0 + sx0 as i32) as usize;
+        let srow = ly * WC_STRIDE + sx0;
+        scene[d..d + (ex - sx0)].copy_from_slice(&cache[srow..srow + (ex - sx0)]);
+    }
+    true
 }
 
 /// Cache key for the taskbar strip: everything that changes its pixels.
@@ -1271,15 +1253,21 @@ fn save_taskbar(scene: &[u32], stride: usize) {
     }
 }
 
-fn draw_window(s: &mut Surface<'_>, w: &Win) {
-    let t_all = ticks();
+fn draw_window_shadow(s: &mut Surface<'_>, w: &Win) {
     /* two-layer soft shadow: plain rect fills (no AA, no sqrt) */
     s.rect_fill(w.x + 2, w.y + 10, w.x + w.w + 2, w.y + w.h + 12, 0x000000, 0x30);
     s.rect_fill(w.x - 2, w.y + 4, w.x + w.w + 6, w.y + w.h + 4, 0x000000, 0x20);
+}
+
+fn draw_window(s: &mut Surface<'_>, w: &Win, with_shadow: bool) {
+    let t_all = ticks();
+    if with_shadow {
+        draw_window_shadow(s, w);
+    }
     let t_shadow = ticks() - t_all;
 
     /* body: frosted acrylic + rounded silhouette */
-    frosted(s, w.x, w.y, w.x + w.w, w.y + w.h, 12.0, 0x2a);
+    frosted_at(s, w.x, w.y, w.x + w.w, w.y + w.h, 12.0, 0x2a, w.sox, w.soy);
     let t_frost = ticks() - t_all - t_shadow;
     /* hairline border: four 1 px rect fills (no analytic AA pass) */
     s.rect_fill(w.x + 8, w.y, w.x + w.w - 8, w.y + 1, 0xffffff, 0x30);
@@ -1321,7 +1309,7 @@ fn draw_window(s: &mut Surface<'_>, w: &Win) {
     s.rect_fill(w.x + 16, cy, w.x + w.w - 16, cy + 56, 0xffffff, 0x12);
     s.text(w.x + 28, cy + 12, "圆角 + 轻亚克力 + 微透叠层", 0xcfe0ff, 0xc0, 1);
     s.text(w.x + 28, cy + 32, "窗口可拖动 / 最小化 / 最大化", 0x9fb2cc, 0xb0, 1);
-    s.text(w.x + 18, (w.y + w.h - 26) as i32, "窗口管理原型 v0.50", 0x8fa3bd, 0x90, 1);
+    s.text(w.x + 18, (w.y + w.h - 26) as i32, "窗口管理原型 v0.51", 0x8fa3bd, 0x90, 1);
     unsafe {
         let d = &mut *core::ptr::addr_of_mut!(WSPLIT);
         d.0 += t_shadow;

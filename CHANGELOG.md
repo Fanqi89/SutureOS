@@ -6,6 +6,23 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.51.0-alpha]
+
+**窗口层与位置解耦：拖动 = 纯 blit（5–7 ticks / 50–70 ms），窗口阶段 280→205 ticks；验收 40/40。**
+
+### Added
+- `rust/suture-gui/src/shell.rs`：`Win.sox/soy` + `frosted_at()`（磨砂采样锚点）、`draw_window_shadow()`、
+  `render_window_layer()`（按 home 锚点渲染含阴影的层）、`composite_window_layer()`（行 memcpy 贴层）、
+  `layer_key()`（只含 w/h/slot），松手时按新位置重新锚定。
+
+### Verification
+- 外壳 **40/40**；拖动重绘稳态 **5–7 ticks**；回归：静态 21/21、交互 13/13、C 桌面 9/9、
+  外观 0 像素、内核 13/14。
+
+### Limits
+- 磨砂按 home 锚点采样（拖动中固定、落点重新锚定）；层不透明（重叠时阴影带内为变暗壁纸）；
+  无 vsync；最大化/还原与菜单无动画；时区写死 +08:00；Wayland 前置与替换 C 桌面未开始。
+
 ## [v0.50.0-alpha]
 
 **图层合成器第一刀：拖动复用窗口层 + 任务栏层缓存 + 部分呈现 + 采样校验和；拖动重绘 ≈117 ms → 60–80 ms；验收 40/40。**
