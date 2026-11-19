@@ -28,6 +28,7 @@ const MENU_W: i32 = 300;
 const MENU_H: i32 = 236;
 const MENU_X: i32 = 12;
 const MENU_Y: i32 = TASKBAR_Y - MENU_H - 8;
+const MENU_ITEMS_Y: i32 = MENU_Y + 46;
 
 const WIN_BODY: &str = "SutureOS 桌面外壳";
 
@@ -131,6 +132,20 @@ static mut XMAP: [u16; SCREEN_W as usize] = [0; SCREEN_W as usize];
 static mut YMAP: [u16; SCREEN_H as usize] = [0; SCREEN_H as usize];
 static mut CACHED: bool = false;
 static mut LAST_STATE: [i32; 20] = [-1; 20];
+/* v0.45.0: the scene cache (FRAME) no longer contains the cursor. The cursor is
+ * composited straight into the framebuffer, so pointer motion only needs to
+ * restore the two small rectangles from FRAME and redraw the arrow. This avoids
+ * the clipping pitfalls that killed the v0.44 dirty-rect attempt. */
+static mut CUR_SEEN: bool = false;
+static mut CUR_PX: i32 = -1;
+static mut CUR_PY: i32 = -1;
+static mut PREV_HOVER: i32 = -2;
+static mut PREV_MX: i32 = -1;
+static mut PREV_MY: i32 = -1;
+static mut CURSOR_FRAMES: u32 = 0;
+/* the cursor bitmap's bounding box (see swrast::cursor) */
+const CUR_W: i32 = 24;
+const CUR_H: i32 = 28;
 static mut LAST_SUM: u32 = 0;
 static mut IDLE_FRAMES: u32 = 0;
 
@@ -613,6 +628,40 @@ pub unsafe fn shell_step(
         IDLE_FRAMES = 0;
     }
 
+    // ---- fast path: only the pointer moved (v0.45.0) ----
+    // FRAME holds the scene WITHOUT the cursor, so erasing the old arrow is just
+    // a small blit from FRAME, and drawing the new one is a small blit + arrow.
+    {
+        let hover = hover_code(sh, mx_c, my_c);
+        let prev_hover = unsafe { PREV_HOVER };
+        let pointer_moved = mx_c != unsafe { PREV_MX } || my_c != unsafe { PREV_MY };
+        if click_x < 0 && click_y < 0 && key < 0 && !sh.dragging && pointer_moved &&
+           hover == prev_hover && unsafe { CUR_SEEN } {
+            let frame = &*core::ptr::addr_of!(FRAME);
+            let (px, py) = unsafe { (CUR_PX, CUR_PY) };
+            blit_rect(frame, wu, fb, pitch_px as usize,
+                      (px - 2, py - 2, px + CUR_W + 2, py + CUR_H + 2));
+            blit_rect(frame, wu, fb, pitch_px as usize,
+                      (mx_c - 2, my_c - 2, mx_c + CUR_W + 2, my_c + CUR_H + 2));
+            draw_cursor(fb, pitch_px as usize, wu, hu, mx_c, my_c);
+            unsafe {
+                CUR_PX = mx_c;
+                CUR_PY = my_c;
+                PREV_MX = mx_c;
+                PREV_MY = my_c;
+                let l = &mut *core::ptr::addr_of_mut!(LAST_STATE);
+                *l = st;
+                CURSOR_FRAMES += 1;
+                if CURSOR_FRAMES == 1 || CURSOR_FRAMES % 60 == 0 {
+                    console_printf(b"[gui-shell] cursor: fast path frames=%d\n\0".as_ptr(),
+                                   CURSOR_FRAMES as i32);
+                }
+            }
+            return LAST_SUM;
+        }
+        unsafe { PREV_HOVER = hover; }
+    }
+
     // 4. draw windows bottom-up
     let t_win0 = ticks();
     let mut order = [0usize, 1, 2, 3];
@@ -724,16 +773,17 @@ pub unsafe fn shell_step(
         sh.prof_bar = 0;
     }
 
-    // 7. cursor
-    swrast::cursor(&mut s, mx_c, my_c);
-
-    // 8. present: one row copy per scanline into the real framebuffer
+    // 7. present the scene (no cursor in FRAME), then composite the cursor
     {
-        let dst = core::slice::from_raw_parts_mut(fb, (pitch_px as usize) * hu);
-        for y in 0..hu {
-            let d = y * (pitch_px as usize);
-            let srow = y * wu;
-            dst[d..d + wu].copy_from_slice(&s.px[srow..srow + wu]);
+        let frame = &*core::ptr::addr_of!(FRAME);
+        blit_rect(frame, wu, fb, pitch_px as usize, (0, 0, SCREEN_W, SCREEN_H));
+        draw_cursor(fb, pitch_px as usize, wu, hu, mx_c, my_c);
+        unsafe {
+            CUR_SEEN = true;
+            CUR_PX = mx_c;
+            CUR_PY = my_c;
+            PREV_MX = mx_c;
+            PREV_MY = my_c;
         }
     }
 
@@ -744,6 +794,63 @@ pub unsafe fn shell_step(
     }
     LAST_SUM = hash;
     hash
+}
+
+/// Code describing what the pointer hovers; any change needs the real painter.
+fn hover_code(sh: &Shell, mx: i32, my: i32) -> i32 {
+    let start = (8, TASKBAR_Y + 5, 34, 28);
+    if mx >= start.0 && mx < start.0 + start.2 && my >= start.1 && my < start.1 + start.3 {
+        return 100;
+    }
+    for i in 0..4 {
+        if let Some((bx, bw)) = wb_rect(&sh.wins, i) {
+            if mx >= bx && mx < bx + bw && my >= TASKBAR_Y + 5 && my < TASKBAR_Y + TASKBAR_H - 5 {
+                return 200 + i as i32;
+            }
+        }
+    }
+    if sh.menu_open && mx >= MENU_X + 10 && mx < MENU_X + MENU_W - 10 &&
+       my >= MENU_ITEMS_Y && my < MENU_ITEMS_Y + MENU_ITEMS.len() as i32 * 44 {
+        return 300 + (my - MENU_ITEMS_Y) / 44;
+    }
+    let hw = hit_win(&sh.wins, mx, my);
+    if hw >= 0 {
+        let w = sh.wins[hw as usize];
+        let (bx, _by, bw, _bh) = control_rect(&w);
+        if my >= w.y && my < w.y + TITLE_H {
+            if mx >= bx && mx < bx + 3 * bw + 8 {
+                return 400 + hw * 4 + (mx - bx) / (bw + 4);
+            }
+            return 500 + hw;
+        }
+        return 600 + hw;
+    }
+    0
+}
+
+/// Copy a rectangle of the scene cache into the framebuffer.
+fn blit_rect(frame: &[u32], stride: usize, fb: *mut u32, pitch_px: usize,
+             r: (i32, i32, i32, i32)) {
+    let x0 = r.0.max(0) as usize;
+    let y0 = r.1.max(0) as usize;
+    let x1 = (r.2.max(0) as usize).min(SCREEN_W as usize);
+    let y1 = (r.3.max(0) as usize).min(SCREEN_H as usize);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let dst = unsafe { core::slice::from_raw_parts_mut(fb, pitch_px * SCREEN_H as usize) };
+    for y in y0..y1 {
+        let d = y * pitch_px + x0;
+        let srow = y * stride + x0;
+        dst[d..d + (x1 - x0)].copy_from_slice(&frame[srow..srow + (x1 - x0)]);
+    }
+}
+
+/// Composite the arrow cursor directly into the framebuffer.
+fn draw_cursor(fb: *mut u32, pitch_px: usize, w: usize, h: usize, x: i32, y: i32) {
+    let px = unsafe { core::slice::from_raw_parts_mut(fb, pitch_px * h) };
+    let mut s = Surface { px, w, h, stride: pitch_px, clip: (0, 0, SCREEN_W, SCREEN_H) };
+    swrast::cursor(&mut s, x, y);
 }
 
 fn draw_window(s: &mut Surface<'_>, w: &Win) {
@@ -793,5 +900,5 @@ fn draw_window(s: &mut Surface<'_>, w: &Win) {
     s.rect_fill(w.x + 16, cy, w.x + w.w - 16, cy + 56, 0xffffff, 0x12);
     s.text(w.x + 28, cy + 12, "圆角 + 轻亚克力 + 微透叠层", 0xcfe0ff, 0xc0, 1);
     s.text(w.x + 28, cy + 32, "窗口可拖动 / 最小化 / 最大化", 0x9fb2cc, 0xb0, 1);
-    s.text(w.x + 18, (w.y + w.h - 26) as i32, "窗口管理原型 v0.44", 0x8fa3bd, 0x90, 1);
+    s.text(w.x + 18, (w.y + w.h - 26) as i32, "窗口管理原型 v0.45", 0x8fa3bd, 0x90, 1);
 }

@@ -228,6 +228,15 @@ def main():
                   'title band mean %.1f' %
                   mean_brightness(bpx, WIN0[0] + 30, WIN0[1] + 8, WIN0[0] + 150, WIN0[1] + 26))
 
+        # ---- (1b) pointer-only motion takes the cursor fast path (v0.45.0) ----
+        for _ in range(24):
+            q.hmp('mouse_move 4 0')
+            time.sleep(0.12)
+            pos[0] += 4
+        check('pointer-only frames use the cursor fast path',
+              wait_for('[gui-shell] cursor: fast path', 30),
+              'log line "[gui-shell] cursor: fast path frames"')
+
         # ---- (2) drag window 0 by its title bar ------------------------------
         move_to(WIN0[0] + 60, WIN0[1] + 14)
         press()

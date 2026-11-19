@@ -6,6 +6,23 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.45.0-alpha]
+
+**指针移动快路径：光标从场景缓存分离、直接合成进 framebuffer；指针移动 2–4 → 13–14 fps；验收 34/34。**
+
+### Added
+- `rust/suture-gui/src/shell.rs`：`FRAME` 只存不含光标的场景；`blit_rect()`/`draw_cursor()`/`hover_code()`；
+  纯指针移动走 fast path（恢复旧/新光标矩形 + 画箭头，日志 `cursor: fast path frames=N`）。
+- `scripts/slint_gui_shell_acceptance.py`：扩到 34 项。
+
+### Verification
+- 外壳 **34/34**；串口心跳 30 帧 2150–2310ms → **13.0–14.0 fps**；回归：静态 21/21、交互 13/13、
+  C 桌面 9/9、外观 0 像素、内核 13/14。
+
+### Limits
+- 快路径只覆盖纯指针移动；悬停切换/拖动/窗口开关仍整屏重绘 ~2 fps；光标形状固定；
+  场景缓存 1024x768；时钟 UTC 只读一次；键盘只在菜单内。
+
 ## [v0.44.0-alpha]
 
 **任务栏真实 RTC 时钟（UTC，内核点阵绘制；原写死 12:00）；外壳验收 33/33。**

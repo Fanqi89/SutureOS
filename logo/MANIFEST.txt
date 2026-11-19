@@ -1,0 +1,19 @@
+SutureOS Logo 规格序列
+按尺寸升序，共 10 档，全部为同一张画面，仅像素尺寸不同。
+
+16  -> SutureOS_logo_16.png
+24  -> SutureOS_logo_24.png
+32  -> SutureOS_logo_32.png
+48  -> SutureOS_logo_48.png
+64  -> SutureOS_logo_64.png
+128 -> SutureOS_logo_128.png
+256 -> SutureOS_logo_256.png
+512 -> SutureOS_logo_512.png
+1024 -> SutureOS_logo_1024.png
+1536 -> SutureOS_logo_1536.png   ← 母版，即开机/关机 Logo 本体，未重采样
+
+规则：
+- 1536 为源图，其余各档均由它 Lanczos 重采样，无重绘/锐化/改色/抠图。
+- 开机与关机共用 1536 这一张，只是动画正放与倒放，不存在第二张图。
+- 开始菜单/任务栏不另做图标，直接从本序列按控件尺寸取档。
+- 全部 RGB、无 alpha；不含文字；版权与约束见 logo/README.md。
