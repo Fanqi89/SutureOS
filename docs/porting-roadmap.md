@@ -80,4 +80,4 @@
 | B21 | v0.35.0-alpha | **数据持久化**（PERSIST 双向镜像、开机恢复、关机落盘） | SutureOS 自有（GPL-3.0） | 三阶段 **32/32**（宿主解析 + 重启后 su bob） | ✅ 本轮完成 |
 | B22 | v0.36.0-alpha | **系统升级（只做覆盖）** | SutureOS 自有 | 四阶段 **11/11**（装 v0.35 → 升级 → 宿主 kernel 逐字节 → 无 ISO 启动 0.36） | ✅ 本轮完成 |
 | B23 | v0.36.0-alpha | **Rust 系统层第一步**（no_std staticlib 链接进内核 + 开机自检） | Rust（core） | `[rust] core v10000 linked, selftest=... PASS` | ✅ 完成 |
-| B24 | 进行中 | **GUI 重做**（圆角+轻亚克力+微透叠层+Fluent 底+拟物化伪 3D 图标；Rust+Slint+Smithay/Wayland） | spike 已出：Slint no_std 软件渲染可编译、Smithay 直上不可行（缺 AF_UNIX/poll/SCM_RIGHTS/memfd/std） | P2：Slint 静态第一帧（队友 worktree port-suture-gui） | ⏳ |
+| B24 | v0.37.0-alpha | **GUI 重做第一步**：新风格第一帧原型（Rust 软光栅器）合入主仓 + `--gc-sections` | SutureOS 自有 | 帧缓冲像素 **13/13**、kernel 4.96MB→3.36MB、C 桌面回归 9/9 | ✅ 完成 |

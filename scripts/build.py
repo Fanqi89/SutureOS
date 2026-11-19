@@ -445,13 +445,103 @@ def main():
                 print("Rust core extraction failed: %r" % exc)
                 rust_obj = None
 
+    # ---- Rust GUI stack (Slint 1.18 + software renderer, prototype) -------
+    # rust/suture-gui is a staticlib that contains the WHOLE Slint tree (~450
+    # archive members), so unlike suture-core we need every object, not just the
+    # crate's own one. What makes this link work:
+    #   * compiler_builtins IS included: the target is soft-float (the kernel is
+    #     built -mno-sse), so Slint's f32 math compiles to calls like __addsf3 /
+    #     __mulsf3 / __fixsfsi which only compiler_builtins provides.
+    #   * its memcpy/memset/memmove/memcmp/bcmp definitions are WEAK in the Rust
+    #     archive (verified with x86_64-elf-nm: "W memset", "W memcpy", ...) and
+    #     kernel/lib/string.c defines them STRONG, so the kernel's win and there
+    #     is no duplicate-symbol error.
+    #   * only this crate's objects are extracted, and suture-core contributes a
+    #     single object, so the two Rust crates never bring two copies of `core`.
+    gui_objs = []
+    gui_manifest = ROOT / "rust" / "suture-gui" / "Cargo.toml"
+    if gui_manifest.exists():
+        rustup_cargo = Path(os.environ.get("USERPROFILE", "")) / ".cargo" / "bin" / "cargo.exe"
+        cargo = str(rustup_cargo) if rustup_cargo.exists() else "cargo"
+        rust_target = "x86_64-unknown-none"
+        print("Building Rust GUI stack (Slint, %s)..." % rust_target)
+        r = subprocess.run(
+            [cargo, "build", "--release", "--target", rust_target,
+             "--manifest-path", str(gui_manifest)],
+            cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        lib = (ROOT / "rust" / "suture-gui" / "target" / rust_target
+               / "release" / "libsuture_gui.a")
+        if r.returncode != 0 or not lib.exists():
+            print("Rust GUI build FAILED (kernel keeps the C fallback):")
+            sys.stdout.write(r.stdout.decode("utf-8", "replace")[-3000:])
+        else:
+            print("Rust GUI: %s (%d bytes)" % (lib.name, lib.stat().st_size))
+            try:
+                data = lib.read_bytes()
+                if not data.startswith(b"!<arch>\n"):
+                    raise ValueError("not an ar archive")
+                members = []
+                longnames = b""
+                pos = 8
+                while pos + 60 <= len(data):
+                    hdr = data[pos:pos + 60]
+                    name = hdr[0:16].decode("ascii", "replace").strip()
+                    size_field = hdr[48:58].decode("ascii", "replace").strip()
+                    if not size_field.isdigit():
+                        break
+                    size = int(size_field)
+                    body = data[pos + 60:pos + 60 + size]
+                    if name == "//":
+                        longnames = body
+                    elif name != "/":
+                        members.append((name, body))
+                    pos += 60 + size + (size & 1)
+                outdir = BUILD / "rust_gui"
+                outdir.mkdir(parents=True, exist_ok=True)
+                skipped = 0
+                for name, body in members:
+                    real = name
+                    if name.startswith("/") and name[1:].strip().isdigit():
+                        off = int(name[1:].strip())
+                        tail = longnames[off:]
+                        real = tail.split(b"/\n", 1)[0].split(b"\n", 1)[0].decode(
+                            "ascii", "replace")
+                    if not real.endswith(".o"):
+                        continue
+                    stem = os.path.basename(real).split("-")[0]
+                    obj = outdir / ("%03d_%s.o" % (len(gui_objs), stem))
+                    obj.write_bytes(body)
+                    gui_objs.append(str(obj))
+                print("Rust GUI objects: %d extracted (soft-float intrinsics included)"
+                      % len(gui_objs))
+            except Exception as exc:                 # noqa: BLE001
+                print("Rust GUI extraction failed: %r" % exc)
+                gui_objs = []
+
     # Link
     elf = BUILD / "kernel.elf"
     if rust_obj is not None:
         objs.append(str(rust_obj))
-    ld_args = [str(LD), "-T", str(ROOT / "boot" / "linker.ld"), "-o", str(elf)] + objs
+    objs.extend(gui_objs)
+    # --gc-sections: the Slint staticlib brings ~420 objects (one per CGU) and
+    # most of that tree is unreachable from the kernel entry point. The linker
+    # script has ENTRY(_start) and KEEP(*(.multiboot)), so the boot path and
+    # everything reachable from it stays; the dead Rust/slint sections go.
+    ld_base = [str(LD), "-T", str(ROOT / "boot" / "linker.ld"),
+               "--gc-sections", "-o", str(elf)]
     print("Linking...")
-    result = subprocess.run(ld_args)
+    # Windows caps a command line at 32767 characters and the Slint staticlib
+    # adds ~450 objects (one per CGU), which is well past that ("WinError 206:
+    # filename or extension too long"). GNU ld takes its inputs from an
+    # @response file, one argument per line, so the link is file-driven.
+    if len(" ".join(objs)) > 20000:
+        rsp = BUILD / "link.rsp"
+        rsp.write_text("\n".join('"' + o.replace("\\", "/") + '"' for o in objs),
+                       encoding="utf-8")
+        print("link response file: %s (%d objects)" % (rsp.name, len(objs)))
+        result = subprocess.run(ld_base + ["@" + str(rsp).replace("\\", "/")])
+    else:
+        result = subprocess.run(ld_base + objs)
     if result.returncode != 0:
         print("link failed")
         return 1

@@ -1,0 +1,128 @@
+// SutureOS GUI prototype scene (Stage 0) - scene v2.
+//
+// Bisected down from the full design (see docs/slint-gui-stage0.md):
+//   * no Text elements: they panicked inside i-slint-core item_tree (index out
+//     of bounds) during the first draw, and the glyph set is build-time anyway;
+//   * no fully-rounded (border-radius == width/2) blobs with gradient+opacity:
+//     the draw never returned with those in the scene;
+//   * every gradient is axis-aligned (rotated gradients show 1px seams in this
+//     renderer - measured in the feasibility spike);
+//   * shadows are emulated by stacked translucent rects (the software renderer's
+//     draw_box_shadow is a `// TODO` stub).
+//
+// What is left is exactly what the acceptance checks: rounded corners,
+// translucency over two different backdrops, a 4-layer fake shadow, a pseudo-3D
+// icon with a specular band.
+
+export component FakeShadow inherits Rectangle {
+    in property <length> r: 18px;
+    in property <length> dy: 8px;
+    in property <color> tint: #000000;
+
+    Rectangle { x: -10px; y: dy - 10px; width: parent.width + 20px; height: parent.height + 20px;
+                border-radius: r + 10px; background: tint.with-alpha(0.05); }
+    Rectangle { x: -7px;  y: dy - 7px;  width: parent.width + 14px; height: parent.height + 14px;
+                border-radius: r + 7px;  background: tint.with-alpha(0.07); }
+    Rectangle { x: -4px;  y: dy - 4px;  width: parent.width + 8px;  height: parent.height + 8px;
+                border-radius: r + 4px;  background: tint.with-alpha(0.10); }
+    Rectangle { x: -1px;  y: dy - 1px;  width: parent.width + 2px;  height: parent.height + 2px;
+                border-radius: r + 1px;  background: tint.with-alpha(0.14); }
+}
+
+export component IconTile inherits Rectangle {
+    in property <length> s: 72px;
+    width: s;
+    height: s;
+    border-radius: s * 0.24;
+    background: @linear-gradient(180deg, #8fc2ff 0%, #4a7de8 55%, #2c4fb0 100%);
+
+    // specular highlight band (fake glass sheen)
+    Rectangle {
+        x: parent.width * 0.10;
+        y: parent.height * 0.07;
+        width: parent.width * 0.80;
+        height: parent.height * 0.34;
+        border-radius: self.height * 0.45;
+        background: @linear-gradient(180deg, #ffffffb8 0%, #ffffff00 100%);
+    }
+    // bottom inner shade -> "thickness"
+    Rectangle {
+        x: 0px;
+        y: parent.height * 0.78;
+        width: parent.width;
+        height: parent.height * 0.22;
+        border-radius: parent.border-radius;
+        background: @linear-gradient(180deg, #00000000 0%, #00000034 100%);
+    }
+    // glyph plate (an "app symbol" without needing text)
+    Rectangle {
+        x: parent.width * 0.30;
+        y: parent.height * 0.36;
+        width: parent.width * 0.40;
+        height: parent.height * 0.28;
+        border-radius: self.height * 0.5;
+        background: #ffffffd0;
+    }
+}
+
+export component DemoWindow inherits Window {
+    width: 1024px;
+    height: 768px;
+    background: #0b1020;
+
+    // ---- wallpaper: axis-aligned gradient on a child rect ----------------
+    // (Window.background cannot be a gradient: software renderer TODO)
+    Rectangle {
+        x: 0px; y: 0px; width: parent.width; height: parent.height;
+        background: @linear-gradient(180deg, #1a2338 0%, #121a2b 45%, #0a0e18 100%);
+    }
+
+    // ---- coloured backdrops: they are what makes the panel's translucency
+    //      measurable (panel over backdrop vs panel over wallpaper only) ----
+    Rectangle {
+        x: 90px; y: 110px; width: 420px; height: 420px;
+        background: @linear-gradient(90deg, #3f7bff 0%, #9a5cff 100%);
+    }
+    Rectangle {
+        x: 640px; y: 90px; width: 300px; height: 300px;
+        background: @linear-gradient(90deg, #12b8a6 0%, #2f6bff 100%);
+    }
+
+    // ======================= main panel =======================
+    FakeShadow { x: 150px; y: 170px; width: 560px; height: 320px; r: 18px; dy: 8px; }
+
+    Rectangle {
+        x: 150px; y: 170px; width: 560px; height: 320px;
+        border-radius: 18px;
+        background: #ffffff26;
+        border-width: 1px;
+        border-color: #ffffff40;
+
+        IconTile { x: 28px; y: 28px; s: 72px; }
+
+        // micro translucent layer stack (light acrylic, no blur yet)
+        Rectangle { x: 28px; y: 128px; width: 504px; height: 74px; border-radius: 12px; background: #ffffff12; }
+        Rectangle { x: 40px; y: 142px; width: 480px; height: 46px; border-radius: 10px; background: #ffffff16; }
+        Rectangle { x: 52px; y: 154px; width: 456px; height: 22px; border-radius: 8px;  background: #ffffff1c; }
+
+        // three list rows
+        Rectangle { x: 28px; y: 220px; width: 504px; height: 30px; border-radius: 9px; background: #ffffff10; }
+        Rectangle { x: 28px; y: 258px; width: 504px; height: 30px; border-radius: 9px; background: #ffffff10; }
+    }
+
+    // ======================= secondary card =======================
+    FakeShadow { x: 760px; y: 420px; width: 210px; height: 210px; r: 16px; dy: 6px; }
+
+    Rectangle {
+        x: 760px; y: 420px; width: 210px; height: 210px;
+        border-radius: 16px;
+        background: @linear-gradient(180deg, #ffffff30 0%, #ffffff12 100%);
+        border-width: 1px;
+        border-color: #ffffff3a;
+
+        IconTile { x: 69px; y: 40px; s: 72px; }
+
+        Rectangle { x: 40px; y: 132px; width: 130px; height: 10px; border-radius: 5px; background: #ffffff7a; }
+        Rectangle { x: 55px; y: 152px; width: 100px; height: 8px;  border-radius: 4px; background: #ffffff4a; }
+    }
+}

@@ -95,6 +95,7 @@ static const struct shell_cmd g_commands[] = {
     {"reboot",  shell_cmd_reboot,  "Reboot the system"},
     {"shutdown",shell_cmd_shutdown,"Shutdown the system"},
     {"startgui",shell_cmd_startgui,"Start GUI interface (fallback to terminal on failure)"},
+    {"guislint",shell_cmd_guislint,"Render one Slint prototype frame (Stage 0, ESC returns)"},
     {"ls",      shell_cmd_ls,      "List directory contents"},
     {"cd",      shell_cmd_cd,      "Change directory"},
     {"pwd",     shell_cmd_pwd,     "Print working directory"},
@@ -578,6 +579,59 @@ int shell_cmd_startgui(int argc, char **argv) {
     }
     shell_puts(g_shell.prompt);
     return ret;
+}
+
+/* Slint GUI prototype (Stage 0): render ONE static frame with the Rust GUI stack
+ * straight into the linear framebuffer.
+ *
+ * Kept as a separate command instead of replacing the desktop because the
+ * existing boot presentation and the C desktop must not move: this only paints
+ * a prototype frame over the current screen and waits for ESC (or 10 s). The
+ * terminal is suspended while the frame is up, otherwise the log line would be
+ * painted on top of it.
+ */
+int shell_cmd_guislint(int argc, char **argv) {
+    (void)argc; (void)argv;
+    extern int slint_gui_render_frame(void);
+    extern int slint_gui_linked(void);
+    extern void console_screen_enable(int on);
+    extern int term_available(void);
+    extern void term_clear(void);
+    extern volatile uint64_t g_tick_count;
+    extern int mbos_kbd_poll(void);
+
+    if (!slint_gui_linked()) {
+        shell_puts("guislint: the Rust GUI object is not linked into this image\n");
+        shell_puts("guislint: (build needs the Rust toolchain + x86_64-unknown-none)\n");
+        return -1;
+    }
+
+    shell_scroll_message("Rendering Slint prototype frame...");
+    console_screen_enable(0);
+    const int r = slint_gui_render_frame();
+    if (r != 0) {
+        console_screen_enable(1);
+        shell_printf("guislint: render failed (error %d)\n", r);
+        return -1;
+    }
+
+    /* Hold the frame so a screendump can capture it (bounded pause spin: the
+     * shell loop must never call sched_yield - double-scheduler bug). */
+    {
+        const uint64_t start = g_tick_count;
+        int done = 0;
+        while (!done && (g_tick_count - start) < 1000u) {   /* 1000 ticks = 10 s */
+            const int sc = mbos_kbd_poll();
+            if (sc >= 0 && (uint32_t)sc == 0x01u) done = 1;  /* ESC make code */
+            for (volatile int spin = 0; spin < 20000; spin++) { }
+        }
+    }
+
+    console_screen_enable(1);
+    if (term_available()) term_clear();
+    shell_puts("guislint: frame shown, back to terminal\n");
+    shell_puts(g_shell.prompt);
+    return 0;
 }
 
 /* ==================== Path / string helpers ==================== */

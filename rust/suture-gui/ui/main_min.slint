@@ -1,0 +1,14 @@
+﻿// Minimal probe: does Slint's software renderer draw AT ALL on this kernel
+// framebuffer? One solid window background + one rounded rect, no gradients,
+// no shadow, no text.
+export component DemoWindow inherits Window {
+    width: 1024px;
+    height: 768px;
+    background: #101828;
+
+    Rectangle {
+        x: 200px; y: 200px; width: 400px; height: 240px;
+        border-radius: 18px;
+        background: #ffffff30;
+    }
+}

@@ -6,6 +6,27 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.37.0-alpha]
+
+**GUI 重做第一步：新风格第一帧原型合入主仓（Rust 软件光栅器）+ `--gc-sections` 减重。**
+`guislint` 把一张"圆角 + 轻亚克力 + 微透叠层 + Fluent 底 + 拟物化伪 3D 图标"的静态样板画进
+framebuffer，像素断言 13/13；C 桌面与启动呈现零改动。
+
+### Added
+- `rust/suture-gui/`（no_std staticlib, `x86_64-unknown-none`）：`swrast.rs` 软光栅器（圆角/渐变/alpha/
+  4 层假阴影/伪 3D 高光）+ 平台适配 `lib.rs`。
+- `kernel/gui/slint_bridge.c/.h` + shell `guislint` 命令（画一帧并保持，ESC/10s 返回终端）。
+- `scripts/build.py`：417 个 Rust 对象提取 + `@link.rsp` + `--gc-sections`（4,956,200 → 3,364,744 B）。
+- `scripts/slint_gui_acceptance.py`（13 项）、`docs/screenshots/slint-prototype-v0.37.0.png`。
+
+### Verification
+- slint_gui **13/13**（圆角 |d| 69/67/73/107、半透明 |d| 196、假阴影 68.3→89.3→102.0、图标高光 223.4）；
+  C 桌面 apps_taskbar 9/9、外观门禁 0 像素、内核 13/14、`[rust] core` PASS、FAT32 21/21。
+
+### Limits
+- 手写光栅器而非 Slint（Slint render 卡死/Text panic，`--features slint` 可复现）；无文字/动效/输入；
+  无真模糊；只支持 32bpp；Rust GUI 仍 ring 0；Wayland 前置未做。
+
 ## [v0.36.0-alpha]
 
 **系统升级（只做覆盖）+ Rust 系统层第一步。**

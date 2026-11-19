@@ -132,6 +132,9 @@ int shell_cmd_kbdstat(int argc, char **argv);
 int shell_cmd_beep(int argc, char **argv);
 /* Intel HDA (kernel/drivers/hda.c): codec status + acceptance tone. */
 int shell_cmd_hdatest(int argc, char **argv);
+/* Slint GUI prototype (kernel/gui/slint_bridge.c + rust/suture-gui): draw one
+ * static prototype frame with Slint's software renderer into the framebuffer. */
+int shell_cmd_guislint(int argc, char **argv);
 
 /* Terminal output helpers */
 void shell_putc(char c);

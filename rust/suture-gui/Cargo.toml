@@ -1,0 +1,34 @@
+[package]
+name = "suture-gui"
+version = "0.2.0"
+edition = "2021"
+description = "SutureOS GUI prototype: Rust software rasteriser (default) + optional Slint backend"
+
+[lib]
+crate-type = ["staticlib"]
+
+[features]
+# Default = hand-written software rasteriser (no external deps, tiny, works).
+# `slint` = the Slint 1.18 software-renderer backend. It links and initialises in
+# the kernel but its renderer hangs on the full scene (docs/slint-gui-stage0.md).
+default = []
+slint = ["dep:slint"]
+
+[dependencies]
+# no_std f32 math (floor/ceil/sqrt): core has no such functions.
+libm = "0.2"
+slint = { version = "1.18.1", optional = true, default-features = false, features = [
+    "compat-1-2",
+    "renderer-software",
+    "libm",
+    "unsafe-single-threaded",
+] }
+
+[build-dependencies]
+slint-build = "1.18.1"
+
+[profile.release]
+opt-level = "s"
+panic = "abort"
+codegen-units = 1
+lto = false
