@@ -6,6 +6,22 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.39.0-alpha]
+
+**轻亚克力：面板/卡片显示真正被模糊的背景（可分离 box blur），验收 21/21。**
+
+### Added
+- `rust/suture-gui/src/swrast.rs`：`acrylic_blur()` 两遍可分离 box blur，临时缓冲只覆盖模糊矩形（≈0.85 MiB .bss）；
+  通道分别累加再打包（打包值求和的进位会造成通道串扰，第一版因此出现彩色条带）。
+- 场景：面板 r=18、卡片 r=14 先模糊背景再叠半透明填充；模糊只写面板内部（外部只读），投影保持不变。
+
+### Verification
+- `scripts/slint_gui_acceptance.py` **21/21**：面板内背景硬边最大跳变 2、面板外 177、面板叠色对比；
+  原 18 项（圆角/半透明/假阴影/伪 3D/5 项字形）保持通过；C 桌面 9/9、外观门禁 0 像素、内核 13/14。
+
+### Limits
+- 静态单帧模糊（无动态背景重算）；半径固定、无分层/噪点；模糊上限 1024x480 硬编码；仍静态样板帧。
+
 ## [v0.38.0-alpha]
 
 **新渲染器接上文字：中文（GB2312 16×16）与英文（8×16）驱动自内核既有字体资产，

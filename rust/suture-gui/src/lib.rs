@@ -101,6 +101,18 @@ pub fn draw_scene(s: &mut Surface) {
     s.hgrad_round(90.0, 110.0, 510.0, 530.0, 96.0, 0x3f7bff, 0x9a5cff, 0xd8);
     s.hgrad_round(640.0, 90.0, 940.0, 390.0, 96.0, 0x12b8a6, 0x2f6bff, 0xc0);
 
+    // 3b. acrylic (v0.39.0): blur the backdrop under the panel BEFORE the panel
+    //     is composited, so the panel shows a frosted copy of the blobs/wallpaper
+    //     behind it instead of a semi-transparent copy. Radius 16 px reads as
+    //     "light acrylic"; the halo margin is part of the blur so edges stay
+    //     smooth. Cost: two separable passes over ~(560+32)x(320+32) = O(200k) px.
+    swrast::acrylic_blur(s, PANEL_X as i32, PANEL_Y as i32,
+                         (PANEL_X + PANEL_W) as i32,
+                         (PANEL_Y + PANEL_H) as i32, 18);
+    swrast::acrylic_blur(s, CARD_X as i32, CARD_Y as i32,
+                         (CARD_X + CARD_W) as i32,
+                         (CARD_Y + CARD_H) as i32, 14);
+
     // 4. main panel: emulated soft shadow, translucent fill, hairline border.
     s.fake_shadow(PANEL_X, PANEL_Y, PANEL_W, PANEL_H, PANEL_R, 8.0, 0x000000, 1.0);
     s.round_rect(
@@ -109,8 +121,8 @@ pub fn draw_scene(s: &mut Surface) {
         PANEL_X + PANEL_W,
         PANEL_Y + PANEL_H,
         PANEL_R,
-        0xffffff,
-        0x26,
+        0xf4f8ff,
+        0x3a,
     );
     s.round_rect_stroke(
         PANEL_X,
@@ -187,7 +199,7 @@ fn checksum(px: &[u32]) -> u32 {
 /// Non-zero when the Rust GUI object is really linked into the image.
 #[no_mangle]
 pub extern "C" fn suture_gui_version() -> u32 {
-    0x0003_0000 // v3 = hand-written rasteriser + text (v1 = Slint build, v2 = shapes only)
+    0x0004_0000 // v4 = rasteriser + text + acrylic blur (v2 shapes, v3 text, v1 Slint)
 }
 
 /// Which renderer backs this build: 2 = hand-written rasteriser, 1 = Slint.

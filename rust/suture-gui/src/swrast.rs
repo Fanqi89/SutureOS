@@ -468,3 +468,108 @@ impl<'a> Surface<'a> {
         pen
     }
 }
+
+// ===========================================================================
+// Acrylic (v0.39.0): separable box blur of the backdrop region
+// ---------------------------------------------------------------------------
+// "Light acrylic" = the panel shows a BLURRED copy of what is behind it, not a
+// semi-transparent copy. Two separable passes (horizontal, then vertical) over a
+// temp buffer of the blur rect, O(area * (2r+1)).
+//
+// IMPORTANT: the three channels are accumulated SEPARATELY (acc_r/g/b). Summing
+// the packed 0x00RRGGBB words and dividing once is wrong - the blue field of the
+// sum overflows its 8 bits and carries into green (and green into red), which is
+// exactly the coloured banding the first version showed on screen.
+//
+// Memory: the temp buffer covers the blur rect only; the main panel expanded by
+// the radius is ~600x360 px = 0.85 MiB of .bss, capped by ACRYLIC_MAX_PX.
+const ACRYLIC_MAX_PX: usize = 1024 * 480;
+static mut ACRYLIC_TMP: [u32; ACRYLIC_MAX_PX] = [0; ACRYLIC_MAX_PX];
+
+#[inline]
+fn rgb_parts(c: u32) -> (u32, u32, u32) {
+    ((c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff)
+}
+
+#[inline]
+fn rgb_pack(r: u32, g: u32, b: u32) -> u32 {
+    ((r & 0xff) << 16) | ((g & 0xff) << 8) | (b & 0xff)
+}
+
+/// Blur the rectangle (x0,y0)-(x1,y1) IN PLACE. Pixels outside the rectangle are
+/// read (so the blur has real neighbours at the edge) but never written, which
+/// keeps the drop shadow just outside the acrylic edge intact.
+pub fn acrylic_blur(s: &mut Surface<'_>, x0: i32, y0: i32, x1: i32, y1: i32,
+                    radius: i32) {
+    let r = radius.clamp(1, 24) as i32;
+    let rx = (x0 - r).max(0);
+    let ry = (y0 - r).max(0);
+    let rx1 = (x1 + r).min(s.w as i32);
+    let ry1 = (y1 + r).min(s.h as i32);
+    let bw = (rx1 - rx) as usize;
+    let bh = (ry1 - ry) as usize;
+    if bw == 0 || bh == 0 || bw * bh > ACRYLIC_MAX_PX {
+        return;
+    }
+    let win = (2 * r + 1) as u32;
+    let tmp = unsafe { &mut *core::ptr::addr_of_mut!(ACRYLIC_TMP) };
+    let row_last = s.w as i32 - 1;
+
+    // pass 1: horizontal box blur of every source row of the expanded rect
+    for j in 0..bh {
+        let base = (ry as usize + j) * s.stride;
+        let mut ar: u32 = 0;
+        let mut ag: u32 = 0;
+        let mut ab: u32 = 0;
+        for k in 0..win {
+            let sx = (rx + k as i32 - r).clamp(0, row_last) as usize;
+            let (cr, cg, cb) = rgb_parts(s.px[base + sx]);
+            ar += cr;
+            ag += cg;
+            ab += cb;
+        }
+        for x in 0..bw {
+            tmp[j * bw + x] = rgb_pack(ar / win, ag / win, ab / win);
+            let drop = rx + x as i32 - r;
+            if drop >= 0 {
+                let (cr, cg, cb) = rgb_parts(s.px[base + drop as usize]);
+                ar -= cr;
+                ag -= cg;
+                ab -= cb;
+            }
+            let add = rx + x as i32 + r + 1;
+            if add <= row_last {
+                let (cr, cg, cb) = rgb_parts(s.px[base + add as usize]);
+                ar += cr;
+                ag += cg;
+                ab += cb;
+            }
+        }
+    }
+
+    // pass 2: vertical box blur, written only inside the clip rectangle
+    for j in 0..bh {
+        let dy = ry as i32 + j as i32;
+        if dy < y0 || dy >= y1 {
+            continue;
+        }
+        let dst = dy as usize * s.stride;
+        for x in 0..bw {
+            let dxx = rx as i32 + x as i32;
+            if dxx < x0 || dxx >= x1 {
+                continue;
+            }
+            let mut ar: u32 = 0;
+            let mut ag: u32 = 0;
+            let mut ab: u32 = 0;
+            for k in 0..win {
+                let jj = (j as i32 + k as i32 - r).clamp(0, bh as i32 - 1) as usize;
+                let (cr, cg, cb) = rgb_parts(tmp[jj * bw + x]);
+                ar += cr;
+                ag += cg;
+                ab += cb;
+            }
+            s.px[dst + dxx as usize] = rgb_pack(ar / win, ag / win, ab / win);
+        }
+    }
+}

@@ -2,7 +2,7 @@
 
 > **一个由 16 个爱好者操作系统项目拼接而成的 x86_64 单内核操作系统**
 > 
-> 当前版本：**v0.38.0-alpha** · 内核编译 **105** 个源文件（源码树约 220 个 C/H/ASM、约 6.0 万行）
+> 当前版本：**v0.39.0-alpha** · 内核编译 **105** 个源文件（源码树约 220 个 C/H/ASM、约 6.0 万行）
 > · 内核 ELF 约 **2.06 MB**（含调试符号）· 可引导 ISO 约 **15.0 MB** · **GPL-3.0** 许可证
 >
 > 移植与许可说明：[`docs/provenance.md`](docs/provenance.md)（模块→上游·文件路径）
@@ -95,6 +95,7 @@ SutureOS（缝合怪系统）是一个实验性的 x86_64 单内核操作系统�
 | v0.36.0 | **系统升级（只做覆盖）+ Rust 系统层第一步** | SutureOS 自有（GPL-3.0）+ Rust 核心 | `kernel/install/installer.c`、`rust/suture-core`、`scripts/upgrade_acceptance.py` | ✅ 四阶段 11/11 + `[rust] core ... PASS` |
 | v0.37.0 | **GUI 重做第一步**（`guislint` Rust 软光栅器新风格样板 + `--gc-sections`） | SutureOS 自有（GPL-3.0） | `rust/suture-gui/`、`kernel/gui/slint_bridge.c`、`scripts/slint_gui_acceptance.py` | ✅ 像素 13/13 + C 桌面回归 9/9 |
 | v0.38.0 | **新渲染器文字**（GB2312 中文 + ASCII，字形逐像素验收） | SutureOS 自有（GPL-3.0） | `rust/suture-gui/src/swrast.rs`、`kernel/gui/slint_bridge.c`、`scripts/slint_gui_acceptance.py` | ✅ 18/18（设/圆/账/个 miss=0） |
+| v0.39.0 | **轻亚克力**（可分离 box blur，面板显示真模糊背景） | SutureOS 自有（GPL-3.0） | `rust/suture-gui/src/swrast.rs`、`scripts/slint_gui_acceptance.py` | ✅ 21/21（内 2 / 外 177） |
 
 ---
 

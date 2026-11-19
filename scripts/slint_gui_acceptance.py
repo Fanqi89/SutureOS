@@ -179,6 +179,56 @@ def text_checks(img, check):
     check('card draws the CJK glyph 个 (scale 1) exactly', ok, detail)
 
 
+
+# ---------------------------------------------------------------------------
+# Acrylic checks (v0.39.0): the panel must show a BLURRED backdrop, and the blur
+# must be scoped to the panel (the drop shadow just outside keeps its gradient).
+# The purple backdrop blob has a hard right edge at x~=600; inside the acrylic
+# panel that edge must be smeared over many pixels (small per-step delta), while
+# the same edge further down - below the panel, outside the acrylic rect - must
+# still be a hard step.
+# ---------------------------------------------------------------------------
+ACRYLIC_EDGE_X = 600          # hard edge of the purple backdrop blob
+ACRYLIC_INSIDE_Y = 250        # inside the main panel (y 170..490)
+
+ACRYLIC_SPAN = 24             # half-width of the sampled run
+ACRYLIC_OUTSIDE_EDGE_X = 90   # the blob's LEFT edge is outside the panel (x<150)
+
+
+def max_step(im, y, x0, x1):
+    px = im.load()
+    worst = 0
+    prev = px[x0, y]
+    for x in range(x0 + 1, x1):
+        cur = px[x, y]
+        d = max(abs(cur[i] - prev[i]) for i in range(3))
+        worst = max(worst, d)
+        prev = cur
+    return worst
+
+
+def acrylic_checks(im, check):
+    inside = max_step(im, ACRYLIC_INSIDE_Y, ACRYLIC_EDGE_X - ACRYLIC_SPAN,
+                      ACRYLIC_EDGE_X + ACRYLIC_SPAN)
+    outside = max_step(im, ACRYLIC_INSIDE_Y,
+                       ACRYLIC_OUTSIDE_EDGE_X - ACRYLIC_SPAN,
+                       ACRYLIC_OUTSIDE_EDGE_X + ACRYLIC_SPAN)
+    check('acrylic: backdrop edge is blurred inside the panel', inside <= 12,
+          'max per-pixel step %d across x=%d..%d at y=%d'
+          % (inside, ACRYLIC_EDGE_X - ACRYLIC_SPAN,
+             ACRYLIC_EDGE_X + ACRYLIC_SPAN, ACRYLIC_INSIDE_Y))
+    check('acrylic: blur is scoped to the panel (same edge sharp outside)',
+          outside >= 60 and outside > inside * 3,
+          'outside step %d (x~%d) vs inside %d (x~%d)'
+          % (outside, ACRYLIC_OUTSIDE_EDGE_X, inside, ACRYLIC_EDGE_X))
+    # the acrylic tint should keep the panel brighter than the raw backdrop
+    px = im.load()
+    panel = px[320, 465]
+    wall = px[80, 465]
+    check('acrylic: panel is tinted/composited over the blurred backdrop',
+          panel != wall, 'panel %s vs wallpaper %s' % (panel, wall))
+
+
 def main():
     do_assert = '--no-assert' not in sys.argv
     log_abs = os.path.join(ROOT, SERIAL)
@@ -352,6 +402,12 @@ def main():
         text_checks(im, check)
     except Exception as exc:                       # noqa: BLE001
         check('text checks', False, repr(exc))
+
+    # ---- (6) acrylic: blurred backdrop, scoped to the panel ----
+    try:
+        acrylic_checks(im, check)
+    except Exception as exc:                       # noqa: BLE001
+        check('acrylic checks', False, repr(exc))
 
     passed = sum(1 for _, ok, _ in checks if ok)
     failed = len(checks) - passed
