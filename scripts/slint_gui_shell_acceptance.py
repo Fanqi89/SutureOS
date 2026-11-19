@@ -204,6 +204,12 @@ def main():
         typ('guishell')
         key('ret')
         check('shell loop started', wait_for('[gui-shell] shell: loop', 150))
+
+        # baseline brightness of the region the launched window will cover: the
+        # closed-state assertion compares against this, not an absolute number
+        base_img = dump_until('base', lambda px: mean_brightness(px, 235, 490, 1000, 700) > 20)
+        base_mean = mean_brightness(base_img.load(), WIN2[0] + 30, WIN2[1] + 60,
+                                    WIN2[0] + 250, WIN2[1] + 180) if base_img is not None else 0.0
         check('taskbar clock comes from the RTC (not the old hardcoded 12:00)',
               wait_for('[gui-shell] clock=', 30),
               'log line "[gui-shell] clock=HH:MM"')
@@ -361,18 +367,24 @@ def main():
         move_to(close_x, close_y)
         click()
         check('close button closes the window', wait_for('[gui-shell] close 2', 60))
-        closed = dump_until('closed', lambda px: mean_brightness(px, WIN2[0] + 30, WIN2[1] + 60,
-                                                                 WIN2[0] + 250, WIN2[1] + 180) < 80)
+        closed = dump_until('closed', lambda px: abs(mean_brightness(px, WIN2[0] + 30, WIN2[1] + 60,
+                                                                      WIN2[0] + 250, WIN2[1] + 180)
+                                                             - base_mean) < 4)
         if closed is not None:
-            check('closed window is gone from the desktop',
-                  mean_brightness(closed.load(), WIN2[0] + 30, WIN2[1] + 60,
-                                  WIN2[0] + 250, WIN2[1] + 180) < 85,
-                  'mean %.1f' % mean_brightness(closed.load(), WIN2[0] + 30, WIN2[1] + 60,
-                                                WIN2[0] + 250, WIN2[1] + 180))
+            closed_mean = mean_brightness(closed.load(), WIN2[0] + 30, WIN2[1] + 60,
+                                          WIN2[0] + 250, WIN2[1] + 180)
+            check('closed window is gone from the desktop', abs(closed_mean - base_mean) < 4,
+                  'mean %.1f vs baseline %.1f' % (closed_mean, base_mean))
 
         # ---- (8) idle frames are skipped (no useless repaints) -----------------
         time.sleep(2.5)
         idle_ok = wait_for('[gui-shell] idle: frame skipped', 20)
+        # ---- (8b) window layer cache actually hits (v0.46.0) ------------------
+        prof = [ln for ln in log_text().splitlines() if 'profile/30' in ln]
+        hit_ok = any(('hit=' in ln and 'hit=0 ' not in ln) for ln in prof)
+        check('window layer cache is reused on repaints', hit_ok,
+              (prof[-1] if prof else 'no profile line'))
+
         check('idle frames skip the repaint', idle_ok,
               'log line "[gui-shell] idle: frame skipped (nothing changed)"' if idle_ok else 'no idle log')
 

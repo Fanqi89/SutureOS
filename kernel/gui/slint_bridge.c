@@ -280,7 +280,10 @@ int slint_gui_run_shell(void)
     int frames = 0;
     int quit = 0;
     while (!quit) {
-        if (frames > 2400) break;          /* frame-count safety net */
+        /* safety nets: frame count is now cheap (cursor fast path ~13 fps),
+         * so keep a generous count plus an absolute time cap */
+        if (frames > 20000) break;
+        if (((g_tick_count - start) * 10u) > 900000u) break;
         if (mouse) mbos_mouse_poll();
         int mx = mouse ? mbos_mouse_x() : (int)w / 2;
         int my = mouse ? mbos_mouse_y() : (int)h / 2;

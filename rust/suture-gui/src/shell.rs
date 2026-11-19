@@ -90,6 +90,9 @@ struct Shell {
     started: bool,
     frame_ms: u32,
     prof_frames: u32,
+    prof_full: u32,
+    prof_cache_hit: u32,
+    prof_cache_miss: u32,
     prof_copy: u64,
     prof_win: u64,
     prof_bar: u64,
@@ -116,6 +119,9 @@ static mut SHELL: Shell = Shell {
     started: false,
     frame_ms: 0,
     prof_frames: 0,
+    prof_full: 0,
+    prof_cache_hit: 0,
+    prof_cache_miss: 0,
     prof_copy: 0,
     prof_win: 0,
     prof_bar: 0,
@@ -132,6 +138,18 @@ static mut XMAP: [u16; SCREEN_W as usize] = [0; SCREEN_W as usize];
 static mut YMAP: [u16; SCREEN_H as usize] = [0; SCREEN_H as usize];
 static mut CACHED: bool = false;
 static mut LAST_STATE: [i32; 20] = [-1; 20];
+/* v0.46.0 window layer cache: a window body + its shadow is position-locked and
+ * content-static (frosted sampling only depends on the wallpaper), so once drawn
+ * it can be blitted. That turns a 400 ms full repaint into a few memcpys for
+ * everything except a window that is moving/resizing right now. */
+const WC_STRIDE: usize = 512;
+const WC_H: usize = 352;
+const WC_MARGIN_L: i32 = 8;
+const WC_MARGIN_T: i32 = 14;
+const WC_MARGIN_R: i32 = 12;
+const WC_MARGIN_B: i32 = 16;
+static mut WIN_CACHE: [[u32; WC_STRIDE * WC_H]; 4] = [[0; WC_STRIDE * WC_H]; 4];
+static mut WIN_KEY: [i32; 4] = [i32::MIN; 4];
 /* v0.45.0: the scene cache (FRAME) no longer contains the cursor. The cursor is
  * composited straight into the framebuffer, so pointer motion only needs to
  * restore the two small rectangles from FRAME and redraw the arrow. This avoids
@@ -675,9 +693,50 @@ pub unsafe fn shell_step(
     for &i in order.iter() {
         let win = sh.wins[i];
         if !win.open || win.minimized {
+            unsafe {
+                WIN_KEY[i] = i32::MIN;
+            }
             continue;
         }
-        draw_window(&mut s, &win);
+        let key = win_key(&win, i);
+        let hit = unsafe { WIN_KEY[i] == key };
+        // Only reuse a cached layer when no lower window overlaps it: the shadow
+        // in the cache was composited against wallpaper alone.
+        let mut overlaps = false;
+        for &j in order.iter() {
+            if j == i || sh.wins[j].z >= win.z || !sh.wins[j].open || sh.wins[j].minimized {
+                continue;
+            }
+            let a = sh.wins[j];
+            if a.x - WC_MARGIN_L < win.x + win.w + WC_MARGIN_R &&
+               win.x - WC_MARGIN_L < a.x + a.w + WC_MARGIN_R &&
+               a.y - WC_MARGIN_T < win.y + win.h + WC_MARGIN_B &&
+               win.y - WC_MARGIN_T < a.y + a.h + WC_MARGIN_B {
+                overlaps = true;
+            }
+        }
+        let frame = &mut *core::ptr::addr_of_mut!(FRAME);
+        if hit && !overlaps {
+            if blit_window_cache(frame, wu, i, &win) {
+                sh.prof_cache_hit += 1;
+                continue;
+            }
+        }
+        {
+            let mut cs = Surface {
+                px: &mut *core::ptr::addr_of_mut!(FRAME),
+                w: wu, h: hu, stride: wu, clip: (0, 0, SCREEN_W, SCREEN_H),
+            };
+            draw_window(&mut cs, &win);
+        }
+        sh.prof_cache_miss += 1;
+        if !overlaps {
+            let frame = &*core::ptr::addr_of!(FRAME);
+            save_window_cache(frame, wu, i, &win);
+            unsafe {
+                WIN_KEY[i] = key;
+            }
+        }
     }
 
     let t_win = ticks() - t_win0;
@@ -759,15 +818,20 @@ pub unsafe fn shell_step(
     }
 
     sh.prof_frames += 1;
+    sh.prof_full += 1;
     sh.prof_copy += t_copy;
     sh.prof_win += t_win;
     sh.prof_bar += t_bar;
     if sh.prof_frames >= 30 {
         unsafe {
-            console_printf(b"[gui-shell] profile/30: copy=%llu win=%llu bar=%llu ticks\n\0".as_ptr(),
-                           sh.prof_copy, sh.prof_win, sh.prof_bar);
+            console_printf(b"[gui-shell] profile/30: full=%d hit=%d miss=%d win=%llu bar=%llu ticks\n\0".as_ptr(),
+                           sh.prof_full as i32, sh.prof_cache_hit as i32,
+                           sh.prof_cache_miss as i32, sh.prof_win, sh.prof_bar);
         }
         sh.prof_frames = 0;
+        sh.prof_full = 0;
+        sh.prof_cache_hit = 0;
+        sh.prof_cache_miss = 0;
         sh.prof_copy = 0;
         sh.prof_win = 0;
         sh.prof_bar = 0;
@@ -853,6 +917,71 @@ fn draw_cursor(fb: *mut u32, pitch_px: usize, w: usize, h: usize, x: i32, y: i32
     swrast::cursor(&mut s, x, y);
 }
 
+/// Cache key for a window layer: only geometry matters (title/accent/body are
+/// static per window index, and focus is not drawn differently).
+fn win_key(w: &Win, slot: usize) -> i32 {
+    w.x.wrapping_mul(7919)
+        .wrapping_add(w.y.wrapping_mul(104_729))
+        .wrapping_add(w.w.wrapping_mul(31))
+        .wrapping_add(w.h.wrapping_mul(17))
+        .wrapping_add(slot as i32)
+}
+
+/// Blit a cached window layer (body + shadow) into the scene cache.
+fn blit_window_cache(scene: &mut [u32], stride: usize, slot: usize, w: &Win) -> bool {
+    let cw = (w.w + WC_MARGIN_L + WC_MARGIN_R) as usize;
+    let ch = (w.h + WC_MARGIN_T + WC_MARGIN_B) as usize;
+    if cw > WC_STRIDE || ch > WC_H || cw == 0 || ch == 0 {
+        return false;
+    }
+    let cache = unsafe { &(&*core::ptr::addr_of!(WIN_CACHE))[slot] };
+    let dx0 = (w.x - WC_MARGIN_L).max(0) as usize;
+    let dy0 = (w.y - WC_MARGIN_T).max(0) as usize;
+    let dx1 = ((w.x - WC_MARGIN_L + cw as i32) as usize).min(SCREEN_W as usize);
+    let dy1 = ((w.y - WC_MARGIN_T + ch as i32) as usize).min(SCREEN_H as usize);
+    if dx1 <= dx0 || dy1 <= dy0 {
+        return true;
+    }
+    let ox = (dx0 as i32 - (w.x - WC_MARGIN_L)) as usize;
+    let oy = (dy0 as i32 - (w.y - WC_MARGIN_T)) as usize;
+    for y in dy0..dy1 {
+        let d = y * stride + dx0;
+        let srow = (y - dy0 + oy) * WC_STRIDE + ox;
+        let n = dx1 - dx0;
+        scene[d..d + n].copy_from_slice(&cache[srow..srow + n]);
+    }
+    true
+}
+
+/// Store the just-drawn window layer (body + shadow) into its cache slot.
+fn save_window_cache(scene: &[u32], stride: usize, slot: usize, w: &Win) {
+    let cw = (w.w + WC_MARGIN_L + WC_MARGIN_R) as usize;
+    let ch = (w.h + WC_MARGIN_T + WC_MARGIN_B) as usize;
+    if cw > WC_STRIDE || ch > WC_H || cw == 0 || ch == 0 {
+        return;
+    }
+    let cache = unsafe { &mut (&mut *core::ptr::addr_of_mut!(WIN_CACHE))[slot] };
+    for row in 0..ch {
+        let y = w.y - WC_MARGIN_T + row as i32;
+        let base = row * WC_STRIDE;
+        if y < 0 || y >= SCREEN_H {
+            for col in 0..cw {
+                cache[base + col] = 0;
+            }
+            continue;
+        }
+        let rowbase = y as usize * stride;
+        for col in 0..cw {
+            let x = w.x - WC_MARGIN_L + col as i32;
+            cache[base + col] = if x < 0 || x >= SCREEN_W {
+                0
+            } else {
+                scene[rowbase + x as usize]
+            };
+        }
+    }
+}
+
 fn draw_window(s: &mut Surface<'_>, w: &Win) {
     /* two-layer soft shadow: plain rect fills (no AA, no sqrt) */
     s.rect_fill(w.x + 2, w.y + 10, w.x + w.w + 2, w.y + w.h + 12, 0x000000, 0x30);
@@ -900,5 +1029,5 @@ fn draw_window(s: &mut Surface<'_>, w: &Win) {
     s.rect_fill(w.x + 16, cy, w.x + w.w - 16, cy + 56, 0xffffff, 0x12);
     s.text(w.x + 28, cy + 12, "圆角 + 轻亚克力 + 微透叠层", 0xcfe0ff, 0xc0, 1);
     s.text(w.x + 28, cy + 32, "窗口可拖动 / 最小化 / 最大化", 0x9fb2cc, 0xb0, 1);
-    s.text(w.x + 18, (w.y + w.h - 26) as i32, "窗口管理原型 v0.45", 0x8fa3bd, 0x90, 1);
+    s.text(w.x + 18, (w.y + w.h - 26) as i32, "窗口管理原型 v0.46", 0x8fa3bd, 0x90, 1);
 }

@@ -6,6 +6,27 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.46.0-alpha]
+
+**窗口层缓存（几何键，含阴影）：窗口阶段 1416→916 ticks/30 帧（−35%）；修掉循环帧数上限与一条靠错因通过的断言；验收 35/35。**
+
+### Added
+- `rust/suture-gui/src/shell.rs`：`win_key()`/`blit_window_cache()`/`save_window_cache()`；命中即 blit，
+  否则重画回填；profile 增加 `full/hit/miss`。
+- `scripts/slint_gui_shell_acceptance.py`：扩到 35 项。
+
+### Fixed
+- 外壳循环安全网 `frames > 2400` → `20000` + 15 分钟上限（快帧路径会让旧上限在验收中途触发）。
+- `closed window is gone` 断言改为与启动前基线比较（旧 `<85` 实为壁纸亮度）。
+
+### Verification
+- 外壳 **35/35**；`profile/30: full=30 hit=27 miss=27 win=916 bar=97`（v0.45 win=1416）；
+  回归：静态 21/21、交互 13/13、C 桌面 9/9、外观 0 像素、内核 13/14。
+
+### Limits
+- 默认两窗口互相重叠 → 重叠不缓存；拖动/最大化每帧重建；整屏重绘 ~330 ms（TCG 混合 ≈80 ns/px）。
+  下一步：图层合成器。
+
 ## [v0.45.0-alpha]
 
 **指针移动快路径：光标从场景缓存分离、直接合成进 framebuffer；指针移动 2–4 → 13–14 fps；验收 34/34。**
