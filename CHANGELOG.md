@@ -6,6 +6,25 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.47.0-alpha]
+
+**掐掉圆角 AA 的软浮点 `sqrt`（覆盖率查表）：frosted 165→17 ticks/4 次绘制，窗口阶段 916→280 ticks/30 帧，整屏重绘 ≈330→117 ms；验收 35/35。**
+
+### Fixed
+- `rust/suture-gui/src/shell.rs`：`CORNER_COV[16][16]` 预计算圆角覆盖率，圆角带不再 per-pixel 调用
+  `fsqrt`（无 SSE 目标上每次都是软浮点调用）；内部区域纯整数循环。
+
+### Added
+- 分段计时日志 `[gui-shell] wsplit shadow=/frosted=/chrome= ticks (x4)` 常驻，供后续性能对比。
+
+### Verification
+- 外壳 **35/35**；`frosted=16`（v0.46 `173`）、`win=280`（v0.46 `916`）；
+  回归：静态 21/21、交互 13/13、C 桌面 9/9、外观 0 像素、内核 13/14。
+
+### Limits
+- 圆角按整数像素中心查表（1 px 级精度）；整屏重绘仍 ~117 ms（下一步：图层合成器）；
+  默认两窗口重叠处不缓存；时钟 UTC 只读一次；键盘只在菜单内；无过渡动画。
+
 ## [v0.46.0-alpha]
 
 **窗口层缓存（几何键，含阴影）：窗口阶段 1416→916 ticks/30 帧（−35%）；修掉循环帧数上限与一条靠错因通过的断言；验收 35/35。**

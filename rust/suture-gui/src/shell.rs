@@ -150,6 +150,11 @@ const WC_MARGIN_R: i32 = 12;
 const WC_MARGIN_B: i32 = 16;
 static mut WIN_CACHE: [[u32; WC_STRIDE * WC_H]; 4] = [[0; WC_STRIDE * WC_H]; 4];
 static mut WIN_KEY: [i32; 4] = [i32::MIN; 4];
+static mut WSPLIT: (u64, u64, u64, u32) = (0, 0, 0, 0);
+/* v0.47.0: rounded-corner coverage LUT. The analytic path called the
+ * soft-float sqrt once per corner pixel; on this no-SSE target that made a
+ * window body ~400 ms. 16x16 entries, built once. */
+static mut CORNER_COV: [[u8; 16]; 16] = [[0; 16]; 16];
 /* v0.45.0: the scene cache (FRAME) no longer contains the cursor. The cursor is
  * composited straight into the framebuffer, so pointer motion only needs to
  * restore the two small rectangles from FRAME and redraw the arrow. This avoids
@@ -225,6 +230,24 @@ unsafe fn build_caches() {
     for y in 0..SCREEN_H as usize {
         ym[y] = ((y * SMALL_H) / (SCREEN_H as usize)) as u16;
     }
+    // rounded-corner coverage table (radius up to 12, integer pixel centres)
+    {
+        let cc = &mut *core::ptr::addr_of_mut!(CORNER_COV);
+        let r = 12i32;
+        for dy in 0..16usize {
+            for dx in 0..16usize {
+                let fx = dx as f32 + 0.5;
+                let fy = dy as f32 + 0.5;
+                let cx = crate::swrast::clampf(fx, r as f32, r as f32);
+                let cy = crate::swrast::clampf(fy, r as f32, r as f32);
+                let ddx = fx - cx;
+                let ddy = fy - cy;
+                let d = crate::swrast::fsqrt(ddx * ddx + ddy * ddy) - r as f32;
+                let cov = crate::swrast::clampf(0.5 - d, 0.0, 1.0);
+                cc[dy][dx] = (cov * 255.0) as u8;
+            }
+        }
+    }
     CACHED = true;
 }
 
@@ -245,45 +268,78 @@ fn small_sample(x: i32, y: i32) -> u32 {
 /// sampled directly (no per-frame blur) plus a translucent white tint.
 fn frosted(s: &mut Surface<'_>, x0: i32, y0: i32, x1: i32, y1: i32, r: f32,
            tint_alpha: u32) {
-    // Fast path: the interior (away from the rounded corners) has full
-    // coverage, so only the four r x r corner squares need the sqrt test.
-    // This is what makes a per-frame window repaint affordable under TCG.
+    // v0.47.0: the interior (full coverage) is an INTEGER-only loop. It used to
+    // evaluate f32 comparisons per pixel; on this target every f32 op is a soft
+    // float call (compiler_builtins), which made a 430x300 window cost ~250 ms.
+    // Only the rounded-corner band still needs the analytic sqrt coverage.
     let rr = r.max(0.0).min(((x1 - x0) as f32) * 0.5).min(((y1 - y0) as f32) * 0.5);
     let ri = rr as i32;
-    let ys = y0.max(0);
-    let ye = y1.min(s.h as i32);
-    let xs = x0.max(0);
-    let xe = x1.min(s.w as i32);
+    let ys = y0.max(0).max(s.clip.1);
+    let ye = y1.min(s.h as i32).min(s.clip.3);
+    let xs = x0.max(0).max(s.clip.0);
+    let xe = x1.min(s.w as i32).min(s.clip.2);
+
+    let in_x0 = x0 + ri;
+    let in_x1 = x1 - ri;
+    let in_y0 = y0 + ri;
+    let in_y1 = y1 - ri;
+
     for y in ys..ye {
-        let fy = y as f32 + 0.5;
-        let in_v = y >= y0 + ri && y < y1 - ri;
-        for x in xs..xe {
-            let cov = if in_v && x >= x0 + ri && x < x1 - ri {
-                1.0
-            } else {
-                let fx = x as f32 + 0.5;
-                let cx = crate::swrast::clampf(fx, x0 as f32 + rr, x1 as f32 - rr);
-                let cy = crate::swrast::clampf(fy, y0 as f32 + rr, y1 as f32 - rr);
-                let dx = fx - cx;
-                let dy = fy - cy;
-                let d = crate::swrast::fsqrt(dx * dx + dy * dy) - rr;
-                crate::swrast::clampf(0.5 - d, 0.0, 1.0)
-            };
-            if cov <= 0.0 {
-                continue;
+        let inside_v = y >= in_y0 && y < in_y1;
+        let row = y as usize * s.stride;
+        if inside_v {
+            // left band (rounded corner region) then interior then right band
+            let li = xs.max(in_x0.min(xe));
+            let ri_end = xe.min(in_x1.max(xs));
+            for x in xs..li {
+                frost_edge_px(s, row, x, y, x0, y0, x1, y1, ri, tint_alpha);
             }
-            let base = small_sample(x, y);
-            let i = y as usize * s.stride + x as usize;
-            let dst = s.px[i] & 0x00ff_ffff;
-            if cov >= 1.0 {
+            for x in li..ri_end {
+                let base = small_sample(x, y);
                 let c = blend_px_raw(base, 0xffffff, tint_alpha);
-                s.px[i] = blend_px_raw(dst, c, 255) & 0x00ff_ffff;
-            } else {
-                let c = blend_px_raw(base, 0xffffff, (tint_alpha as f32 * cov) as u32);
-                s.px[i] = blend_px_raw(dst, c, (cov * 255.0) as u32) & 0x00ff_ffff;
+                s.px[row + x as usize] = c & 0x00ff_ffff;
+            }
+            for x in ri_end..xe {
+                frost_edge_px(s, row, x, y, x0, y0, x1, y1, ri, tint_alpha);
+            }
+        } else {
+            for x in xs..xe {
+                frost_edge_px(s, row, x, y, x0, y0, x1, y1, ri, tint_alpha);
             }
         }
     }
+}
+
+/// Rounded-corner coverage pixel, using the precomputed LUT (no soft-float sqrt
+/// per pixel). `ri` is the corner radius in pixels.
+#[inline]
+fn frost_edge_px(s: &mut Surface<'_>, row: usize, x: i32, y: i32,
+                 x0: i32, y0: i32, x1: i32, y1: i32, ri: i32, tint_alpha: u32) {
+    // distance (in whole pixels) from the inner rect, clamped into the LUT
+    let dx = if x < x0 + ri {
+        x0 + ri - x
+    } else if x >= x1 - ri {
+        x - (x1 - ri - 1)
+    } else {
+        0
+    };
+    let dy = if y < y0 + ri {
+        y0 + ri - y
+    } else if y >= y1 - ri {
+        y - (y1 - ri - 1)
+    } else {
+        0
+    };
+    let (ix, iy) = (dx.clamp(0, 15) as usize, dy.clamp(0, 15) as usize);
+    let cov255 = unsafe { (&*core::ptr::addr_of!(CORNER_COV))[iy][ix] } as u32;
+    if cov255 == 0 {
+        return;
+    }
+    let base = small_sample(x, y);
+    let i = y as usize * s.stride + x as usize;
+    let dst = s.px[i] & 0x00ff_ffff;
+    let c = blend_px_raw(base, 0xffffff, tint_alpha * cov255 / 255);
+    s.px[i] = blend_px_raw(dst, c, cov255) & 0x00ff_ffff;
 }
 
 fn control_rect(w: &Win) -> (i32, i32, i32, i32) {
@@ -983,12 +1039,15 @@ fn save_window_cache(scene: &[u32], stride: usize, slot: usize, w: &Win) {
 }
 
 fn draw_window(s: &mut Surface<'_>, w: &Win) {
+    let t_all = ticks();
     /* two-layer soft shadow: plain rect fills (no AA, no sqrt) */
     s.rect_fill(w.x + 2, w.y + 10, w.x + w.w + 2, w.y + w.h + 12, 0x000000, 0x30);
     s.rect_fill(w.x - 2, w.y + 4, w.x + w.w + 6, w.y + w.h + 4, 0x000000, 0x20);
+    let t_shadow = ticks() - t_all;
 
     /* body: frosted acrylic + rounded silhouette */
     frosted(s, w.x, w.y, w.x + w.w, w.y + w.h, 12.0, 0x2a);
+    let t_frost = ticks() - t_all - t_shadow;
     /* hairline border: four 1 px rect fills (no analytic AA pass) */
     s.rect_fill(w.x + 8, w.y, w.x + w.w - 8, w.y + 1, 0xffffff, 0x30);
     s.rect_fill(w.x + 8, w.y + w.h - 1, w.x + w.w - 8, w.y + w.h, 0xffffff, 0x30);
@@ -1029,5 +1088,17 @@ fn draw_window(s: &mut Surface<'_>, w: &Win) {
     s.rect_fill(w.x + 16, cy, w.x + w.w - 16, cy + 56, 0xffffff, 0x12);
     s.text(w.x + 28, cy + 12, "圆角 + 轻亚克力 + 微透叠层", 0xcfe0ff, 0xc0, 1);
     s.text(w.x + 28, cy + 32, "窗口可拖动 / 最小化 / 最大化", 0x9fb2cc, 0xb0, 1);
-    s.text(w.x + 18, (w.y + w.h - 26) as i32, "窗口管理原型 v0.46", 0x8fa3bd, 0x90, 1);
+    s.text(w.x + 18, (w.y + w.h - 26) as i32, "窗口管理原型 v0.47", 0x8fa3bd, 0x90, 1);
+    unsafe {
+        let d = &mut *core::ptr::addr_of_mut!(WSPLIT);
+        d.0 += t_shadow;
+        d.1 += t_frost;
+        d.2 += ticks() - t_all - t_shadow - t_frost;
+        d.3 += 1;
+        if d.3 >= 4 {
+            console_printf(b"[gui-shell] wsplit shadow=%d frosted=%d chrome=%d ticks (x4)\n\0".as_ptr(),
+                           d.0 as i32, d.1 as i32, d.2 as i32);
+            *d = (0, 0, 0, 0);
+        }
+    }
 }
