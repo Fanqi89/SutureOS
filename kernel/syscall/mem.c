@@ -12,6 +12,36 @@
 
 static uint64_t user_brk[SCHED_MAX_TASKS] = {0};
 
+/* v0.60: bump cursor for `mmap(addr = NULL)`.
+ *
+ * The old code returned `USER_HEAP_MAX - len` for *every* such call, so a second
+ * mapping of a different length silently overwrote the first one's page-table
+ * entries.  Measured on the real thing (Wayland wl_shm pools): memfd A mapped
+ * 24576 B at 0x7fffa000, then memfd B mapped 64000 B at 0x7fff0000 - B's PTEs
+ * replaced A's, and reading through A returned B's bytes.
+ *
+ * Fix: one monotonically descending cursor, so every anonymous and memfd mapping
+ * owns its own address window.  munmap does not return the window (the address
+ * space is leaked, not the pages); that is deliberate - simple and safe - and is
+ * listed as a known limitation in docs/porting-domains-report.md. */
+static uint64_t g_map_cursor = 0;
+
+static uint64_t user_map_alloc(uint64_t nlen)
+{
+    if (g_map_cursor == 0) {
+        g_map_cursor = USER_HEAP_MAX;
+    }
+    if (nlen == 0 || nlen > g_map_cursor - USER_HEAP_START) {
+        return 0;
+    }
+    g_map_cursor = (g_map_cursor - nlen) & ~4095ull;
+    if (g_map_cursor < USER_HEAP_START) {
+        g_map_cursor = USER_HEAP_MAX;
+        return 0;
+    }
+    return g_map_cursor;
+}
+
 uint64_t sys_brk(uint64_t addr, uint64_t a2, uint64_t a3,
                  uint64_t a4, uint64_t a5, uint64_t a6)
 {
@@ -87,9 +117,10 @@ uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
         if (!(flags & MAP_SHARED_)) return (uint64_t)-1;
         if (memfd_is_fd((int)fd) && (offset & 0xFFFull) == 0 && len > 0) {
             const uint64_t nlen = (len + 4095) & ~4095ull;
-            const uint64_t vaddr = addr ? (addr & ~4095ull) : USER_HEAP_MAX - nlen;
-            if (vaddr < USER_HEAP_START || vaddr + nlen > USER_HEAP_MAX) {
-                return (uint64_t)-1;
+            const uint64_t vaddr = addr ? (addr & ~4095ull) : user_map_alloc(nlen);
+            if (vaddr == 0 || vaddr < USER_HEAP_START ||
+                vaddr + nlen > USER_HEAP_MAX) {
+                return (uint64_t)-12;                    /* ENOMEM */
             }
             if (memfd_map(vaddr, (int)fd, nlen, (prot & PROT_WRITE) != 0) != 0) {
                 return (uint64_t)-1;
@@ -102,8 +133,10 @@ uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
     if (!(flags & MAP_PRIVATE)) return (uint64_t)-1;
     if (len == 0) return (uint64_t)-1;
     len = (len + 4095) & ~4095;
-    uint64_t vaddr = addr ? (addr & ~4095) : USER_HEAP_MAX - len;
-    if (vaddr < USER_HEAP_START || vaddr + len > USER_HEAP_MAX) return (uint64_t)-1;
+    uint64_t vaddr = addr ? (addr & ~4095) : user_map_alloc(len);
+    if (vaddr == 0 || vaddr < USER_HEAP_START || vaddr + len > USER_HEAP_MAX) {
+        return (uint64_t)-12;                            /* ENOMEM */
+    }
     for (uint64_t v = vaddr; v < vaddr + len; v += 4096) {
         uint64_t *pte = mmu_walk((uint64_t*)read_cr3(), 0, v, 1);
         if (!pte) {

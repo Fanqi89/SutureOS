@@ -8,36 +8,35 @@ in the repository.
 
 ## [Unreleased]
 
-## [Unreleased]
+### Wayland 进桌面窗口 + 协议补全 + 双缓冲交换链（v0.59.0 之后）
 
-### Wayland 进桌面 + 协议补全 + 交换链（v0.59.0 后续开发中）
-
-- **Wayland surface 进入桌面窗口**：图片查看器现在直接绘制内核 Wayland 服务端最后 commit 的
-  wl_surface（1:1 裁剪 + accent 边框 + `Wayland surface (wl_shm)` 标注；没有 commit 时仍显示
+- **Wayland surface 进入桌面窗口**：图片查看器现在直接绘制内核 Wayland 服务端最后一次 commit 的
+  `wl_surface`（1:1 裁剪 + accent 边框 + `Wayland surface (wl_shm)` 标注；没有 commit 时仍显示
   Logo 预览）。窗口层缓存键里混入 `wl_server_commit_count()`，客户端再 commit 会自动重栅格化。
   新增 `scripts/wl_desktop_window_acceptance.py` **11/11**（真实鼠标开菜单→打开窗口→像素统计：
   8159 个高饱和样本、4304 种颜色、边框 100% 暖色）。
-- **Wayland 协议补全**：`wl_surface.frame` → 下一 commit 发 `wl_callback.done(serial)`、
-  `damage`/`damage_buffer` 累计并折进 commit 行、`wl_display.error`/`delete_id`、
-  `wl_seat.get_pointer` 变为真 wl_pointer（enter/motion/button 取自内核鼠标快照）。
-  ring-3 `run wlclient` 扩展为**两次 commit** + frame 回调 + seat 事件 + 未知对象触发 error
-  （客户端 37 项自检）。`scripts/wl_protocol_acceptance.py` **29/29**：宿主独立重算两帧 FNV-1a
-  （frame1 `c7763445` 与 WL.BIN 256000 B 逐字节一致；frame2 `e6601b45` 与内核第二条 commit 一致）。
+- **Wayland 协议补全**：`wl_surface.frame` → 下一次 commit 发 `wl_callback.done(serial)`；
+  `damage`/`damage_buffer` 累计并折进 commit 行；`wl_display.error`/`delete_id`；
+  `wl_seat.get_pointer` 变成真 wl_pointer（enter/motion/button 取自内核鼠标快照）。ring-3
+  `run wlclient` 扩展为两次 commit + frame 回调 + seat 事件 + 未知对象触发 error（客户端 37 项自检）。
+  `scripts/wl_protocol_acceptance.py` **29/29**：宿主独立重算两帧 FNV-1a（frame1 `c7763445` 与
+  `WL.BIN` 256000 B 逐字节一致；frame2 `e6601b45` 与内核第二条 commit 一致）。
 - **交换链 + vsync 模拟**：`FRAME_A`/`FRAME_B` 双场景缓冲 + FRONT 指针，所有渲染路径画后台缓冲，
-  present 时翻前、整帧拷贝到 framebuffer 后再画光标（screendump 不可能拍到半帧）；10 ms 闸门 +
+  present 时翻页、整帧拷贝到 framebuffer 后再画光标（screendump 不可能拍到半帧）；10 ms 闸门 +
   合并（pending 帧在 idle 分支冲刷，不丢帧）；每 30 帧打
-  `[gui-shell] swap presents=N gens=G skipped=S interval_ms=M`，新增 `guishell swapstat`
-  输出守恒关系 `rendered == scene + skipped`。`scripts/guishell_swap_acceptance.py` **19/19**
-  （指针快速移动 16.3 presents/s；桌面外观 0 像素越界）。
-- 回归（同一份最终 ISO 真跑）：Wayland 29/29、28/28、9/9、wlwin 11/11、swap 19/19、
-  桌面 **19/19**、外壳 **55/55**、应用内容 **25/25**、Logo **14/14**、静态 **21/21**、
-  交互 **13/13**、C 桌面 **9/9**、两套外观门禁 **0 像素**、自检 **16/16**、
-  符号 **1407 / 0 冲突**。产物：`kernel.elf` 6,483,096 B、`sutureos.iso` 23,574,528 B（未发版）。
-- 如实限制：`skipped` 实测恒为 0（外壳循环每帧 ≥3 ticks=30 ms 节流，帧进不了 10 ms 闸门；
-  合并机制已实现但正常操作不触发）；仍无真 vsync/三缓冲；`wl_pointer` 是快照不是事件流
-  （无 leave/后续 motion/`wl_pointer.frame`）；`wl_keyboard` 仍 inert；damage 只累计不驱动局部重绘；
-  WL.BIN 存 frame 1，frame 2 由宿主按"改 32×32 块"重算校验。
+  `[gui-shell] swap presents=N gens=G skipped=S interval_ms=M`，新增 `guishell swapstat` 输出守恒关系
+  `rendered == scene + skipped`。`scripts/guishell_swap_acceptance.py` **19/19**（指针快速移动
+  16.3 presents/s；桌面外观 0 像素越界）。
+- 回归（同一份最终 ISO 真跑）：Wayland 29/29、28/28、9/9、wlwin 11/11、swap 19/19、桌面 **19/19**、
+  外壳 **55/55**、应用内容 **25/25**、Logo **14/14**、静态 **21/21**、交互 **13/13**、C 桌面 **9/9**、
+  两套外观门禁 **0 像素**、自检 **16/16**、符号 **1407 / 0 冲突**。
+  产物：`kernel.elf` 6,483,096 B、`sutureos.iso` 23,574,528 B（未发布）。
+- 如实限制：`skipped` 实测恒为 0（外壳循环每帧 ≥3 ticks=30 ms 节流，帧进不到 10 ms 闸门，合并机制
+  已实现但正常操作不触发）；仍无真 vsync/三缓冲；`wl_pointer` 是快照不是事件流（无 leave/后续
+  motion/`wl_pointer.frame`）；`wl_keyboard` 仍 inert；damage 只累计不驱动局部重绘；WL.BIN 存
+  frame 1，frame 2 由宿主按"改 32×32 块"重算校验。
 
+<!-- ROUND-GUI-FINAL -->
 ## [v0.59.0-alpha]
 
 ### 桌面换代：`startgui` 改为 Rust 桌面外壳 + 最小 Wayland 服务端
