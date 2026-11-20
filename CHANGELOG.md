@@ -36,7 +36,69 @@ in the repository.
   motion/`wl_pointer.frame`）；`wl_keyboard` 仍 inert；damage 只累计不驱动局部重绘；WL.BIN 存
   frame 1，frame 2 由宿主按"改 32×32 块"重算校验。
 
-<!-- ROUND-GUI-FINAL -->
+### GUI 收尾：三缓冲 + 60 Hz 节拍、damage 局部重绘、多客户端 Wayland 与真输入事件流、Wayland 独立窗口、视觉打磨
+
+- **三缓冲 + 高频时基节拍**：`FRAME_A/B/C` + `DRAW/READY/PRESENTED/FREE` 状态机（每帧校验
+  "呈现源必须是 READY、没有缓冲仍在 DRAW"，`buf_checks=.. buf_bad=0`）；呈现对齐 60 Hz 网格
+  （`FRAME_NS=16_666_667`，时基来自 HPET `time_source_now_ns()`），统计
+  presents/presented/skipped/deferred/dropped/jitter_us/latency 与间隔直方图，`guishell swapstat`
+  输出全部字段，守恒式 `rendered == presented + skipped + pending`。
+- **damage 驱动局部重绘**：唯一合成入口 `compose_rect()`——壁纸矩形拷贝 → 窗口层（含阴影）→
+  `apps::draw_live` → 三处淡入淡出 → 焦点输入行 → 任务栏整条 → 开始菜单整块；**全屏重绘就是
+  一个全覆盖 rect**，两条路径构造同源。每 ≤20 个 damage 帧 + 结构性变化跑 oracle：整屏重画到空闲
+  缓冲逐像素比对（`damage: identical` / `MISMATCH at x,y`），不一致就用 oracle 帧修复
+  （实测 `oracle=9.. mismatch=0`）。纯指针/空闲帧重绘占比 **permille 4–5（0.4–0.5% 屏幕）**，
+  拖动重绘 **0–1 ticks（0–10 ms，旧整屏 ≈117 ms）**。
+- **半帧（撕裂）检测（诚实版）**：没有扫描线中断，present 后按固定采样（96 点 + 跳过光标框）比对
+  "刚呈现的缓冲"与 framebuffer，不一致记 `tear: partial present at x,y`；本轮 `tear=13,919 采样 /
+  tear_bad=0`，另有验收连续 20 次在 present 过程中 screendump，与参考桌面 **0 像素差异**。
+- **多客户端 Wayland**：每个连接独立保留自己最后一次 commit 的 surface（像素副本 + w/h/stride/
+  scale/serial），新增 `wl_server_surface_count()/_at()`，旧 `wl_server_latest_surface()` 语义不变
+  （`wlshow`/图片查看器不动）；新 ring-3 客户端 `run wltwo` 单进程开两条连接
+  （160×100@2x + 96×64@1x 子 surface），导出 WLTWO.BIN/WLTWO2.BIN 供宿主逐字节比对。
+- **`wl_keyboard` / `wl_pointer` 真事件流**：`kernel/drivers/mb_kbd.c` 在解码路径镜像进 64 项环
+  （`mbos_kbd_poll()` 语义不变，shell/GUI 照旧消费），server pump 发
+  `keymap(NO_KEYMAP)/enter/modifiers/key(evdev=sc+8, press+release)/leave`；指针改为
+  enter/motion/button(两沿)/leave + `wl_pointer.frame`（v5+ 绑定才发）的持续事件流。
+  实测一次打字 8 press + 9 release、8 个不同 keycode；指针 motion 3 / button 1/1 / frame 6 / leave 1。
+- **`set_buffer_scale` / `wl_region` / `wl_subcompositor`/`wl_subsurface` 语义**：
+  `wl_surface.set_buffer_scale(2)` 记录并导出（commit 行 `scale=2 logical=80x50`）；
+  `wl_region.add/subtract` 面积累计（8000→9600→9500）+ opaque/input 面积上报；子 surface 记录
+  父子与相对偏移（`pos=24,16`）。**都是语义**：不做裁剪、不做合成，报告里如实写明。
+- **Wayland 独立窗口**：新窗口（accent `0x7a5cff`）"Wayland 客户端"，**F2 开关**（开始菜单保持
+  4 行不变，避免移动被冻结的菜单几何与被它锚定的验收坐标）；内容按整数最近邻 1:1/2x 显示 surface、
+  页脚显示 `WxH ・ scale ・ commit` 与"客户端 N #i WxH"（多客户端可观测）；无客户端时显示提示卡，
+  **不回退 Logo**（"没有客户端"要看得见）。窗口层缓存键混入 commit 计数，客户端再 commit 即重栅格化。
+- **视觉打磨（基线本轮重生）**：壁纸加顶部冷光晕 + 六环整数晕影（亚克力采样源同步），伪 3D 图标加
+  内描边/侧棱光/底部反光，窗口加 2 px accent 身份条 + 玻璃内高光 + 22px 倒角控制钮，任务栏圆角
+  按钮/圆角活跃下划线/顶部发丝高光，开始菜单圆角行。`docs/baseline/base_gui.png` 已按新外观重生，
+  门禁仍然 **0 像素**越界；token 与硬约束写在 `docs/gui-visual-spec.md`。
+- **修的真 bug**（现象 → 根因）：
+  - 关窗后画面残留旧窗口 → 动画计数在快照之后才推进，SNAP 记成"已关闭"而画的是"还在淡出"，
+    下一帧 diff 认为无需重绘；改为**快照在动画计数推进之前**拍摄。
+  - 被节拍推迟的 present 丢 damage → 被下一帧取代后那份矩形从未 blit；改为 **ACCUM 累积到真正上屏**。
+  - `blit_logo_region` 绕过 `Surface::clip` → 写到自己 rect 之外污染相邻像素（oracle 抓到 px=45 级差异）；
+    加 `in_clip()` 判断。
+  - `draw_live` 心跳点相位与活数据刷新不同帧 → 把喂给它的时钟钉在 `live_tick*1000`，既保持观感又让
+    oracle 能验证该区域。
+  - **`mmap(addr=NULL)` 二次映射覆盖前一次 PTE**（memfd A 24576B 与 B 64000B 落到重叠区间，透过 A 读到
+    B 的数据）→ 新增 `user_map_alloc()` 单调下降游标，memfd 与匿名两条分支都从游标取窗口
+    （munmap 不还窗口，作为已知限制记录）；`wltwo` 把它变成常驻断言（不重叠 + 第一次映射数据未变）。
+- **验收（同一份最终 ISO 真跑）**：静态 **21/21**、交互 **13/13**、外壳 **55/55**、交换链 **30/30**、
+  合成器 **23/23**、C 桌面应用/任务栏 **9/9**、桌面 **19/19**、应用内容 **25/25**、Logo **14/14**、
+  Wayland 服务端 **28/28**、协议 **29/29**、多客户端 **40/40**、wlshow **9/9**、Wayland 窗口 **11/11**、
+  wlprobe **14/14**、GUI 中文 4/4、图片查看器 4/4、编辑器 5/5、unix **18/18**、shm **18/18**、
+  fdpass **21/21**，两套外观门禁 **0 像素**，开机自检 **16/16**，符号 **1421 全局 / 0 冲突（144 对象）**。
+  产物：`kernel.elf` 6,512,328 B、`sutureos.iso` 23,631,872 B
+  （sha256 `828fcd13ffe92fc2dbfe894a2da8917f9d78a6c73731e1db9eee23419aef0a81`，未发布）。
+- **已知限制**：没有真 vsync 源（60 Hz 是 HPET 墙上时钟网格，present 是同步 blit，"对齐"只保证不早于
+  槽边界）；`dropped` 是软件推断（错槽/被取代帧，空闲期不计）；oracle 是抽样时点（≤20 damage 帧 +
+  结构性变化，非每帧）；damage 合并 ≤6 块、满了退化成包围盒（偏多但不丢）；最大化/还原 4 帧过渡仍整屏；
+  3-tick 节奏下三缓冲轮转罕见（`deferred=0 carry=0`，第三缓冲主要作状态机/oracle 脚手架）；
+  `wl_keyboard.keymap` 是 NO_KEYMAP（内核无 XKB 数据）；键盘第一拍可能先发一条 key 再发 enter；
+  `wl_pointer` 坐标被夹进 surface（无窗口命中测试）；region/subsurface 只记录不合成；连接上限 4、
+  surface 上限 320×200；`mmap` 窗口不回收。
+
 ## [v0.59.0-alpha]
 
 ### 桌面换代：`startgui` 改为 Rust 桌面外壳 + 最小 Wayland 服务端

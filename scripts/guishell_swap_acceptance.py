@@ -8,13 +8,18 @@ and that this changed no pixels:
   * `guishell` still starts the same loop              -> "[gui-shell] shell: loop"
   * the pointer moves through the cursor fast path     -> "cursor: fast path frames="
   * clicks / minimise-restore generate full frames     -> "profile/30:"
-  * every 30 frames the swap counters are logged       -> "[gui-shell] swap presents=N gens=G skipped=S interval_ms=M"
-      - presents == gens on every line (one generation per present)
-      - gens / presents never go backwards (monotonic)
-      - skipped >= 0 and never decreases
-      - interval_ms > 0 (the 100 Hz tick is the only clock)
+  * every 30 frames the swap counters are logged
+      -> "[gui-shell] swap presents=P gens=G presented=PR dropped=D jitter_us=J
+          interval_ms=I skipped=S latency_us=L latency_max_us=LM hist=.."
+      - presents == gens == presented on every line
+      - gens / presents / dropped never go backwards (monotonic)
+      - skipped >= 0, interval_ms > 0, jitter_us inside one 60 Hz slot
+      - production->present latency <= 2 frames, histogram non-empty
   * after ESC, `guishell swapstat` reports the cumulative counters once
-      - presents > 0 and rendered == scene + skipped (accounting closes)
+      - presents == gens == presented, rendered == presented + skipped
+      - damage oracle: 0 mismatches; present completion: 0 tear_bad
+      - buffer state machine: buf_checks > 0, buf_bad == 0, exactly one
+        PRESENTED buffer and no READY buffer left at rest
   * two screendumps of the desktop pass the appearance gate
     (`gui_appearance_check.py --profile new`) -> 0 px outside live rects
   * no kernel PANIC
@@ -31,6 +36,8 @@ import sys
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# own copy with a distinct image name: other sessions on this box kill
+# every process called qemu-system-x86_64 when they clean up strays
 QEMU = r'C:\Program Files\qemu\qemu-system-x86_64.exe'
 QMP_PORT = int(os.environ.get('SWAP_QMP_PORT', '45921'))
 SERIAL = 'build/serial_swap.log'
@@ -84,10 +91,28 @@ class Qmp:
 
 
 SWAP_RE = re.compile(
-    r'\[gui-shell\] swap presents=(\d+) gens=(\d+) skipped=(\d+) interval_ms=(\d+)')
+    r'\[gui-shell\] swap presents=(\d+) gens=(\d+) presented=(\d+) dropped=(\d+) '
+    r'jitter_us=(\d+) interval_ms=(\d+) skipped=(\d+) latency_us=(\d+) '
+    r'latency_max_us=(\d+) hist=([\d,]+)')
 STAT_RE = re.compile(
-    r'\[gui-shell\] swapstat presents=(\d+) gens=(\d+) skipped=(\d+) '
-    r'interval_ms=(\d+) rendered=(\d+) scene=(\d+)')
+    r'\[gui-shell\] swapstat presents=(\d+) gens=(\d+) presented=(\d+) '
+    r'dropped=(\d+) jitter_us=(\d+) interval_ms=(\d+) skipped=(\d+) '
+    r'rendered=(\d+) scene=(\d+) carry=(\d+) full=(\d+) dmg=(\d+) '
+    r'dmg_px=(\d+) framed_px=(\d+) oracle=(\d+) mismatch=(\d+) tear=(\d+) '
+    r'tear_bad=(\d+) late=(\d+) latency_us=(\d+) latency_max_us=(\d+) '
+    r'hist=([\d,]+) deferred=(\d+) pending=(\d+) bufs=(\w+) '
+    r'buf_checks=(\d+) buf_bad=(\d+)')
+
+
+def stats_tuple(m):
+    """swapstat match -> tuple of ints, with the hist/bufs string groups kept."""
+    out = []
+    for i, v in enumerate(m):
+        if i in (21, 24):            # hist, bufs
+            out.append(v)
+        else:
+            out.append(int(v))
+    return tuple(out)
 
 
 def main():
@@ -106,7 +131,9 @@ def main():
             '-drive', 'id=adisk,file=build/fat32_ata.img,format=raw,if=ide',
             '-smp', '2', '-no-reboot', '-no-shutdown']
     print('[swap] ' + ' '.join(argv), flush=True)
-    proc = subprocess.Popen(argv, cwd=ROOT)
+    errlog = open(os.path.join(ROOT, 'build', 'qemu_err.log'), 'wb')
+    proc = subprocess.Popen(argv, cwd=ROOT, stdout=subprocess.DEVNULL,
+                             stderr=errlog)
     checks = []
 
     def log_text():
@@ -210,35 +237,56 @@ def main():
         wait_for(lambda t: len(SWAP_RE.findall(t)) >= 3, 240)
 
         txt = log_text()
-        swap = [tuple(int(x) for x in m) for m in SWAP_RE.findall(txt)]
+        swap = [tuple(int(x) for x in m[:9]) + (m[9],)
+                for m in SWAP_RE.findall(txt)]
         stats = [tuple(int(x) for x in m) for m in STAT_RE.findall(txt)]
 
         check('swap log line appears (>=3 windows of 30 frames)',
               len(swap) >= 3, 'lines=%d' % len(swap))
         check('presents == gens on every swap line (one generation per present)',
-              swap and all(p == g for p, g, s, i in swap),
+              swap and all(m[0] == m[1] for m in swap),
               'first=%r last=%r' % (swap[0] if swap else None,
                                     swap[-1] if swap else None))
+        check('swap log carries the full field set (presented/dropped/jitter/hist)',
+              swap and all(len(m[9]) > 0 for m in swap),
+              'last hist=%s' % (swap[-1][9] if swap else ''))
+        check('presented == presents (every present hands one buffer to the screen)',
+              swap and all(m[2] == m[0] for m in swap),
+              'presented=%r' % [m[2] for m in swap])
         check('presents strictly increases between windows',
               all(b[0] > a[0] for a, b in zip(swap, swap[1:])),
-              'presents=%r' % [p for p, g, s, i in swap])
+              'presents=%r' % [m[0] for m in swap])
         check('gens is monotonically increasing',
               all(b[1] > a[1] for a, b in zip(swap, swap[1:])),
-              'gens=%r' % [g for p, g, s, i in swap])
+              'gens=%r' % [m[1] for m in swap])
         check('skipped is >= 0 and never decreases',
-              all(s >= 0 for p, g, s, i in swap) and
-              all(b[2] >= a[2] for a, b in zip(swap, swap[1:])),
-              'skipped=%r' % [s for p, g, s, i in swap])
-        check('interval_ms > 0 (the 100 Hz tick is the only clock)',
-              all(i > 0 for p, g, s, i in swap),
-              'interval_ms=%r' % [i for p, g, s, i in swap])
+              all(m[6] >= 0 for m in swap) and
+              all(b[6] >= a[6] for a, b in zip(swap, swap[1:])),
+              'skipped=%r' % [m[6] for m in swap])
+        check('dropped is >= 0 and never decreases',
+              all(m[3] >= 0 for m in swap) and
+              all(b[3] >= a[3] for a, b in zip(swap, swap[1:])),
+              'dropped=%r' % [m[3] for m in swap])
+        check('interval_ms > 0 (measured on the HPET grid)',
+              all(m[5] > 0 for m in swap),
+              'interval_ms=%r' % [m[5] for m in swap])
+        check('jitter stays inside one 60 Hz slot (<= 8333 us)',
+              all(0 <= m[4] <= 8333 for m in swap),
+              'jitter_us=%r' % [m[4] for m in swap])
+        check('present latency <= 2 frames (no unbounded queueing)',
+              all(0 <= m[8] < 33_000 for m in swap),
+              'latency_max_us=%r' % [m[8] for m in swap])
+        check('interval histogram buckets are being filled',
+              swap and sum(int(v) for v in swap[-1][9].split(',')) > 0,
+              'hist=%s' % (swap[-1][9] if swap else ''))
 
         # present rate from the last logged window (30 frames)
         if swap:
-            ivl = swap[-1][3]
+            ivl = swap[-1][5]
             rate = 1000.0 / ivl if ivl else 0.0
             print('[swap] last window: presents=%d skipped=%d interval_ms=%d '
-                  '(~%.1f presents/s)' % (swap[-1][0], swap[-1][2], ivl, rate))
+                  'jitter_us=%d (~%.1f presents/s)'
+                  % (swap[-1][0], swap[-1][6], ivl, swap[-1][4], rate))
 
         check('cursor fast path was exercised (pointer-only updates)',
               'cursor: fast path frames=' in txt)
@@ -254,25 +302,46 @@ def main():
         key('ret')
         check('guishell swapstat logs the counters once',
               wait_for(lambda t: '[gui-shell] swapstat' in t, 90))
-        stats = [tuple(int(x) for x in m) for m in STAT_RE.findall(log_text())]
+        stats = [stats_tuple(m) for m in STAT_RE.findall(log_text())]
         if stats:
-            p, g, s, ivl, rendered, scene = stats[-1]
-            print('[swap] swapstat: presents=%d gens=%d skipped=%d interval_ms=%d '
-                  'rendered=%d scene=%d' % (p, g, s, ivl, rendered, scene))
-            check('swapstat presents > 0 after a desktop session', p > 0)
-            check('swapstat presents == gens', p == g)
-            check('accounting closes: rendered == scene presents + skipped',
-                  rendered == scene + s)
+            st = stats[-1]
+            print('[swap] swapstat: presents=%s gens=%s presented=%s dropped=%s '
+                  'jitter_us=%s interval_ms=%s skipped=%s rendered=%s scene=%s '
+                  'oracle=%s mismatch=%s tear=%s tear_bad=%s late=%s '
+                  'bufs=%s buf_checks=%s buf_bad=%s'
+                  % (st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7], st[8],
+                     st[14], st[15], st[16], st[17], st[18], st[24], st[25], st[26]))
+            check('swapstat presents > 0 after a desktop session', int(st[0]) > 0)
+            check('swapstat presents == gens == presented',
+                  st[0] == st[1] == st[2])
+            check('accounting closes: rendered == presented + skipped + pending',
+                  int(st[7]) == int(st[0]) + int(st[6]) + int(st[23]),
+                  'rendered=%s presented=%s skipped=%s pending=%s'
+                  % (st[7], st[0], st[6], st[23]))
+            check('damage oracle: mismatches must be zero',
+                  int(st[15]) == 0, 'oracle=%s mismatch=%s' % (st[14], st[15]))
+            check('present completion check: no partial presents',
+                  int(st[16]) > 0 and int(st[17]) == 0,
+                  'tear=%s tear_bad=%s' % (st[16], st[17]))
+            check('buffer state machine: invariants held, one PRESENTED buffer',
+                  int(st[25]) > 0 and int(st[26]) == 0 and st[24].count('P') == 1
+                  and st[24].count('R') == 0,
+                  'bufs=%s checks=%s bad=%s' % (st[24], st[25], st[26]))
+            check('late frames (missed 60 Hz slot) are a small minority',
+                  int(st[18]) <= max(4, int(st[0]) // 4),
+                  'late=%s presents=%s' % (st[18], st[0]))
+            check('latency stays well under two frames on average',
+                  int(st[20]) < 33_000, 'latency_us=%s' % st[20])
             if swap:
                 check('cumulative counters never go backwards vs the live log',
-                      p >= swap[-1][0] and s >= swap[-1][2])
+                      int(st[0]) >= swap[-1][0] and int(st[6]) >= swap[-1][6])
         else:
             check('swapstat line parsed', False)
 
         # --- dedicated pointer-motion session: how many presents per second
         # does a pure cursor-fast-path session achieve? Two `guishell swapstat`
         # readings bracket the second session, and Python times the burst. ---
-        stats_before = [tuple(int(x) for x in m) for m in STAT_RE.findall(log_text())]
+        stats_before = [stats_tuple(m) for m in STAT_RE.findall(log_text())]
         p_before = stats_before[-1][0] if stats_before else 0
         typ('guishell')
         key('ret')
@@ -292,7 +361,7 @@ def main():
             typ('guishell swapstat')
             key('ret')
             wait_for(lambda t: '[gui-shell] swapstat' in t, 90)
-            stats_after = [tuple(int(x) for x in m) for m in STAT_RE.findall(log_text())]
+            stats_after = [stats_tuple(m) for m in STAT_RE.findall(log_text())]
             p_after = stats_after[-1][0] if stats_after else 0
             dp = p_after - p_before
             rate = dp / t_motion if t_motion > 0 else 0.0

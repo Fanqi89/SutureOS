@@ -59,8 +59,8 @@ original to SutureOS and are kept frozen.
 - DHCP client and DNS resolver
 - Read-only ext4, VimtuFS2 and OS67 (Minix v1) filesystems; writable MayFS
 
-Current build artifacts from the tree: `kernel.elf` ≈ 6.10 MB, `sutureos.iso` ≈ 22.3 MB,
-boot self-tests **16/16**, **1405** global symbols with **0 collisions**.
+Current build artifacts from the tree: `kernel.elf` ≈ 6.5 MB, `sutureos.iso` ≈ 23.6 MB,
+boot self-tests **16/16**, **1421** global symbols with **0 collisions** (144 objects).
 
 **Desktop (v0.59.0-alpha):** the **Rust shell is now the desktop** — `startgui` enters it, and the
 original C desktop moved to `startgui-classic` (its own acceptance suites and appearance gate
@@ -76,12 +76,20 @@ acceptance **55/55**, desktop **19/19**, per-window content **25/25**, logo **14
 **28/28**, wlshow **9/9**; both appearance gates report **0 pixels outside live rectangles**,
 and the boot presentation is unchanged.
 
-**In development (next line, not yet released):** the Wayland client's surface is now shown
-inside a desktop window, the protocol grew frame callbacks, damage and seat pointer events, and
-the presenter has an explicit two-buffer swap chain with a 10 ms vsync gate (counters in
-`guishell swapstat`). Still missing: a real vsync source / triple buffering, damage-driven
-partial redraw, multiple Wayland clients, a real seat event stream (`wl_keyboard`), scaling and
-subsurfaces, plus continued visual polish.
+**This round (post-v0.59.0 GUI wrap-up, not released yet):** presentation moved to triple buffering
+on a HPET-driven 60 Hz grid (drop / jitter / latency / histogram counters in `guishell swapstat`,
+invariant `rendered == presented + skipped + pending`); redraw became damage-driven composition that
+is verified against a full repaint pixel by pixel (`damage: identical`; a pointer-only frame repaints
+0.4-0.5 % of the screen, a drag frame costs 0-10 ms where the old full redraw cost ~117 ms). Wayland
+gained **multiple clients** (one retained surface per connection, plus `run wltwo`, a single process
+that opens two connections), a real `wl_keyboard` / `wl_pointer` event stream (press *and* release,
+motion / button / leave / frame), `set_buffer_scale` and region/subsurface semantics, and a dedicated
+**Wayland window opened with `F2`** (it shows a hint card instead of the logo when no client has
+committed). The look was polished a second time (wallpaper depth and vignette, icon rim light, accent
+identity bar, rounded taskbar and menu) and `docs/baseline/base_gui.png` was regenerated - the gate is
+still 0 pixels. Still missing: a real vsync source (there is no scan-line interrupt on this machine, so
+60 Hz is a wall-clock grid), finer damage merging, per-window keyboard focus, and real Wayland scaling
+composition.
 
 ---
 
@@ -265,8 +273,10 @@ The boot sequence is fixed: scrolling English kernel log → SutureOS banner →
   is frozen separately in `docs/baseline/base_gui_classic.png`.
 - `guislint` renders a single frame of the Rust UI prototype; `guishell` runs the same shell
   directly. `wlshow` presents the last committed Wayland surface, and the image-viewer window
-  paints that same surface directly (run `wlclient` first). `guishell swapstat` prints the
-  present/swap-chain counters.
+  paints that same surface directly (run `wlclient` first). **`F2`** opens the dedicated Wayland
+  window (its footer lists every retained client surface), and `run wltwo` drives two clients at
+  once. `guishell swapstat` prints the present / triple-buffer state / drop / jitter / latency /
+  oracle / damage counters.
 - In `guishell` the focused window also owns the keyboard: typed ASCII goes into its editable
   line, `Enter` commits it to the serial log, `Backspace` edits and `Tab` cycles the focus
   between visible windows; window shadows are alpha-composited over whatever is underneath.

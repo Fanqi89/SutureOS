@@ -21,6 +21,7 @@ Exit code 0 only when every selected script reported RESULT: PASS.
 import argparse
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -57,9 +58,23 @@ SUITE = [
 
 RE_TAIL = re.compile(r'checks=(\d+)\s+ok=(\d+)\s+fail=(\d+)')
 RE_RESULT = re.compile(r'RESULT:\s*(PASS|FAIL)')
+# a few scripts use `RESULT: PASS (checks=N)` instead of the checks/ok/fail tail
+RE_RESULT_CHECKS = re.compile(r'RESULT:\s*(PASS|FAIL)\s*\(checks=(\d+)\)')
+
+
+def fresh_test_volume():
+    """Rebuild the FAT32 fixture QEMU boots with (see the module docstring)."""
+    gen = os.path.join(ROOT, 'scripts', 'mkfat32_testimg.py')
+    subprocess.run([sys.executable, gen], cwd=ROOT, stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL)
+    src = os.path.join(ROOT, 'build', 'fat32.img')
+    dst = os.path.join(ROOT, 'build', 'fat32_ata.img')
+    if os.path.exists(src):
+        shutil.copyfile(src, dst)
 
 
 def run_one(script, timeout):
+    fresh_test_volume()
     path = os.path.join(ROOT, 'scripts', script)
     if not os.path.exists(path):
         return ('missing', None, None, None, 0.0, 'script not found')
@@ -76,6 +91,11 @@ def run_one(script, timeout):
     checks = ok = fail = None
     for m in RE_TAIL.finditer(out):
         checks, ok, fail = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    for m in RE_RESULT_CHECKS.finditer(out):
+        if checks is None:
+            checks = int(m.group(2))
+            ok = checks if m.group(1) == 'PASS' else None
+            fail = 0 if m.group(1) == 'PASS' else checks
     res = None
     for m in RE_RESULT.finditer(out):
         res = m.group(1)

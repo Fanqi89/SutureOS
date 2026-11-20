@@ -197,8 +197,37 @@
 - **交换链 + vsync 模拟（v0.59 后续，未发布）**：双场景缓冲 + FRONT 翻页 + 10 ms 闸门/合并，
   `guishell swapstat` 输出 `rendered == scene + skipped`；`guishell_swap_acceptance` **19/19**，
   桌面外观 0 像素越界。如实限制：skipped 正常操作恒 0（循环 30 ms 节流），无真 vsync/三缓冲。
-- **仍未完成**：真正的 vsync 源与三缓冲/撕裂检测、damage 驱动的局部重绘、多 Wayland 客户端、
-  `wl_keyboard` 事件流与真实输入路由、scaling/subsurface/region 语义。
+- **GUI 收尾（v0.59.0 之后，未发布）**：
+  - 三缓冲 + HPET 60 Hz 栅格节拍：`FRAME_A/B/C` + `DRAW/READY/PRESENTED` 状态机（每帧校验呈现源是
+    READY、没有缓冲仍在 DRAW）、presented 完整性采样、jitter/dropped/latency/直方图全部进
+    `guishell swapstat`，守恒式 `rendered == presented + skipped + pending`；`guishell_swap_acceptance` **30/30**。
+  - damage 驱动局部重绘：唯一合成入口 `compose_rect()`（壁纸矩形 → 窗口层 → 活数据 → 淡入淡出 →
+    焦点行 → 任务栏整条 → 菜单整块），全屏重绘就是"一个全覆盖 rect"；每 ≤20 个 damage 帧 + 结构性
+    变化跑 oracle 整屏重绘逐像素比对（`damage: identical`，0 mismatch，不一致用 oracle 帧修复）。
+    纯指针/空闲帧重绘占比 **4–5 permille**、拖动帧 **0–1 ticks**（旧整屏 ≈117 ms）；
+    20 次 present 中途 screendump 与参考桌面 **0 像素**差异（半帧检测，非扫描线物理测量）。
+    `guishell_damage_acceptance` **23/23**。
+  - Wayland 多客户端：每连接独立保留最后 commit 的 surface（像素/几何/scale/serial），
+    `wl_server_surface_count()/_at()` 导出，旧 `latest_surface()` 语义不变；`run wltwo` 单进程双连接
+    （160×100@2x + 96×64@1x 子 surface）→ `wl_multi_acceptance` **40/40**（宿主独立重算三帧 FNV-1a +
+    FAT32 析出逐字节）。
+  - `wl_keyboard`/`wl_pointer` 真事件流（`mb_kbd.c` 解码路径镜像环 → keymap(NO_KEYMAP)/enter/key
+    press+release/modifiers/leave；enter/motion/button 两沿/leave/frame 按 v5+ 绑定）+
+    `set_buffer_scale` + `wl_region`（add/subtract 面积）+ `wl_subcompositor/wl_subsurface`（记录父子
+    与偏移，**只记录不合成**）。
+  - 独立 **Wayland 窗口**（accent `0x7a5cff`，**F2** 开关；开始菜单仍 4 行，因为菜单几何被既有验收
+    冻结）；整数最近邻 1:1/2x 显示 surface，页脚列出每条保留的 surface，无客户端时显示提示卡、
+    不回退 Logo；窗口层缓存键混入 commit 计数。
+  - 视觉打磨第二轮：壁纸顶部冷光晕 + 六环整数晕影（亚克力采样源同步）、图标内描边/侧棱光/底部反光、
+    窗口 2 px accent 身份条 + 玻璃内高光 + 22px 倒角控制钮、任务栏圆角按钮/圆角活跃下划线/顶部发丝
+    高光、开始菜单圆角行；`docs/baseline/base_gui.png` 按新外观重生，门禁仍 **0 像素**；
+    token 与硬约束登记在 `docs/gui-visual-spec.md`。
+  - 修 `mmap(addr=NULL)` 二次映射覆盖前次 PTE 的 bug（memfd A 24576B 与 B 64000B 落重叠区间）：
+    `user_map_alloc()` 单调下降游标，memfd 与匿名两支共用；`wltwo` 把它变成常驻断言
+    （不重叠 + 第一次映射数据未变），窗口不回收属已知限制。
+- **仍未完成**：真正的 vsync 源（本机没有扫描线中断，60 Hz 是墙上时钟栅格）、damage 合并策略细化、
+  窗口内键盘焦点、Wayland scaling 的真实合成与"surface 作为真正窗口表面"（无窗口命中/摆放）、
+  `wl_keyboard` keymap（内核无 XKB 数据）、多 surface 历史与 buffer 回收、最大/还原过渡的局部重绘。
 
 ## 域 11 跨架构蓝本（已完成：机制重写为通用时基抽象）
 

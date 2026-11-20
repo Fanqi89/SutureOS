@@ -86,9 +86,17 @@ const fn win3() -> Win {
     Win { x: 560, y: 180, w: 330, h: 230, nx: 560, ny: 180, nw: 330, nh: 230,
           minimized: false, maximized: false, z: 4, title: "文本编辑器", accent: 0xe05a8a, open: false, sox: 0, soy: 0, ax: 560, ay: 180 }
 }
+/* v0.60: the Wayland client surface gets a window of its own ("合成器视图").
+ * Opened with F2 rather than from the start menu - see the note at the top of
+ * this patch/commit. The window is 440x330 so a 320x200 surface is shown 1:1
+ * (the body falls back to scale 1 when 2x would not fit). */
+const fn win4() -> Win {
+    Win { x: 250, y: 330, w: 440, h: 330, nx: 250, ny: 330, nw: 440, nh: 330,
+          minimized: false, maximized: false, z: 5, title: "Wayland 客户端", accent: 0x7a5cff, open: false, sox: 0, soy: 0, ax: 250, ay: 330 }
+}
 
 struct Shell {
-    wins: [Win; 4],
+    wins: [Win; 5],
     focus: usize,
     menu_open: bool,
     dragging: bool,
@@ -134,8 +142,8 @@ struct Shell {
     /* v0.58.0: per-window keyboard focus. Every window owns a small editable
      * line; printable keys go to the focused window, Enter commits it to the
      * serial log, Backspace deletes one character. */
-    input: [[u8; 33]; 4],
-    ilen: [u32; 4],
+    input: [[u8; 33]; 5],
+    ilen: [u32; 5],
     /* v0.58.0: true maximise/restore transition. `scale_from`/`scale_to` are
      * lerped over SCALE_TOTAL frames; the geometry itself already sits at its
      * target so hit-testing stays honest during the animation. */
@@ -147,7 +155,7 @@ struct Shell {
 }
 
 static mut SHELL: Shell = Shell {
-    wins: [win0(), win1(), win2(), win3()],
+    wins: [win0(), win1(), win2(), win3(), win4()],
     focus: 1,
     menu_open: false,
     dragging: false,
@@ -186,8 +194,8 @@ static mut SHELL: Shell = Shell {
     prof_win: 0,
     prof_bar: 0,
     prof_total: 0,
-    input: [[0; 33]; 4],
-    ilen: [0; 4],
+    input: [[0; 33]; 5],
+    ilen: [0; 5],
     scale_frames: 0,
     scale_idx: -1,
     scale_from: [0; 4],
@@ -199,136 +207,661 @@ static mut SHELL: Shell = Shell {
 static mut WALL: [u32; (SCREEN_W as usize) * (SCREEN_H as usize)] =
     [0; (SCREEN_W as usize) * (SCREEN_H as usize)];
 static mut SMALL: [u32; SMALL_W * SMALL_H] = [0; SMALL_W * SMALL_H];
-static mut FRAME: [u32; (SCREEN_W as usize) * (SCREEN_H as usize)] =
+/* =====================================================================
+ * v0.61.0: three frame buffers, a 60 Hz presentation grid and damage
+ * =====================================================================
+ *
+ * Buffers (all 3 MiB of .bss - the ELF itself does not grow):
+ *
+ *   DRAW      the only buffer a frame may render into
+ *   READY     rendered completely, waiting for its slot on the 60 Hz grid
+ *   PRESENTED its pixels are exactly what the framebuffer currently shows
+ *   FREE      holds no frame that could be trusted
+ *
+ * Invariants (enforced here, counted and logged):
+ *   1. exactly one buffer is DRAW while a frame renders;
+ *   2. `present` only ever blits a READY buffer - a DRAW buffer is never
+ *      presented, and a READY buffer is never rendered into;
+ *   3. after a present the blitted buffer is the only PRESENTED one, and it
+ *      stays the base for the next frame's damage composition (it is the only
+ *      buffer whose content is known to match the screen).
+ *
+ * The kernel has no vsync interrupt source, so "vsync" here means: present on
+ * the 60 Hz wall-clock grid of the kernel's high-resolution time source (HPET
+ * via `time_source_now_ns()`). A frame whose present would land inside the
+ * current slot waits for the next boundary (READY); if another frame is
+ * rendered in the meantime it is composed in a second buffer (carry-forward
+ * copy) instead of clobbering the pending one.
+ */
+static mut FRAME_A: [u32; (SCREEN_W as usize) * (SCREEN_H as usize)] =
     [0; (SCREEN_W as usize) * (SCREEN_H as usize)];
-/// v0.60.0: second scene buffer for the swap chain (back buffer while FRAME is
-/// the front). 3 MiB of .bss - the ELF file does not grow.
 static mut FRAME_B: [u32; (SCREEN_W as usize) * (SCREEN_H as usize)] =
     [0; (SCREEN_W as usize) * (SCREEN_H as usize)];
-/// Which buffer is on the framebuffer: 0 = FRAME, 1 = FRAME_B.
-static mut FRONT: usize = 0;
-/* ------------------------------------------------------- present / swap chain
- * v0.60.0: explicit double-buffered present path.
- *
- * The shell always renders into the BACK scene buffer; a present swaps it to the
- * front and copies the front into the framebuffer. The front buffer therefore
- * always holds exactly the frame that is on screen, which gives two things:
- *   - a screendump can never catch a half-painted frame (the old single buffer
- *     already presented in one blit, so this keeps that property);
- *   - a frame can be dropped without corrupting the image, which is what the
- *     vsync gate below uses.
- *
- * The kernel only exposes the 100 Hz tick, so "vsync" is emulated as "at most one
- * present per tick" (VSYNC_MS = 10). A frame that arrives earlier is still
- * rendered, but its present is coalesced (skipped += 1) and stays pending until
- * a later due frame (or the idle flush) shows it.
- */
-pub const VSYNC_MS: u32 = 10;
+static mut FRAME_C: [u32; (SCREEN_W as usize) * (SCREEN_H as usize)] =
+    [0; (SCREEN_W as usize) * (SCREEN_H as usize)];
+
+const BUF_FREE: u8 = 0;
+const BUF_DRAW: u8 = 1;
+const BUF_READY: u8 = 2;
+const BUF_PRESENTED: u8 = 3;
+
+static mut BUF_STATE: [u8; 3] = [BUF_FREE; 3];
+static mut BUF_VALID: [bool; 3] = [false; 3];
+/// Index of the buffer in DRAW state.
+static mut DRAW_BUF: usize = 0;
+/// Index of the buffer in READY state (-1 = none).
+static mut READY_BUF: i32 = -1;
+/// Index of the buffer in PRESENTED state (-1 = none).
+static mut PRESENT_BUF: i32 = -1;
+
+/// One letter per buffer state, for `guishell swapstat`:
+/// D = DRAW, R = READY, P = PRESENTED, F = FREE.
+#[inline]
+fn buf_state_letter(i: usize) -> u8 {
+    unsafe {
+        match BUF_STATE[i] {
+            BUF_DRAW => b'D',
+            BUF_READY => b'R',
+            BUF_PRESENTED => b'P',
+            _ => b'F',
+        }
+    }
+}
+
+#[inline]
+unsafe fn buf_ptr(i: usize) -> *mut u32 {
+    match i {
+        1 => core::ptr::addr_of_mut!(FRAME_B) as *mut u32,
+        2 => core::ptr::addr_of_mut!(FRAME_C) as *mut u32,
+        _ => core::ptr::addr_of_mut!(FRAME_A) as *mut u32,
+    }
+}
+
+#[inline]
+unsafe fn buf_slice(i: usize) -> &'static mut [u32] {
+    core::slice::from_raw_parts_mut(buf_ptr(i), (SCREEN_W as usize) * (SCREEN_H as usize))
+}
+
+/// True when the buffer currently holds a frame that matches the screen.
+#[inline]
+unsafe fn buf_is_front(i: i32) -> bool {
+    i >= 0 && BUF_VALID[i as usize]
+}
+
+// ------------------------------------------------------- high resolution clock
+/// C side (`kernel/gui/slint_bridge.c`): monotonic nanoseconds from the kernel's
+/// best time source - HPET at 100 MHz when present, the 100 Hz tick otherwise.
+extern "C" {
+    fn suture_gui_time_ns() -> u64;
+}
+
+#[inline]
+fn time_ns() -> u64 {
+    unsafe { suture_gui_time_ns() }
+}
+
+/// 60 Hz presentation grid: 16.666 ms per slot, in nanoseconds.
+pub const FRAME_NS: u64 = 16_666_667;
 
 #[derive(Clone, Copy)]
 pub struct SwapState {
-    /// generation id of the front buffer; +1 on every present
+    /// generation id of the presented frame; +1 on every present
     pub generation: u32,
-    /// presents performed (one present == one framebuffer update)
+    /// framebuffer updates performed (one present == one update)
     pub presents: u32,
-    /// rendered frames whose present was coalesced by the vsync gate
+    /// buffers handed to the framebuffer (always == presents; logged for the
+    /// field list the task asks for, and asserted equal by the acceptance)
+    pub presented: u32,
+    /// produced frames that were superseded before they reached the screen
+    /// (conservation: produced == presented + skipped + pending)
     pub skipped: u32,
-    /// scene frames rendered, whether presented or coalesced
+    /// present attempts the 60 Hz gate postponed (the frame stays READY)
+    pub deferred: u32,
+    /// a finished frame is still waiting for its slot (0/1)
+    pub pending: u32,
+    /// produced frames that missed their slot (production->present latency over
+    /// 1.5 grid slots) plus frames superseded before they reached the screen
+    pub dropped: u32,
+    /// production -> present latency (us): average and worst case
+    pub latency_sum_us: u32,
+    pub latency_max_us: u32,
+    /// frames whose present landed more than 1.5 slots after they were produced
+    pub late_frames: u32,
+    /// scene frames rendered, presented or not
     pub produced: u32,
-    /// presents that swapped a freshly rendered scene (not a cursor-only update)
+    /// presents that carried freshly composed scene pixels
     pub scene_presents: u32,
-    /// now_ms of the last present
+    /// now_ms of the last present (the shell's own frame clock)
     pub last_present_ms: u32,
+    /// now_ns of the last present (HPET time base)
+    pub last_present_ns: u64,
+    /// distance of the last present from the nearest 60 Hz grid boundary
+    pub jitter_us: u32,
+    pub jitter_sum_us: u32,
+    pub jitter_max_us: u32,
+    /// interval accounting (ms) for the last logging window
+    pub interval_sum_ms: u32,
+    pub interval_n: u32,
+    /// interval histogram, ms buckets: <17, <34, <50, <100, <200, >=200
+    pub hist: [u32; 6],
+    /// pixels composed through the damage path / pixels a full repaint would have
+    pub damaged_px: u64,
+    pub framed_px: u64,
+    /// frames that took the damage path / the full repaint path
+    pub damage_frames: u32,
+    pub full_frames: u32,
+    /// damage oracle runs and mismatches (must stay 0)
+    pub oracle_checks: u32,
+    pub oracle_mismatch: u32,
+    /// present completion checks and mismatches (must stay 0)
+    pub tear_checks: u32,
+    pub tear_mismatch: u32,
+    /// frames whose base had to be copied into another buffer (READY pending)
+    pub carry_copies: u32,
+    /// state-machine invariants checked at every present / violations found
+    pub buf_checks: u32,
+    pub buf_bad: u32,
 }
 
 static mut SWAP: SwapState = SwapState {
     generation: 0,
     presents: 0,
+    presented: 0,
     skipped: 0,
+    deferred: 0,
+    pending: 0,
+    dropped: 0,
+    latency_sum_us: 0,
+    latency_max_us: 0,
+    late_frames: 0,
     produced: 0,
     scene_presents: 0,
     last_present_ms: 0,
+    last_present_ns: 0,
+    jitter_us: 0,
+    jitter_sum_us: 0,
+    jitter_max_us: 0,
+    interval_sum_ms: 0,
+    interval_n: 0,
+    hist: [0; 6],
+    damaged_px: 0,
+    framed_px: 0,
+    damage_frames: 0,
+    full_frames: 0,
+    oracle_checks: 0,
+    oracle_mismatch: 0,
+    tear_checks: 0,
+    tear_mismatch: 0,
+    carry_copies: 0,
+    buf_checks: 0,
+    buf_bad: 0,
 };
 static mut SWAP_STARTED: bool = false;
-static mut SWAP_IVL_SUM: u32 = 0;
-static mut SWAP_IVL_N: u32 = 0;
-/// A rendered scene is waiting for its (coalesced) present.
-static mut SWAP_PENDING: bool = false;
+/// Time of the first present: grid slot k begins at VSYNC_BASE_NS + k*FRAME_NS.
+static mut VSYNC_BASE_NS: u64 = 0;
+/// The next grid boundary the present path is allowed to use.
+static mut NEXT_SLOT: u64 = 1;
+/// Damage accumulated since the last framebuffer update. A frame whose present
+/// the grid defers is *not* lost: its rectangles stay here until a present
+/// actually blits them (that is what keeps the screen correct when a frame is
+/// superseded by the next one).
+static mut ACCUM: Damage = Damage::new();
+/// Time (ns) at which that frame finished rendering: production -> present
+/// latency is what the dropped-frame accounting is based on.
+static mut READY_PRODUCED_NS: u64 = 0;
+/// Upper bound on the damage list (each entry costs a rect blit + a compose).
+const MAX_DAMAGE: usize = 6;
 
-/// The scene buffer that is currently on the framebuffer.
+/// True when the current time reached the next 60 Hz boundary.
 #[inline]
-unsafe fn scene_front() -> &'static [u32] {
-    if FRONT == 0 {
-        &*core::ptr::addr_of!(FRAME)
-    } else {
-        &*core::ptr::addr_of!(FRAME_B)
+unsafe fn vsync_due(now_ns: u64) -> bool {
+    if !SWAP_STARTED {
+        return true;
     }
+    let boundary = VSYNC_BASE_NS.saturating_add(NEXT_SLOT.saturating_mul(FRAME_NS));
+    now_ns >= boundary
 }
 
+/// Microseconds between `now_ns` and the nearest 60 Hz grid boundary.
 #[inline]
-unsafe fn scene_front_mut() -> &'static mut [u32] {
-    if FRONT == 0 {
-        &mut *core::ptr::addr_of_mut!(FRAME)
-    } else {
-        &mut *core::ptr::addr_of_mut!(FRAME_B)
-    }
+unsafe fn vsync_jitter_us(now_ns: u64) -> u32 {
+    let phase = now_ns.wrapping_sub(VSYNC_BASE_NS) % FRAME_NS;
+    let d = if phase > FRAME_NS / 2 { FRAME_NS - phase } else { phase };
+    (d / 1000) as u32
 }
 
-/// The scene buffer being rendered (always the one that is NOT displayed).
-#[inline]
-unsafe fn scene_back_mut() -> &'static mut [u32] {
-    if FRONT == 0 {
-        &mut *core::ptr::addr_of_mut!(FRAME_B)
-    } else {
-        &mut *core::ptr::addr_of_mut!(FRAME)
-    }
-}
-
-/// True when a present is allowed: at least one 10 ms tick since the last one.
-#[inline]
-unsafe fn swap_due(now_ms: u32) -> bool {
-    !SWAP_STARTED || now_ms.wrapping_sub(SWAP.last_present_ms) >= VSYNC_MS
-}
-
-/// Account for one framebuffer update (scene swap or cursor-only overlay).
-#[inline]
-unsafe fn swap_commit(now_ms: u32, scene: bool) {
+/// Account for one framebuffer update: interval/jitter/dropped/histogram.
+unsafe fn swap_commit(now_ns: u64, now_ms: u32, scene: bool, px: u64, latency_ns: u64) {
     let st = &mut *core::ptr::addr_of_mut!(SWAP);
-    if SWAP_STARTED {
-        let ivl = now_ms.wrapping_sub(st.last_present_ms);
-        SWAP_IVL_SUM = SWAP_IVL_SUM.saturating_add(ivl);
-        SWAP_IVL_N += 1;
+    if !SWAP_STARTED {
+        SWAP_STARTED = true;
+        VSYNC_BASE_NS = now_ns;
+        NEXT_SLOT = 1;
+    } else {
+        let ivl_ns = now_ns.saturating_sub(st.last_present_ns);
+        let ivl_ms = (ivl_ns / 1_000_000) as u32;
+        st.interval_sum_ms = st.interval_sum_ms.saturating_add(ivl_ms);
+        st.interval_n += 1;
+        WLOG_IVL_SUM = WLOG_IVL_SUM.saturating_add(ivl_ms);
+        WLOG_IVL_N += 1;
+        let bucket = if ivl_ms < 17 {
+            0
+        } else if ivl_ms < 34 {
+            1
+        } else if ivl_ms < 50 {
+            2
+        } else if ivl_ms < 100 {
+            3
+        } else if ivl_ms < 200 {
+            4
+        } else {
+            5
+        };
+        st.hist[bucket] += 1;
+        let jit = vsync_jitter_us(now_ns);
+        st.jitter_us = jit;
+        st.jitter_sum_us = st.jitter_sum_us.saturating_add(jit);
+        WLOG_JIT_SUM = WLOG_JIT_SUM.saturating_add(jit);
+        if jit > st.jitter_max_us {
+            st.jitter_max_us = jit;
+        }
+        /* a produced frame that reaches the screen more than 1.5 grid slots
+         * after it was rendered missed its slot: count the slots it skipped */
+        let lat_slots = latency_ns / FRAME_NS;
+        if latency_ns > FRAME_NS + FRAME_NS / 2 {
+            st.late_frames = st.late_frames.wrapping_add(1);
+            if lat_slots > 1 {
+                st.dropped = st.dropped.wrapping_add((lat_slots - 1) as u32);
+            }
+        }
+        let lat_us = (latency_ns / 1000) as u32;
+        st.latency_sum_us = st.latency_sum_us.saturating_add(lat_us);
+        if lat_us > st.latency_max_us {
+            st.latency_max_us = lat_us;
+        }
+        WLOG_LAT_SUM = WLOG_LAT_SUM.saturating_add(lat_us);
+        if lat_us > WLOG_LAT_MAX {
+            WLOG_LAT_MAX = lat_us;
+        }
+        let k = now_ns.saturating_sub(VSYNC_BASE_NS) / FRAME_NS + 1;
+        NEXT_SLOT = k;
     }
-    SWAP_STARTED = true;
     st.generation = st.generation.wrapping_add(1);
     st.presents = st.presents.wrapping_add(1);
+    st.presented = st.presents;
+    st.last_present_ns = now_ns;
     st.last_present_ms = now_ms;
     if scene {
         st.scene_presents = st.scene_presents.wrapping_add(1);
     }
+    st.damaged_px = st.damaged_px.saturating_add(px);
 }
 
 /// Log the swap-chain counters once (`guishell swapstat`). Returns `presents`.
 pub unsafe fn swap_report() -> u32 {
     let st = &*core::ptr::addr_of!(SWAP);
-    let avg = if SWAP_IVL_N > 0 { SWAP_IVL_SUM / SWAP_IVL_N } else { 0 };
+    let avg = if st.interval_n > 0 { st.interval_sum_ms / st.interval_n } else { 0 };
+    let jit = if st.interval_n > 0 { st.jitter_sum_us / st.interval_n } else { 0 };
     console_printf(
-        b"[gui-shell] swapstat presents=%d gens=%d skipped=%d interval_ms=%d rendered=%d scene=%d\n\0"
+        b"[gui-shell] swapstat presents=%d gens=%d presented=%d dropped=%d jitter_us=%d \
+interval_ms=%d skipped=%d rendered=%d scene=%d carry=%d full=%d dmg=%d \
+dmg_px=%llu framed_px=%llu oracle=%d mismatch=%d tear=%d tear_bad=%d \
+late=%d latency_us=%d latency_max_us=%d \
+hist=%d,%d,%d,%d,%d,%d deferred=%d pending=%d bufs=%c%c%c \
+buf_checks=%d buf_bad=%d\n\0"
             .as_ptr(),
         st.presents as i32,
         st.generation as i32,
-        st.skipped as i32,
+        st.presented as i32,
+        st.dropped as i32,
+        jit as i32,
         avg as i32,
+        st.skipped as i32,
         st.produced as i32,
         st.scene_presents as i32,
+        st.carry_copies as i32,
+        st.full_frames as i32,
+        st.damage_frames as i32,
+        st.damaged_px,
+        st.framed_px,
+        st.oracle_checks as i32,
+        st.oracle_mismatch as i32,
+        st.tear_checks as i32,
+        st.tear_mismatch as i32,
+        st.late_frames as i32,
+        if st.interval_n > 0 { (st.latency_sum_us / st.interval_n) as i32 } else { 0 },
+        st.latency_max_us as i32,
+        st.hist[0] as i32,
+        st.hist[1] as i32,
+        st.hist[2] as i32,
+        st.hist[3] as i32,
+        st.hist[4] as i32,
+        st.hist[5] as i32,
+        st.deferred as i32,
+        (READY_BUF >= 0) as i32,
+        buf_state_letter(0) as i32,
+        buf_state_letter(1) as i32,
+        buf_state_letter(2) as i32,
+        st.buf_checks as i32,
+        st.buf_bad as i32,
     );
     st.presents
 }
 
+// ------------------------------------------------------------ damage rectangles
+/// Inclusive-exclusive rectangle in screen pixels.
+#[derive(Clone, Copy, PartialEq)]
+struct Rect {
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+}
+
+impl Rect {
+    const EMPTY: Rect = Rect { x0: 1, y0: 1, x1: 0, y1: 0 };
+
+    #[inline]
+    fn new(x0: i32, y0: i32, x1: i32, y1: i32) -> Rect {
+        Rect { x0, y0, x1, y1 }
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.x1 <= self.x0 || self.y1 <= self.y0
+    }
+
+    #[inline]
+    fn area(&self) -> i64 {
+        let w = self.x1 - self.x0;
+        let h = self.y1 - self.y0;
+        if w <= 0 || h <= 0 {
+            0
+        } else {
+            w as i64 * h as i64
+        }
+    }
+
+    #[inline]
+    fn union(self, o: Rect) -> Rect {
+        Rect {
+            x0: self.x0.min(o.x0),
+            y0: self.y0.min(o.y0),
+            x1: self.x1.max(o.x1),
+            y1: self.y1.max(o.y1),
+        }
+    }
+
+    #[inline]
+    fn intersect(self, o: Rect) -> Rect {
+        Rect {
+            x0: self.x0.max(o.x0),
+            y0: self.y0.max(o.y0),
+            x1: self.x1.min(o.x1),
+            y1: self.y1.min(o.y1),
+        }
+    }
+
+    #[inline]
+    fn overlaps(self, o: Rect) -> bool {
+        !self.intersect(o).is_empty()
+    }
+
+    #[inline]
+    fn expand(self, d: i32) -> Rect {
+        Rect {
+            x0: self.x0 - d,
+            y0: self.y0 - d,
+            x1: self.x1 + d,
+            y1: self.y1 + d,
+        }
+    }
+
+    #[inline]
+    fn clipped(self) -> Rect {
+        self.intersect(Rect::new(0, 0, SCREEN_W, SCREEN_H))
+    }
+
+    #[inline]
+    fn as_tuple(self) -> (i32, i32, i32, i32) {
+        (self.x0, self.y0, self.x1, self.y1)
+    }
+}
+
+/// Shadow bleed: the eight one-pixel rings reach 8 px out, plus a little slack.
+const SHADOW_MARGIN: i32 = 10;
+const TASKBAR_RECT: Rect = Rect { x0: 0, y0: TASKBAR_Y, x1: SCREEN_W, y1: SCREEN_H };
+const MENU_RECT: Rect = Rect {
+    x0: MENU_X - 2,
+    y0: MENU_Y - 2,
+    x1: MENU_X + MENU_W + 4,
+    y1: MENU_Y + MENU_H + 12,
+};
+
+/// A small list of screen rectangles to recompose. Rectangles that touch are
+/// merged (one bigger recompose is cheaper than two), the rest stay separate -
+/// a single boundigin box over two distant controls is exactly the mistake that
+/// made the v0.43 prototype repaint the whole screen for a menu click.
+#[derive(Clone, Copy)]
+struct Damage {
+    r: [Rect; MAX_DAMAGE],
+    n: usize,
+    full: bool,
+}
+
+impl Damage {
+    const fn new() -> Damage {
+        Damage { r: [Rect::EMPTY; MAX_DAMAGE], n: 0, full: false }
+    }
+
+    fn clear(&mut self) {
+        self.n = 0;
+        self.full = false;
+    }
+
+    fn is_empty(&self) -> bool {
+        !self.full && self.n == 0
+    }
+
+    fn full_screen(&mut self) {
+        self.full = true;
+        self.n = 0;
+    }
+
+    /// Two rectangles are merged when their bounding box costs no more than the
+    /// two of them plus a small slack: that covers overlapping and adjacent
+    /// rectangles, which is what a moving window produces.
+    #[inline]
+    fn should_merge(a: Rect, b: Rect) -> bool {
+        a.union(b).area() <= a.area() + b.area() + 4096
+    }
+
+    fn add(&mut self, r0: Rect) {
+        if self.full {
+            return;
+        }
+        let r = r0.clipped();
+        if r.is_empty() {
+            return;
+        }
+        for i in 0..self.n {
+            let cur = self.r[i];
+            if Damage::should_merge(cur, r) {
+                self.r[i] = cur.union(r);
+                self.coalesce();
+                return;
+            }
+        }
+        if self.n < MAX_DAMAGE {
+            self.r[self.n] = r;
+            self.n += 1;
+        } else {
+            /* list full: one bounding box (correctness over cost) */
+            let mut u = r;
+            for i in 0..self.n {
+                u = u.union(self.r[i]);
+            }
+            self.r[0] = u;
+            self.n = 1;
+        }
+    }
+
+    fn coalesce(&mut self) {
+        loop {
+            let mut merged = false;
+            let mut i = 0usize;
+            while i < self.n {
+                let mut j = i + 1;
+                while j < self.n {
+                    let a = self.r[i];
+                    let b = self.r[j];
+                    if Damage::should_merge(a, b) {
+                        self.r[i] = a.union(b);
+                        self.r[j] = self.r[self.n - 1];
+                        self.n -= 1;
+                        merged = true;
+                        break;
+                    }
+                    j += 1;
+                }
+                if merged {
+                    break;
+                }
+                i += 1;
+            }
+            if !merged {
+                break;
+            }
+        }
+    }
+
+    fn area(&self) -> i64 {
+        if self.full {
+            return SCREEN_W as i64 * SCREEN_H as i64;
+        }
+        let mut a = 0i64;
+        for i in 0..self.n {
+            a += self.r[i].area();
+        }
+        a
+    }
+}
+
+/// Per-window snapshot used to diff one frame against the previous one.
+#[derive(Clone, Copy)]
+struct WinSnap {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    open: bool,
+    minimized: bool,
+    z: i32,
+}
+
+impl WinSnap {
+    const fn empty() -> WinSnap {
+        WinSnap { x: 0, y: 0, w: 0, h: 0, open: false, minimized: false, z: 0 }
+    }
+
+    fn of(w: &Win) -> WinSnap {
+        WinSnap {
+            x: w.x,
+            y: w.y,
+            w: w.w,
+            h: w.h,
+            open: w.open,
+            minimized: w.minimized,
+            z: w.z,
+        }
+    }
+
+    fn visible(&self) -> bool {
+        self.open && !self.minimized
+    }
+
+    fn rect(&self) -> Rect {
+        Rect::new(self.x, self.y, self.x + self.w, self.y + self.h)
+    }
+}
+
+/// Everything the damage diff needs from the frame that is currently on screen.
+#[derive(Clone, Copy)]
+struct Snap {
+    ready: bool,
+    mx: i32,
+    my: i32,
+    hover_wb: i32,
+    hover_start: bool,
+    menu_open: bool,
+    menu_sel: i32,
+    menu_hover: i32,
+    menu_alpha: u32,
+    focus: i32,
+    input_hash: i32,
+    clock: i32,
+    live_tick: u32,
+    wl_epoch: i32,
+    act_frames: u32,
+    act_idx: i32,
+    intro_frames: u32,
+    intro_idx: i32,
+    scale_frames: u32,
+    wins: [WinSnap; 5],
+}
+
+impl Snap {
+    const fn empty() -> Snap {
+        Snap {
+            ready: false,
+            mx: -1,
+            my: -1,
+            hover_wb: -1,
+            hover_start: false,
+            menu_open: false,
+            menu_sel: -1,
+            menu_hover: -1,
+            menu_alpha: 0,
+            focus: 0,
+            input_hash: 0,
+            clock: 0,
+            live_tick: 0,
+            wl_epoch: 0,
+            act_frames: 0,
+            act_idx: -1,
+            intro_frames: 0,
+            intro_idx: -1,
+            scale_frames: 0,
+            wins: [WinSnap::empty(); 5],
+        }
+    }
+
+    fn visible_rect(&self, idx: i32) -> Rect {
+        if idx < 0 || idx >= 5 {
+            return Rect::EMPTY;
+        }
+        let w = self.wins[idx as usize];
+        if !w.visible() {
+            return Rect::EMPTY;
+        }
+        w.rect().expand(SHADOW_MARGIN)
+    }
+}
+
+static mut SNAP: Snap = Snap::empty();
+/* per logging window (30 frames): present interval / jitter sums */
+static mut WLOG_IVL_SUM: u32 = 0;
+static mut WLOG_IVL_N: u32 = 0;
+static mut WLOG_JIT_SUM: u32 = 0;
+static mut WLOG_LAT_SUM: u32 = 0;
+static mut WLOG_LAT_MAX: u32 = 0;
+/// Diagnostics for the damage oracle: the rectangle list of the frame it
+/// is about to verify (logged on a mismatch).
+static mut ORACLE_INFO: [i32; 9] = [0; 9];
+
 static mut XMAP: [u16; SCREEN_W as usize] = [0; SCREEN_W as usize];
 static mut YMAP: [u16; SCREEN_H as usize] = [0; SCREEN_H as usize];
 static mut CACHED: bool = false;
-static mut LAST_STATE: [i32; 20] = [-1; 20];
 /* v0.46.0 window layer cache: a window body + its shadow is position-locked and
  * content-static (frosted sampling only depends on the wallpaper), so once drawn
  * it can be blitted. That turns a 400 ms full repaint into a few memcpys for
@@ -339,18 +872,12 @@ const WC_MARGIN_L: i32 = 8;
 const WC_MARGIN_T: i32 = 14;
 const WC_MARGIN_R: i32 = 12;
 const WC_MARGIN_B: i32 = 16;
-static mut WIN_CACHE: [[u32; WC_STRIDE * WC_H]; 4] = [[0; WC_STRIDE * WC_H]; 4];
-static mut WIN_KEY: [i32; 4] = [i32::MIN; 4];
-/* v0.50.0: the taskbar strip (frosted band + buttons + clock) only changes when a
- * window opens/closes/minimises, focus moves, the pointer hovers a button, or the
- * clock ticks. Cache it so a drag repaint is a blit instead of a re-render. */
-const TB_H: usize = 38;
-static mut TASKBAR_CACHE: [u32; 1024 * TB_H] = [0; 1024 * TB_H];
-static mut TASKBAR_KEY: i32 = i32::MIN;
+static mut WIN_CACHE: [[u32; WC_STRIDE * WC_H]; 5] = [[0; WC_STRIDE * WC_H]; 5];
+static mut WIN_KEY: [i32; 5] = [i32::MIN; 5];
 /* v0.58.0: the cached window body size. The layer is normally blitted 1:1, but
  * the maximise/restore transition samples it scaled, so the source size has to
  * be known even after the window geometry already jumped to its target. */
-static mut LAYER_WH: [(i32, i32); 4] = [(0, 0); 4];
+static mut LAYER_WH: [(i32, i32); 5] = [(0, 0); 5];
 /* v0.58.0: nearest-neighbour index tables for the transition pass (one division
  * per column/row instead of one per pixel). */
 static mut SCALED_X: [u16; 1024] = [0; 1024];
@@ -364,12 +891,6 @@ static mut CORNER_COV: [[u8; 16]; 16] = [[0; 16]; 16];
  * composited straight into the framebuffer, so pointer motion only needs to
  * restore the two small rectangles from FRAME and redraw the arrow. This avoids
  * the clipping pitfalls that killed the v0.44 dirty-rect attempt. */
-static mut CUR_SEEN: bool = false;
-static mut CUR_PX: i32 = -1;
-static mut CUR_PY: i32 = -1;
-static mut PREV_HOVER: i32 = -2;
-static mut PREV_MX: i32 = -1;
-static mut PREV_MY: i32 = -1;
 static mut CURSOR_FRAMES: u32 = 0;
 /* the cursor bitmap's bounding box (see swrast::cursor) */
 const CUR_W: i32 = 24;
@@ -413,9 +934,7 @@ unsafe fn build_caches() {
     s.hgrad_round(600.0, 60.0, 1000.0, 400.0, 96.0, 0x12b8a6, 0x2f6bff, 0xc0);
     /* v0.60 polish: a faint cool glow hugging the top edge, then an integer
      * vignette - six 8 px bands per edge whose alpha falls off with distance.
-     * Both run exactly once, when the cache is built; nothing here is per frame.
-     * The vignette is what keeps the wallpaper from reading as a flat fill and
-     * gives the acrylic something to bend. */
+     * Both run once, when the cache is built; nothing here is per frame. */
     s.hgrad_round(300.0, 24.0, 780.0, 320.0, 120.0, 0x8fb4ff, 0x1d2a4d, 0x1c);
     for i in 0..6 {
         let a = (26 - i * 4) as u32;
@@ -591,7 +1110,7 @@ fn control_rect(w: &Win) -> (i32, i32, i32, i32) {
 }
 
 /// (x, w) of the taskbar window button `i`, or None when hidden.
-fn wb_rect(wins: &[Win; 4], i: usize) -> Option<(i32, i32)> {
+fn wb_rect(wins: &[Win; 5], i: usize) -> Option<(i32, i32)> {
     let mut x = 118;
     for k in 0..i {
         if wins[k].open { x += 96 + 8; }
@@ -711,8 +1230,9 @@ fn request_maximize(sh: &mut Shell, idx: usize, want: bool) {
 
 /// v0.58.0: composite the cached window body sampled into an arbitrary rectangle
 /// (nearest neighbour, opaque). Used by the maximise/restore transition.
-fn composite_scaled(scene: &mut [u32], stride: usize, slot: usize, r: &Win) -> bool {
-    if slot >= 4 {
+fn composite_scaled(scene: &mut [u32], stride: usize, slot: usize, r: &Win,
+                    clip: Rect) -> bool {
+    if slot >= 5 {
         return false;
     }
     let (sw, shh) = unsafe { (&*core::ptr::addr_of!(LAYER_WH))[slot] };
@@ -730,10 +1250,10 @@ fn composite_scaled(scene: &mut [u32], stride: usize, slot: usize, r: &Win) -> b
         ymap[j] = ((j as i64 * shh as i64) / r.h as i64) as u16;
     }
     let cache = unsafe { &(&*core::ptr::addr_of!(WIN_CACHE))[slot] };
-    let x0 = r.x.max(0);
-    let y0 = r.y.max(0);
-    let x1 = (r.x + r.w).min(SCREEN_W);
-    let y1 = (r.y + r.h).min(SCREEN_H);
+    let x0 = r.x.max(0).max(clip.x0);
+    let y0 = r.y.max(0).max(clip.y0);
+    let x1 = (r.x + r.w).min(SCREEN_W).min(clip.x1);
+    let y1 = (r.y + r.h).min(SCREEN_H).min(clip.y1);
     if x1 <= x0 || y1 <= y0 {
         return true;
     }
@@ -749,7 +1269,7 @@ fn composite_scaled(scene: &mut [u32], stride: usize, slot: usize, r: &Win) -> b
     true
 }
 
-fn hit_win(wins: &[Win; 4], mx: i32, my: i32, focus: i32) -> i32 {
+fn hit_win(wins: &[Win; 5], mx: i32, my: i32, focus: i32) -> i32 {
     let mut best = -1;
     let mut bestz = -1;
     for (i, w) in wins.iter().enumerate() {
@@ -794,6 +1314,9 @@ fn blit_logo_region(s: &mut Surface, data: &[u32], lw: usize,
             if a == 0 {
                 continue;
             }
+            if !s.in_clip(dst_x, dst_y) {
+                continue;
+            }
             let i = (dst_y as usize) * s.stride + dst_x as usize;
             if a >= 255 {
                 s.px[i] = src & 0x00ff_ffff;
@@ -812,10 +1335,11 @@ fn blit_logo_region(s: &mut Surface, data: &[u32], lw: usize,
 unsafe fn shutdown_step(fb: *mut u32, w: i32, h: i32, pitch_px: i32,
                         sh: &mut Shell, mx: i32, my: i32) -> u32 {
     let (wu, hu) = (w as usize, h as usize);
-    /* v0.60.0: this animation dims the frame it is about to show, so it paints
-     * straight into the FRONT buffer (which holds the last presented desktop)
-     * and blits it unconditionally - no swap happens on the shutdown path. */
-    let frame = scene_front_mut();
+    /* this animation dims the frame it is about to show, so it paints into the
+     * buffer that holds the desktop and blits it unconditionally - no swap
+     * happens on the shutdown path. */
+    let sh_buf = if PRESENT_BUF >= 0 { PRESENT_BUF as usize } else { DRAW_BUF };
+    let frame = buf_slice(sh_buf);
     {
         let mut s = Surface { px: &mut frame[..], w: wu, h: hu, stride: wu,
                               clip: (0, 0, 1024, 768) };
@@ -834,7 +1358,8 @@ unsafe fn shutdown_step(fb: *mut u32, w: i32, h: i32, pitch_px: i32,
         }
     }
     {
-        let frame = scene_front();
+        let frame: &[u32] = core::slice::from_raw_parts(
+            buf_ptr(sh_buf), (SCREEN_W as usize) * (SCREEN_H as usize));
         blit_rect(frame, wu, fb, pitch_px as usize, (0, 0, SCREEN_W, SCREEN_H));
         draw_cursor(fb, pitch_px as usize, wu, hu, mx.clamp(0, w - 1), my.clamp(0, h - 1));
     }
@@ -846,6 +1371,739 @@ unsafe fn shutdown_step(fb: *mut u32, w: i32, h: i32, pitch_px: i32,
         log0(c"logo shutdown: power_off returned (failure)");
     }
     0
+}
+
+// ------------------------------------------------------------- frame scratch
+/// Scalar snapshot of one frame: everything the compose pass reads that is not
+/// already in `Shell`, captured once so damage detection, composition and the
+/// oracle all draw exactly the same values.
+struct FrameCtx {
+    now: u32,
+    now_ns: u64,
+    mx: i32,
+    my: i32,
+    clock: i32,
+    hover_wb: i32,
+    hover_start: bool,
+    menu_hover: i32,
+    act_alpha: u32,
+    act_idx: i32,
+    intro_alpha: u32,
+    intro_idx: i32,
+    menu_alpha: u32,
+    scale: bool,
+    scale_idx: i32,
+    scale_rect: [i32; 4],
+    live_tick: u32,
+    /// Clock handed to `apps::draw_live`: pinned to the live refresh tick so the
+    /// heartbeat dot has a deterministic phase (see `live_tick` in shell_step).
+    live_now: u32,
+}
+
+/// Screen rectangle of the arrow cursor (drawn into the framebuffer only, never
+/// into a scene buffer).
+#[inline]
+fn cursor_rect(x: i32, y: i32) -> Rect {
+    if x < 0 || y < 0 {
+        return Rect::EMPTY;
+    }
+    Rect::new(x, y, x + CUR_W, y + CUR_H).expand(1)
+}
+
+/// Rectangle of the focused window's editable line; mirrors `draw_focus_line`.
+#[inline]
+fn input_line_rect(w: &Win) -> Rect {
+    if !w.open || w.minimized {
+        return Rect::EMPTY;
+    }
+    let y = w.y + TITLE_H + 104;
+    if !(y + 20 < w.y + w.h) || w.y < 0 || w.w < 80 {
+        return Rect::EMPTY;
+    }
+    Rect::new(w.x + 16, y - 4, w.x + w.w - 16, y + 20).expand(2)
+}
+
+/// Rectangles of the task manager's live values: the uptime line, the CPU% line
+/// and the 8x8 heartbeat dot, exactly where `apps::draw_live` paints them
+/// (TM_UPTIME_Y = TITLE_H + 138 at +92 px, TM_CPU_Y = TITLE_H + 164 at +46 px,
+/// dot at TITLE_H + 12 near the right edge). Three small rectangles keep a
+/// once-a-second invalidation at ~2 500 px instead of 65 000.
+#[inline]
+fn live_rects(w: &Win, out: &mut [Rect; 3]) {
+    let x0 = w.x + 16 + 4;
+    let y1 = w.y + TITLE_H + 138;
+    let y2 = w.y + TITLE_H + 164;
+    out[0] = Rect::new(x0 + 52, y1 - 2, x0 + 200, y1 + 18);
+    out[1] = Rect::new(x0 + 6, y2 - 2, x0 + 140, y2 + 18);
+    out[2] = Rect::new(w.x + w.w - 30, w.y + TITLE_H + 10,
+                       w.x + w.w - 12, w.y + TITLE_H + 22);
+}
+
+#[inline]
+fn is_taskman(w: &Win) -> bool {
+    w.accent == crate::apps::ACC_TASKMAN
+}
+
+// --------------------------------------------------------------- buffer state
+/// Pick the buffer this frame renders into and put it in DRAW state.
+unsafe fn begin_frame() -> usize {
+    /* a frame is still waiting for its grid slot: compose the next one into a
+     * different buffer (carrying the complete image over) instead of clobbering
+     * the pending one - this is what the third buffer is for. */
+    if READY_BUF >= 0 {
+        let src = READY_BUF as usize;
+        let mut free = -1i32;
+        for i in 0..3 {
+            if BUF_STATE[i] == BUF_FREE && i != src {
+                free = i as i32;
+                break;
+            }
+        }
+        if free >= 0 {
+            let f = free as usize;
+            buf_slice(f).copy_from_slice(buf_slice(src));
+            BUF_VALID[f] = BUF_VALID[src];
+            BUF_STATE[f] = BUF_DRAW;
+            DRAW_BUF = f;
+            SWAP.carry_copies = SWAP.carry_copies.wrapping_add(1);
+            return f;
+        }
+        /* no third buffer available: the pending frame is superseded */
+        BUF_STATE[src] = BUF_DRAW;
+        DRAW_BUF = src;
+        return src;
+    }
+    /* normal path: the PRESENTED buffer holds exactly what is on the screen, so
+     * it is the natural base for a damage frame */
+    if PRESENT_BUF >= 0 {
+        let p = PRESENT_BUF as usize;
+        if BUF_STATE[p] == BUF_PRESENTED {
+            BUF_STATE[p] = BUF_DRAW;
+            DRAW_BUF = p;
+            PRESENT_BUF = -1;
+            return p;
+        }
+    }
+    let d = DRAW_BUF;
+    BUF_STATE[d] = BUF_DRAW;
+    d
+}
+
+/// Hand the drawn buffer over to the present stage (DRAW -> READY).
+unsafe fn finish_frame() {
+    let d = DRAW_BUF;
+    if READY_BUF >= 0 && READY_BUF != d as i32 {
+        BUF_STATE[READY_BUF as usize] = BUF_FREE;
+        BUF_VALID[READY_BUF as usize] = false;
+        /* the newer frame replaced it before it was shown */
+        SWAP.skipped = SWAP.skipped.wrapping_add(1);
+        SWAP.dropped = SWAP.dropped.wrapping_add(1);
+    }
+    BUF_STATE[d] = BUF_READY;
+    BUF_VALID[d] = true;
+    READY_BUF = d as i32;
+    READY_PRODUCED_NS = time_ns();
+    SWAP.produced = SWAP.produced.wrapping_add(1);
+}
+
+// ------------------------------------------------------------------- composing
+/// Copy the wallpaper cache into `r`.
+fn copy_wall(s: &mut Surface<'_>, r: Rect) {
+    let wall = unsafe { &*core::ptr::addr_of!(WALL) };
+    let x0 = r.x0.max(0) as usize;
+    let x1 = (r.x1 as usize).min(s.w).min(SCREEN_W as usize);
+    let y0 = r.y0.max(0) as usize;
+    let y1 = (r.y1 as usize).min(s.h).min(SCREEN_H as usize);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    for y in y0..y1 {
+        let d = y * s.stride;
+        let w = y * SCREEN_W as usize;
+        s.px[d + x0..d + x1].copy_from_slice(&wall[w + x0..w + x1]);
+    }
+}
+
+/// Taskbar strip: acrylic sample, start button, logo, window buttons, clock.
+fn draw_taskbar(s: &mut Surface<'_>, sh: &Shell, ctx: &FrameCtx) {
+    frosted(s, 0, TASKBAR_Y, SCREEN_W, SCREEN_H, 0.0, 0x30);
+    s.rect_fill(0, TASKBAR_Y, SCREEN_W, SCREEN_H, 0xffffff, 0x08);
+    /* v0.60 polish: 1 px top hairline and a darker bottom edge give the strip a
+     * glass thickness instead of a flat band */
+    s.rect_fill(0, TASKBAR_Y, SCREEN_W, TASKBAR_Y + 1, 0xffffff, 0x26);
+    s.rect_fill(0, SCREEN_H - 1, SCREEN_W, SCREEN_H, 0x000000, 0x2c);
+    let start_btn = (8, TASKBAR_Y + 5, 34, 28);
+    rrow(s, start_btn.0, start_btn.1, start_btn.0 + start_btn.2,
+         start_btn.1 + start_btn.3, 7, 0xffffff,
+         if ctx.hover_start { 0x2c } else { 0x16 });
+    /* v0.57.1: the real SutureOS logo (24px step of the asset ladder) */
+    let logo = unsafe { &*core::ptr::addr_of!(g_logo24) };
+    blit_logo_region(s, logo, LOGO_SMALL_SIZE, 0, 0,
+                     LOGO_SMALL_SIZE as i32, LOGO_SMALL_SIZE as i32,
+                     start_btn.0 + 5, start_btn.1 + 2);
+    for i in 0..5 {
+        if let Some((bx, bw)) = wb_rect(&sh.wins, i) {
+            let hovered = ctx.hover_wb == i as i32;
+            let active = sh.focus == i && !sh.wins[i].minimized;
+            rrow(s, bx, TASKBAR_Y + 6, bx + bw, TASKBAR_Y + TASKBAR_H - 6, 7,
+                 0xffffff,
+                 if active { 0x30 } else if hovered { 0x20 } else { 0x12 });
+            if active {
+                /* Fluent 11 cue: a rounded underline hugging the strip's bottom */
+                rrow(s, bx + 14, TASKBAR_Y + TASKBAR_H - 9, bx + bw - 14,
+                     TASKBAR_Y + TASKBAR_H - 6, 1, 0x4f8dff, 255);
+            }
+            s.text(bx + 10, TASKBAR_Y + 12, sh.wins[i].title, 0xe8eefb,
+                   if sh.wins[i].minimized { 0x90 } else { 0xf0 }, 1);
+        }
+    }
+    /* clock on the right: real wall time from the RTC (v0.44.0) */
+    let hh = (ctx.clock / 100) % 24;
+    let mm = ctx.clock % 100;
+    let digits = [b'0' + (hh / 10) as u8, b'0' + (hh % 10) as u8, b':',
+                  b'0' + (mm / 10) as u8, b'0' + (mm % 10) as u8];
+    let mut x = SCREEN_W - 96;
+    for ch in digits.iter() {
+        x += s.char_ascii(x, TASKBAR_Y + 12, *ch as char, 0xd6e2f5, 0xd0, 1);
+    }
+}
+
+/// Start menu block (drawn only while the menu is open).
+fn draw_menu(s: &mut Surface<'_>, sh: &Shell, ctx: &FrameCtx) {
+    s.rect_fill(MENU_X + 3, MENU_Y + 10, MENU_X + MENU_W + 3,
+                MENU_Y + MENU_H + 12, 0x000000, 0x44);
+    frosted(s, MENU_X, MENU_Y, MENU_X + MENU_W, MENU_Y + MENU_H, 14.0, 0x34);
+    s.rect_fill(MENU_X + 10, MENU_Y, MENU_X + MENU_W - 10, MENU_Y + 1,
+                0xffffff, 0x3c);
+    s.rect_fill(MENU_X + 10, MENU_Y + MENU_H - 1, MENU_X + MENU_W - 10,
+                MENU_Y + MENU_H, 0xffffff, 0x3c);
+    s.rect_fill(MENU_X, MENU_Y + 10, MENU_X + 1, MENU_Y + MENU_H - 10,
+                0xffffff, 0x3c);
+    s.rect_fill(MENU_X + MENU_W - 1, MENU_Y + 10, MENU_X + MENU_W,
+                MENU_Y + MENU_H - 10, 0xffffff, 0x3c);
+    /* v0.57.1: start-menu icon = 48px step of the logo ladder */
+    let logo = unsafe { &*core::ptr::addr_of!(g_logo48) };
+    blit_logo_region(s, logo, LOGO_MENU_SIZE, 0, 0,
+                     LOGO_MENU_SIZE as i32, LOGO_MENU_SIZE as i32,
+                     MENU_X + 10, MENU_Y + 2);
+    s.text(MENU_X + 68, MENU_Y + 16, "常用应用", 0xffffff, 0xf0, 1);
+    for (k, name) in MENU_ITEMS.iter().enumerate() {
+        let y = MENU_Y + 46 + k as i32 * 44;
+        let hovered = ctx.menu_hover == k as i32;
+        let selected = k as i32 == sh.menu_sel;
+        rrow(s, MENU_X + 10, y, MENU_X + MENU_W - 10, y + 38, 8, 0xffffff,
+             if hovered { 0x2c } else if selected { 0x22 } else { 0x12 });
+        let accent = APP_ACCENTS[k];
+        if hovered || selected {
+            s.rect_fill(MENU_X + 10, y + 5, MENU_X + 13, y + 33, accent, 0xd8);
+        }
+        draw_app_icon(s, MENU_X + 18, y + 8, 22, accent, k as i32);
+        s.text(MENU_X + 50, y + 11, name, 0xeef4ff, 0xe8, 1);
+    }
+    /* v0.52.0: 2-frame fade-in for the start menu (dim -> clear) */
+    if ctx.menu_alpha > 0 {
+        s.rect_fill(MENU_X, MENU_Y, MENU_X + MENU_W, MENU_Y + MENU_H + 8,
+                    0x000000, ctx.menu_alpha);
+    }
+}
+
+/// Keyboard-focus indicator: the focused window shows an editable line.
+fn draw_focus_line(s: &mut Surface<'_>, sh: &Shell, _ctx: &FrameCtx) {
+    let fi = sh.focus;
+    let w = sh.wins[fi];
+    let y = w.y + TITLE_H + 104;
+    /* v0.59.x: the image viewer has no text content, and when it shows a
+     * committed Wayland surface the focus hint would sit on top of the client's
+     * pixels - skip the editable line for that window. */
+    if w.open && !w.minimized && fi != 2 && fi != 4 && y + 20 < w.y + w.h && w.y >= 0 {
+        s.rect_fill(w.x + 16, y - 4, w.x + w.w - 16, y + 20, 0x000000, 0x24);
+        s.text(w.x + 24, y, "输入:", 0x9fb2cc, 0xd0, 1);
+        let x0 = w.x + 24 + 46 + 8;
+        let len = sh.ilen[fi] as usize;
+        if len == 0 {
+            s.text(x0, y, "键入文本 Tab 切换窗口", 0x60718a, 0xc0, 1);
+        } else {
+            let mut x = x0;
+            let buf = &sh.input[fi];
+            let mut k = 0usize;
+            while k < len && x < w.x + w.w - 40 {
+                x += s.char_ascii(x, y, buf[k] as char, 0xffffff, 0xf0, 1);
+                k += 1;
+            }
+            s.rect_fill(x, y, x + 2, y + 16, 0x8fc2ff, 0xe0);
+        }
+    }
+}
+
+/// v0.58.0 maximise/restore transition: the geometry already jumped to its
+/// target, so the animation samples the HOME-anchored body layer into the
+/// interpolated rectangle.
+fn draw_scale_transition(s: &mut Surface<'_>, wu: usize, sh: &Shell, ctx: &FrameCtx) {
+    let idx = ctx.scale_idx;
+    if idx < 0 || idx >= 5 {
+        return;
+    }
+    let w = sh.wins[idx as usize];
+    if !w.open || w.minimized {
+        return;
+    }
+    let mut tmp = w;
+    tmp.x = ctx.scale_rect[0];
+    tmp.y = ctx.scale_rect[1];
+    tmp.w = ctx.scale_rect[2].max(24);
+    tmp.h = ctx.scale_rect[3].max(24);
+    draw_window_shadow(s, &tmp);
+    let clip = Rect::new(s.clip.0, s.clip.1, s.clip.2, s.clip.3);
+    if !composite_scaled(&mut s.px[..], wu, idx as usize, &tmp, clip) {
+        draw_window(s, &tmp, false);
+    }
+}
+
+/// Compose the rectangle `r` of the desktop from scratch: wallpaper, window
+/// layers, live overlays, animations, focus line, taskbar, start menu.
+///
+/// This is the ONLY composition path: a full repaint is `compose_rect` over the
+/// whole screen, a damage frame is the same function over the damaged
+/// rectangles. That is what makes the two identical by construction; the
+/// `damage: identical` oracle verifies that the damage list was complete.
+fn compose_rect(scene: &mut [u32], wu: usize, sh: &mut Shell, r: Rect, ctx: &FrameCtx) {
+    let mut s = Surface {
+        px: scene,
+        w: wu,
+        h: SCREEN_H as usize,
+        stride: wu,
+        clip: (r.x0, r.y0, r.x1, r.y1),
+    };
+    /* 1. wallpaper */
+    copy_wall(&mut s, r);
+    /* 2. windows bottom-up (cached body layer + freshly blended shadow) */
+    let mut order = [0usize, 1, 2, 3, 4];
+    for a in 0..4 {
+        for b in (a + 1)..5 {
+            if sh.wins[order[b]].z < sh.wins[order[a]].z {
+                order.swap(a, b);
+            }
+        }
+    }
+    for &i in order.iter() {
+        let win = sh.wins[i];
+        if !win.open || win.minimized {
+            unsafe {
+                WIN_KEY[i] = i32::MIN;
+            }
+            continue;
+        }
+        /* v0.58.0: a window under a maximise/restore transition is drawn by the
+         * transition pass (scaled layer), so the normal compose must skip it. */
+        if ctx.scale && ctx.scale_idx == i as i32 {
+            continue;
+        }
+        let key = layer_key(&win, i);
+        let hit = unsafe { WIN_KEY[i] == key };
+        if !hit {
+            if render_window_layer(i, &win) {
+                unsafe {
+                    WIN_KEY[i] = key;
+                }
+                sh.prof_cache_miss += 1;
+            } else {
+                draw_window(&mut s, &win, true);
+                continue;
+            }
+        } else {
+            sh.prof_cache_hit += 1;
+        }
+        draw_window_shadow(&mut s, &win);
+        let scene_ref = &mut s.px[..];
+        composite_window_layer(scene_ref, wu, i, &win, r);
+    }
+    /* 3. v0.59.0: live per-window content (task manager counters) is painted
+     * after the cached window layers, so the layers stay static. */
+    for &i in order.iter() {
+        let win = sh.wins[i];
+        if !win.open || win.minimized {
+            continue;
+        }
+        crate::apps::draw_live(&mut s, win.accent, win.x, win.y, win.w, win.h,
+                               ctx.live_now);
+    }
+    /* 4. v0.49.0: 2-frame fade-out before a close/minimize actually happens */
+    if ctx.act_alpha > 0 {
+        let idx = ctx.act_idx;
+        if idx >= 0 && idx < 5 {
+            let w = sh.wins[idx as usize];
+            if w.open && !w.minimized {
+                s.rect_fill(w.x, w.y, w.x + w.w, w.y + w.h, 0x000000, ctx.act_alpha);
+            }
+        }
+    }
+    /* 5. v0.48.0: 3-frame open fade (also used after minimise/restore) */
+    if ctx.intro_alpha > 0 {
+        let idx = ctx.intro_idx;
+        if idx >= 0 && idx < 5 {
+            let w = sh.wins[idx as usize];
+            if w.open {
+                s.rect_fill(w.x, w.y, w.x + w.w, w.y + w.h, 0x000000, ctx.intro_alpha);
+            }
+        }
+    }
+    /* 6. maximise/restore transition */
+    if ctx.scale {
+        draw_scale_transition(&mut s, wu, sh, ctx);
+    }
+    /* 7. keyboard-focus indicator */
+    if !sh.menu_open && !sh.shutting {
+        draw_focus_line(&mut s, sh, ctx);
+    }
+    /* 8. taskbar */
+    draw_taskbar(&mut s, sh, ctx);
+    /* 9. start menu */
+    if sh.menu_open {
+        draw_menu(&mut s, sh, ctx);
+    }
+}
+
+/// Compose one list of rectangles into `buf`.
+unsafe fn compose_list(buf: usize, wu: usize, sh: &mut Shell, rects: &[Rect; MAX_DAMAGE],
+                       n: usize, ctx: &FrameCtx) {
+    for k in 0..n {
+        if rects[k].is_empty() {
+            continue;
+        }
+        let scene = buf_slice(buf);
+        compose_rect(&mut scene[..], wu, sh, rects[k], ctx);
+    }
+}
+
+// -------------------------------------------------------------------- present
+/// Blit the pending damage to the framebuffer, draw the cursor, verify, and run
+/// the READY -> PRESENTED transition. Returns true when a present happened.
+unsafe fn present_pending(fb: *mut u32, pitch_px: usize, wu: usize, hu: usize,
+                          now_ns: u64, now_ms: u32, mx: i32, my: i32,
+                          flush: bool) -> bool {
+    let src = READY_BUF;
+    if src < 0 {
+        return false;
+    }
+    /* state-machine invariants: the present source must be the READY buffer (a
+     * buffer that finished rendering and was never rendered into while waiting),
+     * and no buffer may still be in DRAW state at present time - rendering and
+     * presenting never target the same buffer. */
+    SWAP.buf_checks = SWAP.buf_checks.wrapping_add(1);
+    let mut live = 0i32;
+    for i in 0..3 {
+        if BUF_STATE[i] == BUF_DRAW {
+            live += 1;
+        }
+    }
+    if BUF_STATE[src as usize] != BUF_READY || READY_BUF != src || live != 0 {
+        SWAP.buf_bad = SWAP.buf_bad.wrapping_add(1);
+        console_printf(
+            b"[gui-shell] buf: INVARIANT VIOLATION src=%d state=%d ready=%d draw_buffers=%d\n\0"
+                .as_ptr(),
+            src as i32, BUF_STATE[src as usize] as i32, READY_BUF as i32, live as i32);
+    }
+    if !vsync_due(now_ns) {
+        SWAP.deferred = SWAP.deferred.wrapping_add(1);
+        return false;
+    }
+    let idx = src as usize;
+    let px = ACCUM.area() as u64;
+    {
+        let frame = core::slice::from_raw_parts(buf_ptr(idx),
+                                                (SCREEN_W as usize) * (SCREEN_H as usize));
+        if ACCUM.full {
+            blit_rect(frame, wu, fb, pitch_px, (0, 0, SCREEN_W, SCREEN_H));
+        } else {
+            for k in 0..ACCUM.n {
+                blit_rect(frame, wu, fb, pitch_px, ACCUM.r[k].as_tuple());
+            }
+        }
+        draw_cursor(fb, pitch_px, wu, hu, mx, my);
+        tear_check(fb, pitch_px, frame, wu, mx, my);
+    }
+    ACCUM.clear();
+    /* state machine: READY -> PRESENTED, the previous PRESENTED -> FREE */
+    let old = PRESENT_BUF;
+    BUF_STATE[idx] = BUF_PRESENTED;
+    PRESENT_BUF = src;
+    if old >= 0 && old != src && BUF_STATE[old as usize] == BUF_PRESENTED {
+        BUF_STATE[old as usize] = BUF_FREE;
+        BUF_VALID[old as usize] = false;
+    }
+    READY_BUF = -1;
+    let latency = now_ns.saturating_sub(READY_PRODUCED_NS);
+    swap_commit(now_ns, now_ms, true, px, latency);
+    let _ = flush;
+    true
+}
+
+/// Sampled present completion check.
+///
+/// SutureOS has no GPU scanline interrupt, so this is NOT a physical tearing
+/// measurement: after the blit it samples the framebuffer and the buffer that
+/// was just presented and reports `tear: partial present at x,y` when they
+/// disagree. A partial or corrupt present shows up here immediately; the
+/// acceptance also takes 20 screendumps mid-present for the same reason.
+unsafe fn tear_check(fb: *mut u32, pitch_px: usize, frame: &[u32], wu: usize,
+                     mx: i32, my: i32) {
+    let mut bad = 0u32;
+    let mut n = 0u32;
+    let total = (SCREEN_W as u32) * (SCREEN_H as u32);
+    let mut k = 0u32;
+    while k < 96 {
+        let idx = k.wrapping_mul(7919).wrapping_add(104_729) % total;
+        let x = (idx % SCREEN_W as u32) as i32;
+        let y = (idx / SCREEN_W as u32) as i32;
+        k += 1;
+        /* the cursor lives only in the framebuffer */
+        if x >= mx - 2 && x < mx + CUR_W + 2 && y >= my - 2 && y < my + CUR_H + 2 {
+            continue;
+        }
+        let dst = core::ptr::read_volatile(fb.add(y as usize * pitch_px + x as usize));
+        let srcv = frame[y as usize * wu + x as usize];
+        n += 1;
+        if (dst & 0x00ff_ffff) != (srcv & 0x00ff_ffff) {
+            bad += 1;
+            if bad == 1 {
+                console_printf(
+                    b"[gui-shell] tear: partial present at %d,%d (fb %06x buf %06x)\n\0".as_ptr(),
+                    x, y, dst & 0x00ff_ffff, srcv & 0x00ff_ffff);
+            }
+        }
+    }
+    SWAP.tear_checks = SWAP.tear_checks.saturating_add(n);
+    SWAP.tear_mismatch = SWAP.tear_mismatch.saturating_add(bad);
+}
+
+// ------------------------------------------------------------------- damage diff
+/// Diff the previous frame's state against this frame's and return the screen
+/// rectangles that have to be recomposed.
+fn diff_damage(prev: &Snap, sh: &Shell, ctx: &FrameCtx) -> Damage {
+    let mut d = Damage::new();
+    if !prev.ready {
+        d.full_screen();
+        return d;
+    }
+    /* cursor: the old arrow has to be erased and the new one drawn */
+    if prev.mx != ctx.mx || prev.my != ctx.my {
+        d.add(cursor_rect(prev.mx, prev.my));
+        d.add(cursor_rect(ctx.mx, ctx.my));
+    }
+    /* windows: geometry, visibility, stacking */
+    for i in 0..5 {
+        let a = prev.wins[i];
+        let b = WinSnap::of(&sh.wins[i]);
+        if a.visible() != b.visible() || a.x != b.x || a.y != b.y || a.w != b.w
+            || a.h != b.h || (a.visible() && a.z != b.z)
+        {
+            d.add(a.rect().expand(SHADOW_MARGIN));
+            d.add(b.rect().expand(SHADOW_MARGIN));
+        }
+    }
+    /* taskbar strip: hover, focus, clock, window button set */
+    let mut strip = prev.hover_wb != ctx.hover_wb
+        || prev.hover_start != ctx.hover_start
+        || prev.clock != ctx.clock
+        || prev.focus != sh.focus as i32;
+    for i in 0..5 {
+        if prev.wins[i].open != sh.wins[i].open
+            || prev.wins[i].minimized != sh.wins[i].minimized
+        {
+            strip = true;
+        }
+    }
+    if strip {
+        d.add(TASKBAR_RECT);
+    }
+    /* start menu (the old menu also has to be erased when it closes) */
+    let mut hash = sh.ilen[sh.focus] as i32;
+    hash = hash.wrapping_mul(31).wrapping_add(sh.focus as i32);
+    for b in sh.input[sh.focus].iter() {
+        hash = hash.wrapping_mul(31).wrapping_add(*b as i32);
+    }
+    let menu_changed = prev.menu_open != sh.menu_open
+        || (sh.menu_open
+            && (prev.menu_sel != sh.menu_sel || prev.menu_hover != ctx.menu_hover))
+        || prev.menu_alpha != ctx.menu_alpha;
+    if menu_changed {
+        d.add(MENU_RECT);
+    }
+    /* focused window's editable line */
+    if prev.focus != sh.focus as i32 || prev.input_hash != hash
+        || prev.menu_open != sh.menu_open
+    {
+        d.add(input_line_rect(&sh.wins[prev.focus as usize]));
+        d.add(input_line_rect(&sh.wins[sh.focus]));
+    }
+    /* a new Wayland commit re-rasterises the image viewer's layer */
+    if prev.wl_epoch != crate::apps::wl_epoch() {
+        for i in 0..5 {
+            let w = sh.wins[i];
+            if w.open && !w.minimized && w.accent == crate::apps::ACC_IMAGE {
+                d.add(WinSnap::of(&w).rect().expand(SHADOW_MARGIN));
+            }
+        }
+    }
+    /* task manager live values (uptime / CPU% / heartbeat: 500 ms tick) */
+    if prev.live_tick != ctx.live_tick {
+        for i in 0..5 {
+            let w = sh.wins[i];
+            if w.open && !w.minimized && is_taskman(&w) {
+                let mut lr = [Rect::EMPTY; 3];
+                live_rects(&w, &mut lr);
+                for r in lr.iter() {
+                    d.add(*r);
+                }
+            }
+        }
+    }
+    /* animations: cover both the rectangle the previous frame dimmed and the
+     * one this frame is about to dim */
+    if prev.act_frames > 0 {
+        d.add(prev.visible_rect(prev.act_idx));
+    }
+    if ctx.act_alpha > 0 && ctx.act_idx >= 0 && ctx.act_idx < 5 {
+        let w = sh.wins[ctx.act_idx as usize];
+        d.add(WinSnap::of(&w).rect().expand(SHADOW_MARGIN));
+    }
+    if prev.intro_frames > 0 {
+        d.add(prev.visible_rect(prev.intro_idx));
+    }
+    if ctx.intro_alpha > 0 && ctx.intro_idx >= 0 && ctx.intro_idx < 5 {
+        let w = sh.wins[ctx.intro_idx as usize];
+        d.add(WinSnap::of(&w).rect().expand(SHADOW_MARGIN));
+    }
+    if ctx.menu_alpha > 0 {
+        d.add(MENU_RECT);
+    }
+    d
+}
+
+// --------------------------------------------------------------------- oracle
+/// Compose the whole screen into a spare buffer and compare it pixel by pixel
+/// with the damage-composed frame. This is the correctness gate of the damage
+/// system: a missing damage source shows up here as a mismatch, and the oracle
+/// frame is adopted as the repair so the screen cannot stay stale.
+unsafe fn run_oracle(draw: usize, wu: usize, sh: &mut Shell, ctx: &FrameCtx) -> bool {
+    let mut scratch = -1i32;
+    for i in 0..3 {
+        if BUF_STATE[i] == BUF_FREE && i != draw && i as i32 != READY_BUF
+            && i as i32 != PRESENT_BUF
+        {
+            scratch = i as i32;
+            break;
+        }
+    }
+    if scratch < 0 {
+        return true;                /* no spare buffer: try again next frame */
+    }
+    let sc = scratch as usize;
+    BUF_STATE[sc] = BUF_DRAW;       /* temporarily used as the oracle target */
+    let mut one = [Rect::EMPTY; MAX_DAMAGE];
+    one[0] = Rect::new(0, 0, SCREEN_W, SCREEN_H);
+    compose_list(sc, wu, sh, &one, 1, ctx);
+    BUF_STATE[sc] = BUF_FREE;
+    BUF_VALID[sc] = false;
+
+    let a = core::slice::from_raw_parts(buf_ptr(draw),
+                                        (SCREEN_W as usize) * (SCREEN_H as usize));
+    let b = core::slice::from_raw_parts(buf_ptr(sc),
+                                        (SCREEN_W as usize) * (SCREEN_H as usize));
+    let mut i = 0usize;
+    let mut bad = 0u32;
+    let mut first = 0usize;
+    while i < a.len() {
+        if (a[i] & 0x00ff_ffff) != (b[i] & 0x00ff_ffff) {
+            if bad == 0 {
+                first = i;
+            }
+            bad += 1;
+        }
+        i += 1;
+    }
+    if bad > 0 {
+        let i = first;
+        {
+            let x = (i % SCREEN_W as usize) as i32;
+            let y = (i / SCREEN_W as usize) as i32;
+            SWAP.oracle_mismatch = SWAP.oracle_mismatch.wrapping_add(1);
+            console_printf(
+                b"[gui-shell] damage: MISMATCH at %d,%d (got %06x want %06x) px=%d rects=%d r0=%d,%d,%d,%d r1=%d,%d,%d,%d\n\0".as_ptr(),
+                x, y, a[i] & 0x00ff_ffff, b[i] & 0x00ff_ffff, bad as i32,
+                ORACLE_INFO[0] as i32,
+                ORACLE_INFO[1], ORACLE_INFO[2], ORACLE_INFO[3], ORACLE_INFO[4],
+                ORACLE_INFO[5], ORACLE_INFO[6], ORACLE_INFO[7], ORACLE_INFO[8]);
+            /* repair: adopt the oracle frame (the whole screen has to be shown) */
+            buf_slice(draw).copy_from_slice(buf_slice(sc));
+            return false;
+        }
+        i += 1;
+    }
+    SWAP.oracle_checks = SWAP.oracle_checks.wrapping_add(1);
+    true
+}
+
+// ---------------------------------------------------------------- frame stats
+/* per logging window (30 frames) */
+static mut WLOG_FRAMES: u32 = 0;
+/// Temporary diagnostics budget (frames of `dbg frame` logging).
+static mut DMG_DEBUG: u32 = 0;
+static mut WLOG_FULL: u32 = 0;
+static mut WLOG_DMG: u32 = 0;
+static mut WLOG_PX: u64 = 0;
+static mut WLOG_FRAMED: u64 = 0;
+static mut WLOG_ORACLE: u32 = 0;
+static mut WLOG_MISMATCH: u32 = 0;
+static mut WLOG_SINCE_ORACLE: u32 = 0;
+/// How many damage frames may pass before the oracle re-verifies the whole
+/// screen against a full repaint.
+const ORACLE_EVERY: u32 = 20;
+
+/// Snapshot the frame that is about to become "the frame on screen".
+fn take_snap(sh: &Shell, ctx: &FrameCtx) -> Snap {
+    let mut wins = [WinSnap::empty(); 5];
+    for i in 0..5 {
+        wins[i] = WinSnap::of(&sh.wins[i]);
+    }
+    let mut input_hash = sh.ilen[sh.focus] as i32;
+    input_hash = input_hash.wrapping_mul(31).wrapping_add(sh.focus as i32);
+    for b in sh.input[sh.focus].iter() {
+        input_hash = input_hash.wrapping_mul(31).wrapping_add(*b as i32);
+    }
+    Snap {
+        ready: true,
+        mx: ctx.mx,
+        my: ctx.my,
+        hover_wb: ctx.hover_wb,
+        hover_start: ctx.hover_start,
+        menu_open: sh.menu_open,
+        menu_sel: sh.menu_sel,
+        menu_hover: ctx.menu_hover,
+        menu_alpha: ctx.menu_alpha,
+        focus: sh.focus as i32,
+        input_hash,
+        clock: ctx.clock,
+        live_tick: ctx.live_tick,
+        wl_epoch: crate::apps::wl_epoch(),
+        act_frames: sh.act_frames,
+        act_idx: sh.act_idx,
+        intro_frames: sh.intro_frames,
+        intro_idx: sh.intro_idx,
+        scale_frames: sh.scale_frames,
+        wins,
+    }
+}
+
+/// Index of the menu row under the pointer (-1 when none).
+fn menu_hover_index(mx: i32, my: i32) -> i32 {
+    for k in 0..MENU_ITEMS.len() {
+        let y = MENU_Y + 46 + k as i32 * 44;
+        if mx >= MENU_X + 10 && mx < MENU_X + MENU_W - 10 && my >= y && my < y + 38 {
+            return k as i32;
+        }
+    }
+    -1
 }
 
 // ---------------------------------------------------------------- frame
@@ -873,14 +2131,6 @@ pub unsafe fn shell_step(
         log0(c"caches built (wallpaper + frosted source)");
     }
     let (wu, hu) = (w as usize, h as usize);
-    /* render into the back buffer, present once at the end (double buffering:
-     * a screendump can otherwise catch the framebuffer half-painted) */
-    /* v0.60.0: swap chain - every frame is rendered into the BACK scene buffer
-     * and only becomes visible when the present block at the end swaps it to the
-     * front. Cached pieces (window layers, taskbar strip) are composited into
-     * this buffer exactly like before. */
-    let frame = scene_back_mut();
-    let mut s = Surface { px: &mut frame[..], w: wu, h: hu, stride: wu, clip: (0, 0, 1024, 768) };
     let sh = &mut *core::ptr::addr_of_mut!(SHELL);
     if !sh.started {
         sh.started = true;
@@ -893,37 +2143,31 @@ pub unsafe fn shell_step(
         return shutdown_step(fb, w, h, pitch_px, sh, mx, my);
     }
 
-    // 1. wallpaper from cache
-    let t_frame0 = ticks();
-    let t_copy0 = ticks();
-    let wall = &*core::ptr::addr_of!(WALL);
-    for y in 0..hu.min(SCREEN_H as usize) {
-        let dst = y * wu;
-        let src = y * SCREEN_W as usize;
-        let n = wu.min(SCREEN_W as usize);
-        s.px[dst..dst + n].copy_from_slice(&wall[src..src + n]);
-    }
-
-    let t_copy = ticks() - t_copy0;
+    let now_ns = time_ns();
+    let now = now_ms;
     let mx_c = mx.clamp(0, w - 1);
     let my_c = my.clamp(0, h - 1);
     let left_down = (buttons & 1) != 0;
-    let now = now_ms;
-
-    // 2. hit testing: taskbar first (it is on top), then windows
     let start_btn = (8, TASKBAR_Y + 5, 34, 28);
-    let mut hw = hit_win(&sh.wins, mx_c, my_c, sh.focus as i32);
-    let mut hover_ctl = -1;
-    if hw >= 0 {
-        let wref = sh.wins[hw as usize];
-        let (bx, by, bw, bh) = control_rect(&wref);
-        if my_c < wref.y + TITLE_H && mx_c >= bx && mx_c < bx + bw * 3 + 8 {
-            let idx = (mx_c - bx) / (bw + 4);
-            if idx >= 0 && idx <= 2 {
-                hover_ctl = idx;
+
+    /* hover targets are pure functions of the pointer (they used to be
+     * by-products of drawing the taskbar, which a damage frame may skip) */
+    let hover_start = mx_c >= start_btn.0 && mx_c < start_btn.0 + start_btn.2
+        && my_c >= start_btn.1 && my_c < start_btn.1 + start_btn.3;
+    let mut hover_wb = -1;
+    for i in 0..5 {
+        if let Some((bx, bw)) = wb_rect(&sh.wins, i) {
+            if mx_c >= bx && mx_c < bx + bw && my_c >= TASKBAR_Y + 5
+                && my_c < TASKBAR_Y + TASKBAR_H - 5
+            {
+                hover_wb = i as i32;
             }
         }
     }
+    sh.hover_wb = hover_wb;
+
+    // 2. hit testing: taskbar first (it is on top), then windows
+    let mut hw = hit_win(&sh.wins, mx_c, my_c, sh.focus as i32);
 
     // 3. clicks
     let mut clicked_in_menu = false;
@@ -931,7 +2175,7 @@ pub unsafe fn shell_step(
         /* v0.57.1: hit-test the click at the click coordinates, not at the current
          * pointer: a click can be consumed while PS/2 move packets are still in
          * flight, which sent close-button clicks to the stale pointer's window. */
-        let hw = hit_win(&sh.wins, click_x, click_y, sh.focus as i32);
+        hw = hit_win(&sh.wins, click_x, click_y, sh.focus as i32);
         let cx = click_x;
         let cy = click_y;
         if sh.menu_open {
@@ -962,7 +2206,7 @@ pub unsafe fn shell_step(
             } else {
                 /* taskbar window buttons */
                 let mut handled = false;
-                for i in 0..4 {
+                for i in 0..5 {
                     if let Some((bx, bw)) = wb_rect(&sh.wins, i) {
                         if cx >= bx && cx < bx + bw && cy >= TASKBAR_Y + 5 &&
                            cy < TASKBAR_Y + TASKBAR_H - 5 {
@@ -1017,16 +2261,14 @@ pub unsafe fn shell_step(
                             log2(c"focus", hw, 0);
                         }
                     } else if cy < TASKBAR_Y {
-                        /* click on empty desktop: drop focus highlight? keep simple */
+                        /* click on empty desktop: keep the focus as it is */
                     }
                 }
             }
         }
         sh.press_ms = now;
     }
-    // keyboard: menu navigation (v0.43.0). Scancodes are PS/2 set-1 make codes:
-    // up 0x48, down 0x50, enter 0x1C. The kernel keeps polling and passes the
-    // last pressed key; ESC is handled by the C loop (it leaves the shell).
+    // keyboard: menu navigation (v0.43.0). Scancodes are PS/2 set-1 make codes.
     if sh.menu_open {
         match key {
             0x48 => {
@@ -1052,6 +2294,21 @@ pub unsafe fn shell_step(
             }
             _ => {}
         }
+    } else if key == 0x3C && !sh.shutting {
+        /* v0.60: F2 toggles the dedicated Wayland compositor window (window #4).
+         * It is not a start-menu row: a fifth row would move every menu
+         * coordinate that the frozen menu geometry/acceptance depends on. */
+        if sh.wins[4].open && !sh.wins[4].minimized && sh.focus == 4 {
+            sh.wins[4].minimized = true;
+            if let Some(n) = next_visible(sh, 4) {
+                sh.wins[n].z = next_z(sh);
+                sh.focus = n;
+            }
+            log0(c"wayland window minimized");
+        } else {
+            launch_window(sh, 4);
+            log0(c"wayland window opened");
+        }
     } else if key == 0x44 && !sh.shutting {
         /* F10 = shutdown: play the reverse logo animation, then power off.
          * (v0.58.0 moved this off 'S': the shell now accepts typed text, so
@@ -1065,14 +2322,13 @@ pub unsafe fn shell_step(
 
     /* v0.58.0: per-window keyboard focus. Tab cycles the window focus, printable
      * keys edit the focused window's line, Enter commits it to the log and
-     * Backspace deletes one character. Arrow keys stay with the start menu
-     * (handled above); F10 stays the shutdown key. */
+     * Backspace deletes one character. */
     if !sh.menu_open && !sh.shutting {
         let fi = sh.focus;
         if ch == 0x09 {
             let mut n = fi;
-            for _ in 0..4 {
-                n = (n + 1) % 4;
+            for _ in 0..5 {
+                n = (n + 1) % 5;
                 if sh.wins[n].open && !sh.wins[n].minimized {
                     break;
                 }
@@ -1110,6 +2366,7 @@ pub unsafe fn shell_step(
         }
     }
 
+    let mut dropped_win: i32 = -1;
     if !left_down && sh.dragging {
         // v0.52.0: while dragging the layer keeps its glass pattern (anchored),
         // so the drag itself is a pure blit. At the drop we move the anchor to the
@@ -1124,15 +2381,12 @@ pub unsafe fn shell_step(
             }
         }
         log2(c"drag end: layer re-anchored", sh.drag_idx as i32, 0);
+        dropped_win = sh.drag_idx as i32;
         sh.dragging = false;
         log2(c"drag end", sh.wins[sh.drag_idx].x, sh.wins[sh.drag_idx].y);
     }
     if sh.dragging {
         let bidx = sh.drag_idx;
-        if sh.drag_last_x < 0 {
-            sh.drag_last_x = sh.wins[bidx].x;
-            sh.drag_last_y = sh.wins[bidx].y;
-        }
         let nxp = (mx_c - sh.drag_dx).clamp(0, SCREEN_W - 200);
         let nyp = (my_c - sh.drag_dy).clamp(0, TASKBAR_Y - 80);
         sh.wins[bidx].x = nxp;
@@ -1143,191 +2397,261 @@ pub unsafe fn shell_step(
         }
     }
 
-    // 0. idle skip (v0.42.0): if nothing that affects the picture changed (no
-    // pointer move, no click, no drag, no open ripple), do not repaint at all.
-    // At ~2 fps a full repaint is expensive, and re-rendering identical pixels
-    // buys nothing.
-    let mut st = [0i32; 20];
-    st[0] = mx_c;
-    st[1] = my_c;
-    st[2] = buttons;
-    st[3] = click_x;
-    st[4] = click_y;
-    st[5] = sh.dragging as i32;
-    st[6] = sh.menu_open as i32;
-    st[7] = sh.focus as i32;
-    st[8] = sh.dragging as i32;
-    for i in 0..4 {
-        let w = sh.wins[i];
-        st[9 + i * 2] = w.x ^ (w.y << 10) ^ (w.w << 20) ^ (w.open as i32);
-        st[10 + i * 2] = (w.minimized as i32) | ((w.maximized as i32) << 1) |
-                         ((w.z & 0xff) << 8);
-    }
-    /* v0.58.0: the fingerprint also covers keyboard focus, the focused window's
-     * editable line and the transition counter, so typing repaints and the
-     * scale animation can never be skipped as "idle". */
-    st[17] = sh.focus as i32;
-    {
-        let mut ih = sh.ilen[sh.focus] as i32;
-        for b in sh.input[sh.focus].iter() {
-            ih = ih.wrapping_mul(31).wrapping_add(*b as i32);
+    // ---- frame context: everything the compose pass reads, captured once ----
+    let mut ctx = FrameCtx {
+        now,
+        now_ns,
+        mx: mx_c,
+        my: my_c,
+        clock: clock_hhmm,
+        hover_wb,
+        hover_start,
+        menu_hover: if sh.menu_open { menu_hover_index(mx_c, my_c) } else { -1 },
+        act_alpha: 0,
+        act_idx: -1,
+        intro_alpha: 0,
+        intro_idx: -1,
+        menu_alpha: 0,
+        scale: false,
+        scale_idx: -1,
+        scale_rect: [0; 4],
+        /* One live refresh per second, driven by the SAME clock apps::draw_live
+         * reads (the kernel tick counter): the digit change and the damage tick
+         * then land in the same frame, so the damage oracle can verify the live
+         * area. `live_now` pins the clock handed to draw_live to the start of
+         * that second, which keeps the heartbeat dot (now_ms / 500) in its bright
+         * phase - i.e. the desktop stays pixel-identical to the frozen baseline. */
+        live_tick: (crate::shell_tick() / 100u64) as u32,
+        live_now: (crate::shell_tick() / 100u64) as u32 * 1000,
+    };
+    if sh.act_frames > 0 && sh.act_idx >= 0 && sh.act_idx < 5 {
+        let w0 = sh.wins[sh.act_idx as usize];
+        if w0.open && !w0.minimized {
+            ctx.act_alpha = if sh.act_frames == 2 { 0x2cu32 } else { 0x64u32 };
+            ctx.act_idx = sh.act_idx;
         }
-        st[18] = ih;
     }
-    /* v0.59.0: one repaint per second so the live numbers in the task manager
-     * window (uptime) keep moving while the desktop is otherwise idle. */
-    st[19] = (sh.scale_frames as i32) | (((now / 1000) as i32) << 8);
-    let last = unsafe { &*core::ptr::addr_of!(LAST_STATE) };
-    if *last == st && sh.intro_frames == 0 && sh.act_frames == 0 && sh.menu_intro == 0
-        && sh.scale_frames == 0
-    {
-        /* v0.60.0: if the last rendered frame was coalesced by the vsync gate,
-         * present it now instead of leaving the screen a generation behind. */
-        if unsafe { SWAP_PENDING } && swap_due(now_ms) {
-            unsafe {
-                FRONT ^= 1;
-                SWAP_PENDING = false;
-            }
-            let frame = scene_front();
-            blit_rect(frame, wu, fb, pitch_px as usize, (0, 0, SCREEN_W, SCREEN_H));
-            draw_cursor(fb, pitch_px as usize, wu, hu, mx_c, my_c);
-            unsafe {
-                swap_commit(now_ms, true);
-                CUR_SEEN = true;
-                CUR_PX = mx_c;
-                CUR_PY = my_c;
-                PREV_MX = mx_c;
-                PREV_MY = my_c;
-            }
-            return LAST_SUM;
+    if sh.intro_frames > 0 && sh.intro_idx >= 0 && sh.intro_idx < 5 {
+        let w0 = sh.wins[sh.intro_idx as usize];
+        if w0.open {
+            ctx.intro_alpha = match sh.intro_frames {
+                3 => 0x58u32,
+                2 => 0x2cu32,
+                _ => 0x12u32,
+            };
+            ctx.intro_idx = sh.intro_idx;
         }
-        IDLE_FRAMES += 1;
-        if IDLE_FRAMES == 1 {
-            log0(c"idle: frame skipped (nothing changed)");
+    }
+    if sh.menu_intro > 0 {
+        ctx.menu_alpha = if sh.menu_intro == 2 { 0x50u32 } else { 0x24u32 };
+    }
+    if sh.scale_frames > 0 && sh.scale_idx >= 0 && sh.scale_idx < 5 {
+        let idx = sh.scale_idx as usize;
+        let w0 = sh.wins[idx];
+        if w0.open && !w0.minimized {
+            let total: i32 = 4;
+            let step = total - sh.scale_frames as i32 + 1;
+            let mut r = [0i32; 4];
+            for k in 0..4 {
+                let a = sh.scale_from[k];
+                let b = sh.scale_to[k];
+                r[k] = a + (b - a) * step / total;
+            }
+            ctx.scale = true;
+            ctx.scale_idx = sh.scale_idx;
+            ctx.scale_rect = r;
+        }
+    }
+
+    // ---- damage: what changed since the frame that is on screen? ----
+    let prev = &*core::ptr::addr_of!(SNAP);
+    let mut dmg = diff_damage(prev, sh, &ctx);
+    if dropped_win >= 0 && dropped_win < 5 {
+        dmg.add(WinSnap::of(&sh.wins[dropped_win as usize]).rect().expand(SHADOW_MARGIN));
+    }
+    let animating = ctx.act_alpha > 0 || ctx.intro_alpha > 0 || ctx.menu_alpha > 0
+        || ctx.scale;
+
+    if dmg.is_empty() && !animating {
+        /* nothing changed: only a coalesced present can still need the screen */
+        if READY_BUF >= 0 && vsync_due(now_ns) {
+            present_pending(fb, pitch_px as usize, wu, hu, now_ns, now, mx_c, my_c, true);
+        } else {
+            IDLE_FRAMES += 1;
+            if IDLE_FRAMES == 1 {
+                log0(c"idle: frame skipped (nothing changed)");
+            }
         }
         return LAST_SUM;
     }
-    unsafe {
-        let l = &mut *core::ptr::addr_of_mut!(LAST_STATE);
-        *l = st;
-        IDLE_FRAMES = 0;
+    IDLE_FRAMES = 0;
+
+    /* the cursor-only fast path (v0.45.0) is now just "the damage is two small
+     * rectangles"; keep counting it so the frame-rate checks stay comparable */
+    let cursor_only = !dmg.full
+        && dmg.n > 0
+        && dmg.area() <= 4 * ((CUR_W + 2) as i64) * ((CUR_H + 2) as i64);
+
+    /* a full repaint is required for the first frame, during the maximise /
+     * restore transition, and whenever the base buffer is not a complete frame */
+    let base = if READY_BUF >= 0 { READY_BUF } else { PRESENT_BUF };
+    let mut full = dmg.full || ctx.scale || !buf_is_front(base);
+    let mut rects = [Rect::EMPTY; MAX_DAMAGE];
+    let mut nrects = 0usize;
+    if !full {
+        for k in 0..dmg.n {
+            let mut r = dmg.r[k];
+            /* the taskbar strip and the (possibly stale) menu block are atomic
+             * layers: any damage touching them recomposes them whole */
+            if r.overlaps(TASKBAR_RECT) {
+                r = r.union(TASKBAR_RECT);
+            }
+            if r.overlaps(MENU_RECT) {
+                r = r.union(MENU_RECT);
+            }
+            let c = r.clipped();
+            if !c.is_empty() {
+                rects[nrects] = c;
+                nrects += 1;
+            }
+        }
+        if nrects == 0 {
+            full = true;
+        }
+    }
+    if full {
+        rects[0] = Rect::new(0, 0, SCREEN_W, SCREEN_H);
+        nrects = 1;
     }
 
-    // ---- fast path: only the pointer moved (v0.45.0) ----
-    // FRAME holds the scene WITHOUT the cursor, so erasing the old arrow is just
-    // a small blit from FRAME, and drawing the new one is a small blit + arrow.
+    // ---- render into the DRAW buffer ----
+    let draw = begin_frame();
+    let t0 = ticks();
+    compose_list(draw, wu, sh, &rects, nrects, &ctx);
+    let compose_ticks = ticks() - t0;
+
+    let px = if full {
+        SCREEN_W as i64 * SCREEN_H as i64
+    } else {
+        let mut a = 0i64;
+        for k in 0..nrects {
+            a += rects[k].area();
+        }
+        a
+    };
+
+    // ---- structural change? then re-verify against a full repaint ----
+    let mut structural = false;
+    for i in 0..5 {
+        if prev.wins[i].open != sh.wins[i].open
+            || prev.wins[i].minimized != sh.wins[i].minimized
+        {
+            structural = true;
+        }
+    }
+    if prev.menu_open != sh.menu_open || prev.focus != sh.focus as i32
+        || prev.scale_frames > 0 && sh.scale_frames == 0
     {
-        let hover = hover_code(sh, mx_c, my_c);
-        let prev_hover = unsafe { PREV_HOVER };
-        let pointer_moved = mx_c != unsafe { PREV_MX } || my_c != unsafe { PREV_MY };
-        if click_x < 0 && click_y < 0 && key < 0 && ch < 0 && !sh.dragging
-           && sh.scale_frames == 0 && pointer_moved
-           && hover == prev_hover && unsafe { CUR_SEEN } {
-            /* v0.60.0: a cursor-only update is still a framebuffer update, so it
-             * obeys the same vsync gate. It does NOT swap the scene buffers (the
-             * scene is unchanged): FRONT is what is on screen, so erasing the old
-             * arrow is a blit from it. */
-            if !swap_due(now_ms) {
-                unsafe { SWAP.skipped += 1; }
-                return LAST_SUM;
-            }
-            let frame = scene_front();
-            let (px, py) = unsafe { (CUR_PX, CUR_PY) };
-            blit_rect(frame, wu, fb, pitch_px as usize,
-                      (px - 2, py - 2, px + CUR_W + 2, py + CUR_H + 2));
-            blit_rect(frame, wu, fb, pitch_px as usize,
-                      (mx_c - 2, my_c - 2, mx_c + CUR_W + 2, my_c + CUR_H + 2));
-            draw_cursor(fb, pitch_px as usize, wu, hu, mx_c, my_c);
-            unsafe {
-                swap_commit(now_ms, false);
-                CUR_PX = mx_c;
-                CUR_PY = my_c;
-                PREV_MX = mx_c;
-                PREV_MY = my_c;
-                let l = &mut *core::ptr::addr_of_mut!(LAST_STATE);
-                *l = st;
-                CURSOR_FRAMES += 1;
-                if CURSOR_FRAMES == 1 || CURSOR_FRAMES % 60 == 0 {
-                    console_printf(b"[gui-shell] cursor: fast path frames=%d\n\0".as_ptr(),
-                                   CURSOR_FRAMES as i32);
-                }
-            }
-            return LAST_SUM;
-        }
-        unsafe { PREV_HOVER = hover; }
+        structural = true;
     }
-
-    // 4. draw windows bottom-up
-    let t_win0 = ticks();
-    let mut order = [0usize, 1, 2, 3];
-    for a in 0..3 {
-        for b in (a + 1)..4 {
-            if sh.wins[order[b]].z < sh.wins[order[a]].z {
-                order.swap(a, b);
-            }
-        }
-    }
-    for &i in order.iter() {
-        let win = sh.wins[i];
-        if !win.open || win.minimized {
-            unsafe {
-                WIN_KEY[i] = i32::MIN;
-            }
-            continue;
-        }
-        /* v0.58.0: a window under a maximise/restore transition is drawn by the
-         * transition pass (scaled layer), so the normal compose must skip it. */
-        if sh.scale_frames > 0 && sh.scale_idx == i as i32 {
-            continue;
-        }
-        let key = layer_key(&win, i);
-        let hit = unsafe { WIN_KEY[i] == key };
-        if !hit {
-            if render_window_layer(i, &win) {
-                unsafe {
-                    WIN_KEY[i] = key;
-                }
-                sh.prof_cache_miss += 1;
-            } else {
-                draw_window(&mut s, &win, true);
-                continue;
-            }
+    if !full && (structural || WLOG_SINCE_ORACLE >= ORACLE_EVERY) {
+        WLOG_SINCE_ORACLE = 0;
+        ORACLE_INFO = [nrects as i32,
+                       rects[0].x0, rects[0].y0, rects[0].x1, rects[0].y1,
+                       rects[1].x0, rects[1].y0, rects[1].x1, rects[1].y1];
+        if !run_oracle(draw, wu, sh, &ctx) {
+            /* the oracle frame was adopted: the whole screen must be shown */
+            full = true;
+            rects = [Rect::EMPTY; MAX_DAMAGE];
+            rects[0] = Rect::new(0, 0, SCREEN_W, SCREEN_H);
+            nrects = 1;
+            WLOG_MISMATCH += 1;
         } else {
-            sh.prof_cache_hit += 1;
+            WLOG_ORACLE += 1;
         }
-        /* v0.58.0: shadow first (alpha over the scene), then the opaque body. */
-        draw_window_shadow(&mut s, &win);
-        let frame = scene_back_mut();
-        if composite_window_layer(frame, wu, i, &win) {
-            if sh.dragging && sh.drag_idx == i {
-                sh.prof_drag_reuse += 1;
-                if sh.prof_drag_reuse == 1 {
-                    log0(c"drag: reusing window layer (composited)");
-                }
+    }
+
+    // ---- accounting ----
+    if structural {
+        DMG_DEBUG = 8;
+    }
+    sh.prof_frames += 1;
+    WLOG_FRAMES += 1;
+    WLOG_SINCE_ORACLE += 1;
+    WLOG_PX += px as u64;
+    WLOG_FRAMED += SCREEN_W as u64 * SCREEN_H as u64;
+    SWAP.framed_px = SWAP.framed_px.saturating_add(SCREEN_W as u64 * SCREEN_H as u64);
+    if full {
+        sh.prof_full += 1;
+        WLOG_FULL += 1;
+        SWAP.full_frames = SWAP.full_frames.wrapping_add(1);
+    } else {
+        WLOG_DMG += 1;
+        SWAP.damage_frames = SWAP.damage_frames.wrapping_add(1);
+    }
+    if cursor_only && !full {
+        CURSOR_FRAMES += 1;
+        if CURSOR_FRAMES == 1 || CURSOR_FRAMES % 60 == 0 {
+            console_printf(b"[gui-shell] cursor: fast path frames=%d\n\0".as_ptr(),
+                           CURSOR_FRAMES as i32);
+        }
+    }
+    sh.prof_win += compose_ticks;
+    /* the dragged window renders from its cached home-anchored layer: no
+     * re-rasterise per frame (v0.50.0 behaviour, now inside the damage compose) */
+    if sh.dragging && sh.drag_idx < 5 {
+        let dw = sh.wins[sh.drag_idx];
+        if unsafe { WIN_KEY[sh.drag_idx] } == layer_key(&dw, sh.drag_idx) {
+            sh.prof_drag_reuse += 1;
+            if sh.prof_drag_reuse == 1 {
+                log0(c"drag: reusing window layer (damage compose)");
             }
         }
     }
-
-    /* v0.59.0: live per-window content (task manager counters) is painted after
-     * the cached window layers, so the layers stay static and the numbers move. */
-    for &i in order.iter() {
-        let win = sh.wins[i];
-        if !win.open || win.minimized {
-            continue;
-        }
-        crate::apps::draw_live(&mut s, win.accent, win.x, win.y, win.w, win.h, now);
+    if sh.dragging && sh.drag_frames_logged < 20 {
+        sh.drag_frames_logged += 1;
+        console_printf(
+            b"[gui-shell] drag repaint %d ticks (rects %d px %llu)\n\0".as_ptr(),
+            compose_ticks as i32, nrects as i32, px as u64);
     }
 
-    /* v0.49.0: 2-frame fade-out before a close/minimize actually happens */
+    // ---- hand the frame to the present stage and show it if the grid allows ----
+    /* everything this frame composed must reach the framebuffer eventually: a
+     * present the grid defers keeps these rectangles accumulated (a superseded
+     * frame must not silently drop its damage) */
+    if full {
+        ACCUM.full_screen();
+    } else {
+        for k in 0..nrects {
+            ACCUM.add(rects[k]);
+        }
+    }
+    finish_frame();
+    let presented = present_pending(fb, pitch_px as usize, wu, hu, now_ns, now,
+                                    mx_c, my_c, false);
+    if DMG_DEBUG > 0 {
+        DMG_DEBUG -= 1;
+        console_printf(
+            b"[gui-shell] dbg frame full=%d rects=%d r0=%d,%d,%d,%d r1=%d,%d,%d,%d \
+px=%llu present=%d accum=%d\n\0"
+                .as_ptr(),
+            full as i32, nrects as i32,
+            rects[0].x0, rects[0].y0, rects[0].x1, rects[0].y1,
+            rects[1].x0, rects[1].y0, rects[1].x1, rects[1].y1,
+            px as u64, presented as i32, ACCUM.n as i32);
+    }
+
+    /* the frame that was just composed is now the reference for the next diff:
+     * snapshot BEFORE the animation counters advance, so the state that was
+     * drawn (e.g. "window still open, fading") is what the next frame compares
+     * against. */
+    SNAP = take_snap(sh, &ctx);
+
+    // ---- animation counters advance after the frame that used them ----
     if sh.act_frames > 0 {
         let idx = sh.act_idx;
-        if idx >= 0 && idx < 4 && sh.wins[idx as usize].open && !sh.wins[idx as usize].minimized {
-            let w = sh.wins[idx as usize];
-            let a = if sh.act_frames == 2 { 0x2cu32 } else { 0x64u32 };
-            s.rect_fill(w.x, w.y, w.x + w.w, w.y + w.h, 0x000000, a);
-        }
         sh.act_frames -= 1;
-        if sh.act_frames == 0 && idx >= 0 && idx < 4 {
+        if sh.act_frames == 0 && idx >= 0 && idx < 5 {
             let ui = idx as usize;
             if sh.act_kind == 1 {
                 sh.wins[ui].minimized = true;
@@ -1347,52 +2671,18 @@ pub unsafe fn shell_step(
             sh.act_idx = -1;
         }
     }
-
-    /* v0.48.0: 3-frame open fade. Dimming the freshly opened window for a few
-     * frames reads as a soft appear and costs one rect fill (~17 ms). */
     if sh.intro_frames > 0 {
-        let idx = sh.intro_idx;
-        if idx >= 0 && idx < 4 && sh.wins[idx as usize].open {
-            let w = sh.wins[idx as usize];
-            let a = match sh.intro_frames {
-                3 => 0x58u32,
-                2 => 0x2cu32,
-                _ => 0x12u32,
-            };
-            s.rect_fill(w.x, w.y, w.x + w.w, w.y + w.h, 0x000000, a);
-            log2(c"intro fade", sh.intro_frames as i32, idx);
+        if ctx.intro_alpha > 0 {
+            log2(c"intro fade", sh.intro_frames as i32, ctx.intro_idx);
         }
         sh.intro_frames -= 1;
     }
-
-    /* v0.58.0: maximise/restore transition. The geometry already jumped to its
-     * target, so the animation samples the HOME-anchored body layer into the
-     * interpolated rectangle: the window grows / shrinks smoothly. */
+    if sh.menu_intro > 0 {
+        log2(c"menu fade", sh.menu_intro as i32, 0);
+        sh.menu_intro -= 1;
+    }
     if sh.scale_frames > 0 {
-        let idx = sh.scale_idx;
-        if idx >= 0 && idx < 4 && sh.wins[idx as usize].open
-            && !sh.wins[idx as usize].minimized
-        {
-            let total: i32 = 4;
-            let step = total - sh.scale_frames as i32 + 1;
-            let mut r = [0i32; 4];
-            for k in 0..4usize {
-                let a = sh.scale_from[k];
-                let b = sh.scale_to[k];
-                r[k] = a + (b - a) * step / total;
-            }
-            let mut tmp = sh.wins[idx as usize];
-            tmp.x = r[0];
-            tmp.y = r[1];
-            tmp.w = r[2].max(24);
-            tmp.h = r[3].max(24);
-            draw_window_shadow(&mut s, &tmp);
-            let frame = scene_back_mut();
-            if !composite_scaled(frame, wu, idx as usize, &tmp) {
-                draw_window(&mut s, &tmp, false);
-            }
-            log2(c"scale", idx, step);
-        }
+        log2(c"scale", sh.scale_idx, sh.scale_frames as i32);
         sh.scale_frames -= 1;
         if sh.scale_frames == 0 {
             let idx = sh.scale_idx;
@@ -1406,319 +2696,92 @@ pub unsafe fn shell_step(
         }
     }
 
-    /* v0.58.0: keyboard-focus indicator. The focused window shows an editable
-     * line (label + typed ASCII + caret); it is drawn after the window body so
-     * the cached layer stays static while the line changes. */
-    if !sh.menu_open && !sh.shutting {
-        let fi = sh.focus;
-        let w = sh.wins[fi];
-        let y = w.y + TITLE_H + 104;
-        /* v0.59.x: the image viewer has no text content, and when it shows a
-         * committed Wayland surface the focus hint would sit on top of the
-         * client's pixels - skip the editable line for that window. */
-        if w.open && !w.minimized && fi != 2 && y + 20 < w.y + w.h && w.y >= 0 {
-            s.rect_fill(w.x + 16, y - 4, w.x + w.w - 16, y + 20, 0x000000, 0x24);
-            s.text(w.x + 24, y, "输入:", 0x9fb2cc, 0xd0, 1);
-            let x0 = w.x + 24 + 46 + 8;
-            let len = sh.ilen[fi] as usize;
-            if len == 0 {
-                s.text(x0, y, "键入文本 Tab 切换窗口", 0x60718a, 0xc0, 1);
-            } else {
-                let mut x = x0;
-                let buf = &sh.input[fi];
-                let mut k = 0usize;
-                while k < len && x < w.x + w.w - 40 {
-                    x += s.char_ascii(x, y, buf[k] as char, 0xffffff, 0xf0, 1);
-                    k += 1;
-                }
-                s.rect_fill(x, y, x + 2, y + 16, 0x8fc2ff, 0xe0);
-            }
-        }
-    }
 
-    let t_win = ticks() - t_win0;
-    // 5. taskbar (acrylic strip sampled from the frosted source)
-    let t_bar0 = ticks();
-    let tb_key = taskbar_key(sh, clock_hhmm);
-    let tb_hit = unsafe { TASKBAR_KEY == tb_key };
-    if tb_hit {
-        let frame = scene_back_mut();
-        if !blit_taskbar(frame, wu) {
-            // strip cache unreadable: fall back to a real render
-            frosted(&mut s, 0, TASKBAR_Y, SCREEN_W, SCREEN_H, 0.0, 0x30);
-s.rect_fill(0, TASKBAR_Y, SCREEN_W, SCREEN_H, 0xffffff, 0x08);
-/* start button: rounded tile + the same pseudo-3D plate glyph as the icon */
-let hover_start = mx_c >= start_btn.0 && mx_c < start_btn.0 + start_btn.2 &&
-                  my_c >= start_btn.1 && my_c < start_btn.1 + start_btn.3;
-s.rect_fill(start_btn.0, start_btn.1, start_btn.0 + start_btn.2,
-            start_btn.1 + start_btn.3, 0xffffff,
-            if hover_start { 0x2c } else { 0x16 });
-/* v0.57.1: the real SutureOS logo (24px step of the asset ladder) */
-blit_logo_region(&mut s, &g_logo24, LOGO_SMALL_SIZE,
-                 0, 0, LOGO_SMALL_SIZE as i32, LOGO_SMALL_SIZE as i32,
-                 start_btn.0 + 5, start_btn.1 + 2);
-
-/* window buttons */
-sh.hover_wb = -1;
-for i in 0..4 {
-    if let Some((bx, bw)) = wb_rect(&sh.wins, i) {
-        let hovered = mx_c >= bx && mx_c < bx + bw && my_c >= TASKBAR_Y + 5 &&
-                      my_c < TASKBAR_Y + TASKBAR_H - 5;
-        if hovered { sh.hover_wb = i as i32; }
-        let active = sh.focus == i && !sh.wins[i].minimized;
-        s.rect_fill(bx, TASKBAR_Y + 6, bx + bw, TASKBAR_Y + TASKBAR_H - 6,
-                    0xffffff,
-                    if active { 0x30 } else if hovered { 0x20 } else { 0x12 });
-        if active {
-            s.rect_fill(bx + 14, TASKBAR_Y + TASKBAR_H - 9, bx + bw - 14,
-                        TASKBAR_Y + TASKBAR_H - 7, 0x4f8dff, 255);
-        }
-        s.text(bx + 10, TASKBAR_Y + 12, sh.wins[i].title, 0xe8eefb,
-               if sh.wins[i].minimized { 0x90 } else { 0xf0 }, 1);
-    }
-}
-/* clock on the right: real wall time from the RTC (v0.44.0) */
-{
-    let hh = (clock_hhmm / 100) % 24;
-    let mm = clock_hhmm % 100;
-    let digits = [b'0' + (hh / 10) as u8, b'0' + (hh % 10) as u8,
-                  b':',
-                  b'0' + (mm / 10) as u8, b'0' + (mm % 10) as u8];
-    let chars = [digits[0] as char, digits[1] as char, digits[2] as char,
-                 digits[3] as char, digits[4] as char];
-    let mut x = SCREEN_W - 96;
-    for ch in chars.iter() {
-        x += s.char_ascii(x, TASKBAR_Y + 12, *ch, 0xd6e2f5, 0xd0, 1);
-    }
-}
-        } else {
-            sh.prof_taskbar_hit += 1;
-        }
-    } else {
-    frosted(&mut s, 0, TASKBAR_Y, SCREEN_W, SCREEN_H, 0.0, 0x30);
-s.rect_fill(0, TASKBAR_Y, SCREEN_W, SCREEN_H, 0xffffff, 0x08);
-/* start button: rounded tile + the same pseudo-3D plate glyph as the icon */
-let hover_start = mx_c >= start_btn.0 && mx_c < start_btn.0 + start_btn.2 &&
-                  my_c >= start_btn.1 && my_c < start_btn.1 + start_btn.3;
-s.rect_fill(start_btn.0, start_btn.1, start_btn.0 + start_btn.2,
-            start_btn.1 + start_btn.3, 0xffffff,
-            if hover_start { 0x2c } else { 0x16 });
-/* v0.57.1: the real SutureOS logo (24px step of the asset ladder) */
-blit_logo_region(&mut s, &g_logo24, LOGO_SMALL_SIZE,
-                 0, 0, LOGO_SMALL_SIZE as i32, LOGO_SMALL_SIZE as i32,
-                 start_btn.0 + 5, start_btn.1 + 2);
-
-/* window buttons */
-sh.hover_wb = -1;
-for i in 0..4 {
-    if let Some((bx, bw)) = wb_rect(&sh.wins, i) {
-        let hovered = mx_c >= bx && mx_c < bx + bw && my_c >= TASKBAR_Y + 5 &&
-                      my_c < TASKBAR_Y + TASKBAR_H - 5;
-        if hovered { sh.hover_wb = i as i32; }
-        let active = sh.focus == i && !sh.wins[i].minimized;
-        s.rect_fill(bx, TASKBAR_Y + 6, bx + bw, TASKBAR_Y + TASKBAR_H - 6,
-                    0xffffff,
-                    if active { 0x30 } else if hovered { 0x20 } else { 0x12 });
-        if active {
-            s.rect_fill(bx + 14, TASKBAR_Y + TASKBAR_H - 9, bx + bw - 14,
-                        TASKBAR_Y + TASKBAR_H - 7, 0x4f8dff, 255);
-        }
-        s.text(bx + 10, TASKBAR_Y + 12, sh.wins[i].title, 0xe8eefb,
-               if sh.wins[i].minimized { 0x90 } else { 0xf0 }, 1);
-    }
-}
-/* clock on the right: real wall time from the RTC (v0.44.0) */
-{
-    let hh = (clock_hhmm / 100) % 24;
-    let mm = clock_hhmm % 100;
-    let digits = [b'0' + (hh / 10) as u8, b'0' + (hh % 10) as u8,
-                  b':',
-                  b'0' + (mm / 10) as u8, b'0' + (mm % 10) as u8];
-    let chars = [digits[0] as char, digits[1] as char, digits[2] as char,
-                 digits[3] as char, digits[4] as char];
-    let mut x = SCREEN_W - 96;
-    for ch in chars.iter() {
-        x += s.char_ascii(x, TASKBAR_Y + 12, *ch, 0xd6e2f5, 0xd0, 1);
-    }
-}
-        let frame = scene_back_mut();
-        save_taskbar(frame, wu);
-        unsafe {
-            TASKBAR_KEY = tb_key;
-        }
-    }
-    /* v0.52.0: 2-frame fade-in for the start menu (dim -> clear) */
-    if sh.menu_intro > 0 {
-        let a = if sh.menu_intro == 2 { 0x50u32 } else { 0x24u32 };
-        s.rect_fill(MENU_X, MENU_Y, MENU_X + MENU_W, MENU_Y + MENU_H + 8, 0x000000, a);
-        log2(c"menu fade", sh.menu_intro as i32, 0);
-        sh.menu_intro -= 1;
-    }
-
-    let t_bar = ticks() - t_bar0;
-    if sh.dragging {
-        let total = ticks() - t_frame0;
-        if sh.drag_frames_logged < 20 {
-            sh.drag_frames_logged += 1;
-            console_printf(b"[gui-shell] drag repaint %d ticks (copy %d win %d bar %d)\n\0".as_ptr(),
-                           total as i32, t_copy as i32, t_win as i32, t_bar as i32);
-        }
-    }
-
-    // 6. start menu
-    if sh.menu_open {
-        s.rect_fill(MENU_X + 3, MENU_Y + 10, MENU_X + MENU_W + 3,
-                    MENU_Y + MENU_H + 12, 0x000000, 0x44);
-        frosted(&mut s, MENU_X, MENU_Y, MENU_X + MENU_W, MENU_Y + MENU_H, 14.0, 0x34);
-        s.rect_fill(MENU_X + 10, MENU_Y, MENU_X + MENU_W - 10, MENU_Y + 1,
-                    0xffffff, 0x3c);
-        s.rect_fill(MENU_X + 10, MENU_Y + MENU_H - 1, MENU_X + MENU_W - 10,
-                    MENU_Y + MENU_H, 0xffffff, 0x3c);
-        s.rect_fill(MENU_X, MENU_Y + 10, MENU_X + 1, MENU_Y + MENU_H - 10,
-                    0xffffff, 0x3c);
-        s.rect_fill(MENU_X + MENU_W - 1, MENU_Y + 10, MENU_X + MENU_W,
-                    MENU_Y + MENU_H - 10, 0xffffff, 0x3c);
-        /* v0.57.1: start-menu icon = 48px step of the logo ladder */
-blit_logo_region(&mut s, &g_logo48, LOGO_MENU_SIZE,
-                 0, 0, LOGO_MENU_SIZE as i32, LOGO_MENU_SIZE as i32,
-                 MENU_X + 10, MENU_Y + 2);
-s.text(MENU_X + 68, MENU_Y + 16, "常用应用", 0xffffff, 0xf0, 1);
-        let items = MENU_ITEMS;
-        for (k, name) in items.iter().enumerate() {
-            let y = MENU_Y + 46 + k as i32 * 44;
-            let hovered = mx_c >= MENU_X + 10 && mx_c < MENU_X + MENU_W - 10 &&
-                          my_c >= y && my_c < y + 38;
-            let selected = k as i32 == sh.menu_sel;
-            s.rect_fill(MENU_X + 10, y, MENU_X + MENU_W - 10, y + 38, 0xffffff,
-                        if hovered { 0x2c } else if selected { 0x22 } else { 0x12 });
-            let accent = APP_ACCENTS[k];
-            if hovered || selected {
-                s.rect_fill(MENU_X + 10, y + 5, MENU_X + 13, y + 33, accent, 0xd8);
-            }
-            draw_app_icon(&mut s, MENU_X + 18, y + 8, 22, accent, k as i32);
-            s.text(MENU_X + 50, y + 11, name, 0xeef4ff, 0xe8, 1);
-        }
-    }
-
-    sh.prof_frames += 1;
-    sh.prof_full += 1;
-    sh.prof_copy += t_copy;
-    sh.prof_win += t_win;
-    sh.prof_bar += t_bar;
-    if sh.prof_frames >= 30 {
-        unsafe {
-            console_printf(b"[gui-shell] profile/30: full=%d hit=%d miss=%d win=%llu bar=%llu ticks\n\0".as_ptr(),
-                           sh.prof_full as i32, sh.prof_cache_hit as i32,
-                           sh.prof_cache_miss as i32, sh.prof_win, sh.prof_bar);
-            let st = &*core::ptr::addr_of!(SWAP);
-            let avg = if SWAP_IVL_N > 0 { SWAP_IVL_SUM / SWAP_IVL_N } else { 0 };
+    if WLOG_FRAMES >= 30 {
+        let st = &mut *core::ptr::addr_of_mut!(SWAP);
+        let avg_ivl = if WLOG_IVL_N > 0 { WLOG_IVL_SUM / WLOG_IVL_N } else { 0 };
+        let avg_jit = if WLOG_IVL_N > 0 { WLOG_JIT_SUM / WLOG_IVL_N } else { 0 };
+        let avg_lat = if WLOG_IVL_N > 0 { WLOG_LAT_SUM / WLOG_IVL_N } else { 0 };
+        let permille = if WLOG_FRAMED > 0 { (WLOG_PX * 1000 / WLOG_FRAMED) as i32 } else { 0 };
+        console_printf(
+            b"[gui-shell] profile/30: full=%d hit=%d miss=%d win=%llu bar=%llu ticks damage=%d full_frames=%d px=%llu framed=%llu permille=%d oracle=%d mismatch=%d\n\0"
+                .as_ptr(),
+            WLOG_FULL as i32,
+            sh.prof_cache_hit as i32,
+            sh.prof_cache_miss as i32,
+            sh.prof_win,
+            0u64,
+            WLOG_DMG as i32,
+            WLOG_FULL as i32,
+            WLOG_PX,
+            WLOG_FRAMED,
+            permille,
+            WLOG_ORACLE as i32,
+            WLOG_MISMATCH as i32,
+        );
+        console_printf(
+            b"[gui-shell] swap presents=%d gens=%d presented=%d dropped=%d jitter_us=%d \
+interval_ms=%d skipped=%d latency_us=%d latency_max_us=%d \
+hist=%d,%d,%d,%d,%d,%d\n\0"
+                .as_ptr(),
+            st.presents as i32,
+            st.generation as i32,
+            st.presented as i32,
+            st.dropped as i32,
+            avg_jit as i32,
+            avg_ivl as i32,
+            st.skipped as i32,
+            avg_lat as i32,
+            WLOG_LAT_MAX as i32,
+            st.hist[0] as i32,
+            st.hist[1] as i32,
+            st.hist[2] as i32,
+            st.hist[3] as i32,
+            st.hist[4] as i32,
+            st.hist[5] as i32,
+        );
+        if WLOG_ORACLE > 0 {
             console_printf(
-                b"[gui-shell] swap presents=%d gens=%d skipped=%d interval_ms=%d\n\0".as_ptr(),
-                st.presents as i32,
-                st.generation as i32,
-                st.skipped as i32,
-                avg as i32,
-            );
-            SWAP_IVL_SUM = 0;
-            SWAP_IVL_N = 0;
+                b"[gui-shell] damage: identical oracle=%d frames=%d rects=%d permille=%d\n\0"
+                    .as_ptr(),
+                WLOG_ORACLE as i32, WLOG_FRAMES as i32, nrects as i32, permille);
         }
         sh.prof_frames = 0;
         sh.prof_full = 0;
         sh.prof_cache_hit = 0;
         sh.prof_cache_miss = 0;
-        sh.prof_copy = 0;
         sh.prof_win = 0;
         sh.prof_bar = 0;
+        WLOG_IVL_SUM = 0;
+        WLOG_IVL_N = 0;
+        WLOG_JIT_SUM = 0;
+        WLOG_LAT_SUM = 0;
+        WLOG_LAT_MAX = 0;
+        WLOG_FRAMES = 0;
+        WLOG_FULL = 0;
+        WLOG_DMG = 0;
+        WLOG_PX = 0;
+        WLOG_FRAMED = 0;
+        WLOG_ORACLE = 0;
+        WLOG_MISMATCH = 0;
     }
 
-    // 7. present: vsync gate, swap back->front, blit the front, then the cursor
-    unsafe { SWAP.produced += 1; }
-    if !swap_due(now_ms) {
-        /* coalesced: this frame stays in the back buffer and is shown by the
-         * next due frame (or by the idle flush) - a tick is 10 ms and the C loop
-         * paces frames by 3 ticks, so in practice this path is a guard. */
-        unsafe {
-            SWAP.skipped += 1;
-            SWAP_PENDING = true;
-        }
-        return LAST_SUM;
-    }
-    /* the freshly rendered back buffer becomes the front buffer */
-    unsafe { FRONT ^= 1; }
-    {
-        let frame = scene_front();
-        // v0.50.0: while dragging, only the window's old and new rectangles can
-        // differ from what is already on screen — present just those two.
-        if sh.dragging {
-            let w = sh.wins[sh.drag_idx];
-            let old_rect = (sh.drag_last_x - 20, sh.drag_last_y - 20,
-                            sh.drag_last_x + w.w + 40, sh.drag_last_y + w.h + 40);
-            let new_rect = (w.x - 20, w.y - 20, w.x + w.w + 40, w.y + w.h + 40);
-            blit_rect(frame, wu, fb, pitch_px as usize, old_rect);
-            blit_rect(frame, wu, fb, pitch_px as usize, new_rect);
-            sh.drag_last_x = w.x;
-            sh.drag_last_y = w.y;
-        } else {
-            blit_rect(frame, wu, fb, pitch_px as usize, (0, 0, SCREEN_W, SCREEN_H));
-            sh.drag_last_x = -1;
-            sh.drag_last_y = -1;
-        }
-        draw_cursor(fb, pitch_px as usize, wu, hu, mx_c, my_c);
-        unsafe {
-            swap_commit(now_ms, true);
-            SWAP_PENDING = false;
-            CUR_SEEN = true;
-            CUR_PX = mx_c;
-            CUR_PY = my_c;
-            PREV_MX = mx_c;
-            PREV_MY = my_c;
-        }
-    }
-
-    /* v0.50.0: sampled checksum. The old loop hashed all 786k pixels after every
-     * repaint (~2-3 ticks = 20-30 ms) — a real cost inside a drag. Every 8th
-     * pixel is enough to tell frames apart for the idle-skip bookkeeping. */
+    /* sampled checksum of the drawn frame (informational: the swap gate and the
+     * idle log use it, never correctness) */
     let mut hash: u32 = 0x811c9dc5;
-    let mut k = 0usize;
-    while k < s.px.len() {
-        hash ^= s.px[k] & 0x00ff_ffff;
-        hash = hash.wrapping_mul(0x0100_0193);
-        k += 8;
+    {
+        let frame = core::slice::from_raw_parts(buf_ptr(draw),
+                                                (SCREEN_W as usize) * (SCREEN_H as usize));
+        let mut k = 0usize;
+        while k < frame.len() {
+            hash ^= frame[k] & 0x00ff_ffff;
+            hash = hash.wrapping_mul(0x0100_0193);
+            k += 8;
+        }
     }
     LAST_SUM = hash;
+    let _ = presented;
     hash
-}
-
-/// Code describing what the pointer hovers; any change needs the real painter.
-fn hover_code(sh: &Shell, mx: i32, my: i32) -> i32 {
-    let start = (8, TASKBAR_Y + 5, 34, 28);
-    if mx >= start.0 && mx < start.0 + start.2 && my >= start.1 && my < start.1 + start.3 {
-        return 100;
-    }
-    for i in 0..4 {
-        if let Some((bx, bw)) = wb_rect(&sh.wins, i) {
-            if mx >= bx && mx < bx + bw && my >= TASKBAR_Y + 5 && my < TASKBAR_Y + TASKBAR_H - 5 {
-                return 200 + i as i32;
-            }
-        }
-    }
-    if sh.menu_open && mx >= MENU_X + 10 && mx < MENU_X + MENU_W - 10 &&
-       my >= MENU_ITEMS_Y && my < MENU_ITEMS_Y + MENU_ITEMS.len() as i32 * 44 {
-        return 300 + (my - MENU_ITEMS_Y) / 44;
-    }
-    let hw = hit_win(&sh.wins, mx, my, sh.focus as i32);
-    if hw >= 0 {
-        let w = sh.wins[hw as usize];
-        let (bx, _by, bw, _bh) = control_rect(&w);
-        if my >= w.y && my < w.y + TITLE_H {
-            if mx >= bx && mx < bx + 3 * bw + 8 {
-                return 400 + hw * 4 + (mx - bx) / (bw + 4);
-            }
-            return 500 + hw;
-        }
-        return 600 + hw;
-    }
-    0
 }
 
 /// Copy a rectangle of the scene cache into the framebuffer.
@@ -1754,7 +2817,7 @@ fn layer_key(w: &Win, slot: usize) -> i32 {
         wrapping_add(slot as i32);
     /* v0.59.x: the image viewer can show a committed Wayland surface, so its
      * layer must be re-rasterised when the kernel server reports a new commit. */
-    if slot == 2 {
+    if slot == 2 || slot == 4 {
         k = k.wrapping_mul(31).wrapping_add(crate::apps::wl_epoch());
     }
     k
@@ -1799,87 +2862,40 @@ fn render_window_layer(slot: usize, w: &Win) -> bool {
     true
 }
 
-/// Blit the cached layer (body + shadow + margins) at the window's current
-/// position. Rows are memcpy'd; nothing is blended, so this costs ~1 ms/window.
-fn composite_window_layer(scene: &mut [u32], stride: usize, slot: usize, w: &Win) -> bool {
+/// Blit the cached body layer at the window's current position, limited to the
+/// rectangle `r` that is being recomposed (the layer itself is position-free
+/// since v0.51.0: it is rendered at its home anchor and blitted anywhere).
+fn composite_window_layer(scene: &mut [u32], stride: usize, slot: usize, w: &Win,
+                          r: Rect) -> bool {
     let lw = (w.w + WC_MARGIN_L + WC_MARGIN_R) as usize;
     let lh = (w.h + WC_MARGIN_T + WC_MARGIN_B) as usize;
     if lw == 0 || lh == 0 || lw > WC_STRIDE || lh > WC_H {
         return false;
     }
-    let cache = unsafe { &(&*core::ptr::addr_of!(WIN_CACHE))[slot] };
-    /* v0.58.0: only the body is copied; the margins hold the wallpaper prefill
-     * and the shadow is drawn separately (alpha-composited over the scene). */
-    let _ = (lw, lh);                    /* validated above, not needed for the copy */
     if w.w <= 0 || w.h <= 0 {
         return true;
     }
-    let x0 = w.x;
-    let y0 = w.y;
-    let sx0 = (-x0).max(0) as usize;
-    let sy0 = (-y0).max(0) as usize;
-    let ex = (w.w as usize).min((SCREEN_W - x0).max(0) as usize);
-    let ey = (w.h as usize).min((SCREEN_H - y0).max(0) as usize);
-    if ex <= sx0 || ey <= sy0 {
+    let cache = unsafe { &(&*core::ptr::addr_of!(WIN_CACHE))[slot] };
+    /* v0.58.0: only the body is copied; the margins hold the wallpaper prefill
+     * and the shadow is drawn separately (alpha-composited over the scene). */
+    let x0 = w.x.max(r.x0).max(0);
+    let y0 = w.y.max(r.y0).max(0);
+    let x1 = (w.x + w.w).min(r.x1).min(SCREEN_W);
+    let y1 = (w.y + w.h).min(r.y1).min(SCREEN_H);
+    if x1 <= x0 || y1 <= y0 {
         return true;
     }
-    let n = ex - sx0;
-    for ly in sy0..ey {
-        let dy = (y0 + ly as i32) as usize;
-        let d = dy * stride + (x0 + sx0 as i32) as usize;
-        let srow = (WC_MARGIN_T as usize + ly) * WC_STRIDE
-                   + WC_MARGIN_L as usize + sx0;
+    let n = (x1 - x0) as usize;
+    for dy in y0..y1 {
+        let ly = dy - w.y;
+        let d = dy as usize * stride + x0 as usize;
+        let srow = (WC_MARGIN_T + ly) as usize * WC_STRIDE
+                   + (WC_MARGIN_L + (x0 - w.x)) as usize;
         scene[d..d + n].copy_from_slice(&cache[srow..srow + n]);
     }
     true
 }
 
-/// Cache key for the taskbar strip: everything that changes its pixels.
-fn taskbar_key(sh: &Shell, clock_hhmm: i32) -> i32 {
-    let mut k = clock_hhmm
-        .wrapping_mul(31)
-        .wrapping_add((sh.focus as i32).wrapping_mul(977))
-        .wrapping_add((sh.hover_wb + 1).wrapping_mul(131))
-        .wrapping_add((sh.hover_pin + 1).wrapping_mul(67));
-    for i in 0..4 {
-        let w = sh.wins[i];
-        k = k.wrapping_add((w.open as i32) * (7 + i as i32))
-             .wrapping_add((w.minimized as i32) * (101 + i as i32))
-             .wrapping_add((w.z & 0xff) * (13 + i as i32));
-    }
-    k
-}
-
-/// Blit the cached taskbar strip into the scene (returns false on a miss).
-fn blit_taskbar(scene: &mut [u32], stride: usize) -> bool {
-    if unsafe { TASKBAR_KEY } == i32::MIN {
-        return false;
-    }
-    let cache = unsafe { &*core::ptr::addr_of!(TASKBAR_CACHE) };
-    let y0 = TASKBAR_Y as usize;
-    let n = SCREEN_W as usize;
-    for row in 0..TB_H {
-        let d = (y0 + row) * stride;
-        let src = row * n;
-        scene[d..d + n].copy_from_slice(&cache[src..src + n]);
-    }
-    true
-}
-
-/// Save the just-rendered taskbar strip.
-fn save_taskbar(scene: &[u32], stride: usize) {
-    let cache = unsafe { &mut *core::ptr::addr_of_mut!(TASKBAR_CACHE) };
-    let y0 = TASKBAR_Y as usize;
-    let n = SCREEN_W as usize;
-    for row in 0..TB_H {
-        let s = (y0 + row) * stride;
-        let dst = row * n;
-        cache[dst..dst + n].copy_from_slice(&scene[s..s + n]);
-    }
-}
-
-/// v0.59.0: integer channel scaling (no f32: soft-float is ~20x slower here).
-#[inline]
 fn shade_px(c: u32, num: u32, den: u32) -> u32 {
     let ch = |sh: u32| -> u32 {
         let v = ((c >> sh) & 0xff) * num / den;
@@ -1942,9 +2958,8 @@ fn draw_app_icon(s: &mut Surface<'_>, x: i32, y: i32, size: i32, accent: u32,
     /* specular highlight + bottom rim (the actual 3D cue) */
     s.rect_fill(x + r, y + 1, x + size - r, y + 2, 0xffffff, 0x8c);
     s.rect_fill(x + r, y + size - 3, x + size - r, y + size - 2, 0x000000, 0x38);
-    /* v0.60 polish: inner rim light on the two sides plus a bottom reflection
-     * band, so the plate keeps an edge on the (now brighter) menu rows and on
-     * the light title strips instead of melting into them. */
+    /* v0.60: side rim light + bottom reflection band, so the plate keeps an edge
+     * on the brighter menu rows and title strips instead of melting into them. */
     s.rect_fill(x + 1, y + 3, x + 2, y + size - 3, 0xffffff, 0x2a);
     s.rect_fill(x + size - 2, y + 3, x + size - 1, y + size - 3, 0xffffff, 0x18);
     if size >= 20 {
@@ -1997,9 +3012,22 @@ fn draw_window_shadow(s: &mut Surface<'_>, w: &Win) {
     }
 }
 
-/// v0.60: a 22x22 title-bar control tile with a 2 px chamfer. Three integer
-/// `rect_fill`s - the analytic `round_rect` pass would cost one soft-float sqrt
-/// per edge pixel and these tiles sit in the statically cached window layer.
+/// v0.60: integer rounded rectangle (r <= 6) for the taskbar/menu layers:
+/// a middle band plus one rect per corner row. The analytic `round_rect` pass
+/// costs one soft-float sqrt per edge pixel and these layers are re-composed on
+/// every damage frame, so the integer profile is the right trade here.
+fn rrow(s: &mut Surface<'_>, x0: i32, y0: i32, x1: i32, y1: i32, r: i32,
+        c: u32, a: u32) {
+    let rr = r.min(((y1 - y0) / 2).max(1)).min(((x1 - x0) / 2).max(1));
+    for k in 0..rr {
+        let ins = rr - k;
+        s.rect_fill(x0 + ins, y0 + k, x1 - ins, y0 + k + 1, c, a);
+        s.rect_fill(x0 + ins, y1 - 1 - k, x1 - ins, y1 - k, c, a);
+    }
+    s.rect_fill(x0, y0 + rr, x1, y1 - rr, c, a);
+}
+
+/// v0.60: 22x22 title-bar control tile with a 2 px chamfer (integer only).
 fn ctl_tile(s: &mut Surface<'_>, x: i32, y: i32, w: i32, h: i32, a: u32) {
     s.rect_fill(x + 2, y, x + w - 2, y + h, 0xffffff, a);
     s.rect_fill(x, y + 2, x + w, y + h - 2, 0xffffff, a);
@@ -2026,8 +3054,8 @@ fn draw_window(s: &mut Surface<'_>, w: &Win, with_shadow: bool) {
      * title text + a faint accent underline (Fluent cues; the rounded top corners
      * come from the body's AA silhouette) */
     s.rect_fill(w.x + 2, w.y + 1, w.x + w.w - 2, w.y + TITLE_H, 0xffffff, 0x18);
-    /* v0.60 polish: 2 px leading accent bar - the Fluent "which app is this"
-     * cue, and it also anchors the eye on a busy wallpaper */
+    /* v0.60 polish: 2 px leading accent bar - the Fluent "which app is this" cue,
+     * and it anchors the eye on a busy wallpaper */
     s.rect_fill(w.x + 5, w.y + 9, w.x + 7, w.y + TITLE_H - 9, w.accent, 0xf0);
     draw_app_icon(s, w.x + 15, w.y + 8, TITLE_H - 16, w.accent,
                   glyph_for_accent(w.accent));

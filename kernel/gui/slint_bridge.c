@@ -13,6 +13,7 @@
  */
 #include "slint_bridge.h"
 #include <stitch/console.h>
+#include "../time/time_source.h"
 
 /* Provided by kernel/main/limine.c (multiboot1 framebuffer fields). */
 extern uint64_t limine_fb_addr;
@@ -257,6 +258,16 @@ void suture_power_off(void)
     power_off();
 }
 
+/* v0.61.0: the compositor paces its presents on a 60 Hz grid built from the
+ * kernel's best time source (HPET at 100 MHz when the firmware has one, the
+ * 100 Hz tick otherwise). `time_source_now_ns()` is the only nanosecond
+ * reader in the kernel, so the Rust side asks for it through this thin shim
+ * instead of re-implementing the counter arithmetic. */
+uint64_t suture_gui_time_ns(void)
+{
+    return time_source_now_ns();
+}
+
 int slint_gui_run_shell(void)
 {
     extern int mbos_kbd_decode(unsigned char scancode);
@@ -384,6 +395,9 @@ int slint_gui_run_shell(void)
                            frames, now_ms, mx, my);
         }
 
+        /* v0.61.0: the Rust compositor does the 60 Hz present pacing itself; the
+         * loop keeps its original 3-tick frame cadence (the input/click timing of
+         * the existing shell acceptance is calibrated on it). */
         const uint64_t t0 = g_tick_count;
         while ((g_tick_count - t0) < 3u) {
             for (volatile int spin = 0; spin < 4000; spin++) { }

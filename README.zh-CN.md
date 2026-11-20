@@ -53,7 +53,7 @@ SutureOS 是一个实验性的 **x86_64 单内核操作系统**，通过移植�
 - 只读 ext4、VimtuFS2、OS67（Minix v1）文件系统；可写 MayFS
 
 当前源码树构建产物：`kernel.elf` 约 6.10 MB，`sutureos.iso` 约 22.3 MB；开机自检 **16/16**，
-全局符号 **1405** 个、**0 冲突**。
+全局符号 **1421** 个、**0 冲突**（144 个对象）。
 
 **桌面（v0.59.0-alpha）：Rust 桌面外壳已成为默认桌面**——`startgui` 进入新桌面，原 C 桌面移到
 `startgui-classic`（它自己的验收套件与外观门禁继续跑）。新桌面有拟物化伪 3D Fluent 应用图标
@@ -65,10 +65,17 @@ wl_buffer/wl_seat 子集，ring-3 客户端 `run wlclient` 用 SCM_RIGHTS 交付
 commit 的 surface 整屏呈现。验收：桌面 **19/19**、外壳 **55/55**、应用内容 **25/25**、
 Logo **14/14**、Wayland **28/28**、wlshow **9/9**，两套外观门禁 **0 像素**，启动呈现未变。
 
-**开发中（下一条版本线，尚未发布）：** Wayland 客户端 surface 已能显示在桌面窗口里，协议补上了
-frame 回调、damage 与 seat 指针事件，呈现器换成显式双缓冲交换链 + 10 ms vsync 闸门
-（`guishell swapstat` 看计数）。仍未做：真正的 vsync 源/三缓冲、damage 驱动的局部重绘、
-多 Wayland 客户端、真实 seat 事件流（`wl_keyboard`）、scaling/subsurface，以及继续视觉打磨。
+**本轮（v0.59.0 之后的 GUI 收尾，尚未发布）：** 呈现改为三缓冲 + HPET 驱动的 60 Hz 栅格节拍
+（掉帧/jitter/延迟/直方图都进 `guishell swapstat`，守恒式 `rendered == presented + skipped + pending`）；
+重绘改为 damage 驱动的局部合成，并用 oracle 把每个 damage 帧与整屏重绘逐像素比对
+（`damage: identical`，纯指针帧只重绘 0.4–0.5% 屏幕，拖动帧 0–10 ms，旧整屏约 117 ms）；
+Wayland 支持**多客户端**（每连接一份保留的 surface + `run wltwo` 双连接客户端）、
+`wl_keyboard`/`wl_pointer` 真事件流（按键 press+release、指针 motion/button/leave/frame）、
+`set_buffer_scale` 与 region/subsurface 语义；新增 **`F2`** 打开的独立 **Wayland 窗口**
+（无客户端时显示提示卡，不回退 Logo）。外观做了第二轮打磨（壁纸纵深/图标内描边/accent 身份条/
+圆角任务栏与菜单），`docs/baseline/base_gui.png` 已按新外观重生、门禁仍 0 像素。
+仍未做：真正的 vsync 源（本机没有扫描线中断，60 Hz 是墙上时钟栅格）、更细的 damage 合并、
+窗口内键盘焦点、Wayland scaling 的真实合成，以及把 Wayland surface 摆放成真正的窗口表面。
 
 ---
 
@@ -243,8 +250,9 @@ qemu-system-x86_64 \
 - `startgui-classic` 打开原 C 桌面（六个应用），它的外观基线单独冻结在
   `docs/baseline/base_gui_classic.png`。
 - `guislint` 渲染 Rust UI 原型的单帧画面；`guishell` 直接运行同一外壳；`wlshow` 把最后 commit 的
-  Wayland surface 整屏呈现，图片查看器窗口也会直接绘制这个 surface（先 `run wlclient`）。
-  `guishell swapstat` 打印 present/交换链计数。
+  Wayland surface 整屏呈现，图片查看器窗口也会直接绘制这个 surface（先 `run wlclient`）；
+  **`F2`** 打开独立的 Wayland 窗口（多客户端时页脚列出每条保留的 surface），`run wltwo` 一条命令
+  同时开两个客户端。`guishell swapstat` 打印 present/三缓冲状态/掉帧/jitter/延迟/oracle 与 damage 计数。
 - `guishell` 里焦点窗口同时拥有键盘：可打印字符进入它的输入行、`Enter` 提交到串口、
   `Backspace` 退格、`Tab` 在可见窗口间切换焦点；窗口阴影按 alpha 合成到下层（壁纸或其他窗口）。
 - 原创 SutureOS Logo（`logo/` 素材阶梯，由 `scripts/mklogo_assets.py` 编译为
