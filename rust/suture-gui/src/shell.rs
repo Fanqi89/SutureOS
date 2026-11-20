@@ -411,6 +411,20 @@ unsafe fn build_caches() {
     s.vgrad3(0, 0, SCREEN_W, SCREEN_H, 0x1b2440, 0x121a2b, 0x090d16, 0.45);
     s.hgrad_round(60.0, 90.0, 500.0, 560.0, 96.0, 0x3f7bff, 0x9a5cff, 0xd0);
     s.hgrad_round(600.0, 60.0, 1000.0, 400.0, 96.0, 0x12b8a6, 0x2f6bff, 0xc0);
+    /* v0.60 polish: a faint cool glow hugging the top edge, then an integer
+     * vignette - six 8 px bands per edge whose alpha falls off with distance.
+     * Both run exactly once, when the cache is built; nothing here is per frame.
+     * The vignette is what keeps the wallpaper from reading as a flat fill and
+     * gives the acrylic something to bend. */
+    s.hgrad_round(300.0, 24.0, 780.0, 320.0, 120.0, 0x8fb4ff, 0x1d2a4d, 0x1c);
+    for i in 0..6 {
+        let a = (26 - i * 4) as u32;
+        let d = i * 8;
+        s.rect_fill(0, d, SCREEN_W, d + 8, 0x000000, a);
+        s.rect_fill(0, SCREEN_H - d - 8, SCREEN_W, SCREEN_H - d, 0x000000, a);
+        s.rect_fill(d, 0, d + 8, SCREEN_H, 0x000000, a);
+        s.rect_fill(SCREEN_W - d - 8, 0, SCREEN_W - d, SCREEN_H, 0x000000, a);
+    }
 
     // small mirror of the wallpaper, blurred -> cheap "frosted" source for
     // windows/taskbar/menu (sampled with nearest neighbour, looks right for
@@ -424,6 +438,20 @@ unsafe fn build_caches() {
                    0x3f7bff, 0x9a5cff, 0xd0);
     ss.hgrad_round(600.0 * sx, 60.0 * sy, 1000.0 * sx, 400.0 * sy, 24.0,
                    0x12b8a6, 0x2f6bff, 0xc0);
+    /* v0.60: the frosted source mirrors the new wallpaper depth, otherwise a
+     * window parked near an edge would be lit differently from the desktop. */
+    ss.hgrad_round(300.0 * sx, 24.0 * sy, 780.0 * sx, 320.0 * sy, 30.0,
+                   0x8fb4ff, 0x1d2a4d, 0x1c);
+    for i in 0..6 {
+        let a = (26 - i * 4) as u32;
+        let d = i * 2;
+        ss.rect_fill(0, d, SMALL_W as i32, d + 2, 0x000000, a);
+        ss.rect_fill(0, SMALL_H as i32 - d - 2, SMALL_W as i32,
+                     SMALL_H as i32 - d, 0x000000, a);
+        ss.rect_fill(d, 0, d + 2, SMALL_H as i32, 0x000000, a);
+        ss.rect_fill(SMALL_W as i32 - d - 2, 0, SMALL_W as i32 - d,
+                     SMALL_H as i32, 0x000000, a);
+    }
     swrast::acrylic_blur(&mut ss, 0, 0, SMALL_W as i32, SMALL_H as i32, 6);
 
     // screen -> small-buffer coordinate maps (built once, 2 KiB total)
@@ -1912,8 +1940,17 @@ fn draw_app_icon(s: &mut Surface<'_>, x: i32, y: i32, size: i32, accent: u32,
         s.rect_fill(x + ins, y + i, x + size - ins, y + i + 1, c, 0xff);
     }
     /* specular highlight + bottom rim (the actual 3D cue) */
-    s.rect_fill(x + r, y + 1, x + size - r, y + 2, 0xffffff, 0x70);
+    s.rect_fill(x + r, y + 1, x + size - r, y + 2, 0xffffff, 0x8c);
     s.rect_fill(x + r, y + size - 3, x + size - r, y + size - 2, 0x000000, 0x38);
+    /* v0.60 polish: inner rim light on the two sides plus a bottom reflection
+     * band, so the plate keeps an edge on the (now brighter) menu rows and on
+     * the light title strips instead of melting into them. */
+    s.rect_fill(x + 1, y + 3, x + 2, y + size - 3, 0xffffff, 0x2a);
+    s.rect_fill(x + size - 2, y + 3, x + size - 1, y + size - 3, 0xffffff, 0x18);
+    if size >= 20 {
+        s.rect_fill(x + r + 1, y + size - 5, x + size - r - 1, y + size - 4,
+                    0xffffff, 0x1e);
+    }
     /* glyph */
     let gx = x + size / 2;
     let gy = y + size / 2;
@@ -1960,6 +1997,15 @@ fn draw_window_shadow(s: &mut Surface<'_>, w: &Win) {
     }
 }
 
+/// v0.60: a 22x22 title-bar control tile with a 2 px chamfer. Three integer
+/// `rect_fill`s - the analytic `round_rect` pass would cost one soft-float sqrt
+/// per edge pixel and these tiles sit in the statically cached window layer.
+fn ctl_tile(s: &mut Surface<'_>, x: i32, y: i32, w: i32, h: i32, a: u32) {
+    s.rect_fill(x + 2, y, x + w - 2, y + h, 0xffffff, a);
+    s.rect_fill(x, y + 2, x + w, y + h - 2, 0xffffff, a);
+    s.rect_fill(x + 1, y + 1, x + w - 1, y + h - 1, 0xffffff, a);
+}
+
 fn draw_window(s: &mut Surface<'_>, w: &Win, with_shadow: bool) {
     let t_all = ticks();
     if with_shadow {
@@ -1976,21 +2022,27 @@ fn draw_window(s: &mut Surface<'_>, w: &Win, with_shadow: bool) {
     s.rect_fill(w.x, w.y + 8, w.x + 1, w.y + w.h - 8, 0xffffff, 0x30);
     s.rect_fill(w.x + w.w - 1, w.y + 8, w.x + w.w, w.y + w.h - 8, 0xffffff, 0x30);
 
-    /* title bar: translucent strip + pseudo-3D app icon + title text + a faint
-     * accent underline (Fluent cue; the rounded top corners come from the body's
-     * AA silhouette) */
-    s.rect_fill(w.x + 2, w.y + 1, w.x + w.w - 2, w.y + TITLE_H, 0xffffff, 0x14);
-    draw_app_icon(s, w.x + 9, w.y + 8, TITLE_H - 16, w.accent,
+    /* title bar: translucent strip + accent identity bar + pseudo-3D app icon +
+     * title text + a faint accent underline (Fluent cues; the rounded top corners
+     * come from the body's AA silhouette) */
+    s.rect_fill(w.x + 2, w.y + 1, w.x + w.w - 2, w.y + TITLE_H, 0xffffff, 0x18);
+    /* v0.60 polish: 2 px leading accent bar - the Fluent "which app is this"
+     * cue, and it also anchors the eye on a busy wallpaper */
+    s.rect_fill(w.x + 5, w.y + 9, w.x + 7, w.y + TITLE_H - 9, w.accent, 0xf0);
+    draw_app_icon(s, w.x + 15, w.y + 8, TITLE_H - 16, w.accent,
                   glyph_for_accent(w.accent));
-    s.text(w.x + 30, w.y + 7, w.title, 0xf2f6ff, 0xf0, 1);
+    s.text(w.x + 36, w.y + 7, w.title, 0xf4f8ff, 0xf2, 1);
     s.rect_fill(w.x + 2, w.y + TITLE_H - 1, w.x + w.w - 2, w.y + TITLE_H,
-                w.accent, 0x2a);
+                w.accent, 0x3c);
+    /* 1 px inner highlight where the title strip meets the body ("glass edge") */
+    s.rect_fill(w.x + 9, w.y + TITLE_H, w.x + w.w - 9, w.y + TITLE_H + 1,
+                0xffffff, 0x10);
 
     /* controls */
     let (bx, by, bw, bh) = control_rect(w);
     for k in 0..3 {
         let x = bx + k * (bw + 4);
-        s.rect_fill(x, by, x + bw, by + bh, 0xffffff, 0x14);
+        ctl_tile(s, x, by, bw, bh, 0x16);
         if k == 0 {
             s.round_rect((x + 7) as f32, (by + 14) as f32, (x + 15) as f32,
                          (by + 16) as f32, 1.0, 0xdfe7f5, 0xe0);

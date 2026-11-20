@@ -38,6 +38,9 @@ pub const ACC_SETTINGS: u32 = 0x4f8dff;
 pub const ACC_TASKMAN: u32 = 0x22c1a8;
 pub const ACC_IMAGE: u32 = 0xf5a524;
 pub const ACC_EDITOR: u32 = 0xe05a8a;
+/// v0.60: dedicated Wayland client window (the compositor surface as a window of
+/// its own instead of living inside the image viewer).
+pub const ACC_WAYLAND: u32 = 0x7a5cff;
 
 /// Window title strip height; mirrored from `shell.rs` (`TITLE_H`).
 const TITLE_H: i32 = 30;
@@ -139,11 +142,124 @@ fn wayland_surface_body(s: &mut Surface<'_>, accent: u32, wx: i32, wy: i32,
     true
 }
 
+/// v0.60: the compositor surface as a window of its own (accent `0x7a5cff`).
+///
+/// The image viewer still shows a committed surface (that is the v0.59
+/// integration and its acceptance gate); this window is the *compositor view*:
+///
+/// * it never falls back to the logo - with no client it shows an explicit hint
+///   card, so "no client has committed yet" stays visible instead of being
+///   disguised as a picture;
+/// * it reads the surface properties back from the server (`w / h / stride /
+///   commits`) rather than hard-coding "320x200";
+/// * the blit is integer nearest-neighbour with `scale` 2 whenever the window is
+///   large enough. That is the observable half of `wl_surface.set_buffer_scale`
+///   semantics: a buffer of `w x h` at scale 2 owns `2w x 2h` logical pixels, so
+///   the compositor is the component that decides how big it lands on screen.
+fn wayland_window_body(s: &mut Surface<'_>, accent: u32, wx: i32, wy: i32, w: i32, h: i32) {
+    let x0 = wx + PAD;
+    let x1 = wx + w - PAD;
+    let y0 = wy + TITLE_H + 10;
+    let mut sw: i32 = 0;
+    let mut sh: i32 = 0;
+    let mut stride: i32 = 0;
+    let mut px: *const u8 = core::ptr::null();
+    let rc = unsafe { wl_server_latest_surface(&mut sw, &mut sh, &mut stride, &mut px) };
+    let commits = unsafe { wl_server_commit_count() };
+    text(s, x0, y0, "Wayland 合成器", TEXT_HI, 0xf0);
+    if rc != 1 || px.is_null() || sw <= 0 || sh <= 0 || stride < sw * 4 {
+        /* no client yet: an explicit hint card (never the logo fallback) */
+        let cy0 = y0 + 26;
+        let cy1 = (wy + h - 20).max(cy0 + 8);
+        round_row(s, x0, cy0, x1, cy1, 0xffffff, 0x14);
+        text(s, x0 + 16, cy0 + 14, "暂无客户端提交 surface", TEXT_MID, 0xe8);
+        if cy0 + 44 < cy1 {
+            text(s, x0 + 16, cy0 + 44, "run wlclient ・ run wltwo", TEXT_LOW, 0xe0);
+        }
+        if cy0 + 68 < cy1 {
+            text(s, x0 + 16, cy0 + 68, "wl_shm ・ XRGB8888", TEXT_LOW, 0xd8);
+        }
+        return;
+    }
+    /* integer scale: 2 when the surface fits, else 1 (nearest neighbour) */
+    let avail_w = x1 - x0;
+    let avail_h = wy + h - 26 - (y0 + 30);
+    let scale = if sw * 2 <= avail_w && sh * 2 <= avail_h { 2 } else { 1 };
+    let dw = sw * scale;
+    let dh = sh * scale;
+    let cx0 = x0;
+    let cy0 = y0 + 30;
+    if dw <= 0 || dh <= 0 || avail_h < 24 {
+        return;
+    }
+    /* accent frame around the surface, same language as the image viewer */
+    s.rect_fill(cx0 - 1, cy0 - 1, cx0 + dw + 1, cy0, accent, 0x80);
+    s.rect_fill(cx0 - 1, cy0 + dh, cx0 + dw + 1, cy0 + dh + 1, accent, 0x80);
+    s.rect_fill(cx0 - 1, cy0, cx0, cy0 + dh, accent, 0x80);
+    s.rect_fill(cx0 + dw, cy0, cx0 + dw + 1, cy0 + dh, accent, 0x80);
+    let mut rows = 0;
+    for dy in 0..dh {
+        let sy = dy / scale;
+        if sy >= sh {
+            break;
+        }
+        let srow = unsafe { px.add((sy * stride) as usize) } as *const u32;
+        let yyy = cy0 + dy;
+        if yyy >= wy + h {
+            break;
+        }
+        for dx in 0..dw {
+            if cx0 + dx >= x1 {
+                break;
+            }
+            let sx = dx / scale;
+            let c = unsafe { core::ptr::read_unaligned(srow.add(sx as usize)) } & 0x00ff_ffff;
+            s.put((cx0 + dx) as usize, yyy as usize, c);
+        }
+        rows += 1;
+    }
+    if rows == 0 {
+        return;
+    }
+    /* footer: properties read back from the server + how to drive it */
+    let fy = cy0 + dh + 6;
+    if fy + 18 > wy + h {
+        return;
+    }
+    let mut b0 = [0u8; 12];
+    let mut b1 = [0u8; 12];
+    let mut b2 = [0u8; 12];
+    let mut x = x0;
+    let sw_s = u32_str(&mut b0, sw as u32);
+    let sh_s = u32_str(&mut b1, sh as u32);
+    x += text_at(s, x, fy, sw_s, TEXT_MID, 0xe2);
+    x += text_at(s, x, fy, "x", TEXT_MID, 0xe2);
+    x += text_at(s, x, fy, sh_s, TEXT_MID, 0xe2);
+    x += text_at(s, x, fy, " ・ scale ", TEXT_LOW, 0xdc);
+    let sc_s = u32_str(&mut b2, scale as u32);
+    x += text_at(s, x, fy, sc_s, TEXT_LOW, 0xdc);
+    x += text_at(s, x, fy, " ・ commit ", TEXT_LOW, 0xdc);
+    let cm_s = u32_str(&mut b0, commits);
+    text(s, x, fy, cm_s, TEXT_LOW, 0xdc);
+}
+
 // ---------------------------------------------------------------- helpers
+
+/// Format a `u32` into a borrowed `&str` (no allocation, no libc).
+fn u32_str<'a>(buf: &'a mut [u8; 12], v: u32) -> &'a str {
+    let n = fmt_u32(buf, v);
+    unsafe { core::str::from_utf8_unchecked(&buf[..n]) }
+}
 
 #[inline]
 fn text(s: &mut Surface<'_>, x: i32, y: i32, t: &str, c: u32, a: u32) {
     s.text(x, y, t, c, a, 1);
+}
+
+/// Like [`text`], but returns the advance width so a row can be built left to
+/// right from substrings without knowing glyph metrics up front.
+fn text_at(s: &mut Surface<'_>, x: i32, y: i32, t: &str, c: u32, a: u32) -> i32 {
+    s.text(x, y, t, c, a, 1)
 }
 
 /// Blend `c` towards white by `pct` percent (integer only).
@@ -220,6 +336,7 @@ pub fn draw_body(s: &mut Surface<'_>, accent: u32, wx: i32, wy: i32, w: i32, h: 
         ACC_TASKMAN => taskman_body(s, accent, wx, wy, w, h),
         ACC_IMAGE => image_body(s, accent, wx, wy, w, h),
         ACC_EDITOR => editor_body(s, accent, wx, wy, w, h),
+        ACC_WAYLAND => wayland_window_body(s, accent, wx, wy, w, h),
         _ => generic_body(s, accent, wx, wy, w, h),
     }
 }
