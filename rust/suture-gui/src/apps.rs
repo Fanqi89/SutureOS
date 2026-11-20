@@ -76,6 +76,11 @@ extern "C" {
     fn wl_server_latest_surface(w: *mut i32, h: *mut i32, stride: *mut i32,
                                 px: *mut *const u8) -> i32;
     fn wl_server_commit_count() -> u32;
+    /* v0.60 (task-5): every connection keeps its own last committed surface. */
+    fn wl_server_surface_count() -> i32;
+    fn wl_server_surface_at(idx: i32, w: *mut i32, h: *mut i32, stride: *mut i32,
+                            scale: *mut i32, serial: *mut u32,
+                            px: *mut *const u8) -> i32;
     fn console_printf(fmt: *const u8, ...) -> i32;
 }
 
@@ -240,7 +245,46 @@ fn wayland_window_body(s: &mut Surface<'_>, accent: u32, wx: i32, wy: i32, w: i3
     x += text_at(s, x, fy, sc_s, TEXT_LOW, 0xdc);
     x += text_at(s, x, fy, " ・ commit ", TEXT_LOW, 0xdc);
     let cm_s = u32_str(&mut b0, commits);
-    text(s, x, fy, cm_s, TEXT_LOW, 0xdc);
+    text_at(s, x, fy, cm_s, TEXT_LOW, 0xdc);
+    /* second footer line: every retained client surface (v0.60 multi-client).
+     * The big blit above is the most recent commit; this line lists what the
+     * server kept, so "two clients are connected" is visible in one window. */
+    let fy2 = fy + 18;
+    if fy2 + 16 <= wy + h {
+        let mut b3 = [0u8; 12];
+        let n = unsafe { wl_server_surface_count() };
+        let mut x2 = x0;
+        x2 += text_at(s, x2, fy2, "客户端 ", TEXT_LOW, 0xd8);
+        let ns = u32_str(&mut b3, if n > 0 { n as u32 } else { 0 });
+        x2 += text_at(s, x2, fy2, ns, TEXT_MID, 0xe0);
+        for i in 0..n.min(3) {
+            let mut iw: i32 = 0;
+            let mut ih: i32 = 0;
+            let mut istride: i32 = 0;
+            let mut iscale: i32 = 1;
+            let mut iserial: u32 = 0;
+            let mut ipx: *const u8 = core::ptr::null();
+            let ok = unsafe {
+                wl_server_surface_at(i, &mut iw, &mut ih, &mut istride,
+                                     &mut iscale, &mut iserial, &mut ipx)
+            };
+            if ok != 1 || iw <= 0 || ih <= 0 {
+                continue;
+            }
+            x2 += text_at(s, x2, fy2, "  #", TEXT_LOW, 0xd0);
+            let si = u32_str(&mut b3, i as u32);
+            x2 += text_at(s, x2, fy2, si, TEXT_LOW, 0xd0);
+            x2 += text_at(s, x2, fy2, " ", TEXT_LOW, 0xd0);
+            let ws = u32_str(&mut b3, iw as u32);
+            x2 += text_at(s, x2, fy2, ws, TEXT_LOW, 0xd0);
+            x2 += text_at(s, x2, fy2, "x", TEXT_LOW, 0xd0);
+            let hs = u32_str(&mut b3, ih as u32);
+            x2 += text_at(s, x2, fy2, hs, TEXT_LOW, 0xd0);
+            x2 += text_at(s, x2, fy2, "@", TEXT_LOW, 0xd0);
+            let ss = u32_str(&mut b3, if iscale > 0 { iscale as u32 } else { 1 });
+            x2 += text_at(s, x2, fy2, ss, TEXT_LOW, 0xd0);
+        }
+    }
 }
 
 // ---------------------------------------------------------------- helpers
