@@ -37,6 +37,9 @@ extern uint32_t suture_gui_interactive_step(uint32_t *fb, int32_t w, int32_t h,
                                             int32_t click_x, int32_t click_y,
                                             int32_t click_btn, uint32_t now_ms);
 
+/* v0.60.0: swap-chain counters (present/coalesce accounting in shell.rs). */
+extern uint32_t suture_gui_swap_report(void);
+
 /* Weak fallbacks: overridden by the Rust staticlib when it is linked in. */
 __attribute__((weak)) uint32_t suture_gui_version(void) { return 0; }
 __attribute__((weak)) uint32_t suture_gui_selftest_render(uint32_t *fb, int32_t w,
@@ -48,6 +51,7 @@ __attribute__((weak)) uint32_t suture_gui_selftest_render(uint32_t *fb, int32_t 
     return 0;
 }
 __attribute__((weak)) uint32_t suture_gui_frames(void) { return 0; }
+__attribute__((weak)) uint32_t suture_gui_swap_report(void) { return 0; }
 __attribute__((weak)) uint32_t suture_gui_interactive_step(uint32_t *fb, int32_t w,
                                                            int32_t h, int32_t pitch,
                                                            int32_t mx, int32_t my,
@@ -60,6 +64,11 @@ __attribute__((weak)) uint32_t suture_gui_interactive_step(uint32_t *fb, int32_t
 }
 
 int slint_gui_linked(void) { return suture_gui_version() != 0; }
+
+/* v0.60.0: `guishell swapstat` - log the present/swap counters once. Returns the
+ * present count (0 when the Rust object is not linked, so the caller can say so
+ * honestly instead of printing zeros that look like a broken counter). */
+uint32_t slint_gui_swap_report(void) { return suture_gui_swap_report(); }
 
 /* ---- glyph access (v0.38.0) -------------------------------------------------
  * font8x16 lives in kernel/drivers/font.c, the CJK blob in kernel/term/cjk16.c.

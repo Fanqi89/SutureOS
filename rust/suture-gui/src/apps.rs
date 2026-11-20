@@ -69,6 +69,74 @@ const ROW_INSET: [i32; 8] = [5, 3, 2, 1, 1, 0, 0, 0];
  * same C symbols. */
 extern "C" {
     static g_logo48: [u32; 48 * 48];
+    /* kernel/ipc/wl_server.c: last committed wl_surface + commit counter. */
+    fn wl_server_latest_surface(w: *mut i32, h: *mut i32, stride: *mut i32,
+                                px: *mut *const u8) -> i32;
+    fn wl_server_commit_count() -> u32;
+    fn console_printf(fmt: *const u8, ...) -> i32;
+}
+
+/// v0.59.x: how many wl_surface commits the kernel server has seen. The shell
+/// mixes this into the window layer key so opening the image viewer before a
+/// client commits cannot leave a stale (logo) layer behind.
+pub fn wl_epoch() -> i32 {
+    unsafe { wl_server_commit_count() as i32 }
+}
+
+/// Paint the last committed Wayland surface into the image viewer body. Returns
+/// false (caller falls back to the logo preview) when nothing was committed yet.
+fn wayland_surface_body(s: &mut Surface<'_>, accent: u32, wx: i32, wy: i32,
+                        w: i32, h: i32) -> bool {
+    let mut sw: i32 = 0;
+    let mut sh: i32 = 0;
+    let mut stride: i32 = 0;
+    let mut px: *const u8 = core::ptr::null();
+    let rc = unsafe { wl_server_latest_surface(&mut sw, &mut sh, &mut stride, &mut px) };
+    if rc != 1 || px.is_null() || sw <= 0 || sh <= 0 || stride < sw * 4 {
+        return false;
+    }
+    let x0 = wx + PAD;
+    let x1 = wx + w - PAD;
+    let y0 = wy + TITLE_H + 8;
+    if x1 - x0 < 40 || wy + h - y0 < 60 {
+        return false;               /* tiny window: keep the logo preview */
+    }
+    /* caption + accent frame, same language as the logo preview */
+    text(s, x0, y0, "Wayland surface (wl_shm)", TEXT_HI, 0xf0);
+    let cy0 = y0 + 24;
+    let cy1 = (wy + h - 24).max(cy0 + 8);
+    s.rect_fill(x0 - 1, cy0 - 1, x1 + 1, cy0, accent, 0x70);
+    s.rect_fill(x0 - 1, cy1, x1 + 1, cy1 + 1, accent, 0x70);
+    s.rect_fill(x0 - 1, cy0, x0, cy1, accent, 0x70);
+    s.rect_fill(x1, cy0, x1 + 1, cy1, accent, 0x70);
+    /* 1:1 blit, clipped to the frame (the 360x240 window is a little shorter
+     * than a 320x200 surface plus captions; the top-left region is what matters
+     * and the clip is visible as the accent frame). */
+    let cw = x1 - x0;
+    let ch = cy1 - cy0;
+    let mut logged = false;
+    for dy in 0..sh {
+        if dy >= ch {
+            break;
+        }
+        let srow = unsafe { px.add((dy * stride) as usize) } as *const u32;
+        for dx in 0..sw {
+            if dx >= cw {
+                break;
+            }
+            let c = unsafe { core::ptr::read_unaligned(srow.add(dx as usize)) } & 0x00ff_ffff;
+            s.put((x0 + dx) as usize, (cy0 + dy) as usize, c);
+        }
+        logged = true;
+    }
+    if logged {
+        unsafe {
+            console_printf(b"[gui-shell] wl surface %dx%d slot 2\n\0".as_ptr(),
+                           sw, sh);
+        }
+    }
+    text(s, x0, cy1 + 6, "wl_shm ・ 320x200 ・ run wlclient", TEXT_LOW, 0xe4);
+    true
 }
 
 // ---------------------------------------------------------------- helpers
@@ -216,6 +284,11 @@ fn taskman_body(s: &mut Surface<'_>, accent: u32, wx: i32, wy: i32, w: i32, _h: 
 /// logo nearest-neighbour scaled 3x (144x144) centred on it, a file-name
 /// caption above and the "48x48 · 3x" footer below.
 fn image_body(s: &mut Surface<'_>, accent: u32, wx: i32, wy: i32, w: i32, h: i32) {
+    /* v0.59.x: a committed Wayland surface wins over the logo preview - that is
+     * the compositor integration (ring-3 client's shm buffer shown in a window). */
+    if wayland_surface_body(s, accent, wx, wy, w, h) {
+        return;
+    }
     let x0 = wx + PAD;
     let x1 = wx + w - PAD;
     text(s, x0, wy + TITLE_H + 8, "SutureOS_logo_1536.png", TEXT_MID, 0xf0);
@@ -253,12 +326,9 @@ fn image_body(s: &mut Surface<'_>, accent: u32, wx: i32, wy: i32, w: i32, h: i32
         for dx in 0..logo {
             let sx = (dx / 3) as usize;
             let src = unsafe { g_logo48[sy * 48 + sx] } & 0x00ff_ffff;
-            /* `scripts/mklogo_assets.py` converts the PNG ladder with
-             * `Image.convert('RGB')`, i.e. the alpha channel is dropped and the
-             * transparent pixels become white. Key that white matte out so the
-             * checkerboard shows through and the preview reads like a
-             * transparent PNG in a real viewer (the glyph itself contains no
-             * near-white pixel, so this removes exactly the matte). */
+            /* The logo bitmaps are 0xAARRGGBB (alpha preserved); their
+             * transparent pixels are 0x00FFFFFF, so keying near-white out here
+             * makes the checkerboard matte show through the glyph's holes. */
             let r = (src >> 16) & 0xff;
             let g = (src >> 8) & 0xff;
             let b = src & 0xff;

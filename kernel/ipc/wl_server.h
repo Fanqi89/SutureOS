@@ -4,14 +4,17 @@
  * Scope: this is the first *real* Wayland server for SutureOS, deliberately cut
  * down to what a client needs to publish one shared-memory surface:
  *   - objects: wl_display(1), wl_registry, wl_callback, wl_compositor,
- *     wl_surface, wl_shm, wl_shm_pool, wl_buffer, wl_seat (+ inert pointer and
- *     keyboard objects so `wl_seat.get_pointer/get_keyboard` does not error);
+ *     wl_surface, wl_shm, wl_shm_pool, wl_buffer, wl_seat, wl_pointer (a real
+ *     object since this batch; wl_keyboard is still inert);
  *   - requests: wl_display.get_registry/sync, wl_registry.bind,
  *     wl_compositor.create_surface, wl_shm.create_pool (memfd over SCM_RIGHTS),
  *     wl_shm_pool.create_buffer/destroy, wl_buffer.destroy,
- *     wl_surface.attach/commit/destroy, wl_seat.get_pointer/get_keyboard;
+ *     wl_surface.attach/damage/damage_buffer/frame/commit/destroy,
+ *     wl_seat.get_pointer/get_keyboard/release, wl_pointer.set_cursor/release,
+ *     wl_callback.destroy;
  *   - events: wl_registry.global, wl_callback.done, wl_buffer.release,
- *     wl_seat.capabilities.
+ *     wl_seat.capabilities, wl_display.error, wl_display.delete_id,
+ *     wl_pointer.enter/motion/button.
  * Wire format is the Wayland one (little endian): u32 object id, u16 opcode,
  * u16 size (size includes the 8-byte header), then the arguments; strings are
  * u32 length including the NUL terminator followed by the bytes padded to 4.
@@ -22,11 +25,22 @@
  * copy of the pixels, so the compositor can blit them later through
  * wl_server_latest_surface().
  *
- * Not implemented (documented, not pretended): wl_display.error/delete_id
- * events, wl_surface.frame/frame callbacks, damage tracking, scaling,
- * subsurface/region objects, wl_shm formats other than XRGB8888 (1), multiple
- * clients, and real input events on the seat (the pointer/keyboard objects are
- * inert).
+ * wl_surface.frame(): the requested wl_callback is completed on the *next*
+ * commit (wl_callback.done(serial), serial is a per-commit monotonic counter);
+ * the object is kept marked-done so the client can still destroy it. Damage
+ * rects are accumulated and logged at commit.
+ *
+ * wl_pointer: a synthetic *snapshot*, not a stream. SutureOS has one task and no
+ * async input queue for clients, so wl_pointer.enter + wl_pointer.motion (and
+ * wl_pointer.button when a button is held) are emitted once, on the first pump
+ * after wl_seat.get_pointer, from the kernel's PS/2 state
+ * (mbos_mouse_x/y/buttons) clamped into the committed surface.
+ *
+ * Still not implemented (documented, not pretended): scaling, subsurface/region
+ * objects (create_region makes an inert object), wl_shm formats other than
+ * XRGB8888 (1), multiple concurrent clients, wl_keyboard events, wl_pointer
+ * frame grouping, and a real wl_display.sync/frame scheduler (the server runs
+ * inside the client's own syscalls, so both complete synchronously).
  */
 #ifndef SUTUREOS_WL_SERVER_H
 #define SUTUREOS_WL_SERVER_H

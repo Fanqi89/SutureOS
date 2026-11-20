@@ -675,6 +675,12 @@ pub unsafe extern "C" fn suture_gui_shell_step(
                       click_btn, now_ms, key, ch, clock_hhmm)
 }
 
+/// Log the swap-chain counters once (`guishell swapstat`). Returns presents.
+#[no_mangle]
+pub unsafe extern "C" fn suture_gui_swap_report() -> u32 {
+    shell::swap_report()
+}
+
 /// Kernel tick counter (~100 Hz), exposed for the shell frame profiler.
 #[no_mangle]
 pub extern "C" fn shell_tick() -> u64 {

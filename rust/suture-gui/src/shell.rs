@@ -201,6 +201,130 @@ static mut WALL: [u32; (SCREEN_W as usize) * (SCREEN_H as usize)] =
 static mut SMALL: [u32; SMALL_W * SMALL_H] = [0; SMALL_W * SMALL_H];
 static mut FRAME: [u32; (SCREEN_W as usize) * (SCREEN_H as usize)] =
     [0; (SCREEN_W as usize) * (SCREEN_H as usize)];
+/// v0.60.0: second scene buffer for the swap chain (back buffer while FRAME is
+/// the front). 3 MiB of .bss - the ELF file does not grow.
+static mut FRAME_B: [u32; (SCREEN_W as usize) * (SCREEN_H as usize)] =
+    [0; (SCREEN_W as usize) * (SCREEN_H as usize)];
+/// Which buffer is on the framebuffer: 0 = FRAME, 1 = FRAME_B.
+static mut FRONT: usize = 0;
+/* ------------------------------------------------------- present / swap chain
+ * v0.60.0: explicit double-buffered present path.
+ *
+ * The shell always renders into the BACK scene buffer; a present swaps it to the
+ * front and copies the front into the framebuffer. The front buffer therefore
+ * always holds exactly the frame that is on screen, which gives two things:
+ *   - a screendump can never catch a half-painted frame (the old single buffer
+ *     already presented in one blit, so this keeps that property);
+ *   - a frame can be dropped without corrupting the image, which is what the
+ *     vsync gate below uses.
+ *
+ * The kernel only exposes the 100 Hz tick, so "vsync" is emulated as "at most one
+ * present per tick" (VSYNC_MS = 10). A frame that arrives earlier is still
+ * rendered, but its present is coalesced (skipped += 1) and stays pending until
+ * a later due frame (or the idle flush) shows it.
+ */
+pub const VSYNC_MS: u32 = 10;
+
+#[derive(Clone, Copy)]
+pub struct SwapState {
+    /// generation id of the front buffer; +1 on every present
+    pub generation: u32,
+    /// presents performed (one present == one framebuffer update)
+    pub presents: u32,
+    /// rendered frames whose present was coalesced by the vsync gate
+    pub skipped: u32,
+    /// scene frames rendered, whether presented or coalesced
+    pub produced: u32,
+    /// presents that swapped a freshly rendered scene (not a cursor-only update)
+    pub scene_presents: u32,
+    /// now_ms of the last present
+    pub last_present_ms: u32,
+}
+
+static mut SWAP: SwapState = SwapState {
+    generation: 0,
+    presents: 0,
+    skipped: 0,
+    produced: 0,
+    scene_presents: 0,
+    last_present_ms: 0,
+};
+static mut SWAP_STARTED: bool = false;
+static mut SWAP_IVL_SUM: u32 = 0;
+static mut SWAP_IVL_N: u32 = 0;
+/// A rendered scene is waiting for its (coalesced) present.
+static mut SWAP_PENDING: bool = false;
+
+/// The scene buffer that is currently on the framebuffer.
+#[inline]
+unsafe fn scene_front() -> &'static [u32] {
+    if FRONT == 0 {
+        &*core::ptr::addr_of!(FRAME)
+    } else {
+        &*core::ptr::addr_of!(FRAME_B)
+    }
+}
+
+#[inline]
+unsafe fn scene_front_mut() -> &'static mut [u32] {
+    if FRONT == 0 {
+        &mut *core::ptr::addr_of_mut!(FRAME)
+    } else {
+        &mut *core::ptr::addr_of_mut!(FRAME_B)
+    }
+}
+
+/// The scene buffer being rendered (always the one that is NOT displayed).
+#[inline]
+unsafe fn scene_back_mut() -> &'static mut [u32] {
+    if FRONT == 0 {
+        &mut *core::ptr::addr_of_mut!(FRAME_B)
+    } else {
+        &mut *core::ptr::addr_of_mut!(FRAME)
+    }
+}
+
+/// True when a present is allowed: at least one 10 ms tick since the last one.
+#[inline]
+unsafe fn swap_due(now_ms: u32) -> bool {
+    !SWAP_STARTED || now_ms.wrapping_sub(SWAP.last_present_ms) >= VSYNC_MS
+}
+
+/// Account for one framebuffer update (scene swap or cursor-only overlay).
+#[inline]
+unsafe fn swap_commit(now_ms: u32, scene: bool) {
+    let st = &mut *core::ptr::addr_of_mut!(SWAP);
+    if SWAP_STARTED {
+        let ivl = now_ms.wrapping_sub(st.last_present_ms);
+        SWAP_IVL_SUM = SWAP_IVL_SUM.saturating_add(ivl);
+        SWAP_IVL_N += 1;
+    }
+    SWAP_STARTED = true;
+    st.generation = st.generation.wrapping_add(1);
+    st.presents = st.presents.wrapping_add(1);
+    st.last_present_ms = now_ms;
+    if scene {
+        st.scene_presents = st.scene_presents.wrapping_add(1);
+    }
+}
+
+/// Log the swap-chain counters once (`guishell swapstat`). Returns `presents`.
+pub unsafe fn swap_report() -> u32 {
+    let st = &*core::ptr::addr_of!(SWAP);
+    let avg = if SWAP_IVL_N > 0 { SWAP_IVL_SUM / SWAP_IVL_N } else { 0 };
+    console_printf(
+        b"[gui-shell] swapstat presents=%d gens=%d skipped=%d interval_ms=%d rendered=%d scene=%d\n\0"
+            .as_ptr(),
+        st.presents as i32,
+        st.generation as i32,
+        st.skipped as i32,
+        avg as i32,
+        st.produced as i32,
+        st.scene_presents as i32,
+    );
+    st.presents
+}
+
 static mut XMAP: [u16; SCREEN_W as usize] = [0; SCREEN_W as usize];
 static mut YMAP: [u16; SCREEN_H as usize] = [0; SCREEN_H as usize];
 static mut CACHED: bool = false;
@@ -660,7 +784,10 @@ fn blit_logo_region(s: &mut Surface, data: &[u32], lw: usize,
 unsafe fn shutdown_step(fb: *mut u32, w: i32, h: i32, pitch_px: i32,
                         sh: &mut Shell, mx: i32, my: i32) -> u32 {
     let (wu, hu) = (w as usize, h as usize);
-    let frame = &mut *core::ptr::addr_of_mut!(FRAME);
+    /* v0.60.0: this animation dims the frame it is about to show, so it paints
+     * straight into the FRONT buffer (which holds the last presented desktop)
+     * and blits it unconditionally - no swap happens on the shutdown path. */
+    let frame = scene_front_mut();
     {
         let mut s = Surface { px: &mut frame[..], w: wu, h: hu, stride: wu,
                               clip: (0, 0, 1024, 768) };
@@ -679,7 +806,7 @@ unsafe fn shutdown_step(fb: *mut u32, w: i32, h: i32, pitch_px: i32,
         }
     }
     {
-        let frame = &*core::ptr::addr_of!(FRAME);
+        let frame = scene_front();
         blit_rect(frame, wu, fb, pitch_px as usize, (0, 0, SCREEN_W, SCREEN_H));
         draw_cursor(fb, pitch_px as usize, wu, hu, mx.clamp(0, w - 1), my.clamp(0, h - 1));
     }
@@ -720,7 +847,11 @@ pub unsafe fn shell_step(
     let (wu, hu) = (w as usize, h as usize);
     /* render into the back buffer, present once at the end (double buffering:
      * a screendump can otherwise catch the framebuffer half-painted) */
-    let frame = &mut *core::ptr::addr_of_mut!(FRAME);
+    /* v0.60.0: swap chain - every frame is rendered into the BACK scene buffer
+     * and only becomes visible when the present block at the end swaps it to the
+     * front. Cached pieces (window layers, taskbar strip) are composited into
+     * this buffer exactly like before. */
+    let frame = scene_back_mut();
     let mut s = Surface { px: &mut frame[..], w: wu, h: hu, stride: wu, clip: (0, 0, 1024, 768) };
     let sh = &mut *core::ptr::addr_of_mut!(SHELL);
     if !sh.started {
@@ -1022,6 +1153,26 @@ pub unsafe fn shell_step(
     if *last == st && sh.intro_frames == 0 && sh.act_frames == 0 && sh.menu_intro == 0
         && sh.scale_frames == 0
     {
+        /* v0.60.0: if the last rendered frame was coalesced by the vsync gate,
+         * present it now instead of leaving the screen a generation behind. */
+        if unsafe { SWAP_PENDING } && swap_due(now_ms) {
+            unsafe {
+                FRONT ^= 1;
+                SWAP_PENDING = false;
+            }
+            let frame = scene_front();
+            blit_rect(frame, wu, fb, pitch_px as usize, (0, 0, SCREEN_W, SCREEN_H));
+            draw_cursor(fb, pitch_px as usize, wu, hu, mx_c, my_c);
+            unsafe {
+                swap_commit(now_ms, true);
+                CUR_SEEN = true;
+                CUR_PX = mx_c;
+                CUR_PY = my_c;
+                PREV_MX = mx_c;
+                PREV_MY = my_c;
+            }
+            return LAST_SUM;
+        }
         IDLE_FRAMES += 1;
         if IDLE_FRAMES == 1 {
             log0(c"idle: frame skipped (nothing changed)");
@@ -1044,7 +1195,15 @@ pub unsafe fn shell_step(
         if click_x < 0 && click_y < 0 && key < 0 && ch < 0 && !sh.dragging
            && sh.scale_frames == 0 && pointer_moved
            && hover == prev_hover && unsafe { CUR_SEEN } {
-            let frame = &*core::ptr::addr_of!(FRAME);
+            /* v0.60.0: a cursor-only update is still a framebuffer update, so it
+             * obeys the same vsync gate. It does NOT swap the scene buffers (the
+             * scene is unchanged): FRONT is what is on screen, so erasing the old
+             * arrow is a blit from it. */
+            if !swap_due(now_ms) {
+                unsafe { SWAP.skipped += 1; }
+                return LAST_SUM;
+            }
+            let frame = scene_front();
             let (px, py) = unsafe { (CUR_PX, CUR_PY) };
             blit_rect(frame, wu, fb, pitch_px as usize,
                       (px - 2, py - 2, px + CUR_W + 2, py + CUR_H + 2));
@@ -1052,6 +1211,7 @@ pub unsafe fn shell_step(
                       (mx_c - 2, my_c - 2, mx_c + CUR_W + 2, my_c + CUR_H + 2));
             draw_cursor(fb, pitch_px as usize, wu, hu, mx_c, my_c);
             unsafe {
+                swap_commit(now_ms, false);
                 CUR_PX = mx_c;
                 CUR_PY = my_c;
                 PREV_MX = mx_c;
@@ -1109,7 +1269,7 @@ pub unsafe fn shell_step(
         }
         /* v0.58.0: shadow first (alpha over the scene), then the opaque body. */
         draw_window_shadow(&mut s, &win);
-        let frame = &mut *core::ptr::addr_of_mut!(FRAME);
+        let frame = scene_back_mut();
         if composite_window_layer(frame, wu, i, &win) {
             if sh.dragging && sh.drag_idx == i {
                 sh.prof_drag_reuse += 1;
@@ -1199,7 +1359,7 @@ pub unsafe fn shell_step(
             tmp.w = r[2].max(24);
             tmp.h = r[3].max(24);
             draw_window_shadow(&mut s, &tmp);
-            let frame = &mut *core::ptr::addr_of_mut!(FRAME);
+            let frame = scene_back_mut();
             if !composite_scaled(frame, wu, idx as usize, &tmp) {
                 draw_window(&mut s, &tmp, false);
             }
@@ -1225,7 +1385,10 @@ pub unsafe fn shell_step(
         let fi = sh.focus;
         let w = sh.wins[fi];
         let y = w.y + TITLE_H + 104;
-        if w.open && !w.minimized && y + 20 < w.y + w.h && w.y >= 0 {
+        /* v0.59.x: the image viewer has no text content, and when it shows a
+         * committed Wayland surface the focus hint would sit on top of the
+         * client's pixels - skip the editable line for that window. */
+        if w.open && !w.minimized && fi != 2 && y + 20 < w.y + w.h && w.y >= 0 {
             s.rect_fill(w.x + 16, y - 4, w.x + w.w - 16, y + 20, 0x000000, 0x24);
             s.text(w.x + 24, y, "输入:", 0x9fb2cc, 0xd0, 1);
             let x0 = w.x + 24 + 46 + 8;
@@ -1251,7 +1414,7 @@ pub unsafe fn shell_step(
     let tb_key = taskbar_key(sh, clock_hhmm);
     let tb_hit = unsafe { TASKBAR_KEY == tb_key };
     if tb_hit {
-        let frame = &mut *core::ptr::addr_of_mut!(FRAME);
+        let frame = scene_back_mut();
         if !blit_taskbar(frame, wu) {
             // strip cache unreadable: fall back to a real render
             frosted(&mut s, 0, TASKBAR_Y, SCREEN_W, SCREEN_H, 0.0, 0x30);
@@ -1350,7 +1513,7 @@ for i in 0..4 {
         x += s.char_ascii(x, TASKBAR_Y + 12, *ch, 0xd6e2f5, 0xd0, 1);
     }
 }
-        let frame = &*core::ptr::addr_of!(FRAME);
+        let frame = scene_back_mut();
         save_taskbar(frame, wu);
         unsafe {
             TASKBAR_KEY = tb_key;
@@ -1419,6 +1582,17 @@ s.text(MENU_X + 68, MENU_Y + 16, "常用应用", 0xffffff, 0xf0, 1);
             console_printf(b"[gui-shell] profile/30: full=%d hit=%d miss=%d win=%llu bar=%llu ticks\n\0".as_ptr(),
                            sh.prof_full as i32, sh.prof_cache_hit as i32,
                            sh.prof_cache_miss as i32, sh.prof_win, sh.prof_bar);
+            let st = &*core::ptr::addr_of!(SWAP);
+            let avg = if SWAP_IVL_N > 0 { SWAP_IVL_SUM / SWAP_IVL_N } else { 0 };
+            console_printf(
+                b"[gui-shell] swap presents=%d gens=%d skipped=%d interval_ms=%d\n\0".as_ptr(),
+                st.presents as i32,
+                st.generation as i32,
+                st.skipped as i32,
+                avg as i32,
+            );
+            SWAP_IVL_SUM = 0;
+            SWAP_IVL_N = 0;
         }
         sh.prof_frames = 0;
         sh.prof_full = 0;
@@ -1429,9 +1603,22 @@ s.text(MENU_X + 68, MENU_Y + 16, "常用应用", 0xffffff, 0xf0, 1);
         sh.prof_bar = 0;
     }
 
-    // 7. present the scene (no cursor in FRAME), then composite the cursor
+    // 7. present: vsync gate, swap back->front, blit the front, then the cursor
+    unsafe { SWAP.produced += 1; }
+    if !swap_due(now_ms) {
+        /* coalesced: this frame stays in the back buffer and is shown by the
+         * next due frame (or by the idle flush) - a tick is 10 ms and the C loop
+         * paces frames by 3 ticks, so in practice this path is a guard. */
+        unsafe {
+            SWAP.skipped += 1;
+            SWAP_PENDING = true;
+        }
+        return LAST_SUM;
+    }
+    /* the freshly rendered back buffer becomes the front buffer */
+    unsafe { FRONT ^= 1; }
     {
-        let frame = &*core::ptr::addr_of!(FRAME);
+        let frame = scene_front();
         // v0.50.0: while dragging, only the window's old and new rectangles can
         // differ from what is already on screen — present just those two.
         if sh.dragging {
@@ -1450,6 +1637,8 @@ s.text(MENU_X + 68, MENU_Y + 16, "常用应用", 0xffffff, 0xf0, 1);
         }
         draw_cursor(fb, pitch_px as usize, wu, hu, mx_c, my_c);
         unsafe {
+            swap_commit(now_ms, true);
+            SWAP_PENDING = false;
             CUR_SEEN = true;
             CUR_PX = mx_c;
             CUR_PY = my_c;
@@ -1533,7 +1722,14 @@ fn draw_cursor(fb: *mut u32, pitch_px: usize, w: usize, h: usize, x: i32, y: i32
 /// wherever the window is. The key therefore only covers size + slot (position is
 /// free); dragging never invalidates it.
 fn layer_key(w: &Win, slot: usize) -> i32 {
-    w.w.wrapping_mul(31).wrapping_add(w.h.wrapping_mul(17)).wrapping_add(slot as i32)
+    let mut k = w.w.wrapping_mul(31).wrapping_add(w.h.wrapping_mul(17)).
+        wrapping_add(slot as i32);
+    /* v0.59.x: the image viewer can show a committed Wayland surface, so its
+     * layer must be re-rasterised when the kernel server reports a new commit. */
+    if slot == 2 {
+        k = k.wrapping_mul(31).wrapping_add(crate::apps::wl_epoch());
+    }
+    k
 }
 
 /// Render the window layer (body + shadow, margins included) at its HOME anchor.

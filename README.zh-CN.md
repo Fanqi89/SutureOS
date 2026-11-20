@@ -65,9 +65,10 @@ wl_buffer/wl_seat 子集，ring-3 客户端 `run wlclient` 用 SCM_RIGHTS 交付
 commit 的 surface 整屏呈现。验收：桌面 **19/19**、外壳 **55/55**、应用内容 **25/25**、
 Logo **14/14**、Wayland **28/28**、wlshow **9/9**，两套外观门禁 **0 像素**，启动呈现未变。
 
-**开发中（下一条版本线，尚未发布）：** vsync/交换链呈现器、Wayland surface 协议剩余部分
-（frame 回调、damage 追踪、多客户端、真实 seat 输入）、把 Wayland surface 嵌入桌面窗口，
-以及继续按既定方向做视觉打磨。
+**开发中（下一条版本线，尚未发布）：** Wayland 客户端 surface 已能显示在桌面窗口里，协议补上了
+frame 回调、damage 与 seat 指针事件，呈现器换成显式双缓冲交换链 + 10 ms vsync 闸门
+（`guishell swapstat` 看计数）。仍未做：真正的 vsync 源/三缓冲、damage 驱动的局部重绘、
+多 Wayland 客户端、真实 seat 事件流（`wl_keyboard`）、scaling/subsurface，以及继续视觉打磨。
 
 ---
 
@@ -242,7 +243,8 @@ qemu-system-x86_64 \
 - `startgui-classic` 打开原 C 桌面（六个应用），它的外观基线单独冻结在
   `docs/baseline/base_gui_classic.png`。
 - `guislint` 渲染 Rust UI 原型的单帧画面；`guishell` 直接运行同一外壳；`wlshow` 把最后 commit 的
-  Wayland surface 整屏呈现（先 `run wlclient`）。
+  Wayland surface 整屏呈现，图片查看器窗口也会直接绘制这个 surface（先 `run wlclient`）。
+  `guishell swapstat` 打印 present/交换链计数。
 - `guishell` 里焦点窗口同时拥有键盘：可打印字符进入它的输入行、`Enter` 提交到串口、
   `Backspace` 退格、`Tab` 在可见窗口间切换焦点；窗口阴影按 alpha 合成到下层（壁纸或其他窗口）。
 - 原创 SutureOS Logo（`logo/` 素材阶梯，由 `scripts/mklogo_assets.py` 编译为

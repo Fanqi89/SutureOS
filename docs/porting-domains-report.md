@@ -189,9 +189,16 @@
   `wlshow` 把最后 commit 的 surface 整屏呈现（整数最近邻 + accent 边框）。
   验收：`wl_server_acceptance` **28/28**（客户端/服务端/宿主三方 hash 一致 + 宿主逐字节 256000 B）、
   `wl_show_acceptance` **9/9**（屏幕实际出现 surface）。
-- **仍未完成**：合成器 vsync/交换链（无双缓冲之外的垂直同步源）；Wayland 的
-  error/delete_id/frame 回调、damage 追踪、多客户端与真实输入路由；视觉继续打磨（用户已给方向，
-  后续按方向迭代）。
+- **Wayland 合成器接线（v0.59 后续，未发布）**：图片查看器窗口直接绘制内核 Wayland 服务端最后
+  commit 的 wl_surface（窗口层缓存键混入 commit 计数）；`wl_desktop_window_acceptance` **11/11**。
+  协议补全：frame 回调→`wl_callback.done(serial)`、damage 累计、`wl_display.error/delete_id`、
+  `wl_seat.get_pointer` 真 wl_pointer（内核鼠标快照）；`wl_protocol_acceptance` **29/29**
+  （宿主重算两帧哈希：frame1 `c7763445` 与 WL.BIN 逐字节一致、frame2 `e6601b45` 与内核日志一致）。
+- **交换链 + vsync 模拟（v0.59 后续，未发布）**：双场景缓冲 + FRONT 翻页 + 10 ms 闸门/合并，
+  `guishell swapstat` 输出 `rendered == scene + skipped`；`guishell_swap_acceptance` **19/19**，
+  桌面外观 0 像素越界。如实限制：skipped 正常操作恒 0（循环 30 ms 节流），无真 vsync/三缓冲。
+- **仍未完成**：真正的 vsync 源与三缓冲/撕裂检测、damage 驱动的局部重绘、多 Wayland 客户端、
+  `wl_keyboard` 事件流与真实输入路由、scaling/subsurface/region 语义。
 
 ## 域 11 跨架构蓝本（已完成：机制重写为通用时基抽象）
 

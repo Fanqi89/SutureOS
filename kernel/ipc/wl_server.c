@@ -12,6 +12,8 @@
 #include <stitch/console.h>
 #include <stitch/string.h>
 
+#include "mb_mouse.h"      /* the kernel's PS/2 pointer state for wl_pointer    */
+#include "time_source.h"   /* monotonic ms for wl_pointer.motion(time)          */
 #include "memfd.h"
 #include "scm_fd.h"
 #include "unix_socket.h"
@@ -21,6 +23,19 @@
 #define WL_HDR_SIZE     8u
 #define WL_DISPLAY_ID   1u
 #define WL_FMT_XRGB8888 1u
+
+/* wl_display event opcodes (server -> client) */
+#define WL_DISPLAY_EV_ERROR      0u
+#define WL_DISPLAY_EV_DELETE_ID  1u
+
+/* wl_display.error codes (wayland.xml, wl_display.error enum) */
+#define WL_ERR_INVALID_OBJECT 0u
+#define WL_ERR_INVALID_METHOD 1u
+
+/* wl_pointer event opcodes (server -> client) */
+#define WL_POINTER_EV_ENTER   0u
+#define WL_POINTER_EV_MOTION  2u
+#define WL_POINTER_EV_BUTTON  3u
 
 /* object types tracked per connection */
 enum {
@@ -66,6 +81,16 @@ struct wl_obj {
     /* wl_surface */
     int32_t  buffer_id;
     int32_t  attach_x, attach_y;
+    /* wl_surface: pending wl_surface.frame callback + accumulated damage */
+    uint32_t frame_cb_id;      /* 0 = no frame callback requested             */
+    int32_t  damage_x, damage_y, damage_w, damage_h;
+    int      damage_valid;
+    /* wl_callback */
+    int      cb_done;
+    uint32_t cb_serial;
+    /* wl_pointer: the synthetic snapshot is emitted on the first pump after
+     * wl_seat.get_pointer, once a surface has been committed. */
+    int      pointer_sent;
 };
 
 struct wl_conn {
@@ -85,7 +110,9 @@ static uint8_t  g_last_px[WL_SURFACE_MAX_BYTES];
 static int      g_last_w, g_last_h, g_last_stride;
 static int      g_last_valid;
 static uint32_t g_last_hash;
+static uint32_t g_last_surface_id;   /* wl_surface id of the last commit        */
 static uint32_t g_commits;
+static uint32_t g_serial;            /* monotonic Wayland serial (>= 1)         */
 static int      g_started;
 
 /* ===================== little-endian helpers ===================== */
@@ -344,6 +371,89 @@ static void emit_seat_capabilities(struct wl_conn *c, uint32_t seat_id,
     ev_end(c, &b);
 }
 
+/* wl_display.error(object_id, code, message): the protocol's own way of saying
+ * "that object/opcode is not valid". The id reported is the offending object, as
+ * wayland.xml specifies (it may be an id the server does not know). */
+static void emit_display_error(struct wl_conn *c, uint32_t object_id,
+                               uint32_t code, const char *message)
+{
+    uint8_t scratch[128];
+    struct wbuf b = ev_begin(c, WL_DISPLAY_ID, WL_DISPLAY_EV_ERROR, scratch,
+                             sizeof(scratch));
+
+    wb_u32(&b, object_id);
+    wb_u32(&b, code);
+    wb_str(&b, message);
+    ev_end(c, &b);
+    console_printf("[wl] display.error object=%u code=%u message=\"%s\"\n",
+                   (uint64_t)object_id, (uint64_t)code, message);
+}
+
+/* wl_display.delete_id(id): tells the client the server released an id the client
+ * allocated, so it may be reused. Sent for every client-initiated destroy. */
+static void emit_display_delete_id(struct wl_conn *c, uint32_t id)
+{
+    uint8_t scratch[16];
+    struct wbuf b = ev_begin(c, WL_DISPLAY_ID, WL_DISPLAY_EV_DELETE_ID, scratch,
+                             sizeof(scratch));
+
+    wb_u32(&b, id);
+    ev_end(c, &b);
+    console_printf("[wl] display.delete_id id=%u\n", (uint64_t)id);
+}
+
+/* Release an object the client asked to destroy: Wayland expects the server to
+ * answer with wl_display.delete_id for the client-allocated id. */
+static void destroy_obj(struct wl_conn *c, struct wl_obj *o)
+{
+    emit_display_delete_id(c, o->id);
+    free_obj(o);
+}
+
+/* wl_pointer events, fixed-point 24.8 for the surface coordinates. */
+static void emit_pointer_enter(struct wl_conn *c, uint32_t pointer_id,
+                               uint32_t serial, uint32_t surface_id,
+                               int x, int y)
+{
+    uint8_t scratch[64];
+    struct wbuf b = ev_begin(c, pointer_id, WL_POINTER_EV_ENTER, scratch,
+                             sizeof(scratch));
+
+    wb_u32(&b, serial);
+    wb_u32(&b, surface_id);
+    wb_u32(&b, (uint32_t)(x << 8));
+    wb_u32(&b, (uint32_t)(y << 8));
+    ev_end(c, &b);
+}
+
+static void emit_pointer_motion(struct wl_conn *c, uint32_t pointer_id,
+                                uint32_t time_ms, int x, int y)
+{
+    uint8_t scratch[64];
+    struct wbuf b = ev_begin(c, pointer_id, WL_POINTER_EV_MOTION, scratch,
+                             sizeof(scratch));
+
+    wb_u32(&b, time_ms);
+    wb_u32(&b, (uint32_t)(x << 8));
+    wb_u32(&b, (uint32_t)(y << 8));
+    ev_end(c, &b);
+}
+
+static void emit_pointer_button(struct wl_conn *c, uint32_t pointer_id,
+                                uint32_t serial, uint32_t time_ms,
+                                uint32_t button, uint32_t state)
+{
+    uint8_t scratch[64];
+    struct wbuf b = ev_begin(c, pointer_id, WL_POINTER_EV_BUTTON, scratch,
+                             sizeof(scratch));
+
+    wb_u32(&b, serial);
+    wb_u32(&b, time_ms);
+    wb_u32(&b, button);
+    wb_u32(&b, state);
+    ev_end(c, &b);
+}
+
 /* ===================== FNV-1a ===================== */
 #define FNV_OFFSET 2166136261u
 #define FNV_PRIME  16777619u
@@ -436,16 +546,54 @@ static void commit_surface(struct wl_conn *c, struct wl_obj *surf)
     g_last_stride = buf->stride;
     g_last_hash = hash;
     g_last_valid = 1;
+    g_last_surface_id = surf->id;
     g_commits++;
+    g_serial++;                          /* one serial per commit, monotonic   */
 
-    console_printf("[wl] commit surface=%u buffer=%u %dx%d stride=%d hash=%08x "
-                   "(%u bytes from memfd fd=%d)\n",
-                   (uint64_t)surf->id, (uint64_t)buf->id, (int64_t)buf->w,
-                   (int64_t)buf->h, (int64_t)buf->stride, (uint64_t)hash,
-                   (uint64_t)copied, (int64_t)pool->pool_fd);
+    /* The damage rect the client accumulated since the previous commit.  It is
+     * logged on commit (nothing is repainted before that) and folded into the
+     * commit line so a single line tells the whole story. */
+    if (surf->damage_valid) {
+        console_printf("[wl] damage surface=%u %d,%d %dx%d\n",
+                       (uint64_t)surf->id, (int64_t)surf->damage_x,
+                       (int64_t)surf->damage_y, (int64_t)surf->damage_w,
+                       (int64_t)surf->damage_h);
+        console_printf("[wl] commit surface=%u buffer=%u %dx%d stride=%d "
+                       "hash=%08x (%u bytes from memfd fd=%d) damage=%d,%d %dx%d "
+                       "serial=%u\n", (uint64_t)surf->id, (uint64_t)buf->id,
+                       (int64_t)buf->w, (int64_t)buf->h, (int64_t)buf->stride,
+                       (uint64_t)hash, (uint64_t)copied, (int64_t)pool->pool_fd,
+                       (int64_t)surf->damage_x, (int64_t)surf->damage_y,
+                       (int64_t)surf->damage_w, (int64_t)surf->damage_h,
+                       (uint64_t)g_serial);
+        surf->damage_valid = 0;
+    } else {
+        console_printf("[wl] commit surface=%u buffer=%u %dx%d stride=%d "
+                       "hash=%08x (%u bytes from memfd fd=%d) serial=%u\n",
+                       (uint64_t)surf->id, (uint64_t)buf->id, (int64_t)buf->w,
+                       (int64_t)buf->h, (int64_t)buf->stride, (uint64_t)hash,
+                       (uint64_t)copied, (int64_t)pool->pool_fd,
+                       (uint64_t)g_serial);
+    }
 
     surf->attach_x = 0;                  /* commit consumes the attachment offset */
     surf->attach_y = 0;
+
+    /* wl_surface.frame(): the callback requested by the client belongs to this
+     * commit, so wl_callback.done(serial) goes out now.  The callback object is
+     * kept (marked done) so the client can still destroy it. */
+    if (surf->frame_cb_id != 0u) {
+        struct wl_obj *cb = find_obj(c, surf->frame_cb_id);
+
+        if (cb != NULL && cb->type == OBJ_CALLBACK) {
+            cb->cb_done = 1;
+            cb->cb_serial = g_serial;
+            emit_callback_done(c, cb->id, g_serial);
+            console_printf("[wl] frame callback done id=%u serial=%u\n",
+                           (uint64_t)cb->id, (uint64_t)g_serial);
+        }
+        surf->frame_cb_id = 0;
+    }
 
     emit_buffer_release(c, buf->id);
     console_printf("[wl] buffer.release id=%u\n", (uint64_t)buf->id);
@@ -476,6 +624,8 @@ static void dispatch_display(struct wl_conn *c, uint16_t opcode, struct rbuf *r)
     default:
         console_printf("[wl] wl_display: unsupported opcode %u\n",
                        (uint64_t)opcode);
+        emit_display_error(c, WL_DISPLAY_ID, WL_ERR_INVALID_METHOD,
+                           "wl_display request is not implemented by this server");
         break;
     }
 }
@@ -612,7 +762,7 @@ static void dispatch_pool(struct wl_conn *c, struct wl_obj *pool, uint16_t opcod
     }
     if (opcode == 1u) {                  /* wl_shm_pool.destroy */
         console_printf("[wl] shm_pool.destroy id=%u\n", (uint64_t)pool->id);
-        free_obj(pool);
+        destroy_obj(c, pool);
         return;
     }
     console_printf("[wl] wl_shm_pool: unsupported opcode %u\n", (uint64_t)opcode);
@@ -624,7 +774,7 @@ static void dispatch_surface(struct wl_conn *c, struct wl_obj *surf,
     switch (opcode) {
     case 0u:                             /* wl_surface.destroy */
         console_printf("[wl] surface.destroy id=%u\n", (uint64_t)surf->id);
-        free_obj(surf);
+        destroy_obj(c, surf);
         break;
     case 1u: {                           /* wl_surface.attach(buffer, x, y) */
         const int32_t buffer_id = rb_i32(r);
@@ -641,15 +791,69 @@ static void dispatch_surface(struct wl_conn *c, struct wl_obj *surf,
         break;
     }
     case 2u:                             /* wl_surface.damage(x,y,w,h) */
-        (void)rb_u32(r); (void)rb_u32(r); (void)rb_u32(r); (void)rb_u32(r);
+    case 7u:                             /* wl_surface.damage_buffer(x,y,w,h) */
+    {
+        const int32_t x = rb_i32(r);
+        const int32_t y = rb_i32(r);
+        const int32_t w = rb_i32(r);
+        const int32_t h = rb_i32(r);
+
+        if (r->err) return;
+        /* Accumulate: several damage calls before one commit merge into the
+         * bounding box, which is all this server needs (it repaints the whole
+         * surface on commit anyway, the rect is protocol evidence + logging). */
+        if (w > 0 && h > 0) {
+            if (!surf->damage_valid) {
+                surf->damage_x = x;
+                surf->damage_y = y;
+                surf->damage_w = w;
+                surf->damage_h = h;
+                surf->damage_valid = 1;
+            } else {
+                const int32_t x0 = surf->damage_x < x ? surf->damage_x : x;
+                const int32_t y0 = surf->damage_y < y ? surf->damage_y : y;
+                const int32_t x1 = (surf->damage_x + surf->damage_w) > (x + w)
+                                       ? (surf->damage_x + surf->damage_w) : (x + w);
+                const int32_t y1 = (surf->damage_y + surf->damage_h) > (y + h)
+                                       ? (surf->damage_y + surf->damage_h) : (y + h);
+
+                surf->damage_x = x0;
+                surf->damage_y = y0;
+                surf->damage_w = x1 - x0;
+                surf->damage_h = y1 - y0;
+            }
+        }
+        console_printf("[wl] surface.%s surface=%u %d,%d %dx%d (accumulated "
+                       "%s%d,%d %dx%d)\n",
+                       (opcode == 2u) ? "damage" : "damage_buffer",
+                       (uint64_t)surf->id, (int64_t)x, (int64_t)y, (int64_t)w,
+                       (int64_t)h, surf->damage_valid ? "" : "none ",
+                       (int64_t)surf->damage_x, (int64_t)surf->damage_y,
+                       (int64_t)surf->damage_w, (int64_t)surf->damage_h);
         break;
+    }
+    case 3u: {                           /* wl_surface.frame(new_id) */
+        const uint32_t id = rb_u32(r);
+        struct wl_obj *cb;
+
+        if (r->err) return;
+        cb = add_obj(c, id, OBJ_CALLBACK);
+        if (cb == NULL) return;
+        cb->cb_done = 0;
+        surf->frame_cb_id = id;
+        console_printf("[wl] surface.frame surface=%u callback=%u (done on the "
+                       "next commit)\n", (uint64_t)surf->id, (uint64_t)id);
+        break;
+    }
     case 6u:                             /* wl_surface.commit */
         commit_surface(c, surf);
         break;
     default:
         console_printf("[wl] wl_surface: unsupported opcode %u "
-                       "(frame/damage-buffer/regions/scaling are not "
-                       "implemented)\n", (uint64_t)opcode);
+                       "(regions/scaling are not implemented)\n",
+                       (uint64_t)opcode);
+        emit_display_error(c, surf->id, WL_ERR_INVALID_METHOD,
+                           "wl_surface request is not implemented by this server");
         break;
     }
 }
@@ -660,20 +864,105 @@ static void dispatch_seat(struct wl_conn *c, struct wl_obj *seat,
     const uint32_t id = rb_u32(r);
 
     if (r->err) return;
-    if (opcode == 0u) {
-        if (add_obj(c, id, OBJ_POINTER) == NULL) return;
-        console_printf("[wl] seat.get_pointer id=%u (inert: this server has no "
-                       "input routing yet)\n", (uint64_t)id);
+    if (opcode == 0u) {                  /* wl_seat.get_pointer(new_id) */
+        struct wl_obj *p = add_obj(c, id, OBJ_POINTER);
+
+        if (p == NULL) return;
+        p->pointer_sent = 0;
+        console_printf("[wl] seat.get_pointer id=%u (real wl_pointer: enter/"
+                       "motion snapshot from the kernel mouse on the next "
+                       "pump)\n", (uint64_t)id);
         return;
     }
-    if (opcode == 1u) {
+    if (opcode == 1u) {                  /* wl_seat.get_keyboard(new_id) */
         if (add_obj(c, id, OBJ_KEYBOARD) == NULL) return;
-        console_printf("[wl] seat.get_keyboard id=%u (inert: this server has no "
-                       "input routing yet)\n", (uint64_t)id);
+        console_printf("[wl] seat.get_keyboard id=%u (inert: keyboard events "
+                       "are not routed by this server yet)\n", (uint64_t)id);
+        return;
+    }
+    if (opcode == 2u) {                  /* wl_seat.release */
+        console_printf("[wl] seat.release id=%u\n", (uint64_t)seat->id);
+        destroy_obj(c, seat);
         return;
     }
     console_printf("[wl] wl_seat(id=%u): unsupported opcode %u\n",
                    (uint64_t)seat->id, (uint64_t)opcode);
+    emit_display_error(c, seat->id, WL_ERR_INVALID_METHOD,
+                       "wl_seat request is not implemented by this server");
+}
+
+/* wl_pointer requests: this server does not track a cursor, so set_cursor is
+ * accepted and ignored (the client is allowed to send it), release destroys the
+ * object like any other. */
+static void dispatch_pointer(struct wl_conn *c, struct wl_obj *ptr,
+                             uint16_t opcode, struct rbuf *r)
+{
+    if (opcode == 0u) {                  /* wl_pointer.set_cursor(serial, ...) */
+        const uint32_t serial = rb_u32(r);
+
+        if (r->err) return;
+        console_printf("[wl] pointer.set_cursor id=%u serial=%u (no cursor "
+                       "surface on this server)\n", (uint64_t)ptr->id,
+                       (uint64_t)serial);
+        return;
+    }
+    if (opcode == 1u) {                  /* wl_pointer.release */
+        console_printf("[wl] pointer.release id=%u\n", (uint64_t)ptr->id);
+        destroy_obj(c, ptr);
+        return;
+    }
+    console_printf("[wl] wl_pointer(id=%u): unsupported opcode %u\n",
+                   (uint64_t)ptr->id, (uint64_t)opcode);
+    emit_display_error(c, ptr->id, WL_ERR_INVALID_METHOD,
+                       "wl_pointer request is not implemented by this server");
+}
+
+/* First pump after wl_seat.get_pointer: publish the kernel's current pointer
+ * state as wl_pointer.enter + wl_pointer.motion (and a button if one is held).
+ * This is a synthetic *snapshot*: SutureOS has one task and no async input
+ * queue for clients, so the compositor cannot stream real motion events yet.
+ * Coordinates are clamped into the committed surface so the client receives a
+ * value that is actually inside the buffer it handed over. */
+static void pointer_emit_pending(struct wl_conn *c)
+{
+    int i;
+
+    if (!g_last_valid || g_last_surface_id == 0u) return;   /* need a surface */
+
+    for (i = 0; i < WL_SERVER_MAX_OBJECTS; i++) {
+        struct wl_obj *o = &c->objs[i];
+        int mx, my, buttons, x, y;
+        uint32_t time_ms;
+
+        if (o->type != OBJ_POINTER || o->pointer_sent) continue;
+
+        mx = mbos_mouse_x();
+        my = mbos_mouse_y();
+        buttons = mbos_mouse_buttons();
+        x = mx;
+        y = my;
+        if (x < 0) x = 0;
+        if (y < 0) y = 0;
+        if (x >= g_last_w) x = g_last_w - 1;
+        if (y >= g_last_h) y = g_last_h - 1;
+        time_ms = (uint32_t)(time_source_now_ns() / 1000000ull);
+
+        g_serial++;                      /* enter carries a fresh serial */
+        emit_pointer_enter(c, o->id, g_serial, g_last_surface_id, x, y);
+        console_printf("[wl] pointer enter id=%u surface=%u %d,%d (kernel mouse "
+                       "%d,%d serial=%u)\n", (uint64_t)o->id,
+                       (uint64_t)g_last_surface_id, (int64_t)x, (int64_t)y,
+                       (int64_t)mx, (int64_t)my, (uint64_t)g_serial);
+        emit_pointer_motion(c, o->id, time_ms, x, y);
+        console_printf("[wl] pointer motion id=%u time=%u %d,%d\n",
+                       (uint64_t)o->id, (uint64_t)time_ms, (int64_t)x, (int64_t)y);
+        if (buttons & 1) {               /* BTN_LEFT = 0x110, PRESSED = 1 */
+            emit_pointer_button(c, o->id, g_serial, time_ms, 0x110u, 1u);
+            console_printf("[wl] pointer button id=%u button=0x110 state=1\n",
+                           (uint64_t)o->id);
+        }
+        o->pointer_sent = 1;
+    }
 }
 
 static void dispatch(struct wl_conn *c, const uint8_t *msg, uint32_t size)
@@ -692,6 +981,9 @@ static void dispatch(struct wl_conn *c, const uint8_t *msg, uint32_t size)
     if (o == NULL) {
         console_printf("[wl] request for unknown object %u (opcode %u)\n",
                        (uint64_t)obj_id, (uint64_t)opcode);
+        /* Protocol answer instead of a silent drop: the client gets a real
+         * wl_display.error naming the offending id. */
+        emit_display_error(c, obj_id, WL_ERR_INVALID_OBJECT, "no such object");
         return;
     }
     switch (o->type) {
@@ -702,18 +994,31 @@ static void dispatch(struct wl_conn *c, const uint8_t *msg, uint32_t size)
     case OBJ_POOL:        dispatch_pool(c, o, opcode, &r); break;
     case OBJ_SURFACE:     dispatch_surface(c, o, opcode, &r); break;
     case OBJ_SEAT:        dispatch_seat(c, o, opcode, &r); break;
+    case OBJ_POINTER:     dispatch_pointer(c, o, opcode, &r); break;
     case OBJ_BUFFER:
         if (opcode == 0u) {
             console_printf("[wl] buffer.destroy id=%u\n", (uint64_t)o->id);
-            free_obj(o);
+            destroy_obj(c, o);
         }
         break;
     case OBJ_CALLBACK:
-        console_printf("[wl] wl_callback(id=%u): requests are not allowed\n",
-                       (uint64_t)o->id);
+        if (opcode == 0u) {              /* wl_callback.destroy */
+            console_printf("[wl] callback.destroy id=%u (done=%d serial=%u)\n",
+                           (uint64_t)o->id, (int64_t)o->cb_done,
+                           (uint64_t)o->cb_serial);
+            destroy_obj(c, o);
+        } else {
+            console_printf("[wl] wl_callback(id=%u): unsupported opcode %u\n",
+                           (uint64_t)o->id, (uint64_t)opcode);
+            emit_display_error(c, o->id, WL_ERR_INVALID_METHOD,
+                               "wl_callback only has destroy");
+        }
         break;
     default:
-        break;                           /* inert pointer/keyboard/region */
+        /* inert keyboard/region objects: accept and ignore their requests */
+        console_printf("[wl] object %u (type %d): request opcode %u ignored\n",
+                       (uint64_t)o->id, (int64_t)o->type, (uint64_t)opcode);
+        break;
     }
 }
 
@@ -782,6 +1087,11 @@ void wl_server_pump(int server_fd)
         memmove(c->in, c->in + size, c->in_len - (uint32_t)size);
         c->in_len -= (uint32_t)size;
     }
+
+    /* A wl_pointer created by wl_seat.get_pointer publishes the kernel's pointer
+     * snapshot on the first pump after its creation (this one, if the request
+     * just arrived, or the next one). */
+    pointer_emit_pending(c);
 
     conn_flush(c);
 }

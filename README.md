@@ -76,9 +76,12 @@ acceptance **55/55**, desktop **19/19**, per-window content **25/25**, logo **14
 **28/28**, wlshow **9/9**; both appearance gates report **0 pixels outside live rectangles**,
 and the boot presentation is unchanged.
 
-**In development (next line, not yet released):** a vsync/swap-chain presenter, the rest of the
-Wayland surface protocol (frame callbacks, damage tracking, multiple clients, real seat input),
-embedding a Wayland surface into a desktop window, and continued visual polish.
+**In development (next line, not yet released):** the Wayland client's surface is now shown
+inside a desktop window, the protocol grew frame callbacks, damage and seat pointer events, and
+the presenter has an explicit two-buffer swap chain with a 10 ms vsync gate (counters in
+`guishell swapstat`). Still missing: a real vsync source / triple buffering, damage-driven
+partial redraw, multiple Wayland clients, a real seat event stream (`wl_keyboard`), scaling and
+subsurfaces, plus continued visual polish.
 
 ---
 
@@ -261,7 +264,9 @@ The boot sequence is fixed: scrolling English kernel log → SutureOS banner →
   Calculator, About SutureOS, Image Viewer, Text Editor, Switch User); its appearance baseline
   is frozen separately in `docs/baseline/base_gui_classic.png`.
 - `guislint` renders a single frame of the Rust UI prototype; `guishell` runs the same shell
-  directly. `wlshow` presents the last committed Wayland surface (run `wlclient` first).
+  directly. `wlshow` presents the last committed Wayland surface, and the image-viewer window
+  paints that same surface directly (run `wlclient` first). `guishell swapstat` prints the
+  present/swap-chain counters.
 - In `guishell` the focused window also owns the keyboard: typed ASCII goes into its editable
   line, `Enter` commits it to the serial log, `Backspace` edits and `Tab` cycles the focus
   between visible windows; window shadows are alpha-composited over whatever is underneath.

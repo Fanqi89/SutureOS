@@ -752,9 +752,9 @@ int shell_cmd_guislint(int argc, char **argv) {
  * taskbar and the start menu; this command hands the screen to that loop and
  * paints nothing itself (so the existing C desktop stays untouched). */
 int shell_cmd_guishell(int argc, char **argv) {
-    (void)argc; (void)argv;
     extern int slint_gui_run_shell(void);
     extern int slint_gui_linked(void);
+    extern uint32_t slint_gui_swap_report(void);
     extern void console_screen_enable(int on);
     extern int term_available(void);
     extern void term_clear(void);
@@ -763,6 +763,18 @@ int shell_cmd_guishell(int argc, char **argv) {
     if (!slint_gui_linked()) {
         shell_puts("guishell: the Rust GUI object is not linked into this image\n");
         return -1;
+    }
+    /* v0.60.0: `guishell swapstat` logs the swap-chain counters once and returns
+     * to the prompt. The counters are cumulative, so this is run after a desktop
+     * session to read back what that session presented. */
+    if (argc > 1 && argv[1] != NULL && strcmp(argv[1], "swapstat") == 0) {
+        const uint32_t n = slint_gui_swap_report();
+        if (n == 0u) {
+            shell_puts("guishell: swapstat: no presents yet (run `guishell` first)\n");
+            return 0;
+        }
+        shell_printf("guishell: swapstat: %u present(s) so far\n", (unsigned long)n);
+        return 0;
     }
     shell_scroll_message("Starting desktop shell prototype...");
     console_screen_enable(0);

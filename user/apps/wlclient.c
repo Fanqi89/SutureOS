@@ -14,11 +14,22 @@
  *   5. memfd_create(320*200*4) + mmap(MAP_SHARED) + a deterministic checkerboard
  *      pattern, so the compositor side can prove the bytes it reads are ours;
  *   6. wl_shm.create_pool(fd over SCM_RIGHTS) + wl_shm_pool.create_buffer +
- *      wl_compositor.create_surface + wl_surface.attach + wl_surface.commit;
+ *      wl_compositor.create_surface + wl_surface.attach + wl_surface.commit
+ *      (frame #1);
  *   7. wait for wl_buffer.release;
  *   8. write the same pixels to /mnt/fat/WL.BIN through the VFS so the host can
  *      recompute the FNV-1a hash independently and compare it with the hash the
- *      server logged at commit.
+ *      server logged at the first commit;
+ *   9. wl_surface.frame() (v0.60): request a wl_callback, which the server
+ *      completes on the next commit (wl_callback.done(serial));
+ *  10. commit #2: change one 32x32 block of the shared buffer, pass a
+ *      wl_surface.damage() rect and commit again; the server logs the damage and
+ *      a second commit hash, then releases the buffer and fires the callback;
+ *  11. wl_callback.destroy -> wl_display.delete_id, proving id recycling;
+ *  12. wl_seat.get_pointer -> a real wl_pointer that receives enter/motion (and
+ *      button when held) from the kernel's PS/2 mouse snapshot;
+ *  13. a request for an object id that was never created -> wl_display.error,
+ *      so the error path is proven instead of assumed.
  *
  * License: GPL-3.0, part of SutureOS. Written from the Wayland protocol
  * specification; no libwayland code is used (there is no libwayland here).
@@ -79,6 +90,16 @@ static long sc3(long nr, long a, long b, long c)
 #define ID_POOL       7u
 #define ID_BUFFER     8u
 #define ID_SURFACE    9u
+#define ID_FRAME_CB   10u    /* wl_callback from wl_surface.frame()          */
+#define ID_POINTER    11u    /* wl_pointer from wl_seat.get_pointer()        */
+#define ID_BOGUS      99u    /* never created: drives the wl_display.error test */
+
+/* Frame 2 changes this block so the damage path has real new pixels. */
+#define DAMAGE_X      32
+#define DAMAGE_Y      32
+#define DAMAGE_W      32
+#define DAMAGE_H      32
+#define DAMAGE_COLOR  0xFF112233u
 
 #define TEXT_BIN "/mnt/fat/WL.BIN"
 
@@ -267,6 +288,15 @@ static unsigned g_globals_seen;
 static unsigned g_global_name_compositor, g_global_name_shm, g_global_name_seat;
 static int g_callback_done, g_buffer_released;
 static unsigned g_seat_caps;
+/* v0.60: frame callbacks / damage / display error / pointer */
+static int g_frame_done, g_pointer_enter, g_pointer_motion;
+static unsigned g_frame_serial;
+static unsigned g_releases;
+static int g_pointer_enter_x, g_pointer_enter_y;
+static int g_pointer_motion_x, g_pointer_motion_y;
+static int g_display_error_seen;
+static unsigned g_display_error_object, g_display_error_code;
+static unsigned g_delete_ids;
 
 /* Handle every pending event; returns when `until_callback_done` is satisfied or
  * nothing is pending any more (bounded). */
@@ -304,13 +334,57 @@ static void pump_events(int until_callback_done)
             g_callback_done = 1;
             printf("[wlclient]   event wl_callback(%u).done serial=%u\n", obj,
                    (unsigned)get32(g_rx + 8));
+        } else if (op == 0u && obj == ID_FRAME_CB) {
+            /* wl_callback.done(serial) for the wl_surface.frame() request */
+            g_frame_done = 1;
+            g_frame_serial = get32(g_rx + 8);
+            printf("[wlclient] frame done serial=%u\n", g_frame_serial);
         } else if (op == 0u && obj == ID_BUFFER) {
             g_buffer_released = 1;
-            printf("[wlclient]   event wl_buffer(%u).release\n", obj);
+            g_releases++;
+            printf("[wlclient]   event wl_buffer(%u).release (n=%u)\n", obj,
+                   g_releases);
         } else if (op == 0u && obj == ID_SEAT) {
             g_seat_caps = get32(g_rx + 8);
             printf("[wlclient]   event wl_seat(%u).capabilities=0x%x\n", obj,
                    g_seat_caps);
+        } else if (op == 0u && obj == ID_POINTER) {
+            /* wl_pointer.enter(serial u32, surface u32, x fixed, y fixed) */
+            if ((unsigned)size >= 24u) {
+                g_pointer_enter = 1;
+                g_pointer_enter_x = (int)(get32(g_rx + 16) >> 8);
+                g_pointer_enter_y = (int)(get32(g_rx + 20) >> 8);
+                printf("[wlclient] pointer enter %d,%d\n", g_pointer_enter_x,
+                       g_pointer_enter_y);
+            }
+        } else if (op == 2u && obj == ID_POINTER) {
+            if ((unsigned)size >= 20u) {
+                g_pointer_motion = 1;
+                g_pointer_motion_x = (int)(get32(g_rx + 12) >> 8);
+                g_pointer_motion_y = (int)(get32(g_rx + 16) >> 8);
+                printf("[wlclient] pointer motion %d,%d\n", g_pointer_motion_x,
+                       g_pointer_motion_y);
+            }
+        } else if (op == 3u && obj == ID_POINTER) {
+            printf("[wlclient]   event wl_pointer.button=%u state=%u\n",
+                   (unsigned)get32(g_rx + 16), (unsigned)get32(g_rx + 20));
+        } else if (op == 0u && obj == ID_DISPLAY) {
+            /* wl_display.error(object_id, code, message) */
+            char msg[96];
+            unsigned off = 16;
+
+            g_display_error_seen = 1;
+            g_display_error_object = get32(g_rx + 8);
+            g_display_error_code = get32(g_rx + 12);
+            msg[0] = '\0';
+            (void)arg_str(g_rx, (unsigned)size, &off, msg, sizeof(msg));
+            printf("[wlclient] display error object=%u code=%u message=\"%s\"\n",
+                   g_display_error_object, g_display_error_code, msg);
+        } else if (op == 1u && obj == ID_DISPLAY) {
+            /* wl_display.delete_id(id) */
+            g_delete_ids++;
+            printf("[wlclient]   event wl_display.delete_id id=%u\n",
+                   (unsigned)get32(g_rx + 8));
         } else {
             printf("[wlclient]   event object=%u opcode=%u size=%d (ignored)\n",
                    obj, op, size);
@@ -480,13 +554,20 @@ int main(int argc, char **argv)
     msg_i32(0);
     check(msg_send(), "attach the buffer to the surface");
 
+    /* ---- 7. commit #1: publish the shared-memory frame ------------------- */
     g_buffer_released = 0;
+    g_releases = 0;
     msg_begin(ID_SURFACE, 6u);           /* wl_surface.commit */
-    check(msg_send(), "commit the surface");
+    check(msg_send(), "commit the surface (frame 1)");
     pump_events(0);
-    check(g_buffer_released, "wl_buffer.release received after commit");
+    check(g_buffer_released, "wl_buffer.release received after commit #1");
 
-    /* ---- 7. the same pixels through the VFS, for the host-side check ----- */
+    /* ---- 8. the same pixels through the VFS, for the host-side check -----
+     * This copy is frame #1 (the canonical checkerboard) on purpose: the host
+     * verifier compares WL.BIN byte-for-byte against that pattern, and writing
+     * 250 KiB costs ~13 s under TCG, so only one frame is exported. Frame #2's
+     * bytes are verified on the host by recomputing the modified pattern and
+     * comparing it with the second `[wl] commit ... hash=` line. */
     printf("[wlclient]        writing %d bytes to %s\n", SURF_BYTES, TEXT_BIN);
     out = r3_open(TEXT_BIN, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (out < 0) {
@@ -514,8 +595,70 @@ int main(int argc, char **argv)
               "the pixel bytes reached " TEXT_BIN " through the VFS");
     }
 
+    /* ---- 9. wl_surface.frame(): completed by the *next* commit ---------- */
+    g_frame_done = 0;
+    msg_begin(ID_SURFACE, 3u);           /* wl_surface.frame(new_id) */
+    msg_u32(ID_FRAME_CB);
+    check(msg_send(), "request wl_surface.frame (wl_callback 10)");
+
+    /* ---- 10. commit #2: change one 32x32 block + a damage rect ---------- */
+    for (y = DAMAGE_Y; y < (unsigned)(DAMAGE_Y + DAMAGE_H); y++) {
+        unsigned *row = (unsigned *)(void *)(map + (unsigned long)y * SURF_STRIDE);
+
+        for (x = DAMAGE_X; x < (unsigned)(DAMAGE_X + DAMAGE_W); x++)
+            row[x] = DAMAGE_COLOR;
+    }
+    msg_begin(ID_SURFACE, 2u);           /* wl_surface.damage(x, y, w, h) */
+    msg_i32(DAMAGE_X);
+    msg_i32(DAMAGE_Y);
+    msg_i32(DAMAGE_W);
+    msg_i32(DAMAGE_H);
+    check(msg_send(), "wl_surface.damage(32,32 32x32)");
+    msg_begin(ID_SURFACE, 6u);           /* wl_surface.commit */
+    check(msg_send(), "commit the surface (frame 2)");
+    pump_events(0);
+    check(g_frame_done, "wl_callback.done arrived for the frame request");
+    check(g_releases >= 2u, "second wl_buffer.release (commit #2 processed)");
+    if (g_releases >= 2u)
+        printf("[wlclient] second commit ok\n");
+
+    /* ---- 11. destroy the callback: the server answers with delete_id ---- */
+    msg_begin(ID_FRAME_CB, 0u);          /* wl_callback.destroy */
+    check(msg_send(), "destroy the frame callback (wl_callback.destroy)");
+    pump_events(0);
+    check(g_delete_ids >= 1u, "wl_display.delete_id after the destroy");
+
+    /* ---- 12. wl_seat.get_pointer -> a real wl_pointer + pointer events -- */
+    g_pointer_enter = 0;
+    g_pointer_motion = 0;
+    msg_begin(ID_SEAT, 0u);              /* wl_seat.get_pointer(new_id) */
+    msg_u32(ID_POINTER);
+    check(msg_send(), "wl_seat.get_pointer (wl_pointer 11)");
+    pump_events(0);
+    check(g_pointer_enter, "wl_pointer.enter received");
+    check(g_pointer_motion, "wl_pointer.motion received");
+
+    msg_begin(ID_POINTER, 1u);           /* wl_pointer.release */
+    check(msg_send(), "wl_pointer.release");
+    pump_events(0);
+
+    /* ---- 13. wl_display.error on a request for an unknown object -------- */
+    g_display_error_seen = 0;
+    msg_begin(ID_BOGUS, 0u);
+    msg_u32(0u);
+    check(msg_send(), "send a request for an unknown object id (99)");
+    pump_events(0);
+    check(g_display_error_seen, "wl_display.error reported the unknown object");
+    check(g_display_error_seen && g_display_error_object == ID_BOGUS,
+          "the error names object 99 (code 0 = invalid object)");
+
     printf("[wlclient] pixels hash=%08x bytes=%d path=" TEXT_BIN "\n", hash,
            (int)SURF_BYTES);
+    printf("[wlclient] protocol summary: releases=%u frame_serial=%u "
+           "delete_ids=%u pointer_enter=%d,%d pointer_motion=%d,%d "
+           "display_error=%u/%u\n", g_releases, g_frame_serial, g_delete_ids,
+           g_pointer_enter_x, g_pointer_enter_y, g_pointer_motion_x,
+           g_pointer_motion_y, g_display_error_object, g_display_error_code);
     printf("[wlclient] ring-3 Wayland client: %d ok, %d FAIL\n", g_ok, g_fail);
     printf(g_fail == 0 ? "[wlclient] RESULT PASS\n" : "[wlclient] RESULT FAIL\n");
     return g_fail == 0 ? 0 : 1;
