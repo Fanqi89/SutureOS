@@ -594,6 +594,40 @@ static int ac97_play_staged(uint32_t samples, uint32_t rate)
 }
 
 /* ===================== public playback API ===================== */
+/* Output volume (v0.57.0): the AC'97 mixer volume registers use ATTEN fields:
+ * bits 12:8 = left, bits 4:0 = right, 0x00 = 0 dB, 0x1F = -46.5 dB (1.5 dB per
+ * step), bit 15 = mute. 0% mutes, 100% = 0 dB. */
+static int g_ac97_volume = 100;
+
+int ac97_set_volume(int percent)
+{
+    if (!ac97_present()) return -1;
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+    g_ac97_volume = percent;
+
+    if (percent == 0) {
+        ac97_wr16(&g_nam, AC97_NAM_MASTER_VOL, 0x8000u);
+        ac97_wr16(&g_nam, AC97_NAM_PCM_OUT_VOL, 0x8000u);
+        console_printf("[ac97] volume=0%% (muted)\n");
+        return 0;
+    }
+    /* integer dB-linear attenuation: 0..31 steps of 1.5 dB */
+    const int steps = ((100 - percent) * 31) / 100;
+    const uint16_t vol = (uint16_t)(((steps & 0x1F) << 8) | (steps & 0x1F));
+    ac97_wr16(&g_nam, AC97_NAM_MASTER_VOL, vol);
+    ac97_wr16(&g_nam, AC97_NAM_PCM_OUT_VOL, vol);
+    const uint16_t rb = ac97_rd16(&g_nam, AC97_NAM_MASTER_VOL);
+    console_printf("[ac97] volume=%d%% (master+pcm atten=%d steps readback=0x%x)\n",
+                   (uint64_t)percent, (uint64_t)steps, (uint64_t)rb);
+    return 0;
+}
+
+int ac97_get_volume(void)
+{
+    return g_ac97_volume;
+}
+
 int ac97_play_pcm(const int16_t *samples, uint32_t frames, uint32_t rate)
 {
     if (!g_present || !samples) return AC97_ERR_IO;

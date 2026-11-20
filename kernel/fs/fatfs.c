@@ -2025,6 +2025,10 @@ int fatfs_sync(void) {    if (!g_vol->mounted) return FATFS_EBUSY;
     int r = fsinfo_flush(s, v);
     lemis_heap_free(s);
     lemis_heap_free(v);
+    /* v0.57.0: also flush the device write cache. The FAT/FSInfo writes above
+     * only reach the controller; without this a power cut right after `sync`
+     * can still lose them (ext2 already did this, FAT32 did not). */
+    if (r == FATFS_OK && blk_flush(g_vol->drive) != 0) r = FATFS_ERR;
     return r;
 }
 

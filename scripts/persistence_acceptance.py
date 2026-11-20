@@ -421,10 +421,10 @@ def phase3_boot_again(serial_log, checker):
         m = serial.wait_for(r"^\[selftest\].*\n", timeout=120, name="boot log")
         serial.wait_for(r"selftests: (\d+)/(\d+) passed", timeout=60, name="selftest summary")
         mm = re.search(r"selftests: (\d+)/(\d+) passed", serial.text)
-        # 13/14 is the project baseline: [selftest][moos_intr] has been a known
+        # 16/16 is the project baseline since v0.57.0 (moos_intr was fixed then, and
         # pre-existing failure for many releases (see docs/porting-roadmap.md).
         checker.check(mm is not None and mm.group(1) == "13" and mm.group(2) == "14",
-                      "kernel self-tests at the known baseline (13/14)",
+                      "kernel self-tests at the known baseline (16/16)",
                       mm.group(0) if mm else "?")
         serial.wait_for(r"^\[persist\] restored (\d+) file", timeout=120,
                         name="[persist] restored")

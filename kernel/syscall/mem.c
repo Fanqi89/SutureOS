@@ -41,6 +41,28 @@ uint64_t sys_brk(uint64_t addr, uint64_t a2, uint64_t a3,
 
 #define MAP_SHARED_ 0x01
 
+/* Software PTE bit: set on mappings that alias a memfd object, whose frames are
+ * owned by the memfd (never by the per-process frame pool). munmap must clear
+ * the PTE but leave those frames alone, otherwise an unmap would recycle frames
+ * that the memfd still hands to other mappings. */
+#define PTE_MEMFD  (1ull << 9)
+
+static void mem_flush_tlb(void);
+
+/* Undo a partially-built anonymous mapping: [start, end) holds PTEs this call
+ * just installed from the user frame pool. */
+static void mmap_rollback(uint64_t start, uint64_t end)
+{
+    for (uint64_t v = start; v < end; v += 4096) {
+        uint64_t *pte = mmu_walk((uint64_t*)read_cr3(), 0, v, 0);
+        if (pte && (*pte & PTE_P) && !(*pte & PTE_MEMFD)) {
+            loader_free_page((void *)(uintptr_t)(*pte & ~0xFFFull));
+        }
+        if (pte) *pte = 0;
+    }
+    mem_flush_tlb();
+}
+
 /* v0.54.0: memfd + MAP_SHARED — the second Wayland prerequisite. A memfd fd
  * mapped twice shares the same physical pages, which is what a wl_shm pool needs. */
 uint64_t sys_memfd_create(uint64_t name, uint64_t flags,
@@ -84,8 +106,20 @@ uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
     if (vaddr < USER_HEAP_START || vaddr + len > USER_HEAP_MAX) return (uint64_t)-1;
     for (uint64_t v = vaddr; v < vaddr + len; v += 4096) {
         uint64_t *pte = mmu_walk((uint64_t*)read_cr3(), 0, v, 1);
-        if (!pte) return (uint64_t)-1;
-        uint64_t pte_val = (uint64_t)loader_alloc_page() | PTE_P | PTE_U;
+        if (!pte) {
+            mmap_rollback(vaddr, v);
+            return (uint64_t)-12;                        /* ENOMEM */
+        }
+        void *page = loader_alloc_page();
+        if (!page) {
+            /* Out of user frames. NEVER map physical page 0 here: the old code
+             * computed NULL | PTE_P | PTE_U, which is a perfectly valid-looking
+             * PTE that aliases the first page of the kernel's low memory. Undo
+             * the pages this call mapped and report -ENOMEM instead. */
+            mmap_rollback(vaddr, v);
+            return (uint64_t)-12;                        /* ENOMEM */
+        }
+        uint64_t pte_val = (uint64_t)(uintptr_t)page | PTE_P | PTE_U;
         if (prot & PROT_WRITE) pte_val |= PTE_W;
         *pte = pte_val;
     }
@@ -124,15 +158,19 @@ uint64_t sys_munmap(uint64_t addr, uint64_t len,
                     uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 {
     (void)a3; (void)a4; (void)a5; (void)a6;
-    /* Unmap the range for real (the old code only returned 0). The frames are not
-     * handed back to the PMM yet - that needs a per-range allocator - but the
-     * mapping is gone, so use-after-unmap faults instead of silently working. */
+    /* Unmap the range for real and hand anonymous frames back to the loader
+     * pool (v0.57.0). memfd-backed mappings keep their frames: the memfd still
+     * owns them and may be mapped elsewhere. */
     if ((addr & 0xFFFull) != 0 || len == 0) return (uint64_t)-22;
     len = (len + 4095) & ~4095ull;
     if (addr < USER_HEAP_START || addr + len > USER_HEAP_MAX) return (uint64_t)-22;
     for (uint64_t v = addr; v < addr + len; v += 4096) {
         uint64_t *pte = mmu_walk((uint64_t*)read_cr3(), 0, v, 0);
-        if (pte && (*pte & PTE_P)) *pte = 0;
+        if (pte && (*pte & PTE_P)) {
+            if (!(*pte & PTE_MEMFD))
+                loader_free_page((void *)(uintptr_t)(*pte & ~0xFFFull));
+            *pte = 0;
+        }
     }
     mem_flush_tlb();
     return 0;

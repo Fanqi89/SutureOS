@@ -253,6 +253,16 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
     st_sched_test();
     st_eevdf_test();
     st_xj_vfs_test();
+    /* User frame pool: alloc/free/exhaustion (v0.57.0 OOM-protection batch). */
+    {
+        extern void st_loader_pool_test(void);
+        st_loader_pool_test();
+    }
+    /* Generic time-source registry (domain 11 cross-arch mechanism). */
+    {
+        extern void st_time_source_test(void);
+        st_time_source_test();
+    }
 
     /* Summary */
     console_printf("\n[stitch] selftests: %u/%u passed\n",
@@ -326,6 +336,12 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
     {
         extern int usb_probe(void);
         (void)usb_probe();
+    /* USB HID class driver: boot keyboard/mouse over EHCI + hot-plug rescan.
+     * Additive only - a machine without an EHCI controller logs nothing new. */
+    {
+        extern int usb_hid_init(void);
+        (void)usb_hid_init();
+    }
     }
 
     /* ---- ATAPI 光驱（数据盘） ---------------------------------------------
@@ -387,6 +403,18 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
             if (n > 0) vfs_write_file("/etc/motd", motd, (uint32_t)n);
         }
         console_puts("[init] ramfs root mounted, demo files seeded\n");
+
+        /* Synthetic /proc: live kernel state as read-only files (no device). */
+        if (vfs_mount("none", "/proc", "procfs") == VFS_OK)
+            console_puts("[init] procfs mounted at /proc\n");
+        else
+            console_puts("[init] WARN: procfs mount failed\n");
+
+        /* Synthetic /sys: hierarchical kernel object tree (block devices). */
+        if (vfs_mount("none", "/sys", "sysfs") == VFS_OK)
+            console_puts("[init] sysfs mounted at /sys\n");
+        else
+            console_puts("[init] WARN: sysfs mount failed\n");
 
         /* ==================== users, credentials, sudo ====================
          * Seeds /etc/passwd + /etc/shadow + /etc/group + /etc/sudoers on first
@@ -635,6 +663,39 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
         }
         if (!sq_done)
             console_puts("[init] squashfs: no SquashFS volume on drive 1/virtio\n");
+    }
+
+    /* ext4 (read-only): a single boot probe, no mount, no self-test.  With an
+     * ext4 volume on the second IDE disk it prints one geometry line, without
+     * one a single no-volume line; real mounting is `mount ext4 1 /mnt/e4`. */
+    {
+        extern int ext4_probe(int drive);
+        (void)ext4_probe(1);
+    }
+
+    /* OS67 inode filesystem (Minix v1 layout, read-only): one boot probe. */
+    {
+        extern int os67fs_boot_probe(int drive);
+        (void)os67fs_boot_probe(1);
+    }
+
+    /* VimtuFS2 (read-only; the VimtuOS on-disk format, spec in
+     * kernel/fs/vimtufs2.c).  A single read-only boot probe: with a volume it
+     * prints one geometry line, without one a single no-volume line.  It does
+     * not mount anything, does not run a self-test and changes no state - the
+     * real mount is `mount vimtufs2 <drive> <mountpoint>` from the shell. */
+    {
+        extern int vimtufs2_boot_probe(int drive);
+        (void)vimtufs2_boot_probe(1);      /* second IDE disk (-drive if=ide,index=1) */
+    }
+
+    /* MayFS (MayOS' checksummed two-slot snapshot filesystem): read-only boot
+     * probe only, one geometry line with a volume or one no-volume line.  It
+     * mounts nothing, runs no self-test and writes nothing; the real mount is
+     * `mount mayfs 1 /mnt/may` from the shell. */
+    {
+        extern int mayfs_boot_probe(int drive);
+        (void)mayfs_boot_probe(1);         /* second IDE disk (-drive if=ide,index=1) */
     }
 
     /* ISO9660 数据光盘（只读）：光驱里如果有“数据盘”，挂到 /mnt/cd 并读根目录
@@ -980,6 +1041,15 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
             console_printf("[  OK  ] HDA: %s\n", hda_name());
         }
         (void)hda_selftest();
+    }
+
+    /* Sound Blaster 16 (ISA) + 8237 DMA: the second audio path, kept polled and
+     * opt-in (no boot tone) so the frozen boot presentation is preserved. */
+    {
+        extern int sb16_init(void);
+        extern const char *sb16_name(void);
+        if (sb16_init() == 0)
+            console_printf("[  OK  ] SB16: %s\n", sb16_name());
     }
 
     console_puts("\n[stitch] Phase-1 self-tests complete. Initializing scheduler...\n");

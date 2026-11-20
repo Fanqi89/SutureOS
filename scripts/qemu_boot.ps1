@@ -14,7 +14,10 @@ This script
   3. optionally types shell commands with `sendkey` (space = spc, '.' = dot,
      '/' = slash, enter = ret),
   4. optionally runs raw human-monitor commands and prints their replies,
-  5. always ends with `quit` and waits for the process to exit.
+  5. optionally waits -AfterMonitorSeconds after the last monitor command so the
+     guest can observe a hot-plug device_add/device_del before the quit
+     (default 0 = historical behaviour),
+  6. always ends with `quit` and waits for the process to exit.
 
 Usage:
   powershell -NoProfile -File scripts/qemu_boot.ps1 -SerialLog build\serial.log `
@@ -33,6 +36,7 @@ param(
     [int]$BootWaitSeconds = 12,
     [int]$KeyDelayMs = 400,
     [int]$AfterKeysSeconds = 8,
+    [int]$AfterMonitorSeconds = 0,
     [int]$MonitorPort = 45554
 )
 
@@ -113,6 +117,13 @@ try {
         Write-Host "[monitor] $c"
         $out = Monitor-Cmd $c
         if ($out) { $out -split "`n" | ForEach-Object { "  $_" } }
+    }
+    # Hot-plug tests need the guest to run *after* the last monitor command (a
+    # device_add/device_del only becomes visible to the guest on its next poll),
+    # so give it a window before the quit below. 0 = historical behaviour.
+    if ($cmdList.Count -gt 0 -and $AfterMonitorSeconds -gt 0) {
+        Write-Host "[qemu] settling $AfterMonitorSeconds s after the monitor commands"
+        Start-Sleep -Seconds $AfterMonitorSeconds
     }
 } finally {
     try { Send-Qmp 'quit' | Out-Null } catch { Write-Warning "QMP quit failed: $_" }

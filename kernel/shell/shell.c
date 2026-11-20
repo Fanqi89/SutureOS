@@ -9,6 +9,10 @@
 #include "rtc.h"        /* date */        /* sudo/su/passwd (kernel/security) */
 #include "userdb.h"
 #include "login.h"      /* login/su/identity switch (multiuser batch) */
+#include "time_source.h" /* timesrc: generic time-source registry (domain 11) */
+#include "virtio_gpu.h" /* vga2d: virtio-gpu 2D scanout backend (opt-in only) */
+#include "usb_hid.h"  /* usbinfo: EHCI boot keyboard/mouse + hot-plug rescan */
+#include "vmsvga.h"     /* vmsvga: VMware SVGA II 2D backend (opt-in only) */
 #include <stitch/types.h>
 #include <stitch/string.h>
 #include <stitch/stdarg.h>
@@ -174,6 +178,7 @@ static const struct shell_cmd g_commands[] = {
     {"ping",    shell_cmd_ping,    "Send ICMP echo requests: ping <ipv4>"},
     {"dhcp",    shell_cmd_dhcp,    "DHCP: acquire a lease, program IP/mask/gateway/DNS: dhcp"},
     {"nslookup",shell_cmd_nslookup,"Resolve an A record through the configured DNS server: nslookup <name>"},
+    {"dns",     shell_cmd_dns,     "Resolve an A record: dns <name> (prints the answer / nxdomain)"},
     {"socktest",shell_cmd_socktest,"Self-test: socket/bind/getsockname/getsockopt/close ABI"},
     {"netstat", shell_cmd_netstat, "Show network statistics"},
     {"tcpecho", shell_cmd_tcpecho, "TCP round trip: tcpecho <ipv4> <port> <text>"},
@@ -186,6 +191,13 @@ static const struct shell_cmd g_commands[] = {
     {"kbdstat", shell_cmd_kbdstat, "Show keyboard IRQ1 ring counters"},
     {"beep",    shell_cmd_beep,    "Play a sine tone on AC'97: beep [freq_hz 20..12000] [ms 10..1000]"},
     {"hdatest", shell_cmd_hdatest, "Intel HDA status + tone: hdatest [freq_hz 20..12000] [ms 10..1000]"},
+    {"hdavol",  shell_cmd_hdavol,  "Intel HDA output volume: hdavol [0..100] (0 = mute, 100 = 0 dB)"},
+    {"ac97vol",  shell_cmd_ac97vol,  "AC'97 output volume: ac97vol [0..100] (0 = mute, 100 = 0 dB)"},
+    {"sb16test", shell_cmd_sb16test, "Sound Blaster 16 (ISA) status + tone: sb16test [freq_hz 20..12000] [ms 10..1000]"},
+    {"vga2d",   shell_cmd_vga2d,   "VirtIO-GPU 2D backend: vga2d [on|off|status] (default boot never touches it)"},
+    {"usbinfo", shell_cmd_usbinfo, "USB HID keyboards/mice + hot-plug rescan: usbinfo [scan|watch [seconds]]"},
+    {"vmsvga",  shell_cmd_vmsvga,  "VMware SVGA II 2D backend: vmsvga [on|off|status] (default boot never touches it)"},
+    {"timesrc", shell_cmd_timesrc, "List the generic time sources (HPET / scheduler tick) and now_ns"},
     {NULL, NULL, NULL}
 };
 
@@ -268,9 +280,13 @@ static void shell_kbd_fill(int budget)
 }
 
 
+/* Defined below (after the USB HID helpers); console_getc drains its ring. */
+static void shell_hid_fill(void);
+
 int console_getc(void) {
     if (g_kbd_tail == g_kbd_head) {
         shell_kbd_fill(16);                 /* refill: one poll is not enough */
+        if (g_kbd_tail == g_kbd_head) shell_hid_fill();
         if (g_kbd_tail == g_kbd_head) return -1;
     }
     {
@@ -419,6 +435,24 @@ int shell_run(void) {
                     extern int net_ready(void);
                     extern void net_poll(void);
                     if (net_ready()) net_poll();
+                }
+                /* VirtIO-GPU 2D backend: keeps the scanout animated while
+                 * `vga2d on` is in effect; a no-op (one global read + branch)
+                 * otherwise, so the default shell path is unchanged. */
+                {
+                    extern void virtio_gpu_service(void);
+                    virtio_gpu_service();
+                }
+                /* USB HID: poll the boot keyboard/mouse + hot-plug rescan
+                 * while the shell is idle (no-op without an EHCI controller). */
+                {
+                    extern void usb_hid_idle(void);
+                    usb_hid_idle();
+                }
+                /* VMware SVGA II 2D backend: no-op unless `vmsvga on` was typed. */
+                {
+                    extern void vmsvga_service(void);
+                    vmsvga_service();
                 }
                 for (volatile int spin = 0; spin < 20000; spin++) {
                     __asm__ volatile("pause");
@@ -2148,19 +2182,18 @@ int shell_cmd_netstat(int argc, char **argv) {
 /* DHCP client: on demand only (never at boot). Acquires a lease and programs the
  * address/mask/gateway/resolver the stack uses from then on. */
 int shell_cmd_dhcp(int argc, char **argv) {
-    extern int dhcp_client_acquire(dhcp_lease_t *out, int timeout_ms);
+    extern int dhcp_acquire(uint32_t timeout_ticks);
     extern uint32_t net_ip(void), net_gw(void), net_mask(void), net_dns(void);
     int rc;
-    dhcp_lease_t lease;
     char ip[16], mask[16], gw[16], dns[16];
     (void)argc; (void)argv;
 
     if (!net_ready()) {
-        shell_puts("dhcp: network is not up (no RTL8139 / net_init failed)\n");
+        shell_puts("dhcp: no NIC / network not ready (net_init found no RTL8139 or e1000)\n");
         return -1;
     }
     shell_puts("DHCP: sending DISCOVER to 255.255.255.255:67 ...\n");
-    rc = dhcp_client_acquire(&lease, 4000);
+    rc = dhcp_acquire(400u);                 /* 400 ticks @100 Hz = 4 s */
     if (rc != 0) {
         shell_printf("dhcp: no lease (error %d)%s\n", (int64_t)rc,
                      (rc == -110) ? " - no reply from a DHCP server" : "");
@@ -2170,10 +2203,7 @@ int shell_cmd_dhcp(int argc, char **argv) {
     net_ip_to_str(net_mask(), mask, sizeof(mask));
     net_ip_to_str(net_gw(), gw, sizeof(gw));
     net_ip_to_str(net_dns(), dns, sizeof(dns));
-    shell_printf("dhcp: lease %s mask %s gateway %s dns %s (server ",
-                 ip, mask, gw, dns);
-    net_ip_to_str(lease.server_id, ip, sizeof(ip));
-    shell_printf("%s, %u s)\n", ip, (unsigned)lease.lease_secs);
+    shell_printf("dhcp: ip %s mask %s gateway %s dns %s\n", ip, mask, gw, dns);
     return 0;
 }
 
@@ -2205,6 +2235,35 @@ int shell_cmd_nslookup(int argc, char **argv) {
     }
     net_ip_to_str(ip, answer, sizeof(answer));
     shell_printf("%s has address %s\n", argv[1], answer);
+    return 0;
+}
+
+/* DNS resolver: dns <name> - the concise form of the same A-record lookup. */
+int shell_cmd_dns(int argc, char **argv) {
+    extern int dns_resolve(const char *name, uint32_t *out_ip, int timeout_ms);
+    uint32_t ip = 0;
+    char answer[16];
+    int rc;
+
+    if (argc < 2) {
+        shell_puts("usage: dns <name>    e.g. dns example.com\n");
+        return -1;
+    }
+    if (!net_ready()) {
+        shell_puts("dns: no NIC / network not ready\n");
+        return -1;
+    }
+    if (net_dns() == 0u) {
+        shell_puts("dns: no DNS server configured (run dhcp first)\n");
+        return -1;
+    }
+    rc = dns_resolve(argv[1], &ip, 1500);
+    if (rc != 0) {
+        shell_printf("dns: %s: no answer (error %d)\n", argv[1], (int64_t)rc);
+        return -1;
+    }
+    net_ip_to_str(ip, answer, sizeof(answer));
+    shell_printf("dns: %s -> %s\n", argv[1], answer);
     return 0;
 }
 
@@ -2301,7 +2360,14 @@ static int wget_parse_url(const char *url, uint32_t *ip, uint16_t *port,
     uint32_t n = 0;
     while (*p && n + 1u < path_cap) path[n++] = *p++;
     path[n] = '\0';
-    if (net_ip_from_str(host_out, ip) != 0) return -1;
+    if (net_ip_from_str(host_out, ip) != 0) {
+        /* Not a dotted quad: resolve it through the DHCP-provided resolver.
+         * -2 tells the caller "the name did not resolve" so the error message
+         * can name the real problem instead of blaming the URL syntax. */
+        extern int dns_resolve(const char *name, uint32_t *out_ip, int timeout_ms);
+        if (dns_resolve(host_out, ip, 1500) != 0)
+            return -2;
+    }
     *port = prt;
     return 0;
 }
@@ -2314,8 +2380,9 @@ int shell_cmd_wget(int argc, char **argv) {
     extern int tcp_close(int h);
 
     if (argc < 2) {
-        shell_puts("usage: wget http://<ipv4>[:port]/<path> [outfile]\n"
-                   "   e.g. wget http://10.0.2.2:8089/hello.txt /mnt/fat/HELLO.TXT\n");
+        shell_puts("usage: wget http://<host>[:port]/<path> [outfile]\n"
+                   "   e.g. wget http://10.0.2.2:8089/hello.txt /mnt/fat/HELLO.TXT\n"
+                   "        wget http://example.com/index.html (hostname resolved via DNS)\n");
         return -1;
     }
     if (!net_ready()) {
@@ -2327,10 +2394,19 @@ int shell_cmd_wget(int argc, char **argv) {
     uint16_t port = 0;
     char path[192];
     char host[64];
-    if (wget_parse_url(argv[1], &ip, &port, path, sizeof(path), host, sizeof(host)) != 0) {
-        shell_printf("wget: bad url '%s' (expected http://<ipv4>[:port]/<path>)\n",
-                     argv[1]);
-        return -1;
+    {
+        const int prc = wget_parse_url(argv[1], &ip, &port, path, sizeof(path),
+                                       host, sizeof(host));
+        if (prc == -2) {
+            shell_printf("wget: cannot resolve host '%s' (run dhcp first if no "
+                         "DNS server is configured)\n", host);
+            return -1;
+        }
+        if (prc != 0) {
+            shell_printf("wget: bad url '%s' (expected http://<host>[:port]/<path>)\n",
+                         argv[1]);
+            return -1;
+        }
     }
 
     /* Output file: explicit argument, else the URL's basename in the cwd. */
@@ -2979,8 +3055,301 @@ int shell_cmd_hdatest(int argc, char **argv) {
     return 0;
 }
 
-/* ==================== Boot message logging ==================== */
+/* Output volume for the Intel HDA path (v0.57.0): hdavol [0..100].
+ * With no argument it prints the current volume. */
+int shell_cmd_hdavol(int argc, char **argv) {
+    extern int hda_init(void);
+    extern int hda_present(void);
+    extern int hda_set_volume(int percent);
+    extern int hda_get_volume(void);
 
+    if (!hda_present() && hda_init() != 0) {
+        shell_puts("hdavol: no Intel HDA controller\n");
+        return 0;
+    }
+    if (argc < 2) {
+        shell_printf("[hda] volume=%d%%\n", (unsigned)hda_get_volume());
+        return 0;
+    }
+    const int v = shell_atoi(argv[1]);
+    if (v < 0 || v > 100) {
+        shell_puts("hdavol: volume must be 0..100 (0 = mute, 100 = 0 dB)\n");
+        return 0;
+    }
+    if (hda_set_volume(v) == 0)
+        shell_printf("[hda] volume set to %d%%\n", (unsigned)v);
+    else
+        shell_puts("hdavol: FAILED (codec not ready)\n");
+    return 0;
+}
+
+/* Drain decoded USB HID keyboard characters into the same ring. A machine
+ * whose only keyboard is USB has nothing on the PS/2 port, and QEMU's input
+ * layer routes injected keys to the USB keyboard only when one exists, so this
+ * is also what makes typing work in a USB-keyboard VM. No-op when no HID
+ * device is claimed (every machine without an EHCI controller). */
+static void shell_hid_fill(void)
+{
+    if (!usb_hid_present()) return;
+    for (int i = 0; i < 8; i++) {
+        const int ch = usb_hid_take_char();
+        if (ch <= 0) return;
+        {
+            const int next = (g_kbd_head + 1) % SHELL_KBD_RING;
+            if (next == g_kbd_tail) return;      /* ring full */
+            g_kbd_ring[g_kbd_head] = (char)ch;
+            g_kbd_head = next;
+        }
+    }
+}
+
+/* ==================== USB HID status / live monitor ====================
+ * The EHCI driver (kernel/drivers/usb_ehci.c) owns the storage path; the HID
+ * class driver (kernel/drivers/usb_hid.c) owns the boot keyboard/mouse and the
+ * root-port rescan.
+ *
+ *   usbinfo                  rescan the EHCI root ports, list the attached
+ *                            keyboards/mice, show the last decoded event and
+ *                            drain whatever input is pending
+ *   usbinfo watch [seconds]  keep scanning + polling for N seconds (default
+ *                            20) and print every key press / mouse movement;
+ *                            a device plugged in while it runs shows up as
+ *                            "[usb-hid] hotplug: new HID on port N"
+ *   usbinfo scan             only rescan the ports (hot-plug tick)
+ */
+static void usbinfo_show_event(const usb_hid_event_t *ev)
+{
+    if (ev->kind == USB_HID_EV_KEY) {
+        char a = (ev->ascii >= 32 && ev->ascii < 127) ? ev->ascii : '-';
+        shell_printf("  event key    dev%d usage=0x%x ascii=%c mods=0x%x\n",
+                     ev->index, (unsigned)ev->keycode, a,
+                     (unsigned)ev->mods);
+    } else if (ev->kind == USB_HID_EV_MOUSE) {
+        shell_printf("  event mouse  dev%d dx=%d dy=%d btn=%u\n", ev->index,
+                     (int)ev->dx, (int)ev->dy, (unsigned)ev->buttons);
+    }
+}
+
+int shell_cmd_usbinfo(int argc, char **argv)
+{
+    int i;
+    int n;
+    int watch_seconds = 0;
+
+    if (argc > 1 && strcmp(argv[1], "watch") == 0) {
+        watch_seconds = 20;
+        if (argc > 2) {
+            int v = 0;
+            const char *p = argv[2];
+            while (*p >= '0' && *p <= '9') v = v * 10 + (*p++ - '0');
+            if (v > 0 && v <= 600) watch_seconds = v;
+        }
+    } else if (argc > 1 && strcmp(argv[1], "scan") != 0) {
+        shell_printf("usbinfo: unknown argument '%s' (use: usbinfo [scan|watch [seconds]])\n",
+                     argv[1]);
+        return -1;
+    }
+
+    /* A scan is what turns "a keyboard was plugged in" into a device slot. */
+    (void)usb_hid_init();
+    (void)usb_hid_scan();
+    n = usb_hid_count();
+
+    shell_printf("usbinfo: %d HID device(s) on the EHCI controller\n", n);
+    for (i = 0; i < USB_HID_MAX_DEV; i++) {
+        int kind = usb_hid_kind(i);
+        const char *what = kind == USB_HID_KIND_KEY ? "kbd" :
+                           kind == USB_HID_KIND_MOUSE ? "mouse" :
+                           kind == USB_HID_KIND_OTHER ? "hid" : "-";
+        if (kind == USB_HID_KIND_NONE)
+            continue;
+        shell_printf("  dev%d %-5s %s\n", i, what, usb_hid_name(i));
+    }
+    if (n == 0)
+        shell_puts("  (no boot keyboard/mouse; plug one into an EHCI root port "
+                   "and run 'usbinfo scan')\n");
+
+    {
+        usb_hid_event_t last;
+        if (usb_hid_last_event(&last))
+            usbinfo_show_event(&last);
+        else
+            shell_puts("  last event: none yet\n");
+    }
+
+    if (watch_seconds > 0) {
+        extern volatile uint64_t g_tick_count;
+        uint64_t deadline = g_tick_count + (uint64_t)watch_seconds * 100u;
+        int printed = 0;
+
+        shell_printf("usbinfo: watching for %d s (keys/mouse/plug events; "
+                     "'usbinfo watch' is bounded, ESC does not interrupt it)\n",
+                     watch_seconds);
+        while (g_tick_count < deadline) {
+            usb_hid_event_t ev;
+
+            (void)usb_hid_scan();
+            while (usb_hid_poll(&ev) == 1) {
+                usbinfo_show_event(&ev);
+                printed++;
+            }
+            for (volatile int spin = 0; spin < 4000; spin++)
+                __asm__ volatile("pause");
+        }
+        shell_printf("usbinfo: watch done, %d event(s), %d HID device(s)\n",
+                     printed, usb_hid_count());
+        return 0;
+    }
+
+    /* One drain pass: print what is already pending (a keystroke that arrived
+     * before the command was typed is not lost). */
+    {
+        usb_hid_event_t ev;
+        int printed = 0;
+
+        while (usb_hid_poll(&ev) == 1 && printed < 16) {
+            usbinfo_show_event(&ev);
+            printed++;
+        }
+    }
+    return 0;
+}
+
+/* `vmsvga [on|off|status]` - the only entry point into
+ * kernel/drivers/vmsvga.c.  Exactly the same opt-in contract as `vga2d`: the
+ * driver is deliberately never called from the boot path, and no boot-time
+ * self-test was added for it, so a default `-vga std` boot prints not a single
+ * `[vmsvga]` line (the PCI function 15ad:0405 is simply not there).
+ *
+ * `vmsvga on`  - probe PCI 15ad:0405, verify the SVGA_REG_ID round trip on the
+ *                BAR0 index/value port pair, program and read back the scanout
+ *                mode, map BAR1 (VRAM) and BAR2 (command FIFO), configure the
+ *                ring, enable the scanout and push a full frame through
+ *                SVGA_CMD_UPDATE; the periodic animation is then paced from the
+ *                shell idle loop.
+ * `vmsvga off` - stop the periodic update and hand the screen back to the
+ *                terminal (which repaints its own grid over the last frame).
+ * `vmsvga`     - print the live state. */
+/* Set while `vmsvga on` has suspended the terminal's screen output (the
+ * backend owns the scanout then).  Kept here rather than in the driver so the
+ * driver stays a pure display backend with no terminal/GUI dependency. */
+static int g_vmsvga_screen_suspended = 0;
+
+int shell_cmd_vmsvga(int argc, char **argv) {
+    extern void console_screen_enable(int on);
+    extern int term_available(void);
+    extern void term_clear(void);
+
+    if (argc < 2) {
+        vmsvga_status();
+        return 0;
+    }
+    if (strcmp(argv[1], "on") == 0) {
+        /* Suspend the terminal's screen output *before* the backend paints, so
+         * nothing (neither the bring-up log nor the next prompt) is drawn over
+         * the frame afterwards: the terminal writes into the very same VRAM.
+         * Logging keeps going to COM1, and the terminal grid is left untouched
+         * while suspended, so `vmsvga off` restores it below. */
+        const int suspended_before = g_vmsvga_screen_suspended;
+        if (!g_vmsvga_screen_suspended) {
+            console_screen_enable(0);
+            g_vmsvga_screen_suspended = 1;
+        }
+        if (vmsvga_on() != 0) {
+            if (!suspended_before) {
+                console_screen_enable(1);
+                if (term_available()) term_clear();
+                g_vmsvga_screen_suspended = 0;
+            }
+            shell_printf("vmsvga: could not start the VMware SVGA II 2D backend "
+                         "(see the [vmsvga] lines above)\n");
+            return 1;
+        }
+        return 0;
+    }
+    if (strcmp(argv[1], "off") == 0) {
+        (void)vmsvga_off();
+        if (g_vmsvga_screen_suspended) {
+            console_screen_enable(1);
+            if (term_available()) term_clear();
+            g_vmsvga_screen_suspended = 0;
+        }
+        return 0;
+    }
+    if (strcmp(argv[1], "status") == 0) {
+        vmsvga_status();
+        return 0;
+    }
+    shell_printf("vmsvga: unknown argument '%s' (usage: vmsvga [on|off|status])\n",
+                 argv[1]);
+    return 1;
+}
+
+/* AC'97 output volume (kernel/drivers/ac97.c): ac97vol [0..100]. */
+int shell_cmd_ac97vol(int argc, char **argv) {
+    extern int ac97_init(void);
+    extern int ac97_present(void);
+    extern int ac97_set_volume(int percent);
+    extern int ac97_get_volume(void);
+    if (!ac97_present() && ac97_init() != 0) {
+        shell_puts("ac97vol: no AC'97 codec\n");
+        return 0;
+    }
+    if (argc < 2) {
+        shell_printf("[ac97] volume=%d%%\n", (unsigned)ac97_get_volume());
+        return 0;
+    }
+    const int v = shell_atoi(argv[1]);
+    if (v < 0 || v > 100) {
+        shell_puts("ac97vol: volume must be 0..100\n");
+        return 0;
+    }
+    if (ac97_set_volume(v) == 0)
+        shell_printf("[ac97] volume set to %d%%\n", (unsigned)v);
+    else
+        shell_puts("ac97vol: FAILED (codec not ready)\n");
+    return 0;
+}
+
+int shell_cmd_sb16test(int argc, char **argv) {
+    extern int sb16_init(void);
+    extern int sb16_present(void);
+    extern const char *sb16_name(void);
+    extern int sb16_beep(uint32_t freq_hz, uint32_t duration_ms);
+    uint32_t freq = 440u, dur = 500u;
+
+    if (!sb16_present() && sb16_init() != 0) {
+        shell_puts("sb16test: no Sound Blaster 16 DSP (boot QEMU with "
+                   "-device sb16,audiodev=a0)\n");
+        return 0;
+    }
+    if (argc > 1) {
+        const int f = shell_atoi(argv[1]);
+        if (f < 20 || f > 12000) {
+            shell_puts("sb16test: frequency must be 20..12000 Hz\n");
+            return 0;
+        }
+        freq = (uint32_t)f;
+    }
+    if (argc > 2) {
+        const int d = shell_atoi(argv[2]);
+        if (d < 10 || d > 1000) {
+            shell_puts("sb16test: duration must be 10..1000 ms\n");
+            return 0;
+        }
+        dur = (uint32_t)d;
+    }
+
+    shell_printf("[sb16] %s: playing %u Hz for %u ms...\n", sb16_name(),
+                 (unsigned)freq, (unsigned)dur);
+    if (sb16_beep(freq, dur) == 0)
+        shell_puts("[sb16] beep complete\n");
+    else
+        shell_puts("[sb16] beep FAILED (DSP/DMA error)\n");
+    return 0;
+}
+
+/* ==================== Boot message logging ==================== */
 void shell_log_boot(const char *fmt, ...) {
     char buf[256];
     va_list args;
@@ -3013,4 +3382,75 @@ void shell_log_boot_fail(const char *fmt, ...) {
     }
 }
 
+/* ==================== VirtIO-GPU 2D display backend ====================
+ * `vga2d [on|off|status]` - the only entry point into
+ * kernel/drivers/virtio_gpu.c.  The driver is deliberately never called from
+ * the boot path: a plain boot (and the GUI) must look exactly as before, so
+ * not a single `[vga2d]` line appears unless the user types this command.
+ *
+ * `vga2d on`  - probe the modern virtio-pci device, create the 2D resource,
+ *               attach the 3 MiB static backing store, point scanout 0 at it
+ *               and start the periodic TRANSFER_TO_HOST_2D + RESOURCE_FLUSH
+ *               animation (paced from the shell idle loop).
+ * `vga2d off` - stop the periodic presentation; the last frame stays on
+ *               screen because the scanout is intentionally left attached.
+ * `vga2d`     - print the live state. */
+int shell_cmd_vga2d(int argc, char **argv) {
+    if (argc < 2) {
+        virtio_gpu_status();
+        return 0;
+    }
+    if (strcmp(argv[1], "on") == 0) {
+        if (virtio_gpu_on() != 0) {
+            shell_printf("vga2d: could not start the virtio-gpu 2D backend "
+                         "(see the [vga2d] lines above)\n");
+            return 1;
+        }
+        return 0;
+    }
+    if (strcmp(argv[1], "off") == 0) {
+        (void)virtio_gpu_off();
+        return 0;
+    }
+    if (strcmp(argv[1], "status") == 0) {
+        virtio_gpu_status();
+        return 0;
+    }
+    shell_printf("vga2d: unknown argument '%s' (usage: vga2d [on|off|status])\n",
+                 argv[1]);
+    return 1;
+}
+/* Generic time-source registry (domain 11 cross-arch mechanism): list the
+ * registered monotonic counters and the current nanosecond reading. */
+int shell_cmd_timesrc(int argc, char **argv) {
+    (void)argc; (void)argv;
+    extern int time_source_count(void);
+    extern const time_source_t *time_source_at(int index);
+    extern const time_source_t *time_source_best(void);
+    extern uint64_t time_source_now_ns(void);
+    extern uint64_t time_source_uptime_us(void);
 
+    const time_source_t *best = time_source_best();
+    const int n = time_source_count();
+    for (int i = 0; i < n; i++) {
+        const time_source_t *src = time_source_at(i);
+        if (!src) continue;
+        shell_printf("[time] %d: %s %u Hz prio=%d%s\n",
+                     (unsigned)i, src->name, (unsigned)src->freq_hz,
+                     (int)src->prio, (src == best) ? " (best)" : "");
+    }
+    /* Two readings with a ~10 ms gap: proves the clock advances and lets the
+     * host-side acceptance recompute the delta from the source frequency. */
+    uint64_t t0 = time_source_now_ns();
+    uint64_t t1 = t0;
+    for (int i = 0; i < 5000000 && (t1 - t0) < 10000000ull; i++)
+        t1 = time_source_now_ns();
+    if (t1 < t0) t1 = t0;
+    shell_printf("[time] now_ns=%llu uptime_us=%llu\n",
+                 (unsigned long long)t1,
+                 (unsigned long long)time_source_uptime_us());
+    shell_printf("[time] probe: t0_ns=%llu t1_ns=%llu delta_ns=%llu (expected ~10 ms)\n",
+                 (unsigned long long)t0, (unsigned long long)t1,
+                 (unsigned long long)(t1 - t0));
+    return 0;
+}

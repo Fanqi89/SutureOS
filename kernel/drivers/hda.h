@@ -114,4 +114,10 @@ int hda_beep(uint32_t freq_hz, uint32_t duration_ms);
  *   [hda] selftest: PASS played 48000 frames @48000 Hz (expect 1.000 s) */
 int hda_selftest(void);
 
+/* Output volume (v0.57.0): 0 = mute, 100 = 0 dB. Applies the codec's output
+ * amp gain to every node on the resolved playback path; re-asserted before each
+ * playback because codec power transitions reset the amps. */
+int hda_set_volume(int percent);
+int hda_get_volume(void);
+
 #endif /* SUTUREOS_HDA_H */

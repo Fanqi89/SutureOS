@@ -2,6 +2,7 @@
 #include <stitch/types.h>
 #include <stitch/string.h>
 #include <stitch/console.h>
+#include <stitch/selftest.h>
 #include "loader.h"
 #include "el0_validate.h"
 #include "syscall.h"
@@ -69,15 +70,77 @@ int elf_load_user(const void *buf, size_t len,
 }
 
 static uint64_t user_page_pool[256][512] __attribute__((aligned(4096)));
-static int user_page_pool_used = 0;
+/* v0.57.0: bitmap instead of a monotonic cursor. This pool is the only source
+ * of user pages for anonymous mmap (kernel/syscall/mem.c). The old cursor only
+ * ever moved forward, so a program that mapped and unmapped memory ran the pool
+ * dry; every later mmap then got loader_alloc_page() == NULL and mem.c mapped
+ * physical page 0 with P|U set (pte_value = 0 | PTE_P | PTE_U) instead of
+ * returning -ENOMEM. A bitmap plus loader_free_page makes munmap hand frames
+ * back and lets mem.c roll back a partially failed mapping. */
+static uint8_t user_page_pool_used[256];
 
 void *loader_alloc_page(void)
 {
-    if (user_page_pool_used >= 256) return NULL;
-    void *p = &user_page_pool[user_page_pool_used][0];
-    user_page_pool_used++;
-    memset(p, 0, 4096);
-    return p;
+    for (int i = 0; i < 256; i++) {
+        if (!user_page_pool_used[i]) {
+            user_page_pool_used[i] = 1;
+            void *p = &user_page_pool[i][0];
+            memset(p, 0, 4096);
+            return p;
+        }
+    }
+    return NULL;
+}
+
+void loader_free_page(void *page)
+{
+    const uintptr_t base = (uintptr_t)&user_page_pool[0][0];
+    const uintptr_t addr = (uintptr_t)page;
+    if (addr < base || addr >= base + sizeof(user_page_pool)) return;
+    const uintptr_t off = addr - base;
+    if ((off & 0xFFFu) != 0) return;                 /* not page-aligned */
+    const uintptr_t idx = off / 4096u;
+    if (idx >= 256u) return;
+    user_page_pool_used[idx] = 0;
+}
+
+uint32_t loader_pool_free_pages(void)
+{
+    uint32_t n = 0;
+    for (int i = 0; i < 256; i++)
+        if (!user_page_pool_used[i]) n++;
+    return n;
+}
+
+/* Self test: the pool must fill exactly 256 pages, report exhaustion as NULL,
+ * give a freed page back to the next allocator, and end with the full pool
+ * available again. Synthetic and self-contained - it never touches the
+ * allocator state other modules rely on. */
+void st_loader_pool_test(void)
+{
+    void *pages[256];
+    bool ok = true;
+    const uint32_t before = loader_pool_free_pages();
+
+    for (int i = 0; i < 256; i++) {
+        pages[i] = loader_alloc_page();
+        ok = ok && (pages[i] != NULL);
+    }
+    ok = ok && (loader_pool_free_pages() == 0);
+    ok = ok && (loader_alloc_page() == NULL);        /* pool exhausted -> NULL */
+
+    loader_free_page(pages[123]);
+    ok = ok && (loader_pool_free_pages() == 1);
+    void *again = loader_alloc_page();
+    ok = ok && (again == pages[123]);                /* the freed slot is reused */
+    loader_free_page(again);
+
+    for (int i = 0; i < 256; i++) {
+        if (i == 123) continue;
+        loader_free_page(pages[i]);
+    }
+    ok = ok && (loader_pool_free_pages() == before);
+    st_run("loader_pool", ok);
 }
 
 extern void *vfs_read_file(const char *path, size_t *len);

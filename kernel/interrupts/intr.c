@@ -117,9 +117,10 @@ void moos_intr_handler(struct moos_regs *frame, uint64_t vec)
         return;
     }
 
-    if (vec < 256u)
-        g_counts[vec]++;
-    g_last_vector = vec;
+    /* NOTE: the per-vector counter and g_last_vector are already updated at the
+     * top of this function (before the #PF / SMP early returns). Counting again
+     * here made every non-early-returning interrupt count TWICE, which is what
+     * kept the moos_intr self-test failing (it asserts exactly +1 per call). */
 
     /* Legacy PIC IRQs (0x20-0x2F). These normally have a dedicated ISR (the
      * timer uses timer_handler.S via vim_idt_set_timer_gate), but an IRQ that
@@ -256,6 +257,7 @@ void st_moos_intr_test(void)
     /* 1) registry starts empty for all 256 slots */
     for (int i = 0; i < 256; i++)
         ok = ok && (moos_irq_get(i) == NULL);
+    if (!ok) console_printf("[moos_intr] stage 1 failed (registry not empty)\n");
 
     /* 2) register + dispatch: handler runs once, sees the right vector and
      *    the very frame we passed in */
@@ -269,6 +271,7 @@ void st_moos_intr_test(void)
     ok = ok && (g_h1_vec == 40);
     ok = ok && (g_h1_frame == &frame);
     ok = ok && (moos_irq_get(40) == test_handler_a);
+    if (!ok) console_printf("[moos_intr] stage 2 failed (register/dispatch)\n");
 
     /* 3) duplicate registration overwrites (only B runs afterwards) */
     moos_irq_register(40, test_handler_b);
@@ -293,6 +296,7 @@ void st_moos_intr_test(void)
     moos_irq_dispatch(256, &frame);
     ok = ok && (moos_irq_get(-1) == NULL);
     ok = ok && (moos_irq_get(256) == NULL);
+    if (!ok) console_printf("[moos_intr] stage 3 failed (overwrite/range)\n");
 
     /* 4) moos_intr_handler: counts the vector, records it, does not die.
      *    vec 200 is >= 32 => no warning path. Registered handler (if any)
@@ -304,6 +308,7 @@ void st_moos_intr_test(void)
     ok = ok && (moos_intr_last_vector() == 200);
     moos_intr_handler(&frame, 200);
     ok = ok && (moos_intr_count(200) == before + 2u);
+    if (!ok) console_printf("[moos_intr] stage 4 failed (count vec 200)\n");
 
     /*    unexpected CPU exception (vec 13): warning only, count still taken,
      *    no panic - exercising that path is the point of this assertion. */
@@ -313,6 +318,7 @@ void st_moos_intr_test(void)
     moos_intr_handler(&frame, 13);
     ok = ok && (moos_intr_count(13) == before + 1u);
     ok = ok && (moos_intr_last_vector() == 13);
+    if (!ok) console_printf("[moos_intr] stage 5 failed (count/last vec 13)\n");
 
     /*    a registered handler is invoked by moos_intr_handler as well */
     frame.vector = 41;
@@ -323,6 +329,7 @@ void st_moos_intr_test(void)
     ok = ok && (g_h1_calls == 1);
     ok = ok && (g_h1_vec == 41);
     moos_irq_register(41, NULL);
+    if (!ok) console_printf("[moos_intr] stage 6 failed (handler via intr_handler)\n");
 
     st_run("moos_intr", ok);
 }

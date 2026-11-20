@@ -82,6 +82,7 @@ def main():
         f"-I{ROOT}/kernel/ipc",        # pipe/fifo
         f"-I{ROOT}/kernel/shell",      # shell_process_line (sudo re-dispatch)
         f"-I{ROOT}/kernel/term",
+        f"-I{ROOT}/kernel/time",       # generic time-source registry
         "-O2", "-g", "-Wall", "-Wextra"
     ]
     

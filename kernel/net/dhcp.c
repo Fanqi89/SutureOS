@@ -33,8 +33,12 @@
 #define DHCP_OPT_PARAM_LIST  55
 #define DHCP_OPT_CLIENT_ID   61
 
-#define DHCP_ATTEMPTS        4
-#define DHCP_WAIT_MS         1000
+/* g_tick_count (the tick unit dhcp_acquire() takes) runs at ~100 Hz on the PIT;
+ * kernel/security/sudo.c uses the same constant for the same reason. */
+#define DHCP_TICK_HZ         100u
+/* Floor for one DORA phase, so a tiny tick budget still leaves the broadcast a
+ * real chance to be answered (slirp answers in single-digit ms). */
+#define DHCP_MIN_BUDGET_US   500000u
 
 static uint32_t dhcp_rd32be(const uint8_t *p)
 {
@@ -175,36 +179,59 @@ int dhcp_parse_reply(const uint8_t *buf, uint32_t len, uint32_t xid, dhcp_lease_
     return 0;
 }
 
-/* One transaction step: send `msg_type` and wait for a reply of `want_type`. */
+/* One transaction step: send `msg_type` and wait at most `budget_us` for a reply
+ * of `want_type`.
+ *
+ * net_recvfrom() stalls for a fixed 3 s when no datagram arrives, so the first
+ * version could not honour the caller's timeout at all (4 retries = up to 12 s of
+ * dead wait per phase). Polling with MSG_DONTWAIT keeps the whole wait inside the
+ * caller's budget and still returns the instant slirp answers. */
 static int dhcp_step(int fd, const net_sockaddr_t *to, uint8_t msg_type, uint32_t xid,
                      const uint8_t mac[6], uint32_t requested_ip, uint32_t server_id,
-                     uint8_t want_type, dhcp_lease_t *lease, int wait_ms)
+                     uint8_t want_type, dhcp_lease_t *lease, uint32_t budget_us)
 {
     uint8_t pkt[DHCP_OPTIONS_OFF + 64u];
     uint8_t reply[576];
-    int len = dhcp_build_packet(pkt, (uint32_t)sizeof(pkt), msg_type, xid, mac,
-                                requested_ip, server_id);
-    int attempt;
+    uint64_t start;
+    int len;
 
+    len = dhcp_build_packet(pkt, (uint32_t)sizeof(pkt), msg_type, xid, mac,
+                            requested_ip, server_id);
     if (len < 0)
         return -EINVAL;
+    if (net_sendto(fd, pkt, (size_t)len, 0, to, (socklen_t)sizeof(*to)) != len)
+        return -EIO;
 
-    for (attempt = 0; attempt < DHCP_ATTEMPTS; attempt++) {
+    start = net_now_us();
+    for (;;) {
         int n;
-        if (net_sendto(fd, pkt, (size_t)len, 0, to, (socklen_t)sizeof(*to)) != len)
-            continue;
-        n = net_recvfrom(fd, reply, sizeof(reply), 0, NULL, NULL);
-        if (n <= 0)
-            continue;
-        if (dhcp_parse_reply(reply, (uint32_t)n, xid, lease) != 0)
-            continue;
-        if (lease->message_type == want_type)
-            return 0;
-        if (lease->message_type == DHCP_MSG_NAK)
-            return -EPROTO;
+        /* net_dgram_recv() returns -EAGAIN *before* it pumps the RX ring when
+         * MSG_DONTWAIT is set, so this loop has to drive net_poll() itself -
+         * otherwise the OFFER/ACK never even reaches the socket slot. */
+        net_poll();
+        n = net_recvfrom(fd, reply, sizeof(reply), MSG_DONTWAIT, NULL, NULL);
+        if (n > 0) {
+            if (dhcp_parse_reply(reply, (uint32_t)n, xid, lease) != 0)
+                continue;                        /* foreign / malformed datagram */
+            if (lease->message_type == want_type)
+                return 0;
+            if (lease->message_type == DHCP_MSG_NAK)
+                return -EPROTO;                  /* the server refused us */
+            continue;                            /* e.g. an OFFER while we await ACK */
+        }
+        if (n != -EAGAIN)
+            return n;                            /* -EBADF / -ENOTSOCK */
+        if ((net_now_us() - start) >= (uint64_t)budget_us)
+            return -ETIMEDOUT;
+        for (volatile int spin = 0; spin < 2000; spin++)
+            __asm__ volatile("pause");
     }
-    (void)wait_ms;
-    return -ETIMEDOUT;
+}
+
+static const char *dhcp_ip_str(uint32_t ip, char *buf, uint32_t buflen)
+{
+    net_ip_to_str(ip, buf, buflen);
+    return buf;
 }
 
 int dhcp_client_acquire(dhcp_lease_t *out, int timeout_ms)
@@ -213,10 +240,11 @@ int dhcp_client_acquire(dhcp_lease_t *out, int timeout_ms)
     dhcp_lease_t ack;
     net_sockaddr_t bcast;
     uint8_t mac[6];
+    char ipbuf[16], maskbuf[16], gwbuf[16], dnsbuf[16], sidbuf[16];
     uint32_t xid;
+    uint32_t budget_us;
     int fd;
     int rc;
-    (void)timeout_ms;
 
     if (out == NULL)
         return -EINVAL;
@@ -225,6 +253,8 @@ int dhcp_client_acquire(dhcp_lease_t *out, int timeout_ms)
         return -ENETDOWN;
     if (net_mac(mac) != 0)
         return -ENETDOWN;
+    if (timeout_ms <= 0)
+        timeout_ms = 4000;
 
     fd = net_socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0)
@@ -246,20 +276,37 @@ int dhcp_client_acquire(dhcp_lease_t *out, int timeout_ms)
 
     xid = (uint32_t)net_now_us() ^ ((uint32_t)mac[4] << 16) ^ ((uint32_t)mac[5] << 8);
 
+    /* The caller's budget covers the whole DORA: DISCOVER/OFFER takes the first
+     * half and REQUEST/ACK the second, so a silent server cannot eat both. */
+    budget_us = (uint32_t)timeout_ms * 1000u / 2u;
+    if (budget_us < DHCP_MIN_BUDGET_US)
+        budget_us = DHCP_MIN_BUDGET_US;
+
+    console_printf("[dhcp] DISCOVER xid=0x%08x\n", (uint64_t)xid);
+
     /* DISCOVER goes out from 0.0.0.0: a client without a lease must not claim
      * one, and the server keys the reply off chaddr/xid, not the source IP. */
     net_set_tx_src_ip(0u);
     rc = dhcp_step(fd, &bcast, DHCP_MSG_DISCOVER, xid, mac, 0, 0,
-                   DHCP_MSG_OFFER, &offer, DHCP_WAIT_MS);
+                   DHCP_MSG_OFFER, &offer, budget_us);
     if (rc == 0) {
+        console_printf("[dhcp] OFFER %s from %s\n",
+                       dhcp_ip_str(offer.ip, ipbuf, sizeof(ipbuf)),
+                       dhcp_ip_str(offer.server_id, sidbuf, sizeof(sidbuf)));
+        console_printf("[dhcp] REQUEST ip=%s server=%s\n",
+                       dhcp_ip_str(offer.ip, ipbuf, sizeof(ipbuf)),
+                       dhcp_ip_str(offer.server_id, sidbuf, sizeof(sidbuf)));
         rc = dhcp_step(fd, &bcast, DHCP_MSG_REQUEST, xid, mac,
-                       offer.ip, offer.server_id, DHCP_MSG_ACK, &ack, DHCP_WAIT_MS);
+                       offer.ip, offer.server_id, DHCP_MSG_ACK, &ack, budget_us);
     }
     net_clear_tx_src_ip();
     (void)net_close(fd);
 
-    if (rc != 0)
+    if (rc != 0) {
+        if (rc == -ETIMEDOUT)
+            console_puts("[dhcp] timeout: no OFFER/ACK from a DHCP server\n");
         return rc;
+    }
 
     /* Program the stack: address/mask/gateway + resolver. */
     net_configure_ip(ack.ip,
@@ -270,7 +317,28 @@ int dhcp_client_acquire(dhcp_lease_t *out, int timeout_ms)
     if (ack.server_id == 0u)
         ack.server_id = offer.server_id;
     *out = ack;
+
+    console_printf("[dhcp] ACK ip=%s mask=%s gw=%s dns=%s lease=%us\n",
+                   dhcp_ip_str(ack.ip, ipbuf, sizeof(ipbuf)),
+                   dhcp_ip_str(net_mask(), maskbuf, sizeof(maskbuf)),
+                   dhcp_ip_str(net_gw(), gwbuf, sizeof(gwbuf)),
+                   dhcp_ip_str(net_dns(), dnsbuf, sizeof(dnsbuf)),
+                   (uint64_t)ack.lease_secs);
     return 0;
+}
+
+/* Tick-based entry point used by the shell: g_tick_count is ~100 Hz. */
+int dhcp_acquire(uint32_t timeout_ticks)
+{
+    dhcp_lease_t lease;
+    uint32_t ms;
+
+    if (timeout_ticks == 0u)
+        timeout_ticks = DHCP_TICK_HZ * 4u;          /* 4 s default */
+    ms = (uint32_t)(((uint64_t)timeout_ticks * 1000ull) / DHCP_TICK_HZ);
+    if (ms == 0u)
+        ms = 1u;
+    return dhcp_client_acquire(&lease, (int)ms);
 }
 
 /* ===================== silent-on-success self test ===================== */

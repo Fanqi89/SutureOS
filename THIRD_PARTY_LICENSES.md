@@ -141,7 +141,136 @@ GPL-3.0 **聚合兼容**（aggregate compatible），即本项目整体可按 GP
   改动清单写在两个新文件头部。
 
 
----
+### 19. e1ruBSD / XEKernelOS / zeroAOS / SukiOS / myos / AntzOS — self-written BIOS boot chain (v0.57.0)
+- 引入文件: `boot/selfboot/stage1.S`（512 字节 MBR）、`boot/selfboot/stage2.S`（16 位→32 位→x86_64
+  长模式加载器）、`boot/selfboot/stage2.ld`、`scripts/build_boot_disk.py`、`scripts/selfboot_acceptance.py`
+- 机制来源（**读取后改写，非逐行拷贝**）:
+  - e1ruBSD `sys/arch/amd64/boot/bootsect.S` + `stage2.S`（**BSD-2-Clause**，yhcmac-prog）：
+    MBR 布局、INT 13h/AH=42h 结构、stage-2 链、A20/GDT/保护模式配方
+  - XEKernelOS `src/boot/boot.asm` + `src/boot/stage2.asm`（**MIT**，XEKernel）：MBR→Stage2→32 位链形
+  - zeroAOS `versions/v0.10-float/boot.asm`（**Apache-2.0**，Holmes-2011）：VESA VBE 模式发现与线性帧缓冲交接
+  - SukiOS `boot/boot.S`（**GPL-3.0**，bil-fis）：x86_64 长模式启动顺序（PAE→CR3→EFER→CR0.PG）
+  - myos `boot.asm`（**BSD-2 文本**，doujiaozh）：A20/GDT 配方
+  - AntzOS `boot/mbr.asm`（**MIT**，HuangPichao）：MBR→保护模式交接模式
+- 说明: 全部以 GAS（Intel 语法）重写，按 SutureOS 的磁盘布局（stage1 512 B + stage2 16 KiB +
+  flat kernel at LBA 33）适配；内核镜像零改动（复用 `boot/boot.S` 的 multiboot1 契约与新增的
+  `_start64` 入口）。上游仅作机制蓝本，未拷贝可识别的代码块；D 盘素材库对应目录只读。
+- Apache-2.0 义务: 保留本项版权/许可声明（zeroAOS 贡献仅为 VBE 机制描述，未包含其代码）。
+- 验收: `py -3 scripts/build_boot_disk.py` + `py -3 scripts/selfboot_acceptance.py`（25/25，含宿主侧
+  与独立 objcopy 产物逐字节比对、patched header 与 ELF 符号表比对、QEMU 无 CD 启动到 shell）。
+
+
+### 20. LoongOS / token-os / MikuOS — cross-architecture timebase blueprint (v0.57.0, domain 11)
+- 引入文件: `kernel/time/time_source.c`, `kernel/time/time_source.h`, `scripts/time_source_acceptance.py`
+- 机制来源（**只读理解，未拷任何代码**）:
+  - LoongOS（**MIT**，AArch64 裸机：调度/FS/ELF/virtio/TCP；generic timer + tick 抽象）
+  - token-os（**MIT**，aarch64 裸机内核 + 内核内 agent）
+  - MikuOS（**MIT**，RISC-V 64 内核，本地 LICENSE 实读；仓库参考）
+- 说明: x86_64 侧实现完全自写——HPET（固件 period）作高分辨率源、100 Hz 调度 tick 作单调回退、
+  纳秒换算按"整秒 + 余数"拆分避免 `ticks*1e9` 溢出；上游仅提供"一个带已知频率的单调计数器 + 最佳源选择"
+  这一跨架构机制形状。
+
+### 21. XJ380 / LunaixOS — synthetic /proc blueprint (v0.57.0, domain 6)
+- 引入文件: `kernel/fs/procfs_vfs.c`、`scripts/procfs_acceptance.py`
+- 机制来源（**只读理解，未拷任何代码**）:
+  - XJ380 `driver/fs/vfs/vfs.cpp`（**Apache-2.0**）：procfs 节点表/合成文件思路
+  - LunaixOS POSIX-VFS procfs 布局（**MIT**，本地 LICENSE 实读；参考）
+  - Linux /proc 文本约定（`key: value` 行）
+- 说明: x86_64 上完全自写——按 VFS 驱动接口实现只读合成文件，文本在 open 时生成到
+  per-handle 缓冲；含上一轮失败的根因修复（VFS_O_RDONLY/WRONLY/RDWR 位掩码误判）。
+
+### 22. Neumann / Powerint-DOS-386 — SB16 + 8237 DMA register blueprint (v0.57.0, domain 4)
+- 引入文件: `kernel/drivers/sb16.c`, `kernel/drivers/sb16.h`, `scripts/sb16_acceptance.py`
+- 机制来源（**只读核对寄存器顺序与硬件坑，未拷代码**）:
+  - Neumann（**GPL-3.0**）：`kernel/drivers/audio/sb16/sb16.c`、`kernel/drivers/dma/dma.c`
+  - Powerint-DOS-386（**GPL-3.0**）：`kernel/drivers/sb16.c`、`kernel/drivers/dma/dma.c`
+- 说明: SB16/8237 寄存器语义本身是公开硬件文档；驱动由 SutureOS 自写，`sb16_`/`g_sb16_` 前缀，
+  8237 24 位地址限制用独立 `.sb16_dma` 链接段解决（DMA 缓冲落 0x210000）。
+
+### 23. OASIS VirtIO 1.2 规范 — virtio-gpu 2D 后端（v0.57.0, domain 9）
+- 引入文件: `kernel/drivers/virtio_gpu.c`, `kernel/drivers/virtio_gpu.h`, `scripts/virtio_gpu_acceptance.py`
+- 依据: OASIS VirtIO 1.2 规范 §2.7（PCI capability）/§4.1（virtqueue）/§5.7（GPU device）；
+  virtqueue 机制参考本仓库已有 `kernel/drivers/virtio_blk.c`；**未拷贝任何第三方源码**。
+  QEMU 的 capability 顺序（common@+0x0 / isr@+0x1000 / device@+0x2000 / notify@+0x3000）
+  为外部观测结果，代码一律解析 capability 而不写死偏移。
+
+### 24. USB HID 1.11 / USB 2.0 / EHCI 1.0 规范 — USB HID 类驱动（v0.57.0, domain 8）
+- 引入文件: `kernel/drivers/usb_hid.c`, `usb_hid.h`、`usb_ehci.c/.h` 的 HID hooks、`scripts/usb_hid_acceptance.py`
+- 依据: USB HID 1.11 附录 B（boot 键盘 8 字节/鼠标 3 字节报告、SET_IDLE 0x0A、SET_PROTOCOL 0x0B）、
+  USB 2.0 §9（GET_DESCRIPTOR/SET_ADDRESS/SET_CONFIGURATION）、EHCI 1.0 §3（被 NAK 的 qTD 保持 active ⇒ 超时=无数据）。
+  传输层复用本仓库既有 `usb_ehci.c`（其上游 HanOS MIT + HBOS GPL-3.0 出处已在该文件头，本批未改归属）。
+  **未拷贝任何第三方源码**。
+
+### 25. LunaixOS / Linux /sys conventions — synthetic sysfs (v0.57.0, domain 6)
+- 引入文件: `kernel/fs/sysfs_vfs.c`、`scripts/sysfs_acceptance.py`
+- 机制来源（**只读参考，未拷代码**）: LunaixOS 的 sysfs 树布局；Linux `/sys/block/<dev>/{size,dev,ro}` 文件约定。
+- 说明: 完全自写——静态树（kernel/ + block/），块设备来自本仓库 `g_blk_devices` 链表，文本在 open 时生成。
+
+### 26. Linux ext4 on-disk spec — read-only ext4 driver (v0.57.0, domain 6)
+- 引入文件: `kernel/fs/ext4.c`, `ext4.h`, `ext4_vfs.c`, `scripts/mkfs_ext4_testimg.py`, `verify_ext4_read.py`
+- 依据: Linux 内核公开规格 `Documentation/filesystems/ext4`（superblock / group descriptors / inode /
+  extent tree / directory entries）。仓内 `kernel/fs/ext2.c` 仅作代码"形状"参考（块层、错误码、VFS 适配布局），
+  **未复制任何第三方源码**；镜像生成器与宿主校验器均为纯标准库自写。
+
+### 27. VimtuOS VimtuFS2 format — read-only vimtufs2 driver (v0.57.0, domain 6)
+- 引入文件: `kernel/fs/vimtufs2.c`, `vimtufs2.h`, `vimtufs2_vfs.c`, `scripts/mkfs_vimtufs2_testimg.py`,
+  `verify_vimtufs2_read.py`, `docs/vimtufs2-port.md`
+- 格式规格与参考实现: **VimtuOS** `kernel/vfs64.h`（磁盘布局 / inode 表 / 块链 / mtime 打包）、
+  `kernel/vfs64.cpp`（`VFS_O_*`/`VFS_I_*` 偏移、`sb_verify`、`inode_ok`、`rmap_*`、`vfs64_format`），
+  **GPL-3.0**（与本项目兼容）。本实现是**按规格重写**，未整段拷贝 VimtuOS 源码；每个偏移在 C 文件头
+  注释里标了参考行号。VimtuOS 参考目录全程只读。
+
+### 28. VMware SVGA II register spec — vmsvga 2D backend (v0.57.0, domain 9)
+- 引入文件: `kernel/drivers/vmsvga.c`, `vmsvga.h`, `scripts/vmsvga_acceptance.py`
+- 依据: VMware SVGA II 公开寄存器/命令编号规格；QEMU `-device vmware-svga` 的实际行为全部靠外部实测
+  （QMP `info pci`/`info qtree` + 驱动把每个读回的寄存器值打进日志）。**未拷贝任何第三方源码**。
+
+### 29. OS67 inode filesystem (Minix v1 layout) — read-only os67fs driver (v0.57.0, domain 6)
+- 引入文件: `kernel/fs/os67fs.c`, `os67fs.h`, `os67fs_vfs.c`, `scripts/mkfs_os67_testimg.py`,
+  `verify_os67_read.py`, `scripts/os67fs_acceptance.py`
+- 格式规格与算法参考（**GPL-3.0**，本地 LICENSE 实读）: **OS67** `inc/minix.h`（superblock / d_inode / dir_entry / IBLK / IMAP_BLK /
+  ZMAP_BLK）、`inc/inode.h`（inode 缓存 API，NINODE）、`fs/inode.c`（缓存/引用计数/锁/块映射）、
+  `fs/bitmap.c`（位图编号）、`fs/dir.c`（目录项）。**实现自写，未拷贝 OS67 源码**；OS67 参考目录只读。
+
+### 30. MayOS MayFS — checksummed two-slot snapshot filesystem (v0.57.0, domain 6)
+- 引入文件: `kernel/fs/mayfs.c`, `mayfs.h`, `mayfs_vfs.c`, `scripts/mkfs_mayfs_testimg.py`,
+  `verify_mayfs_read.py`, `scripts/mayfs_acceptance.py`, `docs/mayfs-format-notes.md`
+- 来源: **MayOS** `kernel/fs.c`（14,483 B）+ `kernel/core.h`（`File` / `FS_MAX` / `FILE_CAP`）。
+- **许可（实读，权威）**: `MayOS/LICENSE` = **MIT License, Copyright (c) 2024 MayOS Project**。
+  素材库清单曾记为 GPL-3.0 同族，以仓库内 LICENSE 文件为准；MIT 与本项目 GPL-3.0-or-later 相容。
+- 实现自写（数据结构布局、FNV-1a 校验和与双槽/generation 语义按规格），未整段拷贝 MayOS 源码。
+
+### 31. Uinxed-Kernel — Apache-2.0（ATAPI 光驱 PIO 驱动，v0.16.0, domain 5）
+- 本地素材库路径（只读参考）: `C:\Users\fanqi\Desktop\自研操作系统\Uinxed-Kernel`
+- 上游许可: **Apache License 2.0**（仓库 `LICENSE` 实读）；版权行来自源文件头
+  `Copyright (C) 2020 ViudiraTech, 2026 MicroFish`；仓库另有 `NOTICE` 与 `CREDITS`。
+- 引入文件: `kernel/drivers/atapi.c`、`atapi.h`（参考 `drivers/block/ata/pata/atapi.c` 的
+  ATAPI 协议流程：IDENTIFY PACKET 0xA1 → PACKET 0xA0 + CDB → 按设备 Byte Count 搬数据 →
+  REQUEST SENSE 兜底；**按 SutureOS 风格重写**：纯轮询、无 IRQ、每步有界等待、2048 字节扇区）。
+- Apache-2.0 义务: 已保留版权/许可声明；上游 `NOTICE` 内容（OVMF、Limine 等第三方组件声明）
+  已核对，本项目未分发上游二进制；如未来分发包含上游代码的产物，需同时附带该 NOTICE。
+
+### 32. Deshab-OS / Lnxrm — Apache-2.0（算法/思路参考，无代码拷贝）
+- 本地素材库路径（只读参考）: `C:\Users\fanqi\Desktop\自研操作系统\Deshab-OS`、
+  `C:\Users\fanqi\Desktop\自研操作系统\Lnxrm`（两者 `LICENSE` 实读均为 Apache-2.0）。
+- 用途: 只作为**算法/思路对照**——ext2 写路径的位图/间接块思路参考 Deshab-OS `CODE/dsk/ext4.c`；
+  OOM 保护/内存回收思路参考 Lnxrm；**未拷贝任何代码**，SutureOS 中的实现为自写。
+- 义务: 本项目未分发上述上游代码，故无 Apache-2.0 文件级义务；此条目仅用于溯源记录。
+
+### 33. flanterm — BSD-2-Clause（终端渲染器，v0.9.0 起）
+- 上游: **flanterm**，Copyright (C) 2022-2025 mintsuki and contributors；BSD-2-Clause。
+  本项目 vendored 自 **CoolPotOS** `src/term/flanterm`（同为 BSD-2），保留上游许可头。
+- 引入文件: `kernel/term/flanterm/`（`flanterm.c`、`flanterm_backends/fb.c`、`flanterm.h` 等，
+  基本原样保留）+ SutureOS 适配层 `kernel/term/term.c/.h`（BSD-2 允许修改；改动处标注
+  `SutureOS fix`，如 `plot_char_*_uncanvas` 默认前景色误用 `default_bg` 的修复）。
+- 义务: 保留版权声明与许可文本；本项目已在 vendored 文件头与本节登记。
+
+### 34. musl libc — MIT（动态链接器实现参考，v0.1x 起）
+- 上游: **musl**（Copyright (C) 2005-2020 Rich Felker；MIT）。
+- 用途: `kernel/syscall/dynlink.c` 的 ELF 解析/符号表/重定位/依赖加载/TLS 是**参考**
+  musl `src/ldso/dynlink.c` 自行实现的（内核内动态链接器，运行在 ring 0 的内核侧），
+  **未引入 musl 的构建产物或源码副本**；本项目 ring-3 libc 来自 VimtuOS 同族（见 §14）。
+- 义务: 未分发 musl 代码，无文件级义务；保留此溯源与 MIT 声明。
 
 ## 本项目原创部分
 - `boot/linker.ld`, `kernel/main/*`, `lib/kprintf.c`, `lib/string.c`,

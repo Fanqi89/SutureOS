@@ -21,6 +21,7 @@
 #define DNS_FLAG_RD     0x0100u     /* recursion desired                        */
 #define DNS_FLAG_QR     0x8000u
 #define DNS_RCODE_MASK  0x000Fu
+#define DNS_RCODE_NXDOMAIN 3u
 #define DNS_MAX_ATTEMPTS 2
 #define DNS_TIMEOUT_MS   1000
 
@@ -33,6 +34,14 @@ static void dns_wr16(uint8_t *p, uint16_t v)
 {
     p[0] = (uint8_t)(v >> 8);
     p[1] = (uint8_t)(v & 0xFFu);
+}
+
+/* RCODE of a response (0 = NOERROR, 2 = SERVFAIL, 3 = NXDOMAIN, ...). The parser
+ * rejects every non-zero code; this only exists so the log can name the reason
+ * honestly instead of calling an NXDOMAIN a "timeout". */
+static uint16_t dns_rcode(const uint8_t *buf)
+{
+    return (uint16_t)(dns_rd16(buf + 2) & DNS_RCODE_MASK);
 }
 
 int dns_build_query(const char *name, uint16_t id, uint8_t *buf, uint32_t buflen)
@@ -192,25 +201,54 @@ int dns_resolve(const char *name, uint32_t *out_ip, int timeout_ms)
     server.sin_port   = htons(DNS_PORT);
     server.sin_addr   = net_dns_ip;
 
+    console_printf("[dns] query %s id=0x%04x\n", name, (uint64_t)id);
+
     for (attempt = 0; attempt < DNS_MAX_ATTEMPTS; attempt++) {
-        int n;
+        uint64_t start;
         if (net_sendto(fd, query, (size_t)qlen, 0, &server,
                        (socklen_t)sizeof(server)) != qlen)
             continue;
-        n = net_recvfrom(fd, answer, sizeof(answer), 0, NULL, NULL);
-        if (n > 0) {
-            const int r = dns_parse_response(answer, (uint32_t)n, id, out_ip);
-            if (r == 0) {
-                (void)net_close(fd);
-                return 0;
+        /* Poll instead of a blocking recvfrom: the socket layer's fixed 3 s
+         * stall would make `timeout_ms` a lie and every failed lookup take 3 s. */
+        start = net_now_us();
+        for (;;) {
+            int n;
+            /* MSG_DONTWAIT makes net_dgram_recv() return -EAGAIN before it pumps
+             * the RX ring, so the loop has to call net_poll() itself. */
+            net_poll();
+            n = net_recvfrom(fd, answer, sizeof(answer), MSG_DONTWAIT,
+                             NULL, NULL);
+            if (n > 0) {
+                const int r = dns_parse_response(answer, (uint32_t)n, id, out_ip);
+                if (r == 0) {
+                    char ipstr[16];
+                    net_ip_to_str(*out_ip, ipstr, sizeof(ipstr));
+                    console_printf("[dns] answer %s -> %s (1 A record)\n",
+                                   name, ipstr);
+                    (void)net_close(fd);
+                    return 0;
+                }
+                if (r == -EPROTO || r == -ENOENT) {
+                    const uint16_t rcode = dns_rcode(answer);
+                    if (rcode == DNS_RCODE_NXDOMAIN)
+                        console_printf("[dns] nxdomain %s\n", name);
+                    else
+                        console_printf("[dns] %s: unusable answer (rcode=%u, err=%d)\n",
+                                       name, (uint64_t)rcode, (int64_t)r);
+                    (void)net_close(fd);
+                    return r;                /* a real answer, just not an A */
+                }
             }
-            if (r == -EPROTO || r == -ENOENT) {
-                (void)net_close(fd);
-                return r;                    /* a real answer, just not an A */
-            }
+            if (n != -EAGAIN)
+                break;                       /* socket error: stop retrying */
+            if ((net_now_us() - start) >= (uint64_t)timeout_ms * 1000ull)
+                break;
+            for (volatile int spin = 0; spin < 2000; spin++)
+                __asm__ volatile("pause");
         }
     }
     (void)net_close(fd);
+    console_printf("[dns] timeout %s (no answer from DNS server)\n", name);
     return -EAGAIN;
 }
 

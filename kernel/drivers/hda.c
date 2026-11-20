@@ -1039,12 +1039,86 @@ static uint32_t hda_tone_fill(uint32_t freq_hz, uint32_t duration_ms)
     return frames;
 }
 
+/* ===================== output volume ====================================
+ * v0.57.0: the codec path was always opened at 0 dB. Set the output amp gain
+ * of every node on the resolved path so a caller can attenuate the mix
+ * (0 = mute, 100 = 0 dB). Gain is expressed in the codec's own amp steps: the
+ * capability (PARAM 0x12) reports num_steps in bits 6:0 and the step size in
+ * dB in bits 14:8 (0 means 1 dB), and the 0 dB index is num_steps. */
+static int g_volume_percent = 100;
+
+static void hda_apply_volume_path(int percent)
+{
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+
+    for (uint8_t k = 0; k < g_path_len; k++) {
+        const uint32_t cap = hda_param(g_codec, g_path_nodes[k], HDA_PARAM_OUT_AMP_CAP);
+        if (cap == HDA_PARAM_INVALID || cap == 0u) continue;
+
+        const int num_steps = (int)(cap & 0x7Fu);
+        /* 1 dB per step. QEMU's hda-duplex reports OUT_AMP_CAP=0x80034A4A, whose
+         * bits 14:8 (0x4A) cannot sensibly be a dB-per-step value, and dividing
+         * the attenuation by it rounds to 0 and never attenuates. The HDA spec
+         * default for a missing step size is 1 dB, so use that. */
+        const int step_db = 1;
+
+        if (percent == 0) {
+            /* bit7 = mute */
+            (void)hda_verb(g_codec, g_path_nodes[k], HDA_VERB_SET_AMP_GAIN_MUTE,
+                           (uint16_t)(0x8000u | 0x2000u | 0x1000u | 0x0080u), NULL, 0);
+            continue;
+        }
+        /* attenuation in dB: 0% -> -60 dB floor, 100% -> 0 dB. Linear in dB on
+         * purpose: the kernel has no libm and -mno-sse turns float math into
+         * soft-float calls, so this stays integer-only. */
+        int atten_db = ((percent - 100) * 60) / 100;
+        if (atten_db > 0) atten_db = 0;
+        if (atten_db < -60) atten_db = -60;
+        int gain = num_steps + atten_db / step_db;   /* index, 0..num_steps */
+        if (gain < 0) gain = 0;
+        if (gain > num_steps) gain = num_steps;
+        (void)hda_verb(g_codec, g_path_nodes[k], HDA_VERB_SET_AMP_GAIN_MUTE,
+                       (uint16_t)(0x8000u | 0x2000u | 0x1000u | (uint32_t)gain),
+                       NULL, 0);
+        /* One line per node while a volume is being set: records the codec's
+         * amp capability and the gain index actually written.  QEMU's
+         * hda-duplex codec exposes no usable output amp steps in some builds
+         * (cap == 0), which is why the WAV backend amplitude may not change
+         * even though the verb was issued - the acceptance script reports that
+         * limitation instead of pretending the tone got quieter. */
+        console_printf("[hda] amp node=%u cap=0x%x steps=%d gain=%d (percent=%d)\n",
+                       (uint64_t)g_path_nodes[k], (uint64_t)cap,
+                       (uint64_t)num_steps, (uint64_t)gain, (uint64_t)percent);
+    }
+}
+
+int hda_set_volume(int percent)
+{
+    if (g_state != 1) return HDA_ERR_NODEV;
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+    g_volume_percent = percent;
+    hda_apply_volume_path(percent);
+    console_printf("[hda] volume=%d%% (output amp gain set on %u path node(s))\n",
+                   (uint64_t)percent, (uint64_t)g_path_len);
+    return HDA_OK;
+}
+
+int hda_get_volume(void)
+{
+    return g_volume_percent;
+}
+
 /* ===================== public playback API =============================== */
 int hda_play_pcm(const int16_t *interleaved, uint32_t frames)
 {
     if (g_state != 1) return HDA_ERR_NODEV;
     if (!interleaved || frames == 0u || frames > HDA_MAX_FRAMES)
         return HDA_ERR_ARG;
+    /* Re-assert the requested volume: codec power transitions during bring-up
+     * reset the amps, and a volume set before the first tone must still apply. */
+    if (g_volume_percent != 100) hda_apply_volume_path(g_volume_percent);
     memcpy(g_pcm, interleaved, (size_t)frames * 4u);
     return hda_stream_play(frames);
 }

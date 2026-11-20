@@ -20,6 +20,14 @@ SECTIONS
     .rodata ALIGN(4K) : { *(.rodata .rodata.*) }
 
     .data ALIGN(4K) : { *(.data .data.*) }
+    /* SB16 8237 DMA buffer: must sit below 16 MiB (24-bit address bus) and be
+     * 64 KiB aligned inside one 64 KiB page window. NOLOAD so it is not part of
+     * the flat kernel image. */
+    .sb16_dma ALIGN(64K) (NOLOAD) : {
+        __sb16_dma_section_start = .;
+        KEEP(*(.sb16_dma))
+        __sb16_dma_section_end = .;
+    }
 
     .bss ALIGN(4K) : {
         _bss_start = .;

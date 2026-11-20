@@ -93,12 +93,24 @@ int vfs_init(void) {
     extern const vfs_fs_driver_t squashfs_driver;
     extern const vfs_fs_driver_t iso9660_driver;
     extern const vfs_fs_driver_t xj_vfs_driver;
+    extern const vfs_fs_driver_t procfs_driver;   /* synthetic /proc */
+    extern const vfs_fs_driver_t sysfs_driver;    /* synthetic /sys */
+    extern const vfs_fs_driver_t vimtufs2_driver; /* VimtuFS2, read-only */
+    extern const vfs_fs_driver_t ext4_driver;     /* ext4, read-only */
+    extern const vfs_fs_driver_t os67fs_driver;   /* OS67 minix v1, read-only */
+    extern const vfs_fs_driver_t mayfs_driver;    /* MayFS (MayOS snapshot FS) */
     
     vfs_register_driver(&ext2_driver);
     vfs_register_driver(&fatfs_driver);
     vfs_register_driver(&squashfs_driver);
     vfs_register_driver(&iso9660_driver);
     vfs_register_driver(&xj_vfs_driver);
+    vfs_register_driver(&procfs_driver);
+    vfs_register_driver(&sysfs_driver);
+    vfs_register_driver(&vimtufs2_driver);   /* VimtuFS2 (read-only) */
+    vfs_register_driver(&ext4_driver);       /* ext4 (read-only) */
+    vfs_register_driver(&os67fs_driver);     /* OS67 minix v1 (read-only) */
+    vfs_register_driver(&mayfs_driver);      /* MayFS (MayOS snapshot FS) */
     
     console_puts("[vfs] VFS subsystem initialized\n");
     return VFS_OK;

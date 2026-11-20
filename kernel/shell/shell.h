@@ -118,6 +118,8 @@ int shell_cmd_smptest(int argc, char **argv);
 int shell_cmd_ping(int argc, char **argv);
 int shell_cmd_dhcp(int argc, char **argv);
 int shell_cmd_nslookup(int argc, char **argv);
+/* DNS A-record lookup: dns <name>. */
+int shell_cmd_dns(int argc, char **argv);
 int shell_cmd_socktest(int argc, char **argv);
 int shell_cmd_netstat(int argc, char **argv);
 /* TCP (kernel/net/tcp.c): connect + send + receive + close, all polled. */
@@ -132,6 +134,22 @@ int shell_cmd_kbdstat(int argc, char **argv);
 int shell_cmd_beep(int argc, char **argv);
 /* Intel HDA (kernel/drivers/hda.c): codec status + acceptance tone. */
 int shell_cmd_hdatest(int argc, char **argv);
+/* Intel HDA output volume (kernel/drivers/hda.c): 0 = mute, 100 = 0 dB. */
+int shell_cmd_hdavol(int argc, char **argv);
+/* Generic time-source registry (kernel/time/time_source.c). */
+int shell_cmd_timesrc(int argc, char **argv);
+/* VirtIO-GPU 2D display backend (kernel/drivers/virtio_gpu.c): attach the
+ * static backing store to scanout 0 and animate it, or stop again.  Nothing
+ * runs unless the user asks, so the default boot presentation is untouched. */
+int shell_cmd_vga2d(int argc, char **argv);
+/* VMware SVGA II 2D display backend (kernel/drivers/vmsvga.c): opt-in only. */
+int shell_cmd_vmsvga(int argc, char **argv);
+/* USB HID (EHCI boot keyboard/mouse + hot-plug): usbinfo [scan|watch [s]]. */
+int shell_cmd_usbinfo(int argc, char **argv);
+/* Sound Blaster 16 (ISA) status + tone: sb16test [freq_hz] [ms]. */
+int shell_cmd_sb16test(int argc, char **argv);
+/* AC'97 output volume: ac97vol [0..100]. */
+int shell_cmd_ac97vol(int argc, char **argv);
 /* Slint GUI prototype (kernel/gui/slint_bridge.c + rust/suture-gui): draw one
  * static prototype frame with Slint's software renderer into the framebuffer. */
 int shell_cmd_guislint(int argc, char **argv);

@@ -67,6 +67,12 @@ int dhcp_parse_reply(const uint8_t *buf, uint32_t len, uint32_t xid, dhcp_lease_
  * -EPROTO a NAK or a malformed reply. */
 int dhcp_client_acquire(dhcp_lease_t *out, int timeout_ms);
 
+/* One complete DORA with the timeout counted in scheduler ticks (g_tick_count
+ * runs at ~100 Hz); this is the entry point the shell command `dhcp` uses. The
+ * budget covers the whole handshake, and a successful lease is programmed into
+ * the stack. Same negative errno set as dhcp_client_acquire(). */
+int dhcp_acquire(uint32_t timeout_ticks);
+
 /* Silent-on-success unit test: packet builder byte layout + reply parser against
  * a hand-built ACK. Prints `[dhcp] selftest FAIL ...` only on failure. */
 int dhcp_selftest(void);

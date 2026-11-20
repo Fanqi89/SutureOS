@@ -23,7 +23,7 @@ What it proves (each item is an assertion below):
   * the volume ends up clean: every R3* path removed, the original files intact,
     no orphaned cluster chains, FSInfo consistent,
   * the pre-existing acceptance programs (`run probe` / `run hello` /
-    `run forktest`) still pass, the kernel self-tests still report 13/14 and no
+    `run forktest`) still pass, the kernel self-tests still report 16/16 and no
     PANIC appears.
 
 QMP port 45805 (the task's assigned port). The serial log is build/serial_r3tools.log.
@@ -287,11 +287,11 @@ def main():
     check('no ring-3 user fault in the transcript',
           'user fault' not in log and 'user #PF' not in log)
     m = re.search(r'\[stitch\] selftests: (\d+)/(\d+) passed', log)
-    check('kernel self-tests still 13/14',
+    check('kernel self-tests still 16/16',
           m is not None and m.group(1) == '13' and m.group(2) == '14',
           m.group(0) if m else 'self-test summary line missing')
-    check('kernel self-test suite says 13/14 (WARNING line is the known moos_intr)',
-          '[stitch] selftests: 13/14 passed' in log)
+    check('kernel self-test suite says 16/16 (moos_intr fixed in v0.57.0)',
+          '[stitch] selftests: 16/16 passed' in log)
     check('FAT32 volume mounted', '[fat32] mount drive=0 ' in log and
           '(fat32)' in log)
     check('no guest-side FAT32 self-test failure',

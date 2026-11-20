@@ -101,4 +101,9 @@ int ac97_beep(uint32_t freq_hz, uint32_t duration_ms);
  *   [ac97] selftest: played 48000 frames @48000 Hz (expect 1.000 s) */
 int ac97_selftest(void);
 
+/* Output volume (v0.57.0): 0 = mute, 100 = 0 dB. Applies to the master and
+ * PCM-out mixer registers. */
+int ac97_set_volume(int percent);
+int ac97_get_volume(void);
+
 #endif /* SUTUREOS_AC97_H */

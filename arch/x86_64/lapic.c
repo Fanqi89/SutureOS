@@ -3,6 +3,7 @@
  * Original license: GPL-3.0
  */
 #include "lapic.h"
+#include "hpet.h"
 #include <stitch/io.h>
 #include <stitch/console.h>
 #include <stitch/types.h>
@@ -85,13 +86,46 @@ void hanos_lapic_eoi(void) {
 }
 
 /* ---- LAPIC timer calibration -------------------------------------------
- * The LAPIC timer counts at the (unknown) bus clock divided by 16, so the old
- * "assume 1 MHz" constant made the system tick run ~2.4x too fast. Measure it
- * once against the 8254 PIT: channel 0 keeps counting at 1.193182 MHz even on
- * machines where its interrupt is not routed to the CPU (which is exactly the
- * situation here), so its latched counter is a usable time reference.
+ * The LAPIC timer counts at the (unknown) bus clock divided by 16, so any
+ * "assume 1 MHz" constant makes the system tick run at the wrong speed.
+ *
+ * Preferred reference: the HPET main counter, whose femtosecond period comes
+ * from the firmware and is exact. Fallback: the 8254 PIT channel-0 counter,
+ * which keeps counting at 1.193182 MHz even when its interrupt is not routed
+ * to the CPU - but in mode 3 the counter decrements once per TWO input clocks,
+ * so the old code (which used PIT_HZ directly) calibrated ~2x too high.
  * Returns LAPIC ticks per second at the current divider. */
 static uint32_t lapic_measure_ticks_per_sec(void) {
+    if (hanos_hpet_ready()) {
+        const uint64_t hz = hanos_hpet_frequency_hz();
+        uint64_t window = hz / 50u;                /* ~20 ms */
+        if (window == 0) window = hz / 100u;
+        if (window != 0) {
+            lapic_write(LAPIC_REG_TIMER_DIVIDE, 0x3);   /* divide by 16 */
+            lapic_write(LAPIC_REG_LVT_TIMER, 0x20);     /* one-shot, unmasked */
+            lapic_write(LAPIC_REG_TIMER_INIT_COUNT, 0x00FFFFFFu);
+            const uint64_t t0 = hanos_hpet_read_counter();
+            uint64_t elapsed = 0;
+            do {
+                elapsed = hanos_hpet_read_counter() - t0;
+            } while (elapsed < window);
+            const uint32_t remaining = lapic_read(LAPIC_REG_TIMER_CURRENT_COUNT);
+            lapic_write(LAPIC_REG_TIMER_INIT_COUNT, 0); /* stop */
+            const uint32_t ticks = 0x00FFFFFFu - remaining;
+            if (ticks != 0 && ticks < 0x00FFFFFFu) {
+                const uint64_t rate = ((uint64_t)ticks * hz) / elapsed;
+                if (rate != 0 && rate <= 0xFFFFFFFFull) {
+                    console_printf("[lapic] calibration source: HPET (%llu Hz)\n",
+                                   (unsigned long long)hz);
+                    return (uint32_t)rate;
+                }
+            }
+            console_printf("[lapic] HPET calibration out of range (ticks=%u elapsed=%llu)\n",
+                           (uint64_t)ticks, (unsigned long long)elapsed);
+            /* fall through to the PIT reference */
+        }
+    }
+
     /* read the PIT channel-0 counter (latch, then low/high) */
     #define PIT_CTRL_PORT 0x43u
     #define PIT_CH0_PORT  0x40u
@@ -110,7 +144,8 @@ static uint32_t lapic_measure_ticks_per_sec(void) {
     lapic_write(LAPIC_REG_LVT_TIMER, 0x20);            /* one-shot, unmasked  */
     lapic_write(LAPIC_REG_TIMER_INIT_COUNT, 0x00FFFFFFu);
 
-    /* wait until the PIT has advanced ~55000 counts (~46 ms), tracking wraps */
+    /* wait until the PIT has advanced ~55000 counts (~46 ms of PIT ticks),
+     * tracking wraps */
     uint32_t pit_ticks = 0;
     while (pit_ticks < 55000u) {
         outb(PIT_CTRL_PORT, 0x00);
@@ -124,10 +159,13 @@ static uint32_t lapic_measure_ticks_per_sec(void) {
     lapic_write(LAPIC_REG_TIMER_INIT_COUNT, 0);        /* stop */
     const uint32_t lapic_ticks = 0x00FFFFFFu - remaining;
 
-    if (pit_ticks == 0 || lapic_ticks == 0) return 1000000u;   /* give up, keep old default */
-    /* ticks/sec = lapic_ticks * PIT_HZ / pit_ticks */
-    uint64_t rate = ((uint64_t)lapic_ticks * PIT_HZ) / pit_ticks;
+    if (pit_ticks == 0 || lapic_ticks == 0) return 1000000u;   /* keep old default */
+    /* ticks/sec = lapic_ticks * (PIT_HZ / 2) / pit_ticks
+     * (mode 3 decrements the counter every second input clock) */
+    uint64_t rate = ((uint64_t)lapic_ticks * (PIT_HZ / 2u)) / pit_ticks;
     if (rate == 0 || rate > 0xFFFFFFFFull) return 1000000u;
+    console_printf("[lapic] calibration source: PIT (8254 mode 3, %u Hz effective)\n",
+                   (uint64_t)(PIT_HZ / 2u));
     return (uint32_t)rate;
 }
 

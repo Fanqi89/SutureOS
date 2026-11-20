@@ -6,6 +6,38 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [v0.57.0-alpha]
+
+**十二域移植收尾：补齐文件系统、USB HID、虚拟显示、音频、DHCP/DNS 与自写 BIOS 引导链等能力（全部真机 QEMU 验收）。**
+
+### 新增
+
+- 自写 64 位 BIOS 引导链（MBR → stage2 → long mode），与 Limine 共用同一 `kernel.elf`；`selfboot_acceptance` 25/25。
+- 真实 HPET、HPET 校准 LAPIC 定时器、通用时基 `time_source`（`hpet_acceptance` 13/13、`time_source_acceptance` 10/10）。
+- 文件系统：ext4 只读（44/44 + 宿主 217/217）、VimtuFS2 只读（62/62 + 173/173）、OS67 Minix-v1 只读（14/14 + 128/128）、MayFS 可写（27/27 + 42/42 + recovery 13/13）；合成 procfs（9/9）与 sysfs（9/9）。
+- 存储/外设：USB HID 键盘鼠标 + 热插拔（14/14）、SB16 + 8237 DMA（23/23）、AC'97 输出音量（7/7）、HDA 输出音量（9/9）。
+- 图形：virtio-gpu 2D（27/27）与 VMware SVGA II 2D（34/34），均为显式 opt-in、默认启动不触碰。
+- 网络：DHCP 客户端 + DNS 解析（17/17）。
+- 文档：`docs/porting-domains-report.md`、`docs/porting-final-summary.md`、`docs/porting-source-map.md`（64 个候选来源状态表）、双语 README。
+
+### 修复
+
+- `moos_intr` 自检长期 13/14：中断处理对异常向量重复计数；删除重复计数后开机自检 16/16。
+- procfs 所有读取被拒：`VFS_O_RDONLY` 位掩码把只读打开误判为写；改为按 `mode = flags & 3` 只拒绝 WRONLY/RDWR。
+- DHCP/DNS 永远超时：`net_recvfrom(MSG_DONTWAIT)` 在 `net_dgram_recv()` 之前返回 `-EAGAIN`，轮询路径不驱动 RX 环；改为自行 `net_poll()` 并有界等待。
+- USB HID 描述符解析失败：EHCI qTD token 的剩余字节在 bits 30:16，且 HID report descriptor 需 `bmRequestType=0x81`。
+- SB16 不发声：`0xC0` 单周期 DMA 命令必须带 format 字节，且方波累加器需 `+= 2*freq`；DMA 缓冲需独立 64 KiB 对齐段（24 位地址总线）。
+- FAT32 `sync` 未真正刷盘：补 `blk_flush()`。
+- mmap 失败路径可能映射物理页 0：改为回滚并返回 `-ENOMEM`；munmap 回收非 memfd 帧。
+
+### 验收
+
+`selfboot 25/25 · hpet 13/13（自检 16/16）· time_source 10/10 · procfs 9/9 · sysfs 9/9 · sb16 23/23 · ac97 音量 7/7 · hda 音量 9/9 · usb_hid 14/14（存储 7/7）· virtio-gpu 27/27 · vmsvga 34/34 · dhcpdns 17/17 · ext4 44/44 + 宿主 217/217 · vimtufs2 62/62 + 宿主 173/173 · os67fs 14/14 + 宿主 128/128 · mayfs 27/27 + 宿主 42/42 + recovery 13/13 · GUI 外观 0 像素 · symbol-scan 1381 符号 0 冲突`
+
+### 已知限制
+
+见 `docs/release-notes-v0.57.0-alpha.md` 的「已知限制」一节；要点：UEFI 启动未验证、virtio-gpu/vmsvga 仅 2D 且上限 1024×768、ext4/VimtuFS2/OS67FS 只读、MayFS 单文件上限 4095 字节、部分驱动仅 QEMU 验证。
+
 ## [v0.56.0-alpha]
 
 **四个 Wayland 前置能力首次从 ring 3 跑通：wlprobe 探针（14/14）。**

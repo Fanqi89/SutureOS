@@ -83,7 +83,10 @@ int memfd_map(uint64_t vaddr, int fd, uint64_t len, int writable)
     int slot;
     uint64_t n, i;
     uint64_t *cr3 = (uint64_t *)(uintptr_t)read_cr3();
-    uint64_t flags = PTE_P | PTE_U | (writable ? PTE_W : 0);
+    /* PTE_MEMFD (software bit 9): marks this PTE as aliasing a memfd-owned page
+     * so munmap clears the mapping without recycling the frame into the process
+     * frame pool (the memfd still hands it to other mappings). */
+    uint64_t flags = PTE_P | PTE_U | (writable ? PTE_W : 0) | (1ull << 9);
 
     if (memfd_decode(fd, &slot) != 0) return -EINVAL_;
     if ((vaddr & 0xFFF) != 0 || len == 0) return -EINVAL_;

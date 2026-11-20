@@ -31,5 +31,7 @@ typedef struct acpi_hpet {
 bool hanos_hpet_init(void);
 uint64_t hanos_hpet_read_counter(void);
 void hanos_hpet_wait_us(uint32_t us);
+bool hanos_hpet_ready(void);
+uint64_t hanos_hpet_frequency_hz(void);
 
 #endif /* STITCH_HPET_H */

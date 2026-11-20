@@ -34,7 +34,11 @@ DYNAMIC = [
     # windows count are all live numbers whose digits change width run to run.
     # The static labels stay to the left of x=100 and are still checked.
     ('Task Manager value column (PMM/heap/uptime/FPS/windows)', (100, 84, 353, 240)),
-    ('Task Manager CPU-busy bar',                           (40, 200, 360, 226)),
+    # The CPU-busy bar is live data AND its left edge sits at x=36 (the bar is
+    # drawn from the window's inner margin, not from x=40): measured on a real
+    # boot the fill/empty difference lands in columns 36..39, so the rectangle
+    # must start at x=30 or the gate reports live data as a visual regression.
+    ('Task Manager CPU-busy bar',                           (30, 200, 360, 226)),
     ('Calculator display + status line',                    (382, 50, 622, 184)),
     ('About window version string',                         (648, 118, 970, 148)),
     # Taskbar right-hand side: RTC clock, current user name and measured FPS are

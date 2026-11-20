@@ -20,6 +20,10 @@
  *   - only high-speed devices are enumerated: a full/low-speed device is handed
  *     back to the companion controller (PORTSC.PO=1), see the limitation note
  *     in usb_ehci.c.
+ *   - added the thin usb_ehci_* hooks at the bottom of this header: HID is a
+ *     separate class driver (kernel/drivers/usb_hid.c) that reuses this
+ *     driver's port reset, address allocator, control transfers and async qTD
+ *     machinery instead of duplicating the transport.
  */
 #ifndef STITCH_USB_EHCI_H
 #define STITCH_USB_EHCI_H
@@ -56,6 +60,59 @@ uint32_t usb_block_size(void);
  * Prints "[usb] selftest PASS (read=1 cat=1)" on success.
  * Does nothing when no USB storage is present. */
 void usb_selftest(void);
+
+/* ===================== hooks for the HID class driver =====================
+ * kernel/drivers/usb_hid.c does the HID descriptor walk, the boot-report
+ * decoding and the hot-plug policy, but owns no transport code: everything
+ * below is a thin wrapper over the port/qTD machinery in usb_ehci.c. They are
+ * only used by usb_hid.c - the storage path above never calls them.
+ *
+ * PORTSC bits the HID scanner needs (same values as the private EHCI_PORTSC_*
+ * macros inside usb_ehci.c: CCS bit0, CSC bit1, PED bit2). */
+#define USB_EHCI_PORTSC_CCS (1u << 0)
+#define USB_EHCI_PORTSC_CSC (1u << 1)
+#define USB_EHCI_PORTSC_PED (1u << 2)
+
+/* 1 when the controller is up (BAR mapped, operational base known). */
+int usb_ehci_ready(void);
+
+/* Number of root ports (0 when the controller is not up). */
+uint32_t usb_ehci_ports(void);
+
+/* Raw PORTSC of a 1-based root port (0 when out of range). */
+uint32_t usb_ehci_portsc(uint32_t port);
+
+/* Acknowledge the RW1C change bits (CSC/PEDC/OCC) of a port. */
+void usb_ehci_portsc_ack(uint32_t port);
+
+/* Reset a root port (PR held ~50 ms, cleared explicitly, then wait for PED).
+ * Returns 0 when the port came up enabled = a high-speed device answered. */
+int usb_ehci_port_reset(uint32_t port);
+
+/* Hand a port back to the companion controller (PORTSC.PO = 1). */
+void usb_ehci_port_release(uint32_t port);
+
+/* Next USB device address (1..8) from the shared allocator. */
+int usb_ehci_alloc_address(void);
+
+/* Control transfer to an arbitrary device address. Returns the number of bytes
+ * received for an IN transfer (short packets measured via the qTD residual), 0
+ * for OUT/no-data transfers, -1 on failure. */
+int usb_ehci_ctl(uint8_t addr, uint16_t mps, const uint8_t *setup, uint32_t len,
+                 int in, const void *out);
+
+/* Buffer usb_ehci_ctl() fills for IN transfers (16 KiB). */
+const uint8_t *usb_ehci_in_data(void);
+
+/* One interrupt-IN transfer. Returns bytes received (>0), 0 for a zero-length
+ * packet, -2 when the device NAKed (no report pending, not an error) and -1 on
+ * a real transfer error. `ms` bounds the poll. */
+int usb_ehci_intr_in(uint8_t addr, uint16_t mps, uint8_t ep, uint32_t *toggle,
+                     void *buf, uint32_t len, uint32_t ms);
+
+/* Root port the mass-storage device was enumerated on (0 when none). The HID
+ * scanner must never reset that port. */
+int usb_ehci_storage_port(void);
 
 #ifdef __cplusplus
 }

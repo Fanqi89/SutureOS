@@ -219,8 +219,8 @@ def main():
         checks.append((name, bool(cond), detail))
 
     # ---------------- guest transcript: regression ------------------
-    add('boot self-test regression 13/14',
-        '[stitch] selftests: 13/14 passed' in log)
+    add('boot self-test baseline 16/16',
+        '[stitch] selftests: 16/16 passed' in log)
     add('the sudo/creds/userdb self-test still passes (sudotest)',
         'sudo selftest: RESULT PASS' in log)
     add('FAT32 self-tests still pass',

@@ -37,14 +37,23 @@
 /* ---------------- Static storage (page tables, stack) ---------------- */
 .section .bss
 .align 4096
+/* Exported for the self-written BIOS boot chain (boot/selfboot/stage2.S):
+ * scripts/build_boot_disk.py patches these addresses into stage 2, which
+ * builds the very same identity map before entering long mode and jumping to
+ * _start64. Kept as one definition so both chains share one page-table layout. */
+.global pml4
 pml4:       .skip 4096
+.global pdpt
 pdpt:       .skip 4096
+.global pd0
 pd0:        .skip 4096
 pd_high:    .skip 4096          /* PD for the top-2GiB alias window (PDPT[511]) */
+.global pd_io
 pd_io:      .skip 4096          /* PD for 0xC0000000-0xFFFFFFFF (LAPIC/IOAPIC) */
 .align 16
 stack_bottom:
             .skip 16384                 /* 16 KiB kernel stack */
+.global stack_top
 stack_top:
 
 /* ---------------- GDT (64-bit code + data) ---------------- */
@@ -168,5 +177,30 @@ _start:
     jmp .halt
 
 .size _start, . - _start
+
+/* ---------------- 64-bit entry for the self-written boot chain -----------
+ * Used by the second boot path (boot/selfboot/stage1.S + stage2.S, staged by
+ * scripts/build_boot_disk.py) - the primary Limine path still enters through
+ * _start above. By the time stage 2 jumps here the CPU is ALREADY in long
+ * mode with the identity page tables built at pml4/pdpt/pd0/pd_io, .bss
+ * cleared, edi = 0x2BADB002 and esi = multiboot1 info pointer.
+ *
+ * So this entry must NOT clear .bss again (that would zero the live page
+ * tables and the kernel stack would fault) and must not rebuild them; it only
+ * establishes the kernel stack and calls kernel_main with the multiboot
+ * (magic, mbi) pair.
+ */
+.global _start64
+_start64:
+    cli
+    cld
+    movq $stack_top, %rsp
+    xorq %rbp, %rbp
+    call kernel_main
+.halt64:
+    cli
+    hlt
+    jmp .halt64
+.size _start64, . - _start64
 
 .section .note.GNU-stack,"",@progbits

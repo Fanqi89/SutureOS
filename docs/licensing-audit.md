@@ -85,6 +85,23 @@
 | `kernel/term/cjk16.c` 字体子集 | HBOS `fonts/ZhengGeDianHei-16.ttf`（name 表 nameID 13 实读为 **SIL OFL-1.1**；Copyright 2026 yzdnn / Fontworks DotGothic16） | OFL-1.1 | ✅ v0.20.0（OFL 全文在 docs/licenses/OFL-1.1.txt） |
 | `kernel/drivers/usb_ehci.c` | HanOS EHCI 驱动（MIT）为骨架；HBOS `src/usb_msc.c`（GPL-3.0）的 CBW/CSW 布局与 BOT 流程作参考 | MIT + GPL-3.0 | ✅ v0.23.0 |
 | `kernel/drivers/hda.c` | PlantOS（MIT）`src/kernel/drivers/sound/hda.c` 为骨架；ReliefOS HDA 设计/实战文档仅作只读参考（未拷代码） | MIT | ✅ v0.27.0 |
+| `kernel/drivers/sb16.c/.h`（域 4 SB16+DMA） | Neumann（GPL-3.0）、Powerint-DOS-386（GPL-3.0）**仅核对寄存器顺序，未拷代码** | GPL-3.0 | ✅ v0.57.0，见 THIRD_PARTY_LICENSES.md §22 |
+| `kernel/drivers/usb_hid.c/.h` + EHCI HID hooks（域 8） | 自写；依据 USB HID 1.11 / USB 2.0 / EHCI 规范，传输层复用既有 usb_ehci（HanOS MIT + HBOS GPL-3.0 已登记） | GPL-3.0 | ✅ v0.57.0，见 THIRD_PARTY_LICENSES.md §24 |
+| `kernel/drivers/virtio_gpu.c/.h`（域 9 virtio-gpu 2D） | 自写；依据 OASIS VirtIO 1.2 规范 + 仓内 virtio_blk.c 参考 | GPL-3.0 | ✅ v0.57.0，见 THIRD_PARTY_LICENSES.md §23 |
+| `kernel/term/flanterm/`（终端渲染器） | flanterm（**BSD-2-Clause**，mintsuki；vendored 自 CoolPotOS），改动标注 `SutureOS fix` | BSD-2 | ✅ 见 THIRD_PARTY_LICENSES.md §33 |
+| `kernel/syscall/dynlink.c`（内核动态链接器） | 参考 musl `src/ldso/dynlink.c`（**MIT**），自写实现、未拷代码 | MIT（reference） | ✅ 见 THIRD_PARTY_LICENSES.md §34 |
+| `kernel/drivers/atapi.c/.h`（域 5 ATAPI 光驱） | Uinxed-Kernel（**Apache-2.0**，`LICENSE` 实读，`NOTICE` 已核对）；协议流程重写 | Apache-2.0 | ✅ v0.16.0，见 THIRD_PARTY_LICENSES.md §31 |
+| ext2 写算法 / 内存回收思路（参考） | Deshab-OS / Lnxrm（**Apache-2.0**，仅算法对照、未拷代码） | Apache-2.0（reference） | ✅ 登记 THIRD_PARTY_LICENSES.md §32、docs/provenance.md |
+| `kernel/fs/mayfs.c/.h`（域 6 MayFS 可写） | MayOS `kernel/fs.c`，**实读 LICENSE = MIT**（清单误记 GPL-3.0，以文件为准）；实现自写 | 上游 MIT / 本项目 GPL-3.0 | ✅ v0.57.0，见 THIRD_PARTY_LICENSES.md §30 |
+| `kernel/fs/os67fs.c/.h`（域 6 OS67 inode FS 只读） | 规格源自 OS67（GPL-3.0），按规格重写、未拷代码 | GPL-3.0 | ✅ v0.57.0，见 THIRD_PARTY_LICENSES.md §29 |
+| `kernel/fs/ext4.c/.h`（域 6 ext4 只读） | 自写；依据 Linux 公开 ext4 规格 | GPL-3.0 | ✅ v0.57.0，见 THIRD_PARTY_LICENSES.md §26 |
+| `kernel/fs/vimtufs2.c/.h`（域 6 VimtuFS2 只读） | 规格源自 VimtuOS（**GPL-3.0**），按规格重写、未拷代码 | GPL-3.0 | ✅ v0.57.0，见 THIRD_PARTY_LICENSES.md §27 |
+| `kernel/drivers/vmsvga.c/.h`（域 9 vmsvga 2D） | 自写；VMware SVGA II 公开规格 + QEMU 实测 | GPL-3.0 | ✅ v0.57.0，见 THIRD_PARTY_LICENSES.md §28 |
+| `kernel/fs/sysfs_vfs.c`（域 6 合成 /sys） | LunaixOS sysfs 布局 + Linux /sys 约定，**仅机制、未拷代码** | GPL-3.0 | ✅ v0.57.0，见 THIRD_PARTY_LICENSES.md §25 |
+| `kernel/fs/procfs_vfs.c`（域 6 合成 /proc） | XJ380（Apache-2.0）procfs 节点表思路、LunaixOS procfs 布局、Linux /proc 文本约定，**仅机制、未拷代码** | Apache-2.0/MIT（机制）+ GPL-3.0（实现） | ✅ v0.57.0，见 THIRD_PARTY_LICENSES.md §21 |
+| `kernel/time/time_source.c/.h`（域 11 跨架构时基） | LoongOS（MIT，AArch64）、token-os（MIT，aarch64）、MikuOS（RISC-V 参考）**仅作机制蓝本，未拷代码** | MIT（机制）+ GPL-3.0（实现） | ✅ v0.57.0，见 THIRD_PARTY_LICENSES.md §20 |
+| v0.57.0 批次（HPET/LAPIC/intr/loader 页池/HDA 音量/FAT32 sync/自写引导链） | HanOS hpet.c（GPL-3.0）骨架；PlantOS hda.c（MIT）骨架；e1ruBSD/XEKernelOS/zeroAOS/SukiOS/myos/AntzOS 六份引导机制蓝本（BSD-2/MIT/Apache-2.0/GPL-3.0/BSD-2/MIT）；其余为本仓库自写 | GPL-3.0 / MIT / BSD-2 / Apache-2.0（聚合兼容） | ✅ 见 docs/porting-domains-report.md 与 THIRD_PARTY_LICENSES.md §19 |
+| `boot/selfboot/stage1.S` / `stage2.S` / `stage2.ld`、`scripts/build_boot_disk.py`、`scripts/selfboot_acceptance.py` | e1ruBSD `bootsect.S`+`stage2.S`（BSD-2）、XEKernelOS `boot/stage2.asm`（MIT）、zeroAOS `v0.10-float/boot.asm`（Apache-2.0，仅 VBE 机制）、SukiOS `boot/boot.S`（GPL-3.0，长模式顺序）、myos `boot.asm`（BSD-2）、AntzOS `boot/mbr.asm`（MIT）；**全部读后以 GAS 重写，未拷可识别代码块** | BSD-2 / MIT / Apache-2.0 / GPL-3.0 / BSD-2 | ✅ v0.57.0（逐条登记见 THIRD_PARTY_LICENSES.md §19） |
 
 ## 5. 维护规则
 

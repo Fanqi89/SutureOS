@@ -9,6 +9,7 @@
 #include "gdt_idt.h"
 
 #include "hpet.h"
+#include "time_source.h"
 #include "task.h"
 #include "fbcon.h"
 
@@ -54,6 +55,10 @@ void kernel_arch_init(void)
         mbos_pit_init(100);
         console_puts("[init] PIT channel 0 programmed to 100 Hz\n");
     }
+
+    /* Generic time-source registry (domain 11 cross-arch mechanism): HPET as the
+     * high-resolution source, the 100 Hz scheduler tick as the monotonic fallback. */
+    time_source_init();
 
     console_puts("[init] Hardware init complete (legacy PIC mode)\n");
 }

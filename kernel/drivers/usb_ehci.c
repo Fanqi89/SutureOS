@@ -49,6 +49,7 @@
 
 #include "mmu.h"        /* mmu_map_mmio_identity()                    */
 #include "mb_pit.h"     /* 8254 counter: wall clock without interrupts */
+#include "time_source.h" /* fine-grained waits for the HID poll path   */
 #include "block.h"      /* blk_device / blk_register                  */
 #include "usb_ehci.h"
 
@@ -219,6 +220,13 @@ static uint8_t     g_csw[64]         __attribute__((aligned(64)));
 static uint8_t     g_save[USB_SECTOR_SIZE] __attribute__((aligned(64)));
 static uint8_t     g_pat[USB_SECTOR_SIZE]  __attribute__((aligned(64)));
 
+/* HID (usb_hid.c) interrupt-IN transfers use their own qTD/buffer and the
+ * second queue head, so a poll can never disturb the storage driver's QH[0]
+ * overlay or its CBW/CSW/data bounce buffers. */
+static usb_qtd_t   g_intr_qtd __attribute__((aligned(32)));
+static uint8_t     g_intr[64] __attribute__((aligned(64)));
+static int         g_intr_resid_seen;   /* one-shot residual diagnostic */
+
 /* ===================== driver state ===================== */
 static uint64_t g_mmio;             /* BAR0, identity mapped              */
 static uint32_t g_op;               /* operational register base          */
@@ -296,6 +304,35 @@ static void usb_clflush(const void *addr, uint32_t len)
  * backstop guarantees this can never hang the boot. */
 #define USB_DELAY_SPIN_BACKSTOP 20000000u
 
+static void usb_delay_ms(uint32_t ms);
+
+/* Sub-millisecond delay from the best registered time source (HPET on every
+ * machine this kernel boots on, see kernel/time/time_source.c).
+ *
+ * Why this exists: the 8254-based usb_delay_ms() is quantised at one PIT period
+ * (10 ms at 100 Hz), and the HID poll path waits twice per transfer. A NAKed
+ * interrupt-IN therefore cost ~40 ms, which is longer than the ~100 ms a
+ * keyboard holds a key down - polling then missed key presses (typing lost
+ * characters). A ~1 MHz+ counter makes the same waits 1-3 ms. When only the
+ * coarse scheduler tick is available this falls back to the old behaviour. */
+static void usb_delay_us(uint32_t us)
+{
+    const time_source_t *src = time_source_best();
+    uint64_t need;
+    uint64_t start;
+
+    if (src == NULL || src->read == NULL || src->freq_hz < 1000000ull) {
+        usb_delay_ms(1);
+        return;
+    }
+    need = src->freq_hz * (uint64_t)us / 1000000ull;
+    if (need == 0ull)
+        need = 1ull;
+    start = src->read();
+    while ((src->read() - start) < need)
+        __asm__ volatile("pause");
+}
+
 static void usb_delay_ms(uint32_t ms)
 {
     uint32_t hz = mbos_pit_hz();
@@ -329,16 +366,16 @@ static void usb_delay_ms(uint32_t ms)
  * overlap. The async schedule is stopped while software rewrites the QH
  * (otherwise the controller may be mid-fetch and the overlay is torn). */
 static void usb_qh_arm(usb_qh_t *qh, uint8_t addr, uint8_t ep, uint8_t speed,
-                       uint16_t mps, uint32_t qtd_index)
+                       uint16_t mps, usb_qtd_t *first)
 {
     uint32_t i;
 
     /* Stop async scheduling: RS|PSE, no ASE. */
     usb_mmio_wr(g_op + EHCI_OP_USBCMD, EHCI_USBCMD_RS | EHCI_USBCMD_PSE);
-    for (i = 0; i < 100u; i++) {
+    for (i = 0; i < 400u; i++) {
         if ((usb_mmio_rd(g_op + EHCI_OP_USBSTS) & EHCI_USBSTS_ASYNC) == 0u)
             break;
-        usb_delay_ms(1);
+        usb_delay_us(100);
     }
     /* Clear latched status errors (RW1C): a host system error halts the HC. */
     usb_mmio_wr(g_op + EHCI_OP_USBSTS, 0x3Fu);
@@ -357,7 +394,7 @@ static void usb_qh_arm(usb_qh_t *qh, uint8_t addr, uint8_t ep, uint8_t speed,
     /* SutureOS: the chain MUST be published at the overlay's Next qTD
      * pointer (0x10). Writing cur_qtd instead makes the controller fetch
      * nothing at all. */
-    qh->next_qtd = (uint32_t)usb_ptr_phys(&g_qtd[qtd_index]);
+    qh->next_qtd = (uint32_t)usb_ptr_phys(first);
     qh->alt_qtd = USB_QH_TERMINATE;
     qh->token = 0;
 
@@ -386,6 +423,29 @@ static int usb_wait_qtds(usb_qtd_t *first, uint32_t count, uint32_t ms)
         if (!busy)
             return 0;
         usb_delay_ms(1);
+    }
+    return -1;
+}
+
+/* Same, but with a microsecond budget: the HID poll path cannot afford the
+ * 10 ms quantisation of usb_delay_ms() (see usb_delay_us()). */
+static int usb_wait_qtds_us(usb_qtd_t *first, uint32_t count, uint32_t us)
+{
+    uint32_t elapsed;
+
+    for (elapsed = 0; elapsed <= us; elapsed += 100u) {
+        uint32_t i;
+        int busy = 0;
+
+        for (i = 0; i < count; i++) {
+            if (first[i].token & USB_QTD_ACTIVE) {
+                busy = 1;
+                break;
+            }
+        }
+        if (!busy)
+            return 0;
+        usb_delay_us(100);
     }
     return -1;
 }
@@ -473,7 +533,7 @@ static int usb_control(uint8_t addr, uint8_t speed, uint16_t mps,
     usb_clflush(g_data, len > 0 ? len : 1u);
     usb_clflush(g_qtd, n * sizeof(usb_qtd_t));
 
-    usb_qh_arm(&g_qh[0], addr, 0, speed, mps, 0);
+    usb_qh_arm(&g_qh[0], addr, 0, speed, mps, &g_qtd[0]);
 
     if (usb_wait_qtds(g_qtd, n, 500u) != 0 || usb_check_qtds(n) != 0) {
         console_printf("[usb] control req=%x addr=%u len=%u %s FAILED "
@@ -544,7 +604,7 @@ static int usb_bulk(uint8_t ep, uint16_t mps, int in, uint32_t *toggle,
     usb_clflush(bounce, len);
     usb_clflush(&g_qtd[0], sizeof(g_qtd[0]));
 
-    usb_qh_arm(&g_qh[0], g_dev_addr, ep, g_dev_speed, mps, 0);
+    usb_qh_arm(&g_qh[0], g_dev_addr, ep, g_dev_speed, mps, &g_qtd[0]);
 
     if (usb_wait_qtds(g_qtd, 1, 2000u) != 0 || usb_check_qtds(1) != 0) {
         console_printf("[usb] bulk ep=%x %s len=%u FAILED (tok=%x)\n",
@@ -1317,6 +1377,188 @@ int usb_present(void)      { return g_have_device ? 1 : 0; }
 int usb_drive(void)        { return g_have_device ? g_drive : -1; }
 uint64_t usb_blocks(void)  { return g_have_device ? g_blocks : 0; }
 uint32_t usb_block_size(void) { return g_have_device ? g_block_size : 0; }
+
+/* ===================== HID support hooks =====================
+ * kernel/drivers/usb_hid.c is the HID class driver: it owns the descriptor
+ * walk, the boot-report decoders and the hot-plug policy, but no transport
+ * code. These entry points are deliberately thin wrappers so the port reset,
+ * address allocator, control-transfer and async-qTD machinery above stays the
+ * single implementation that both drivers share.
+ *
+ * Nothing here runs unless usb_hid.c calls it, and usb_hid_init() bails out on
+ * usb_ehci_ready() == 0, so a machine without an EHCI controller keeps the
+ * boot log and the block-device list it had before HID support existed. */
+
+/* 1 when the controller was brought up (BAR mapped, operational base known). */
+int usb_ehci_ready(void)
+{
+    return (g_mmio != 0 && g_op != 0) ? 1 : 0;
+}
+
+uint32_t usb_ehci_ports(void)
+{
+    return g_nports;
+}
+
+/* Raw PORTSC of a 1-based root port (0 when the port is out of range). */
+uint32_t usb_ehci_portsc(uint32_t port)
+{
+    if (port == 0 || port > g_nports)
+        return 0;
+    return usb_port_rd(port);
+}
+
+/* Acknowledge the latched change bits (CSC/PEDC/OCC are RW1C) without
+ * touching PP/PED: PORTSC.PED is read/write, so it has to be written back as
+ * read or the port gets disabled by the acknowledge. */
+void usb_ehci_portsc_ack(uint32_t port)
+{
+    uint32_t psc;
+
+    if (port == 0 || port > g_nports)
+        return;
+    psc = usb_port_rd(port);
+    usb_port_wr(port, (psc & (EHCI_PORTSC_PP | EHCI_PORTSC_PED))
+                      | EHCI_PORTSC_RWC);
+}
+
+/* Port reset (PR held ~50 ms, then cleared, then wait for PED) - the exact
+ * sequence the storage enumeration uses. Returns 0 when the port came up
+ * enabled, i.e. when a high-speed device answered. */
+int usb_ehci_port_reset(uint32_t port)
+{
+    if (port == 0 || port > g_nports)
+        return -1;
+    return usb_port_reset(port);
+}
+
+/* Hand a port back to the companion controller (PO=1). Used when a port holds
+ * a full/low-speed device: EHCI itself cannot run split transactions here. */
+void usb_ehci_port_release(uint32_t port)
+{
+    uint32_t psc;
+
+    if (port == 0 || port > g_nports)
+        return;
+    psc = usb_port_rd(port);
+    if (!(psc & EHCI_PORTSC_CCS))
+        return;
+    usb_port_wr(port, (psc & (EHCI_PORTSC_PP | EHCI_PORTSC_PED))
+                      | EHCI_PORTSC_PO | EHCI_PORTSC_RWC);
+}
+
+/* Next USB device address from the shared allocator (1..8). */
+int usb_ehci_alloc_address(void)
+{
+    return (int)usb_alloc_address();
+}
+
+/* Control transfer at an arbitrary address / max-packet-size, all devices on
+ * an EHCI root port are high speed. Returns the number of bytes transferred
+ * for an IN transfer, 0 for an OUT/no-data transfer, -1 on failure. */
+int usb_ehci_ctl(uint8_t addr, uint16_t mps, const uint8_t *setup, uint32_t len,
+                 int in, const void *out)
+{
+    uint32_t resid;
+
+    if (setup == NULL || len > USB_DATA_BYTES)
+        return -1;
+    if (usb_control(addr, EHCI_SPEED_HIGH, mps, setup, len, in, out) != 0)
+        return -1;
+    if (len == 0 || !in)
+        return (int)len;
+
+    /* The data stage is g_qtd[1] (see usb_control): the controller leaves the
+     * untransferred byte count in the token's Total-Bytes-To-Transfer field
+     * (bits 30:16), decremented as the data moves. A residual equal to the
+     * request would mean "nothing arrived", which cannot happen for a qTD that
+     * completed without an error status - so treat that case (a controller
+     * that does not rewrite the field) as a full transfer. */
+    resid = (g_qtd[1].token >> USB_QTD_BYTES_SHIFT) & 0x7FFFu;
+    if (resid >= len)
+        return (int)len;
+    return (int)(len - resid);
+}
+
+/* The buffer usb_ehci_ctl() fills for IN transfers. */
+const uint8_t *usb_ehci_in_data(void)
+{
+    return g_data;
+}
+
+/* One interrupt-IN transfer through the second queue head. Used by the HID
+ * driver, whose interrupt endpoints NAK until a report is pending:
+ *   > 0  bytes received (a short packet reports its real length)
+ *     0  the device answered with a zero-length packet
+ *    -2  no data (the qTD stayed active and was aborted: a NAK, not an error)
+ *    -1  a real transfer error (STALL/babble/transaction error)
+ * `ms` bounds the wait, so a poll costs at most that much. */
+int usb_ehci_intr_in(uint8_t addr, uint16_t mps, uint8_t ep, uint32_t *toggle,
+                     void *buf, uint32_t len, uint32_t ms)
+{
+    uint32_t resid;
+    uint32_t got;
+
+    if (toggle == NULL || buf == NULL || len == 0 || len > sizeof(g_intr))
+        return -1;
+    if (!g_mmio || g_op == 0)
+        return -1;
+
+    memset(&g_intr_qtd, 0, sizeof(g_intr_qtd));
+    g_intr_qtd.next = USB_QH_TERMINATE;
+    g_intr_qtd.alt_next = USB_QH_TERMINATE;
+    g_intr_qtd.token = USB_QTD_TOKEN(USB_PID_IN, len) | (*toggle & USB_QTD_DT);
+    usb_qtd_buffers(&g_intr_qtd, usb_ptr_phys(g_intr), len);
+
+    memset(g_intr, 0, sizeof(g_intr));
+    usb_clflush(g_intr, len);
+    usb_clflush(&g_intr_qtd, sizeof(g_intr_qtd));
+
+    usb_qh_arm(&g_qh[1], addr, ep, EHCI_SPEED_HIGH, mps, &g_intr_qtd);
+
+    if (usb_wait_qtds_us(&g_intr_qtd, 1, ms * 1000u) != 0) {
+        /* Still active: the device NAKed (no report pending). Stop the async
+         * schedule and drop the qTD so the next poll starts from a clean
+         * chain instead of inheriting a stale active descriptor. */
+        usb_mmio_wr(g_op + EHCI_OP_USBCMD,
+                    EHCI_USBCMD_RS | EHCI_USBCMD_PSE);
+        g_intr_qtd.token = 0;
+        return -2;
+    }
+    if (g_intr_qtd.token & USB_QTD_ERR_MASK) {
+        console_printf("[usb-hid] interrupt IN ep=%x FAILED (tok=%x)\n",
+                       (uint64_t)ep, (uint64_t)g_intr_qtd.token);
+        g_intr_qtd.token = 0;
+        g_xfer_errors++;
+        return -1;
+    }
+
+    resid = (g_intr_qtd.token >> USB_QTD_BYTES_SHIFT) & 0x7FFFu;
+    got = (resid < len) ? (len - resid) : len;
+    if (!g_intr_resid_seen) {
+        /* Once per boot, and only when a HID device exists: record whether the
+         * controller really reports the untransferred byte count. This is the
+         * field that distinguishes a short boot report from a full one, so it
+         * is the first thing to check when porting to new silicon. */
+        g_intr_resid_seen = 1;
+        console_printf("[usb-hid] qtd token=%x len=%u residual=%s (%u)\n",
+                       (uint64_t)g_intr_qtd.token, (uint64_t)len,
+                       resid < len ? "usable" : "not-reported", (uint64_t)resid);
+    }
+    *toggle ^= USB_QTD_DT;
+    usb_clflush(g_intr, len);
+    if (got > 0)
+        memcpy(buf, g_intr, got);
+    g_intr_qtd.token = 0;
+    return (int)got;
+}
+
+/* Root port owned by the mass-storage device (0 when none): the HID scanner
+ * must never reset or re-enumerate that port. */
+int usb_ehci_storage_port(void)
+{
+    return g_have_device ? (int)g_dev_port : 0;
+}
 
 /* ===================== boot self-test ===================== */
 void usb_selftest(void)

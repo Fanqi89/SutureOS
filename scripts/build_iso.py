@@ -247,9 +247,14 @@ log_level=info
     print(f"  Copying ISO root to temp location: {temp_iso_root}")
     shutil.copytree(ISO_DIR, temp_iso_root, dirs_exist_ok=True)
     
-    # Use MSYS2's xorriso - need to convert Windows path to MSYS2 path
-    # C:\sutureos_iso_temp\iso_root -> /c/sutureos_iso_temp/iso_root
-    msys_path = "/c/sutureos_iso_temp/iso_root"
+    # Use MSYS2's xorriso - need to convert Windows path to MSYS2 path.
+    # Derive it from temp_iso_root instead of hardcoding, so changing temp_dir
+    # above (parallel worktree / port copies) cannot desynchronise the two paths
+    # (xorriso would then fail with "Cannot determine attributes of source file").
+    _drive = temp_dir.drive.lower().rstrip(":")
+    _rel = str(temp_iso_root).replace("\\", "/")
+    _rel = _rel[len(temp_dir.drive) + 1:] if _rel.startswith(temp_dir.drive + "/") else _rel
+    msys_path = "/%s/%s" % (_drive, _rel)
     xorriso_path = r"C:\msys64\usr\bin\xorriso.exe"
     xorriso_cmd = [
         xorriso_path,
