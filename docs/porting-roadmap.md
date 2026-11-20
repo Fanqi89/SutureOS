@@ -100,4 +100,4 @@
 | B41 | v0.54.0 | **memfd + MAP_SHARED**（Wayland 第二块前置） | SutureOS 自有 | `shm_acceptance` **18/18**、内核自检 16 项 | ✅ 完成 |
 | B42 | v0.55.0 | **SCM_RIGHTS**（sendmsg/recvmsg 传 fd）——Wayland 四大内核前置齐 | SutureOS 自有 | `fdpass_acceptance` **21/21** | ✅ 完成 |
 | B43 | v0.56.0 | **ring-3 探针**：四个 Wayland 前置从用户态跑通（探针 ABI 10..14） | SutureOS 自有 | `wlprobe_acceptance` **14/14** | ✅ 完成 |
-| B44 | 待做 | **最小 wl server**（wl_compositor/wl_shm/wl_seat）+ POSIX 化 socket 接口（msghdr/sockaddr/bind-listien-accept）；用户态 ftruncate(memfd)；最后用新外壳替换 C 桌面 `startgui` 并重建 GUI 外观基线 | SutureOS 自有 | 待实现 | ⏳ |
+| B44 | v0.59.0（未发布批次） | **最小 wl server**（named AF_UNIX bind/connect + wl_compositor/wl_shm/wl_seat 子集 + ring-3 wlclient + `wlshow`）；用新外壳替换 C 桌面 `startgui`（旧桌面保留为 `startgui-classic`）并重建 GUI 外观基线（`--profile new|classic`） | SutureOS 自有 | `wl_server_acceptance` **28/28**、`wl_show_acceptance` **9/9**、桌面 **19/19**、两套外观门禁 **0 像素** | ✅ 完成 |

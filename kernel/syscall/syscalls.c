@@ -138,13 +138,23 @@ void fd_table_release(int slot)
 
 /* Pipe end behind `fd`: an encoded pipe fd (>= PIPE_FD_BASE) is returned as it
  * is, an ordinary slot holding a duplicated pipe end resolves through the
- * table. -1 when `fd` is neither. */
+ * table. -1 when `fd` is neither.
+ *
+ * v0.58.0: an encoded AF_UNIX socketpair/Wayland endpoint (>= UNIX_FD_BASE) is
+ * returned as it is too. Without this a ring-3 Wayland client could write a
+ * request (through the int 0x80 send-msg probe ABI) but never read the reply:
+ * read()/write() only knew pipes and the small descriptor table, and the unix
+ * fd number is larger than both. */
 int fd_pipe_end(int fd)
 {
     extern sched_cpu_t sched_cpu;
     const int tid = fd_slot();
 
     if (pipe_is_fd(fd)) return fd;
+    {
+        extern int unix_is_fd(int fd);
+        if (unix_is_fd(fd)) return fd;
+    }
     if (fd < 0 || fd >= MAX_FDS) return -1;
     if (tid < 0 || tid >= SCHED_MAX_TASKS) return -1;
     if (fd_tables[tid][fd].pipe_fd < 0) return -1;
@@ -340,6 +350,8 @@ uint64_t sys_read(uint64_t fd, uint64_t buf, uint64_t len,
         if (pfd >= 0) {
             EL0_CHECK(buf, len);
             if (unix_is_fd(pfd)) {
+                extern void wl_sock_pump_fd(int fd);
+                wl_sock_pump_fd(pfd);       /* dispatch pending Wayland requests */
                 return (uint64_t)(int64_t)unix_read_fd(pfd, (void *)(uintptr_t)buf,
                                                        (uint32_t)len);
             }
@@ -375,8 +387,11 @@ uint64_t sys_write(uint64_t fd, uint64_t buf, uint64_t len,
         if (pfd >= 0) {
             EL0_CHECK(buf, len);
             if (unix_is_fd(pfd)) {
-                return (uint64_t)(int64_t)unix_write_fd(pfd, (const void *)(uintptr_t)buf,
-                                                        (uint32_t)len);
+                extern void wl_sock_pump_fd(int fd);
+                const int64_t w = unix_write_fd(pfd, (const void *)(uintptr_t)buf,
+                                                (uint32_t)len);
+                wl_sock_pump_fd(pfd);       /* dispatch pending Wayland requests */
+                return (uint64_t)w;
             }
             return (uint64_t)(int64_t)pipe_write_fd(pfd, (const void *)(uintptr_t)buf,
                                                    (uint32_t)len);

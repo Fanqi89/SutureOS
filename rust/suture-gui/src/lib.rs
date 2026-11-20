@@ -23,6 +23,10 @@
 #[cfg(feature = "slint")]
 extern crate alloc;
 
+/* v0.59.0: per-window application content (settings rows, live task manager
+ * numbers, the logo image viewer, the editor buffer) lives in its own module so
+ * the shell keeps owning only window management. */
+pub mod apps;
 pub mod shell;
 pub mod swrast;
 
@@ -664,10 +668,11 @@ pub unsafe extern "C" fn suture_gui_shell_step(
     click_btn: i32,
     now_ms: u32,
     key: i32,
+    ch: i32,
     clock_hhmm: i32,
 ) -> u32 {
     shell::shell_step(fb, w, h, pitch_px, mx, my, buttons, click_x, click_y,
-                      click_btn, now_ms, key, clock_hhmm)
+                      click_btn, now_ms, key, ch, clock_hhmm)
 }
 
 /// Kernel tick counter (~100 Hz), exposed for the shell frame profiler.

@@ -30,3 +30,7 @@ __pycache__/
 
 # Rust build artifacts (kernel-side no_std staticlib)
 rust/*/target/
+
+# Generated logo bitmaps (scripts/mklogo_assets.py; source of truth = logo/*.png)
+kernel/gui/logo_assets.c
+kernel/gui/logo_assets.h

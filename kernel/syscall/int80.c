@@ -17,6 +17,10 @@
  * Numbers (user/lib/vimtu64.h):
  *   1 write(fd,buf,len)  2 exit(code)      3 getpid()      4 ticks()
  *   5 sleep_ms(ms)       6 open(path,flags)7 read(fd,buf,len) 8 close(fd)
+ * v0.58.0 added the two named-socket calls a Wayland client needs (see
+ * kernel/ipc/wl_sock.c):
+ *  15 bind(sockfd, name)   -> 0 / -errno   (EADDRINUSE when the name is taken)
+ *  16 connect(name)        -> new client fd / -errno
  * Everything else answers -ENOSYS, which the libc reports as an error instead of
  * silently pretending to work.
  */
@@ -53,6 +57,9 @@
 #define V64_NR_MAP_SHARED 12            /* (fd, len) -> vaddr                */
 #define V64_NR_SEND_FD    13            /* (sockfd, fd, buf, len) -> bytes   */
 #define V64_NR_RECV_FD    14            /* (sockfd, int*outfd, buf, len)     */
+/* v0.58.0: AF_UNIX *named* endpoints — how a Wayland client finds the server. */
+#define V64_NR_BIND       15            /* (sockfd, name) -> 0 / -errno      */
+#define V64_NR_CONNECT    16            /* (name) -> client fd / -errno      */
 
 #define V64_WRITE_MAX 1024u
 
@@ -153,6 +160,33 @@ static void int80_handler(struct moos_regs *f)
         const uint64_t path = frame_get(f, FRAME_RDI);
         extern int user_exec_from_frame(const char *path, void *frame);
         ret = (uint64_t)(int64_t)user_exec_from_frame((const char *)(uintptr_t)path, f);
+        break;
+    }
+    case V64_NR_BIND:
+    {
+        /* Named endpoint: wl_sock.c keeps the name table, wl_server.c the protocol.
+         * A ring-3 caller can create socketpairs (number 10) and bind a name, and
+         * connect() finds the compositor's endpoint by name. */
+        extern int wl_named_bind(int fd, const char *name);
+        const int sock = (int)frame_get(f, FRAME_RDI);
+        const uint64_t namep = frame_get(f, FRAME_RSI);
+        if (namep == 0 || !user_ptr_ok((const void *)(uintptr_t)namep, 2)) {
+            ret = (uint64_t)-14;            /* -EFAULT */
+            break;
+        }
+        ret = (uint64_t)(int64_t)wl_named_bind(sock,
+                                               (const char *)(uintptr_t)namep);
+        break;
+    }
+    case V64_NR_CONNECT:
+    {
+        extern int wl_named_connect(const char *name);
+        const uint64_t namep = frame_get(f, FRAME_RDI);
+        if (namep == 0 || !user_ptr_ok((const void *)(uintptr_t)namep, 2)) {
+            ret = (uint64_t)-14;
+            break;
+        }
+        ret = (uint64_t)(int64_t)wl_named_connect((const char *)(uintptr_t)namep);
         break;
     }
     case V64_NR_EXIT:

@@ -29,7 +29,7 @@ extern uint32_t suture_gui_shell_step(uint32_t *fb, int32_t w, int32_t h,
                                       int32_t pitch_px, int32_t mx, int32_t my,
                                       int32_t buttons, int32_t click_x,
                                       int32_t click_y, int32_t click_btn,
-                                      uint32_t now_ms, int32_t key,
+                                      uint32_t now_ms, int32_t key, int32_t ch,
                                       int32_t clock_hhmm);
 extern uint32_t suture_gui_interactive_step(uint32_t *fb, int32_t w, int32_t h,
                                             int32_t pitch_px, int32_t mx,
@@ -240,8 +240,17 @@ static int clock_local_from_utc(int utc_hhmm)
     return (total / 60) * 100 + (total % 60);
 }
 
+/* v0.57.1: called by the Rust shell when the logo shutdown animation ends. */
+void suture_power_off(void)
+{
+    extern void power_off(void);
+    console_printf("[gui-shell] power off\n");
+    power_off();
+}
+
 int slint_gui_run_shell(void)
 {
+    extern int mbos_kbd_decode(unsigned char scancode);
     extern int mbos_mouse_present(void);
     extern void mbos_mouse_poll(void);
     extern int mbos_mouse_x(void), mbos_mouse_y(void), mbos_mouse_buttons(void);
@@ -294,6 +303,13 @@ int slint_gui_run_shell(void)
     const uint64_t start = g_tick_count;
     int frames = 0;
     int quit = 0;
+
+    /* v0.59.0: keystroke queue. One frame can drain many bytes from the 8042,
+     * but the Rust step accepts ONE key/character per frame; keeping only the
+     * last one silently dropped fast keystrokes (measured: "hello" -> "hllo"). */
+    struct kbd_event { int sc; int ch; };
+    static struct kbd_event kq[32];
+    static int kq_head, kq_tail;
     while (!quit) {
         /* safety nets: frame count is now cheap (cursor fast path ~13 fps),
          * so keep a generous count plus an absolute time cap */
@@ -312,13 +328,31 @@ int slint_gui_run_shell(void)
         if (mouse) (void)mbos_mouse_take_click(&cx, &cy, &cb);
 
         int sc;
-        int key = -1;                      /* last pressed key this frame */
         while ((sc = mbos_kbd_poll()) >= 0) {
+            /* v0.58.0: decode every byte (make *and* break) so the shell gets a
+             * character for its per-window text line; mbos_kbd_decode() owns the
+             * shift/caps state. v0.59.0: queue the events instead of dropping all
+             * but the last one. */
+            const int dec = mbos_kbd_decode((unsigned char)sc);
             if ((uint32_t)sc == 0x01u) {
                 quit = 1;
-            } else if ((sc & 0x80) == 0) {  /* make code only */
-                key = sc;
+                continue;
             }
+            if ((sc & 0x80) == 0 || dec) {
+                const int next = (kq_tail + 1) % 32;
+                if (next != kq_head) {
+                    kq[kq_tail].sc = (sc & 0x80) ? -1 : sc;
+                    kq[kq_tail].ch = dec;
+                    kq_tail = next;
+                }
+            }
+        }
+        int key = -1;                      /* key/char served this frame */
+        int chr = -1;
+        if (kq_head != kq_tail) {
+            key = kq[kq_head].sc;
+            chr = kq[kq_head].ch;
+            kq_head = (kq_head + 1) % 32;
         }
 
         /* refresh the wall clock once a minute (6000 ticks at 100 Hz) */
@@ -333,7 +367,7 @@ int slint_gui_run_shell(void)
 
         const uint32_t now_ms = (uint32_t)((g_tick_count - start) * 10u);
         (void)suture_gui_shell_step(fb, (int32_t)w, (int32_t)h, (int32_t)pitch_px,
-                                    mx, my, buttons, cx, cy, cb, now_ms, key,
+                                    mx, my, buttons, cx, cy, cb, now_ms, key, chr,
                                     clock_hhmm);
         frames++;
         if ((frames % 30) == 0) {

@@ -167,14 +167,31 @@
 - **vmsvga（VMware SVGA II，本轮补齐，已完成）**：`kernel/drivers/vmsvga.c/.h`——PCI 15ad:0405 探测、**BAR0 的 32 位 index/value I/O 端口对**（本机 0xc050/0xc051，不是 MMIO 寄存器文件）、BAR1 16 MiB VRAM、BAR2 64 KiB 命令 FIFO、`SVGA_REG_ID` 往返校验、FIFO MIN/MAX/NEXT/STOP 字节口径、`SVGA_CMD_UPDATE` 脏矩形；shell `vmsvga on/off/status` 为唯一入口，`on` 前 `console_screen_enable(0)`（终端与 svga 共用 VRAM），`off` 交还终端。关键实测事实：设备未编程模式时 WIDTH/HEIGHT 是 QEMU 占位 surface 的 640x480，必须编程一个不同模式（1024x768）否则 screendump 永远是占位图；默认启动 0 条 `[vmsvga]`。来源：自写，依据 VMware SVGA II 公开寄存器规格 + QEMU 外部实测。验收：`scripts/vmsvga_acceptance.py` **34/34**（screendump 1024x768 == 驱动几何、非黑 1.0000、8 色带逐像素、白方块 64×64 位移 x 673→365、off 后 update 计数不增、默认 `-vga std` 0 条 [vmsvga]、无设备时诚实拒绝）；默认终端截图逐像素 0/786432 差异，GUI 外观 0 像素。限制：只用 UPDATE 命令（RECT_FILL/RECT_COPY 能力位不用）、仅 2D、无 cursor/IRQ、仅 QEMU 验证。
 - **未完成**：真 vsync/交换链未做；本域未改动既有显存/合成接口（避免动启动呈现）。
 
-## 域 10 GUI 应用 / 用户态功能（已完成功能层；视觉方向按用户要求暂停）
+## 域 10 GUI 应用 / 用户态功能（已完成：桌面换代 + 最小 Wayland 服务端）
 
 - **覆盖证据**：图片查看器（BMP/QOI）、文本编辑器、开始菜单/任务栏/最小化最大化/关闭、多用户切换、ring-3 文件工具、Wayland 四前置（AF_UNIX socketpair+poll 18/18、memfd+MAP_SHARED 18/18、SCM_RIGHTS 21/21、ring-3 wlprobe 14/14）。
 - **三项验收**
   1. `scripts/editor_acceptance.py` **5/5**（GUI 编辑器真实键鼠写入，`[edit] saved 17 bytes`）。
   2. 宿主独立逐字节：`EDIT.TXT` == `b'hello editor 42\n'`。
   3. 外观 0 像素（GUI 视觉零改动）。
-- **未完成**：最小 wl server、替换 C 桌面 `startgui`、GUI 大改（**用户明确要求等他定方向，未自作主张**）。
+- **新 GUI（Rust 自写渲染器，v0.58 开发中，未发布）**：窗口层改为"不透明窗体 + 每帧 alpha 阴影环"
+  （旧实现把阴影烘进层缓存并在黑底上合成，窗周是黑色硬边，实测 (0,0,0)）；新增窗口内键盘焦点
+  与可编辑行（Enter 提交到串口、Backspace 退格、Tab 循环焦点）；最大化/还原改为 4 帧几何过渡。
+  验收：外壳 **55/55**、`logo_acceptance` **12/12**（F10 关机动画 + ACPI S5）。
+- **桌面换代（用户 2026-11-21 批准）**：`startgui` = Rust 桌面外壳（圆角 + 轻亚克力 + 伪 3D
+  Fluent 图标 + 每窗真实应用内容），原 C 桌面保留为 `startgui-classic` 并继续跑它自己的外观门禁；
+  两套基线：`docs/baseline/base_gui.png`（新）与 `base_gui_classic.png`（旧），门禁 `--profile new|classic`。
+  验收：`desktop_acceptance` **19/19**、`gui_apps_content_acceptance` **25/25**、外壳 **55/55**、
+  Logo（含 alpha）**14/14**、两套门禁 **0 像素**。
+- **最小 Wayland 服务端（完成）**：named AF_UNIX 端点（int 0x80 号 15/16 bind/connect）+
+  wl_display/wl_registry/wl_callback/wl_compositor/wl_surface/wl_shm/wl_shm_pool/wl_buffer/wl_seat
+  子集；ring-3 `run wlclient` 经 SCM_RIGHTS 交付 memfd，commit 时服务端读像素算 FNV-1a；
+  `wlshow` 把最后 commit 的 surface 整屏呈现（整数最近邻 + accent 边框）。
+  验收：`wl_server_acceptance` **28/28**（客户端/服务端/宿主三方 hash 一致 + 宿主逐字节 256000 B）、
+  `wl_show_acceptance` **9/9**（屏幕实际出现 surface）。
+- **仍未完成**：合成器 vsync/交换链（无双缓冲之外的垂直同步源）；Wayland 的
+  error/delete_id/frame 回调、damage 追踪、多客户端与真实输入路由；视觉继续打磨（用户已给方向，
+  后续按方向迭代）。
 
 ## 域 11 跨架构蓝本（已完成：机制重写为通用时基抽象）
 

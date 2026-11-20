@@ -65,6 +65,7 @@ int shell_cmd_exit(int argc, char **argv);
 int shell_cmd_reboot(int argc, char **argv);
 int shell_cmd_shutdown(int argc, char **argv);
 int shell_cmd_startgui(int argc, char **argv);
+int shell_cmd_startgui_classic(int argc, char **argv);
 int shell_cmd_ls(int argc, char **argv);
 int shell_cmd_cd(int argc, char **argv);
 int shell_cmd_pwd(int argc, char **argv);
@@ -156,6 +157,7 @@ int shell_cmd_guislint(int argc, char **argv);
 /* Desktop-shell prototype (v0.41.0): windows + taskbar + start menu on the new
  * renderer. Interactive until ESC. */
 int shell_cmd_guishell(int argc, char **argv);
+int shell_cmd_wlshow(int argc, char **argv);
 
 /* Terminal output helpers */
 void shell_putc(char c);

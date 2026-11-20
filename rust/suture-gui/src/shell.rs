@@ -30,7 +30,15 @@ const MENU_X: i32 = 12;
 const MENU_Y: i32 = TASKBAR_Y - MENU_H - 8;
 const MENU_ITEMS_Y: i32 = MENU_Y + 46;
 
-const WIN_BODY: &str = "SutureOS 桌面外壳";
+/* v0.58.0: soft shadow ring around a window body, one alpha per pixel of
+ * distance (1 px out ... 8 px out). The shadow is composited against whatever is
+ * already in the scene, so it darkens the wallpaper, a window below it or a
+ * neighbour's acrylic band instead of painting the hard black halo the baked
+ * layer used to leave behind. */
+const SHADOW_RING: [u32; 8] = [0x22, 0x1c, 0x16, 0x10, 0x0b, 0x07, 0x04, 0x02];
+
+/* v0.59.0: the shared placeholder body text is gone - every window paints its
+ * own application content through crate::apps::draw_body. */
 
 const SMALL_W: usize = 256;
 const SMALL_H: usize = 192;
@@ -96,6 +104,9 @@ struct Shell {
     hover_ctl: i32,    /* hovered title-bar control (0 min,1 max,2 close) */
     hover_win: i32,
     menu_sel: i32,
+    /* v0.57.1: logo shutdown animation (S key): frame counter while playing */
+    shutting: bool,
+    shut_frame: u32,
     /* v0.48.0: window open fade-in (frames left) + which window */
     intro_frames: u32,
     intro_idx: i32,
@@ -120,6 +131,19 @@ struct Shell {
     prof_win: u64,
     prof_bar: u64,
     prof_total: u64,
+    /* v0.58.0: per-window keyboard focus. Every window owns a small editable
+     * line; printable keys go to the focused window, Enter commits it to the
+     * serial log, Backspace deletes one character. */
+    input: [[u8; 33]; 4],
+    ilen: [u32; 4],
+    /* v0.58.0: true maximise/restore transition. `scale_from`/`scale_to` are
+     * lerped over SCALE_TOTAL frames; the geometry itself already sits at its
+     * target so hit-testing stays honest during the animation. */
+    scale_frames: u32,
+    scale_idx: i32,
+    scale_from: [i32; 4],
+    scale_to: [i32; 4],
+    scale_kind: i32,
 }
 
 static mut SHELL: Shell = Shell {
@@ -139,6 +163,8 @@ static mut SHELL: Shell = Shell {
     hover_ctl: -1,
     hover_win: -1,
     menu_sel: 0,
+    shutting: false,
+    shut_frame: 0,
     intro_frames: 0,
     intro_idx: -1,
     menu_intro: 0,
@@ -160,6 +186,13 @@ static mut SHELL: Shell = Shell {
     prof_win: 0,
     prof_bar: 0,
     prof_total: 0,
+    input: [[0; 33]; 4],
+    ilen: [0; 4],
+    scale_frames: 0,
+    scale_idx: -1,
+    scale_from: [0; 4],
+    scale_to: [0; 4],
+    scale_kind: 0,
 };
 
 // ---------------------------------------------------------------- caches
@@ -190,6 +223,14 @@ static mut WIN_KEY: [i32; 4] = [i32::MIN; 4];
 const TB_H: usize = 38;
 static mut TASKBAR_CACHE: [u32; 1024 * TB_H] = [0; 1024 * TB_H];
 static mut TASKBAR_KEY: i32 = i32::MIN;
+/* v0.58.0: the cached window body size. The layer is normally blitted 1:1, but
+ * the maximise/restore transition samples it scaled, so the source size has to
+ * be known even after the window geometry already jumped to its target. */
+static mut LAYER_WH: [(i32, i32); 4] = [(0, 0); 4];
+/* v0.58.0: nearest-neighbour index tables for the transition pass (one division
+ * per column/row instead of one per pixel). */
+static mut SCALED_X: [u16; 1024] = [0; 1024];
+static mut SCALED_Y: [u16; 768] = [0; 768];
 static mut WSPLIT: (u64, u64, u64, u32) = (0, 0, 0, 0);
 /* v0.47.0: rounded-corner coverage LUT. The analytic path called the
  * soft-float sqrt once per corner pixel; on this no-SSE target that made a
@@ -407,16 +448,25 @@ fn wb_rect(wins: &[Win; 4], i: usize) -> Option<(i32, i32)> {
     Some((x, 96))
 }
 
+/* v0.59.0: one accent per app, shared by the start-menu row, the window title
+ * bar icon and the pseudo-3D plate (matches Win::accent). */
+const APP_ACCENTS: [u32; 4] = [0x4f8dff, 0x22c1a8, 0xf5a524, 0xe05a8a];
+
 const MENU_ITEMS: [&str; 4] =
     ["系统设置", "任务管理器", "图片查看器", "文本编辑器"];
 
 /// Z above every window: the shell only has 4, so a counter is enough.
+static mut Z_COUNTER: i32 = 100;
+
 fn next_z(sh: &Shell) -> i32 {
-    let mut m = 0;
-    for w in sh.wins.iter() {
-        if w.z > m { m = w.z; }
+    /* v0.57.1: a monotonic counter, not "max+1": a menu launch and a focus bump
+     * in the same frame used to be able to produce the SAME z value, after which
+     * hit_win() routed a close-button click to the window underneath. */
+    let _ = sh;
+    unsafe {
+        Z_COUNTER += 1;
+        Z_COUNTER
     }
-    m + 1
 }
 
 /// First visible (open, not minimised) window other than `skip`.
@@ -460,17 +510,187 @@ fn launch_window(sh: &mut Shell, idx: usize) {
     log2(c"menu launch", idx as i32, 0);
 }
 
-fn hit_win(wins: &[Win; 4], mx: i32, my: i32) -> i32 {
+/// v0.58.0: start a maximise/restore transition. The geometry is applied
+/// immediately (the taskbar, hit-testing and the layer key follow the target
+/// state) while `scale_from`/`scale_to` drive the visual interpolation, because
+/// the layer cache only ever holds the normal-size body.
+fn request_maximize(sh: &mut Shell, idx: usize, want: bool) {
+    if idx >= sh.wins.len() {
+        return;
+    }
+    let from = {
+        let w = sh.wins[idx];
+        [w.x, w.y, w.w, w.h]
+    };
+    let z = next_z(sh);
+    let to;
+    if want {
+        let w = &mut sh.wins[idx];
+        w.nx = from[0];
+        w.ny = from[1];
+        w.nw = from[2];
+        w.nh = from[3];
+        w.maximized = true;
+        w.x = 0;
+        w.y = 0;
+        w.w = SCREEN_W;
+        w.h = TASKBAR_Y;
+        to = [0, 0, SCREEN_W, TASKBAR_Y];
+    } else {
+        let w = &mut sh.wins[idx];
+        w.maximized = false;
+        w.x = w.nx;
+        w.y = w.ny;
+        w.w = w.nw;
+        w.h = w.nh;
+        to = [w.nx, w.ny, w.nw, w.nh];
+    }
+    sh.wins[idx].z = z;
+    sh.wins[idx].minimized = false;
+    sh.focus = idx;
+    sh.scale_from = from;
+    sh.scale_to = to;
+    sh.scale_frames = 4;
+    sh.scale_idx = idx as i32;
+    sh.scale_kind = if want { 1 } else { 2 };
+    log2(c"scale begin", idx as i32, sh.scale_kind);
+    log2(if want { c"maximize" } else { c"restore" }, idx as i32, 0);
+}
+
+/// v0.58.0: composite the cached window body sampled into an arbitrary rectangle
+/// (nearest neighbour, opaque). Used by the maximise/restore transition.
+fn composite_scaled(scene: &mut [u32], stride: usize, slot: usize, r: &Win) -> bool {
+    if slot >= 4 {
+        return false;
+    }
+    let (sw, shh) = unsafe { (&*core::ptr::addr_of!(LAYER_WH))[slot] };
+    if sw <= 0 || shh <= 0 || r.w <= 0 || r.h <= 0
+        || r.w > SCREEN_W || r.h > SCREEN_H || r.x < 0 || r.y < 0
+    {
+        return false;
+    }
+    let xmap = unsafe { &mut *core::ptr::addr_of_mut!(SCALED_X) };
+    let ymap = unsafe { &mut *core::ptr::addr_of_mut!(SCALED_Y) };
+    for i in 0..r.w as usize {
+        xmap[i] = ((i as i64 * sw as i64) / r.w as i64) as u16;
+    }
+    for j in 0..r.h as usize {
+        ymap[j] = ((j as i64 * shh as i64) / r.h as i64) as u16;
+    }
+    let cache = unsafe { &(&*core::ptr::addr_of!(WIN_CACHE))[slot] };
+    let x0 = r.x.max(0);
+    let y0 = r.y.max(0);
+    let x1 = (r.x + r.w).min(SCREEN_W);
+    let y1 = (r.y + r.h).min(SCREEN_H);
+    if x1 <= x0 || y1 <= y0 {
+        return true;
+    }
+    for dy in y0..y1 {
+        let sy = ymap[(dy - r.y) as usize] as usize + WC_MARGIN_T as usize;
+        let srow = sy * WC_STRIDE;
+        let drow = dy as usize * stride;
+        for dx in x0..x1 {
+            let sx = xmap[(dx - r.x) as usize] as usize + WC_MARGIN_L as usize;
+            scene[drow + dx as usize] = cache[srow + sx];
+        }
+    }
+    true
+}
+
+fn hit_win(wins: &[Win; 4], mx: i32, my: i32, focus: i32) -> i32 {
     let mut best = -1;
     let mut bestz = -1;
     for (i, w) in wins.iter().enumerate() {
         if !w.open || w.minimized { continue; }
-        if mx >= w.x && mx < w.x + w.w && my >= w.y && my < w.y + w.h && w.z > bestz {
-            best = i as i32;
-            bestz = w.z;
+        if mx >= w.x && mx < w.x + w.w && my >= w.y && my < w.y + w.h {
+            if w.z > bestz || (w.z == bestz && i as i32 == focus) {
+                best = i as i32;
+                bestz = w.z;
+            }
         }
     }
     best
+}
+
+// ---------------------------------------------------------------- logo assets
+extern "C" {
+    static g_logo24: [u32; 24 * 24];
+    static g_logo48: [u32; 48 * 48];
+    static g_logo768: [u32; 768 * 768];
+    fn suture_power_off();
+}
+
+const LOGO_SMALL_SIZE: usize = 24;
+const LOGO_MENU_SIZE: usize = 48;
+const LOGO_FULL_SIZE: usize = 768;
+const LOGO_TILE: i32 = 256;          /* 3x3 tiles of the 768px logo */
+
+/// Copy a rectangular region of a generated logo bitmap to the scene (1:1).
+/// v0.59.0: the bitmaps are 0xAARRGGBB — the logo ladder has a transparent
+/// background, so transparent pixels leave the surface alone and partial alpha
+/// is blended (the old code kept the PNG's white RGB and drew a white square).
+fn blit_logo_region(s: &mut Surface, data: &[u32], lw: usize,
+                    sx: i32, sy: i32, tw: i32, th: i32, dx: i32, dy: i32) {
+    for row in 0..th {
+        let dst_y = dy + row;
+        if dst_y < 0 || dst_y >= SCREEN_H { continue; }
+        for col in 0..tw {
+            let dst_x = dx + col;
+            if dst_x < 0 || dst_x >= SCREEN_W { continue; }
+            let src = data[((sy + row) as usize) * lw + (sx + col) as usize];
+            let a = (src >> 24) & 0xff;
+            if a == 0 {
+                continue;
+            }
+            let i = (dst_y as usize) * s.stride + dst_x as usize;
+            if a >= 255 {
+                s.px[i] = src & 0x00ff_ffff;
+            } else {
+                let d = s.px[i] & 0x00ff_ffff;
+                s.px[i] = blend_px_raw(d, src & 0x00ff_ffff, a);
+            }
+        }
+    }
+}
+
+/// One frame of the shutdown animation: dim the desktop, draw the 768px logo,
+/// then hide its 3x3 tiles in reverse order (tile 8 first) - the reverse of the
+/// boot reveal described in logo/README.md, faster (10 frames ~= 0.7 s at the
+/// shell's frame rate), and it does not wait for the animation to finish.
+unsafe fn shutdown_step(fb: *mut u32, w: i32, h: i32, pitch_px: i32,
+                        sh: &mut Shell, mx: i32, my: i32) -> u32 {
+    let (wu, hu) = (w as usize, h as usize);
+    let frame = &mut *core::ptr::addr_of_mut!(FRAME);
+    {
+        let mut s = Surface { px: &mut frame[..], w: wu, h: hu, stride: wu,
+                              clip: (0, 0, 1024, 768) };
+        s.rect_fill(0, 0, SCREEN_W, SCREEN_H, 0x000000, 0xd8);
+        let hidden = sh.shut_frame.min(10);
+        for ty in 0..3 {
+            for tx in 0..3 {
+                let idx = ty * 3 + tx;
+                if (idx as u32) < 9u32.saturating_sub(hidden) {
+                    blit_logo_region(&mut s, &g_logo768, LOGO_FULL_SIZE,
+                                     tx * LOGO_TILE, ty * LOGO_TILE,
+                                     LOGO_TILE, LOGO_TILE,
+                                     128 + tx * LOGO_TILE, ty * LOGO_TILE);
+                }
+            }
+        }
+    }
+    {
+        let frame = &*core::ptr::addr_of!(FRAME);
+        blit_rect(frame, wu, fb, pitch_px as usize, (0, 0, SCREEN_W, SCREEN_H));
+        draw_cursor(fb, pitch_px as usize, wu, hu, mx.clamp(0, w - 1), my.clamp(0, h - 1));
+    }
+    console_printf(b"[gui-shell] logo shutdown %d\n\0".as_ptr(), sh.shut_frame as i32);
+    sh.shut_frame += 1;
+    if sh.shut_frame >= 10 {
+        log0(c"logo shutdown done");
+        suture_power_off();
+        log0(c"logo shutdown: power_off returned (failure)");
+    }
+    0
 }
 
 // ---------------------------------------------------------------- frame
@@ -487,6 +707,7 @@ pub unsafe fn shell_step(
     _click_btn: i32,
     now_ms: u32,
     key: i32,
+    ch: i32,
     clock_hhmm: i32,
 ) -> u32 {
     if fb.is_null() || w <= 0 || h <= 0 || pitch_px < w {
@@ -506,6 +727,11 @@ pub unsafe fn shell_step(
         sh.started = true;
         sh.frame_ms = now_ms;
         log0(c"shell: loop started");
+    }
+    /* v0.57.1: logo shutdown animation runs before (and instead of) the desktop
+     * render; it ends by powering the machine off. */
+    if sh.shutting {
+        return shutdown_step(fb, w, h, pitch_px, sh, mx, my);
     }
 
     // 1. wallpaper from cache
@@ -527,7 +753,7 @@ pub unsafe fn shell_step(
 
     // 2. hit testing: taskbar first (it is on top), then windows
     let start_btn = (8, TASKBAR_Y + 5, 34, 28);
-    let mut hw = hit_win(&sh.wins, mx_c, my_c);
+    let mut hw = hit_win(&sh.wins, mx_c, my_c, sh.focus as i32);
     let mut hover_ctl = -1;
     if hw >= 0 {
         let wref = sh.wins[hw as usize];
@@ -543,6 +769,10 @@ pub unsafe fn shell_step(
     // 3. clicks
     let mut clicked_in_menu = false;
     if click_x >= 0 && click_y >= 0 {
+        /* v0.57.1: hit-test the click at the click coordinates, not at the current
+         * pointer: a click can be consumed while PS/2 move packets are still in
+         * flight, which sent close-button clicks to the stale pointer's window. */
+        let hw = hit_win(&sh.wins, click_x, click_y, sh.focus as i32);
         let cx = click_x;
         let cy = click_y;
         if sh.menu_open {
@@ -584,33 +814,9 @@ pub unsafe fn shell_step(
                             sh.last_click_idx = i as i32;
                             let is_focus = sh.focus == i && !sh.wins[i].minimized;
                             if double {
-                                /* toggle maximise */
-                                if sh.wins[i].maximized {
-                                    sh.wins[i].maximized = false;
-                                    sh.wins[i].x = sh.wins[i].nx;
-                                    sh.wins[i].y = sh.wins[i].ny;
-                                    sh.wins[i].w = sh.wins[i].nw;
-                                    sh.wins[i].h = sh.wins[i].nh;
-                                    log2(c"restore", i as i32, 0);
-                                    sh.intro_frames = 3;
-                                    sh.intro_idx = i as i32;
-                                } else {
-                                    sh.wins[i].nx = sh.wins[i].x;
-                                    sh.wins[i].ny = sh.wins[i].y;
-                                    sh.wins[i].nw = sh.wins[i].w;
-                                    sh.wins[i].nh = sh.wins[i].h;
-                                    sh.wins[i].maximized = true;
-                                    sh.wins[i].x = 0;
-                                    sh.wins[i].y = 0;
-                                    sh.wins[i].w = SCREEN_W;
-                                    sh.wins[i].h = TASKBAR_Y;
-                                    log2(c"maximize", i as i32, 0);
-                                    sh.intro_frames = 3;
-                                    sh.intro_idx = i as i32;
-                                }
-                                sh.wins[i].minimized = false;
-                                sh.focus = i;
-                                sh.wins[i].z = next_z(sh);
+                                /* v0.58.0: true transition instead of a pop */
+                                let want = !sh.wins[i].maximized;
+                                request_maximize(sh, i, want);
                             } else if is_focus {
                                 begin_act(sh, 1, i);
                             } else {
@@ -630,31 +836,8 @@ pub unsafe fn shell_step(
                         if cx >= bx && cx < bx + bw * 3 + 8 && cy >= by && cy < by + bh {
                             let idx = (cx - bx) / (bw + 4);
                             if idx == 1 {
-                                if sh.wins[hw as usize].maximized {
-                                    let ww = &mut sh.wins[hw as usize];
-                                    ww.maximized = false;
-                                    ww.x = ww.nx;
-                                    ww.y = ww.ny;
-                                    ww.w = ww.nw;
-                                    ww.h = ww.nh;
-                                    log2(c"restore", hw, 0);
-                                    sh.intro_frames = 3;
-                                    sh.intro_idx = hw;
-                                } else {
-                                    let ww = &mut sh.wins[hw as usize];
-                                    ww.nx = ww.x;
-                                    ww.ny = ww.y;
-                                    ww.nw = ww.w;
-                                    ww.nh = ww.h;
-                                    ww.maximized = true;
-                                    ww.x = 0;
-                                    ww.y = 0;
-                                    ww.w = SCREEN_W;
-                                    ww.h = TASKBAR_Y;
-                                    log2(c"maximize", hw, 0);
-                                    sh.intro_frames = 3;
-                                    sh.intro_idx = hw;
-                                }
+                                let want = !sh.wins[hw as usize].maximized;
+                                request_maximize(sh, hw as usize, want);
                             } else if idx == 0 {
                                 begin_act(sh, 1, hw as usize);
                             } else {
@@ -710,8 +893,62 @@ pub unsafe fn shell_step(
             }
             _ => {}
         }
+    } else if key == 0x44 && !sh.shutting {
+        /* F10 = shutdown: play the reverse logo animation, then power off.
+         * (v0.58.0 moved this off 'S': the shell now accepts typed text, so
+         * every printable key has to reach the focused window.) */
+        sh.shutting = true;
+        sh.shut_frame = 0;
+        log0(c"logo shutdown start");
     } else if key == 0x50 || key == 0x48 {
         // up/down with the menu closed is ignored (keeps the log honest)
+    }
+
+    /* v0.58.0: per-window keyboard focus. Tab cycles the window focus, printable
+     * keys edit the focused window's line, Enter commits it to the log and
+     * Backspace deletes one character. Arrow keys stay with the start menu
+     * (handled above); F10 stays the shutdown key. */
+    if !sh.menu_open && !sh.shutting {
+        let fi = sh.focus;
+        if ch == 0x09 {
+            let mut n = fi;
+            for _ in 0..4 {
+                n = (n + 1) % 4;
+                if sh.wins[n].open && !sh.wins[n].minimized {
+                    break;
+                }
+            }
+            if n != fi {
+                sh.wins[n].z = next_z(sh);
+                sh.focus = n;
+                log2(c"focus cycle", n as i32, 0);
+            }
+        } else if sh.wins[fi].open && !sh.wins[fi].minimized {
+            let len = sh.ilen[fi] as usize;
+            if ch == 0x0a || ch == 0x0d {
+                if len > 0 {
+                    let buf = &sh.input[fi];
+                    console_printf(b"[gui-shell] input win=%d text=%s\n\0".as_ptr(),
+                                   fi as i32, buf.as_ptr());
+                    log2(c"input commit", fi as i32, len as i32);
+                    sh.ilen[fi] = 0;
+                    sh.input[fi][0] = 0;
+                }
+            } else if ch == 0x08 {
+                if len > 0 {
+                    sh.ilen[fi] -= 1;
+                    sh.input[fi][len - 1] = 0;
+                    log2(c"input backspace", fi as i32, (len - 1) as i32);
+                }
+            } else if ch >= 0x20 && ch < 0x7f && len < 32 {
+                sh.input[fi][len] = ch as u8;
+                sh.input[fi][len + 1] = 0;
+                sh.ilen[fi] = len as u32 + 1;
+                if len == 0 {
+                    log2(c"input start", fi as i32, 0);
+                }
+            }
+        }
     }
 
     if !left_down && sh.dragging {
@@ -767,8 +1004,24 @@ pub unsafe fn shell_step(
         st[10 + i * 2] = (w.minimized as i32) | ((w.maximized as i32) << 1) |
                          ((w.z & 0xff) << 8);
     }
+    /* v0.58.0: the fingerprint also covers keyboard focus, the focused window's
+     * editable line and the transition counter, so typing repaints and the
+     * scale animation can never be skipped as "idle". */
+    st[17] = sh.focus as i32;
+    {
+        let mut ih = sh.ilen[sh.focus] as i32;
+        for b in sh.input[sh.focus].iter() {
+            ih = ih.wrapping_mul(31).wrapping_add(*b as i32);
+        }
+        st[18] = ih;
+    }
+    /* v0.59.0: one repaint per second so the live numbers in the task manager
+     * window (uptime) keep moving while the desktop is otherwise idle. */
+    st[19] = (sh.scale_frames as i32) | (((now / 1000) as i32) << 8);
     let last = unsafe { &*core::ptr::addr_of!(LAST_STATE) };
-    if *last == st && sh.intro_frames == 0 && sh.act_frames == 0 && sh.menu_intro == 0 {
+    if *last == st && sh.intro_frames == 0 && sh.act_frames == 0 && sh.menu_intro == 0
+        && sh.scale_frames == 0
+    {
         IDLE_FRAMES += 1;
         if IDLE_FRAMES == 1 {
             log0(c"idle: frame skipped (nothing changed)");
@@ -788,8 +1041,9 @@ pub unsafe fn shell_step(
         let hover = hover_code(sh, mx_c, my_c);
         let prev_hover = unsafe { PREV_HOVER };
         let pointer_moved = mx_c != unsafe { PREV_MX } || my_c != unsafe { PREV_MY };
-        if click_x < 0 && click_y < 0 && key < 0 && !sh.dragging && pointer_moved &&
-           hover == prev_hover && unsafe { CUR_SEEN } {
+        if click_x < 0 && click_y < 0 && key < 0 && ch < 0 && !sh.dragging
+           && sh.scale_frames == 0 && pointer_moved
+           && hover == prev_hover && unsafe { CUR_SEEN } {
             let frame = &*core::ptr::addr_of!(FRAME);
             let (px, py) = unsafe { (CUR_PX, CUR_PY) };
             blit_rect(frame, wu, fb, pitch_px as usize,
@@ -833,6 +1087,11 @@ pub unsafe fn shell_step(
             }
             continue;
         }
+        /* v0.58.0: a window under a maximise/restore transition is drawn by the
+         * transition pass (scaled layer), so the normal compose must skip it. */
+        if sh.scale_frames > 0 && sh.scale_idx == i as i32 {
+            continue;
+        }
         let key = layer_key(&win, i);
         let hit = unsafe { WIN_KEY[i] == key };
         if !hit {
@@ -848,6 +1107,8 @@ pub unsafe fn shell_step(
         } else {
             sh.prof_cache_hit += 1;
         }
+        /* v0.58.0: shadow first (alpha over the scene), then the opaque body. */
+        draw_window_shadow(&mut s, &win);
         let frame = &mut *core::ptr::addr_of_mut!(FRAME);
         if composite_window_layer(frame, wu, i, &win) {
             if sh.dragging && sh.drag_idx == i {
@@ -857,6 +1118,16 @@ pub unsafe fn shell_step(
                 }
             }
         }
+    }
+
+    /* v0.59.0: live per-window content (task manager counters) is painted after
+     * the cached window layers, so the layers stay static and the numbers move. */
+    for &i in order.iter() {
+        let win = sh.wins[i];
+        if !win.open || win.minimized {
+            continue;
+        }
+        crate::apps::draw_live(&mut s, win.accent, win.x, win.y, win.w, win.h, now);
     }
 
     /* v0.49.0: 2-frame fade-out before a close/minimize actually happens */
@@ -906,6 +1177,74 @@ pub unsafe fn shell_step(
         sh.intro_frames -= 1;
     }
 
+    /* v0.58.0: maximise/restore transition. The geometry already jumped to its
+     * target, so the animation samples the HOME-anchored body layer into the
+     * interpolated rectangle: the window grows / shrinks smoothly. */
+    if sh.scale_frames > 0 {
+        let idx = sh.scale_idx;
+        if idx >= 0 && idx < 4 && sh.wins[idx as usize].open
+            && !sh.wins[idx as usize].minimized
+        {
+            let total: i32 = 4;
+            let step = total - sh.scale_frames as i32 + 1;
+            let mut r = [0i32; 4];
+            for k in 0..4usize {
+                let a = sh.scale_from[k];
+                let b = sh.scale_to[k];
+                r[k] = a + (b - a) * step / total;
+            }
+            let mut tmp = sh.wins[idx as usize];
+            tmp.x = r[0];
+            tmp.y = r[1];
+            tmp.w = r[2].max(24);
+            tmp.h = r[3].max(24);
+            draw_window_shadow(&mut s, &tmp);
+            let frame = &mut *core::ptr::addr_of_mut!(FRAME);
+            if !composite_scaled(frame, wu, idx as usize, &tmp) {
+                draw_window(&mut s, &tmp, false);
+            }
+            log2(c"scale", idx, step);
+        }
+        sh.scale_frames -= 1;
+        if sh.scale_frames == 0 {
+            let idx = sh.scale_idx;
+            log2(c"scale done", idx, sh.scale_kind);
+            /* the pre-existing fade-in now follows the transition, so the
+             * settled frame still reads as a soft arrival */
+            sh.intro_frames = 3;
+            sh.intro_idx = idx;
+            sh.scale_idx = -1;
+            sh.scale_kind = 0;
+        }
+    }
+
+    /* v0.58.0: keyboard-focus indicator. The focused window shows an editable
+     * line (label + typed ASCII + caret); it is drawn after the window body so
+     * the cached layer stays static while the line changes. */
+    if !sh.menu_open && !sh.shutting {
+        let fi = sh.focus;
+        let w = sh.wins[fi];
+        let y = w.y + TITLE_H + 104;
+        if w.open && !w.minimized && y + 20 < w.y + w.h && w.y >= 0 {
+            s.rect_fill(w.x + 16, y - 4, w.x + w.w - 16, y + 20, 0x000000, 0x24);
+            s.text(w.x + 24, y, "输入:", 0x9fb2cc, 0xd0, 1);
+            let x0 = w.x + 24 + 46 + 8;
+            let len = sh.ilen[fi] as usize;
+            if len == 0 {
+                s.text(x0, y, "键入文本 Tab 切换窗口", 0x60718a, 0xc0, 1);
+            } else {
+                let mut x = x0;
+                let buf = &sh.input[fi];
+                let mut k = 0usize;
+                while k < len && x < w.x + w.w - 40 {
+                    x += s.char_ascii(x, y, buf[k] as char, 0xffffff, 0xf0, 1);
+                    k += 1;
+                }
+                s.rect_fill(x, y, x + 2, y + 16, 0x8fc2ff, 0xe0);
+            }
+        }
+    }
+
     let t_win = ticks() - t_win0;
     // 5. taskbar (acrylic strip sampled from the frosted source)
     let t_bar0 = ticks();
@@ -923,10 +1262,10 @@ let hover_start = mx_c >= start_btn.0 && mx_c < start_btn.0 + start_btn.2 &&
 s.rect_fill(start_btn.0, start_btn.1, start_btn.0 + start_btn.2,
             start_btn.1 + start_btn.3, 0xffffff,
             if hover_start { 0x2c } else { 0x16 });
-s.rect_fill(start_btn.0 + 10, start_btn.1 + 7, start_btn.0 + 24,
-            start_btn.1 + 21, 0x9fd0ff, 0xe0);
-s.rect_fill(start_btn.0 + 12, start_btn.1 + 9, start_btn.0 + 22,
-            start_btn.1 + 14, 0xffffff, 0xd0);
+/* v0.57.1: the real SutureOS logo (24px step of the asset ladder) */
+blit_logo_region(&mut s, &g_logo24, LOGO_SMALL_SIZE,
+                 0, 0, LOGO_SMALL_SIZE as i32, LOGO_SMALL_SIZE as i32,
+                 start_btn.0 + 5, start_btn.1 + 2);
 
 /* window buttons */
 sh.hover_wb = -1;
@@ -973,10 +1312,10 @@ let hover_start = mx_c >= start_btn.0 && mx_c < start_btn.0 + start_btn.2 &&
 s.rect_fill(start_btn.0, start_btn.1, start_btn.0 + start_btn.2,
             start_btn.1 + start_btn.3, 0xffffff,
             if hover_start { 0x2c } else { 0x16 });
-s.rect_fill(start_btn.0 + 10, start_btn.1 + 7, start_btn.0 + 24,
-            start_btn.1 + 21, 0x9fd0ff, 0xe0);
-s.rect_fill(start_btn.0 + 12, start_btn.1 + 9, start_btn.0 + 22,
-            start_btn.1 + 14, 0xffffff, 0xd0);
+/* v0.57.1: the real SutureOS logo (24px step of the asset ladder) */
+blit_logo_region(&mut s, &g_logo24, LOGO_SMALL_SIZE,
+                 0, 0, LOGO_SMALL_SIZE as i32, LOGO_SMALL_SIZE as i32,
+                 start_btn.0 + 5, start_btn.1 + 2);
 
 /* window buttons */
 sh.hover_wb = -1;
@@ -1048,7 +1387,11 @@ for i in 0..4 {
                     0xffffff, 0x3c);
         s.rect_fill(MENU_X + MENU_W - 1, MENU_Y + 10, MENU_X + MENU_W,
                     MENU_Y + MENU_H - 10, 0xffffff, 0x3c);
-        s.text(MENU_X + 18, MENU_Y + 16, "常用应用", 0xffffff, 0xf0, 1);
+        /* v0.57.1: start-menu icon = 48px step of the logo ladder */
+blit_logo_region(&mut s, &g_logo48, LOGO_MENU_SIZE,
+                 0, 0, LOGO_MENU_SIZE as i32, LOGO_MENU_SIZE as i32,
+                 MENU_X + 10, MENU_Y + 2);
+s.text(MENU_X + 68, MENU_Y + 16, "常用应用", 0xffffff, 0xf0, 1);
         let items = MENU_ITEMS;
         for (k, name) in items.iter().enumerate() {
             let y = MENU_Y + 46 + k as i32 * 44;
@@ -1057,7 +1400,11 @@ for i in 0..4 {
             let selected = k as i32 == sh.menu_sel;
             s.rect_fill(MENU_X + 10, y, MENU_X + MENU_W - 10, y + 38, 0xffffff,
                         if hovered { 0x2c } else if selected { 0x22 } else { 0x12 });
-            s.rect_fill(MENU_X + 18, y + 8, MENU_X + 40, y + 30, 0x8fc2ff, 0xd8);
+            let accent = APP_ACCENTS[k];
+            if hovered || selected {
+                s.rect_fill(MENU_X + 10, y + 5, MENU_X + 13, y + 33, accent, 0xd8);
+            }
+            draw_app_icon(&mut s, MENU_X + 18, y + 8, 22, accent, k as i32);
             s.text(MENU_X + 50, y + 11, name, 0xeef4ff, 0xe8, 1);
         }
     }
@@ -1142,7 +1489,7 @@ fn hover_code(sh: &Shell, mx: i32, my: i32) -> i32 {
        my >= MENU_ITEMS_Y && my < MENU_ITEMS_Y + MENU_ITEMS.len() as i32 * 44 {
         return 300 + (my - MENU_ITEMS_Y) / 44;
     }
-    let hw = hit_win(&sh.wins, mx, my);
+    let hw = hit_win(&sh.wins, mx, my, sh.focus as i32);
     if hw >= 0 {
         let w = sh.wins[hw as usize];
         let (bx, _by, bw, _bh) = control_rect(&w);
@@ -1199,9 +1546,20 @@ fn render_window_layer(slot: usize, w: &Win) -> bool {
         return false;
     }
     let cache = unsafe { &mut (&mut *core::ptr::addr_of_mut!(WIN_CACHE))[slot] };
-    // clear so stale pixels of a previous layer cannot leak through the margins
-    for v in cache.iter_mut() {
-        *v = 0;
+    /* v0.58.0: prefill with the wallpaper under the HOME anchor so the rounded
+     * corner AA blends into the real backdrop instead of black. The body itself
+     * is opaque, so only the 12 px corner band is affected. */
+    let wall = unsafe { &*core::ptr::addr_of!(WALL) };
+    let bx = w.ax - WC_MARGIN_L;
+    let by = w.ay - WC_MARGIN_T;
+    for ly in 0..lh {
+        let wy = (by + ly as i32).clamp(0, SCREEN_H - 1) as usize;
+        let wrow = wy * SCREEN_W as usize;
+        let drow = ly * WC_STRIDE;
+        for lx in 0..lw {
+            let wx = (bx + lx as i32).clamp(0, SCREEN_W - 1) as usize;
+            cache[drow + lx] = wall[wrow + wx];
+        }
     }
     let mut cs = Surface { px: &mut cache[..], w: lw, h: lh, stride: WC_STRIDE,
                            clip: (0, 0, lw as i32, lh as i32) };
@@ -1210,7 +1568,10 @@ fn render_window_layer(slot: usize, w: &Win) -> bool {
     wc.y = WC_MARGIN_T;
     wc.sox = w.ax - WC_MARGIN_L;
     wc.soy = w.ay - WC_MARGIN_T;
-    draw_window(&mut cs, &wc, true);
+    /* v0.58.0: the shadow is no longer part of the layer (it has to blend with
+     * the scene), so only the body is rendered here. */
+    draw_window(&mut cs, &wc, false);
+    unsafe { (&mut *core::ptr::addr_of_mut!(LAYER_WH))[slot] = (w.w, w.h); }
     true
 }
 
@@ -1223,20 +1584,28 @@ fn composite_window_layer(scene: &mut [u32], stride: usize, slot: usize, w: &Win
         return false;
     }
     let cache = unsafe { &(&*core::ptr::addr_of!(WIN_CACHE))[slot] };
-    let x0 = w.x - WC_MARGIN_L;
-    let y0 = w.y - WC_MARGIN_T;
+    /* v0.58.0: only the body is copied; the margins hold the wallpaper prefill
+     * and the shadow is drawn separately (alpha-composited over the scene). */
+    let _ = (lw, lh);                    /* validated above, not needed for the copy */
+    if w.w <= 0 || w.h <= 0 {
+        return true;
+    }
+    let x0 = w.x;
+    let y0 = w.y;
     let sx0 = (-x0).max(0) as usize;
     let sy0 = (-y0).max(0) as usize;
-    let ex = lw.min((SCREEN_W - x0).max(0) as usize);
-    let ey = lh.min((SCREEN_H - y0).max(0) as usize);
+    let ex = (w.w as usize).min((SCREEN_W - x0).max(0) as usize);
+    let ey = (w.h as usize).min((SCREEN_H - y0).max(0) as usize);
     if ex <= sx0 || ey <= sy0 {
         return true;
     }
+    let n = ex - sx0;
     for ly in sy0..ey {
         let dy = (y0 + ly as i32) as usize;
         let d = dy * stride + (x0 + sx0 as i32) as usize;
-        let srow = ly * WC_STRIDE + sx0;
-        scene[d..d + (ex - sx0)].copy_from_slice(&cache[srow..srow + (ex - sx0)]);
+        let srow = (WC_MARGIN_T as usize + ly) * WC_STRIDE
+                   + WC_MARGIN_L as usize + sx0;
+        scene[d..d + n].copy_from_slice(&cache[srow..srow + n]);
     }
     true
 }
@@ -1285,10 +1654,114 @@ fn save_taskbar(scene: &[u32], stride: usize) {
     }
 }
 
+/// v0.59.0: integer channel scaling (no f32: soft-float is ~20x slower here).
+#[inline]
+fn shade_px(c: u32, num: u32, den: u32) -> u32 {
+    let ch = |sh: u32| -> u32 {
+        let v = ((c >> sh) & 0xff) * num / den;
+        if v > 255 { 255 } else { v }
+    };
+    (ch(16) << 16) | (ch(8) << 8) | ch(0)
+}
+
+#[inline]
+fn lerp_px(a: u32, b: u32, i: i32, n: i32) -> u32 {
+    if n <= 0 {
+        return a;
+    }
+    let ch = |sh: u32| -> u32 {
+        let av = ((a >> sh) & 0xff) as i32;
+        let bv = ((b >> sh) & 0xff) as i32;
+        (av + (bv - av) * i / n).clamp(0, 255) as u32
+    };
+    (ch(16) << 16) | (ch(8) << 8) | ch(0)
+}
+
+/// Which glyph belongs to a window accent (0 settings, 1 task manager,
+/// 2 image viewer, 3 text editor).
+#[inline]
+fn glyph_for_accent(accent: u32) -> i32 {
+    match accent {
+        0x22c1a8 => 1,
+        0xf5a524 => 2,
+        0xe05a8a => 3,
+        _ => 0,
+    }
+}
+
+/// v0.59.0: pseudo-3D Fluent app icon: rounded plate with a vertical gradient,
+/// a specular top highlight, a dark bottom rim and a soft drop shadow. The
+/// rounded silhouette is drawn with per-row insets (integer rect fills only) so
+/// a 22 px icon costs no soft-float sqrt.
+fn draw_app_icon(s: &mut Surface<'_>, x: i32, y: i32, size: i32, accent: u32,
+                 glyph: i32) {
+    if size < 8 {
+        return;
+    }
+    let r = if size >= 20 { 3 } else { 2 };
+    let light = shade_px(accent, 150, 100);
+    let dark = shade_px(accent, 58, 100);
+    /* drop shadow (pseudo-3D: the plate floats above the surface) */
+    s.rect_fill(x + 2, y + 2, x + size + 2, y + size + 2, 0x000000, 0x34);
+    for i in 0..size {
+        /* inset profile: r, r-1, 0, 0, ... 0, r-1, r */
+        let ins = if i < r {
+            r - i
+        } else if i >= size - r {
+            r - (size - 1 - i)
+        } else {
+            0
+        };
+        let c = lerp_px(light, dark, i, (size - 1).max(1));
+        s.rect_fill(x + ins, y + i, x + size - ins, y + i + 1, c, 0xff);
+    }
+    /* specular highlight + bottom rim (the actual 3D cue) */
+    s.rect_fill(x + r, y + 1, x + size - r, y + 2, 0xffffff, 0x70);
+    s.rect_fill(x + r, y + size - 3, x + size - r, y + size - 2, 0x000000, 0x38);
+    /* glyph */
+    let gx = x + size / 2;
+    let gy = y + size / 2;
+    let g = if size >= 20 { 4 } else { 3 };
+    match glyph {
+        0 => {                       /* settings: ring */
+            s.rect_fill(gx - g, gy - 1, gx + g, gy + 1, 0xffffff, 0xd8);
+            s.rect_fill(gx - 1, gy - g, gx + 1, gy + g, 0xffffff, 0xd8);
+        }
+        1 => {                       /* task manager: bars */
+            s.rect_fill(gx - g, gy + 1, gx - g + 2, gy + g, 0xffffff, 0xd0);
+            s.rect_fill(gx - 1, gy - 2, gx + 1, gy + g, 0xffffff, 0xd0);
+            s.rect_fill(gx + g - 2, gy - g, gx + g, gy + g, 0xffffff, 0xd0);
+        }
+        2 => {                       /* image viewer: frame */
+            s.rect_fill(gx - g, gy - g, gx + g, gy - g + 1, 0xffffff, 0xd0);
+            s.rect_fill(gx - g, gy + g - 1, gx + g, gy + g, 0xffffff, 0xd0);
+            s.rect_fill(gx - g, gy - g + 1, gx - g + 1, gy + g - 1, 0xffffff, 0xd0);
+            s.rect_fill(gx + g - 1, gy - g + 1, gx + g, gy + g - 1, 0xffffff, 0xd0);
+            s.rect_fill(gx - 2, gy, gx + 2, gy + 2, 0xffffff, 0xc0);
+        }
+        _ => {                       /* text editor: text lines */
+            s.rect_fill(gx - g, gy - g, gx + g, gy - g + 1, 0xffffff, 0xd0);
+            s.rect_fill(gx - g, gy, gx + 1, gy + 1, 0xffffff, 0xd0);
+            s.rect_fill(gx - g, gy + g - 1, gx + g, gy + g, 0xffffff, 0xd0);
+        }
+    }
+}
+
 fn draw_window_shadow(s: &mut Surface<'_>, w: &Win) {
-    /* two-layer soft shadow: plain rect fills (no AA, no sqrt) */
-    s.rect_fill(w.x + 2, w.y + 10, w.x + w.w + 2, w.y + w.h + 12, 0x000000, 0x30);
-    s.rect_fill(w.x - 2, w.y + 4, w.x + w.w + 6, w.y + w.h + 4, 0x000000, 0x20);
+    /* v0.58.0: eight one-pixel rings around the body, each ring one rect fill per
+     * side so a corner pixel is covered exactly once. Every ring blends black
+     * over what is already there, which is what makes the shadow correct over
+     * the wallpaper *and* over a window underneath. Cost is the ring perimeter
+     * only (~12k px for a 430x300 window). */
+    for (k, alpha) in SHADOW_RING.iter().enumerate() {
+        let d = k as i32 + 1;
+        let (x0, y0) = (w.x - d, w.y - d);
+        let (x1, y1) = (w.x + w.w + d, w.y + w.h + d);
+        s.rect_fill(x0, y0, x1, y0 + 1, 0x000000, *alpha);          /* top */
+        s.rect_fill(x0, y1 - 1, x1, y1, 0x000000, *alpha);          /* bottom */
+        s.rect_fill(x0, y0 + 1, x0 + 1, y1 - 1, 0x000000, *alpha);  /* left */
+        s.rect_fill(x1 - 1, y0 + 1, x1, y1 - 1, 0x000000, *alpha);  /* right */
+    }
 }
 
 fn draw_window(s: &mut Surface<'_>, w: &Win, with_shadow: bool) {
@@ -1307,12 +1780,15 @@ fn draw_window(s: &mut Surface<'_>, w: &Win, with_shadow: bool) {
     s.rect_fill(w.x, w.y + 8, w.x + 1, w.y + w.h - 8, 0xffffff, 0x30);
     s.rect_fill(w.x + w.w - 1, w.y + 8, w.x + w.w, w.y + w.h - 8, 0xffffff, 0x30);
 
-    /* title bar: translucent strip + title text + accent dot (plain fill; the
-     * rounded top corners come from the body's AA silhouette) */
+    /* title bar: translucent strip + pseudo-3D app icon + title text + a faint
+     * accent underline (Fluent cue; the rounded top corners come from the body's
+     * AA silhouette) */
     s.rect_fill(w.x + 2, w.y + 1, w.x + w.w - 2, w.y + TITLE_H, 0xffffff, 0x14);
-    s.round_rect((w.x + 12) as f32, (w.y + 11) as f32, (w.x + 20) as f32,
-                 (w.y + 19) as f32, 4.0, w.accent, 0xf0);
-    s.text(w.x + 28, w.y + 7, w.title, 0xf2f6ff, 0xf0, 1);
+    draw_app_icon(s, w.x + 9, w.y + 8, TITLE_H - 16, w.accent,
+                  glyph_for_accent(w.accent));
+    s.text(w.x + 30, w.y + 7, w.title, 0xf2f6ff, 0xf0, 1);
+    s.rect_fill(w.x + 2, w.y + TITLE_H - 1, w.x + w.w - 2, w.y + TITLE_H,
+                w.accent, 0x2a);
 
     /* controls */
     let (bx, by, bw, bh) = control_rect(w);
@@ -1335,13 +1811,9 @@ fn draw_window(s: &mut Surface<'_>, w: &Win, with_shadow: bool) {
         }
     }
 
-    /* body content: a couple of text lines + a small translucent card */
-    s.text(w.x + 18, w.y + TITLE_H + 16, WIN_BODY, 0xdfe7f5, 0xb0, 1);
-    let cy = w.y + TITLE_H + 44;
-    s.rect_fill(w.x + 16, cy, w.x + w.w - 16, cy + 56, 0xffffff, 0x12);
-    s.text(w.x + 28, cy + 12, "圆角 + 轻亚克力 + 微透叠层", 0xcfe0ff, 0xc0, 1);
-    s.text(w.x + 28, cy + 32, "窗口可拖动 / 最小化 / 最大化", 0x9fb2cc, 0xb0, 1);
-    s.text(w.x + 18, (w.y + w.h - 26) as i32, "窗口管理原型 v0.52", 0x8fa3bd, 0x90, 1);
+    /* v0.59.0: per-window application content (settings / task manager /
+     * image viewer / editor) is painted by the apps module. */
+    crate::apps::draw_body(s, w.accent, w.x, w.y, w.w, w.h);
     unsafe {
         let d = &mut *core::ptr::addr_of_mut!(WSPLIT);
         d.0 += t_shadow;

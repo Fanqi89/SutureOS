@@ -6,6 +6,67 @@ every release is cut as an annotated git tag `v<version>` whose message also
 describes the release. Tags are never moved or deleted, so all versions coexist
 in the repository.
 
+## [Unreleased]
+
+## [v0.59.0-alpha]
+
+### 桌面换代：`startgui` 改为 Rust 桌面外壳 + 最小 Wayland 服务端
+
+- **`startgui` 现在启动 Rust 桌面外壳**（圆角窗口 + 轻亚克力 + 任务栏 + 开始菜单 + 伪 3D 应用图标）；
+  原 C 桌面完整保留为 **`startgui-classic`**（`startgui test` 仍走它的指针自检，Rust 未链接时如实回退并打日志）。
+  启动方式未变：滚动英文日志 → 系统名 banner → 黑底白字终端 → 显式输入 `startgui`。
+- **视觉方向落地**（用户 2026-11-21 批准）：拟物化伪 3D 应用图标——开始菜单 22px、窗口标题栏 14px，
+  纵向渐变盘 + 顶部高光 + 底部暗边 + 投影，四个应用各自 accent（蓝/青/橙/粉）；标题栏加 accent 下划线。
+- **Logo 透明通道修复**：`scripts/mklogo_assets.py` 曾用 `convert('RGB')` 丢掉 alpha，机上每个 Logo
+  都垫着一块白色方块；现在生成 0xAARRGGBB 并在外壳里 alpha 混合（不透明像素与 PNG 完全一致、
+  透明像素 0 个纯白、透明区均值跟随背景）。
+- **键盘输入队列**：一帧里从 8042 读到的多个按键不再只保留最后一个（修复快速连打丢字，实测 "hello"→"hllo"）。
+- **每窗真实应用内容**：系统设置三行设置项、任务管理器实时 uptime/CPU% + 两条进度条、
+  图片查看器棋盘格 + 真实 48px Logo 3× + 文件名标注、文本编辑器三行带行号代码 + 光标块。
+- **最小 Wayland 服务端**：named AF_UNIX 端点（bind/connect，int 0x80 号 15/16）+ wl_display/
+  wl_registry/wl_callback/wl_compositor/wl_surface/wl_shm/wl_shm_pool/wl_buffer/wl_seat 子集；
+  ring-3 `run wlclient` 用 SCM_RIGHTS 交付 memfd，commit 时服务端从 memfd 读像素并算 FNV-1a；
+  新增 `wlshow` 命令把最后 commit 的 wl_surface 整屏呈现（整数最近邻缩放 + accent 边框）。
+- **外观基线换代**：新桌面冻结为 `docs/baseline/base_gui.png`，C 桌面基线迁到
+  `docs/baseline/base_gui_classic.png`；`gui_appearance_check.py` 支持 `--profile new|classic`。
+- 验收：桌面 **19/19**、外壳 **55/55**、应用内容 **25/25**、Logo **14/14**、Wayland 服务端 **28/28**、
+  wlshow **9/9**、静态 **21/21**、交互 **13/13**、C 桌面 **9/9**、两套外观门禁 **0 像素**、
+  自检 **16/16**、符号 **1405 / 0 冲突**。
+- 产物：`kernel.elf` 6,400,672 B、`sutureos.iso` 23,410,688 B（版本号仍 `0.58.0-alpha`，未发布）。
+
+### 新 GUI（Rust 外壳）第二轮：阴影合成、窗口内键盘焦点、真实过渡
+
+- 修复窗口阴影变成黑色硬边（v0.46 起层缓存把阴影烘在黑色背景上，窗周实测 (0,0,0)）：
+  阴影改为按距离查表的 8 层像素环，逐帧 alpha 合成到场景，层缓存只保留不透明窗体，
+  圆角 AA 用所在位置的壁纸预填。验收断言：阴影带 == 壁纸 × (1-α)
+  （band (85,82,196) vs 期望 (85,82,196)）、上层窗口阴影正确压暗下层窗口体
+  （shaded (136,107,216) vs body (148,118,237)）。
+- 新增窗口内键盘焦点与可编辑行：点击窗口取得焦点，可打印字符进入该窗口的输入行，
+  `Enter` 提交（串口 `[gui-shell] input win=N text=...`）、`Backspace` 退格、
+  `Tab` 在可见窗口间循环焦点（`focus cycle N`）；输入行只在焦点窗口内绘制，
+  窗口层缓存保持静态。
+- 最大化/还原改为真正的几何过渡：4 帧内把窗口体层最近邻采样到插值矩形
+  （几何立即到目标，点击命中不受动画影响），结束后接原有 3 帧淡入；
+  `scale begin` / `scale N` / `scale done` 可验收。
+- 关机键 `S` → **`F10`**（外壳现在接受可打印文本，必须把 `S` 留给窗口输入）。
+- 验收：外壳 **55/55**（新增阴影 2、Tab 焦点 1、过渡 3、键盘输入 3、确定性最小化 1）；
+  `logo_acceptance` **12/12**（改用 F10）；静态 **21/21**、交互 **13/13**、C 桌面 **9/9**、
+  外观门禁 0 像素。C 桌面与冻结的启动呈现未改动。
+- 版本号推进到 `0.58.0-alpha`（未发布）。
+
+### 新 GUI（Rust 外壳）与 Logo 资产（上一轮，未发布）
+
+- 修复 `guishell` 关闭按钮点击路由：点击命中改用点击坐标而非当前指针，z 序改为单调计数器
+  （菜单启动与聚焦同帧不再产生相同 z），关闭按钮现在稳定生效；外壳验收 **42/42**。
+- 新增 `scripts/mklogo_assets.py`：把 `logo/` 尺寸阶梯编译成 `kernel/gui/logo_assets.c`
+  （24px 开始按钮图标、48px 开始菜单图标、768px 关机动画图；运行时不解码 PNG）。
+- `guishell` 开始按钮与开始菜单头部改用真实 Logo，逐像素验收：24px 图标 0/576 像素差异，
+  48px 图标 0/2304 像素差异。
+- 新增 `S` 键关机动画（v0.58.0 起改为 `F10`，因为外壳开始接受窗口文本输入）：暗化桌面 → 显示 768px Logo → 3×3 分块逆序收起 → ACPI S5 关机；
+  `scripts/logo_acceptance.py` **12/12**（含 QEMU 真关机）。
+- C 桌面与启动呈现不变：`gui_baseline_shot` 动态矩形外 **0 像素**；自检 **16/16**；
+  `symbol-scan` 1385 符号 / 0 冲突。
+
 ## [v0.57.0-alpha]
 
 **十二域移植收尾：补齐文件系统、USB HID、虚拟显示、音频、DHCP/DNS 与自写 BIOS 引导链等能力（全部真机 QEMU 验收）。**

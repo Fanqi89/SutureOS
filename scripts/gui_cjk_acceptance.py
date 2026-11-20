@@ -102,7 +102,9 @@ def main():
             time.sleep(0.4)
             for _ in range(24):
                 key('backspace', 0.015)
-            typ('startgui')
+            for _ch in 'startgui-classic':
+                key('minus' if _ch == '-' else _ch, 0.12)
+            time.sleep(0.3)
             key('ret')
             time.sleep(3.2)
             if '[gui] main loop start' in log_text():

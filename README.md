@@ -59,8 +59,26 @@ original to SutureOS and are kept frozen.
 - DHCP client and DNS resolver
 - Read-only ext4, VimtuFS2 and OS67 (Minix v1) filesystems; writable MayFS
 
-Current build artifacts from the tree: `kernel.elf` ≈ 3.76 MB, `sutureos.iso` ≈ 17.6 MB,
-boot self-tests **16/16**, **1381** global symbols with **0 collisions**.
+Current build artifacts from the tree: `kernel.elf` ≈ 6.10 MB, `sutureos.iso` ≈ 22.3 MB,
+boot self-tests **16/16**, **1405** global symbols with **0 collisions**.
+
+**Desktop (v0.59.0-alpha):** the **Rust shell is now the desktop** — `startgui` enters it, and the
+original C desktop moved to `startgui-classic` (its own acceptance suites and appearance gate
+still run against it). The shell has pseudo-3D Fluent app icons (22 px in the start menu, 14 px
+in every title bar: gradient plate + specular highlight + dark rim + drop shadow, one accent per
+app), per-window application content (settings rows, live uptime/CPU figures, a logo image
+viewer, an editor buffer), real logo alpha blending, and a keystroke queue that no longer drops
+characters. A **minimal Wayland server** lives in the kernel: named AF_UNIX endpoints
+(`bind`/`connect`), the wl_display/wl_registry/wl_callback/wl_compositor/wl_surface/wl_shm/
+wl_shm_pool/wl_buffer/wl_seat subset, a ring-3 client (`run wlclient`) that hands its memfd over
+with SCM_RIGHTS, and `wlshow`, which presents the last committed surface on screen. Shell
+acceptance **55/55**, desktop **19/19**, per-window content **25/25**, logo **14/14**, Wayland
+**28/28**, wlshow **9/9**; both appearance gates report **0 pixels outside live rectangles**,
+and the boot presentation is unchanged.
+
+**In development (next line, not yet released):** a vsync/swap-chain presenter, the rest of the
+Wayland surface protocol (frame callbacks, damage tracking, multiple clients, real seat input),
+embedding a Wayland surface into a desktop window, and continued visual polish.
 
 ---
 
@@ -218,7 +236,7 @@ The boot sequence is fixed: scrolling English kernel log → SutureOS banner →
 
 ### Shell
 
-87 commands are available; `help` prints the full list.
+89 commands are available; `help` prints the full list.
 
 | Group | Commands |
 |---|---|
@@ -227,17 +245,32 @@ The boot sequence is fixed: scrolling English kernel log → SutureOS banner →
 | Users | `login` `su` `sudo` `whoami` `id` `passwd` `users` `useradd` `userdel` |
 | Networking | `ping` `dhcp` `dns` `nslookup` `wget` `tcpecho` `tcpsend` `tcpserve` `tcpapi` `tcpstat` `netstat` |
 | Hardware | `usbinfo` `kbdstat` `mouseinfo` `beep` `hdatest` `hdavol` `ac97vol` `sb16test` |
-| Display / GUI | `startgui` `guislint` `guishell` `vga2d` `vmsvga` |
-| Ring 3 | `run` `ushell` `ring3` `ring3test` `unixtest` `shmtest` `fdpass` `systest` `pipetest` |
+| Display / GUI | `startgui` `startgui-classic` `guislint` `guishell` `wlshow` `vga2d` `vmsvga` |
+| Ring 3 | `run` `wlclient` `ushell` `ring3` `ring3test` `unixtest` `shmtest` `fdpass` `systest` `pipetest` |
 
 ### GUI
 
-- `startgui` opens the original desktop with six applications: Task Manager, Calculator,
-  About SutureOS, Image Viewer (BMP/QOI), Text Editor, Switch User.
-- Windows support dragging, minimize/maximize/restore, close and double-click-to-maximize;
-  four applications are pinned to the taskbar.
-- `guislint` renders a single frame of the Rust UI prototype; `guishell` runs its interactive
-  desktop shell prototype (windows, taskbar, start menu, transitions).
+- `startgui` opens the **Rust desktop shell**: rounded windows over a light-acrylic backdrop,
+  a taskbar with the SutureOS logo start button and a live clock, and a start menu with
+  pseudo-3D Fluent app icons. Windows support dragging, minimize/maximize/restore (a real
+  4-frame geometry transition), close, double-click-to-maximize, and keyboard focus.
+- Each window shows its own application content: settings rows, live uptime/CPU figures with
+  progress bars, an image viewer (checkerboard + the real SutureOS logo at 3x) and an editor
+  buffer with numbered lines.
+- `startgui-classic` opens the original C desktop with six applications (Task Manager,
+  Calculator, About SutureOS, Image Viewer, Text Editor, Switch User); its appearance baseline
+  is frozen separately in `docs/baseline/base_gui_classic.png`.
+- `guislint` renders a single frame of the Rust UI prototype; `guishell` runs the same shell
+  directly. `wlshow` presents the last committed Wayland surface (run `wlclient` first).
+- In `guishell` the focused window also owns the keyboard: typed ASCII goes into its editable
+  line, `Enter` commits it to the serial log, `Backspace` edits and `Tab` cycles the focus
+  between visible windows; window shadows are alpha-composited over whatever is underneath.
+- The original SutureOS logo (`logo/` asset ladder, compiled by `scripts/mklogo_assets.py`
+  into `kernel/gui/logo_assets.c`) is used by the Rust shell: 24 px icon in the start button,
+  48 px icon in the start-menu header, and the 768 px step for the shutdown animation.
+  The PNG ladder's alpha channel is preserved and blended in the shell. Press **`F10`** in
+  `guishell` to play the reverse logo animation and power the machine off (ACPI S5). The kernel
+  never decodes PNG at runtime, and the boot presentation is unchanged.
 
 ### Users and privileges
 

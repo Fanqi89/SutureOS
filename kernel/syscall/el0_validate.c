@@ -4,6 +4,7 @@
 #include <stitch/types.h>
 #include <stitch/console.h>
 #include "el0_validate.h"
+#include "mmu.h"          /* mmu_walk(): fall back to the live page tables */
 
 #define EL0_MAX_RANGES 8
 
@@ -31,6 +32,31 @@ int el0_grant_range(uint64_t start, uint64_t len)
     return 0;
 }
 
+/* v0.58.0: a buffer does not have to live inside the granted image window to be
+ * a legitimate user pointer. brk()/mmap() memory (the anonymous heap and every
+ * MAP_SHARED memfd mapping) is mapped user-accessible *after* the launch-time
+ * grant, and a Wayland client writes its pixels from exactly such a mapping -
+ * without this walk, write(fd, mapped_pixels, n) failed with -EPERM ("bad ptr")
+ * even though the pages were perfectly valid user pages.
+ *
+ * Accepted only when every page of [va, va+len) is PRESENT and USER: kernel
+ * mappings have U/S=0, so a kernel pointer is still rejected. create=0 keeps
+ * this read-only (mmu_walk must never allocate a page table from here). */
+static int el0_user_pages_ok(uint64_t va, uint64_t len)
+{
+    uint64_t *pml4 = (uint64_t *)(uintptr_t)read_cr3();
+    uint64_t p = va & ~0xFFFull;
+    const uint64_t end = (va + len + 0xFFFull) & ~0xFFFull;
+
+    for (; p < end; p += 0x1000ULL) {
+        uint64_t *pte = mmu_walk(pml4, 0, p, 0);
+        if (pte == NULL) return 0;
+        if ((*pte & PTE_P) == 0) return 0;
+        if ((*pte & PTE_U) == 0) return 0;
+    }
+    return 1;
+}
+
 /* 检查指针是否在授权范围内 */
 int el0_ptr_ok(uint64_t va, uint64_t len)
 {
@@ -40,6 +66,7 @@ int el0_ptr_ok(uint64_t va, uint64_t len)
         if (va >= el0_ranges[i].start &&
             va + len <= el0_ranges[i].start + el0_ranges[i].len)
             return 1;
+    if (el0_user_pages_ok(va, len)) return 1;
     console_printf("[el0] bad ptr va=%p len=%llu\n", (void*)va, len);
     return 0;
 }

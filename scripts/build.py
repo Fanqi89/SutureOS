@@ -220,6 +220,32 @@ def main():
         shutil.copy2(str(tdir / "prog.bin.o"), str(eobj))
         user_embed_objs.append(str(eobj))
 
+    # ---- logo assets ---------------------------------------------------------
+    # The kernel never decodes PNG at runtime. `logo/` is the source of truth and
+    # scripts/mklogo_assets.py turns the 24/48/1536 steps of the ladder into the C
+    # arrays compiled here (the 768 px shutdown frame is an exact 2:1 decimation of
+    # the 1536 master). The generated files are ignored by git and rebuilt when a
+    # PNG or the generator is newer than them.
+    logo_dir = ROOT / "logo"
+    logo_c = ROOT / "kernel" / "gui" / "logo_assets.c"
+    logo_h = ROOT / "kernel" / "gui" / "logo_assets.h"
+    logo_gen = ROOT / "scripts" / "mklogo_assets.py"
+    logo_pngs = [logo_dir / ("SutureOS_logo_%d.png" % n) for n in (24, 48, 1536)]
+    missing = [str(p) for p in logo_pngs if not p.exists()]
+    if missing:
+        print("logo ladder missing: " + ", ".join(missing))
+        return 1
+    newest = max(p.stat().st_mtime for p in logo_pngs + [logo_gen])
+    stale = (not logo_c.exists() or not logo_h.exists()
+             or logo_c.stat().st_mtime < newest or logo_h.stat().st_mtime < newest)
+    if stale:
+        print("Generating kernel/gui/logo_assets.c from the logo/ PNG ladder...")
+        r = subprocess.run([sys.executable, str(logo_gen)], cwd=str(ROOT))
+        if r.returncode != 0:
+            print("logo asset generation failed")
+            return 1
+        print("logo assets: %d bytes" % logo_c.stat().st_size)
+
     # Collect sources
     sources = []
     for pattern in ["boot/*.S", "arch/x86_64/*.c", "arch/x86_64/*.S", 

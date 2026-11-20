@@ -52,8 +52,22 @@ SutureOS 是一个实验性的 **x86_64 单内核操作系统**，通过移植�
 - DHCP 客户端与 DNS 解析器
 - 只读 ext4、VimtuFS2、OS67（Minix v1）文件系统；可写 MayFS
 
-当前源码树构建产物：`kernel.elf` 约 3.76 MB，`sutureos.iso` 约 17.6 MB；开机自检 **16/16**，
-全局符号 **1381** 个、**0 冲突**。
+当前源码树构建产物：`kernel.elf` 约 6.10 MB，`sutureos.iso` 约 22.3 MB；开机自检 **16/16**，
+全局符号 **1405** 个、**0 冲突**。
+
+**桌面（v0.59.0-alpha）：Rust 桌面外壳已成为默认桌面**——`startgui` 进入新桌面，原 C 桌面移到
+`startgui-classic`（它自己的验收套件与外观门禁继续跑）。新桌面有拟物化伪 3D Fluent 应用图标
+（开始菜单 22px、每扇窗标题栏 14px：渐变盘 + 顶部高光 + 暗边 + 投影，每个应用独立 accent）、
+每窗真实应用内容（设置项 / 实时 uptime·CPU / Logo 图片查看器 / 编辑器缓冲）、Logo 透明通道
+与键盘输入队列（一帧多键不再丢字）。内核里有**最小 Wayland 服务端**：named AF_UNIX 端点
+（`bind`/`connect`）+ wl_display/wl_registry/wl_compositor/wl_surface/wl_shm/wl_shm_pool/
+wl_buffer/wl_seat 子集，ring-3 客户端 `run wlclient` 用 SCM_RIGHTS 交付 memfd，`wlshow` 把最后
+commit 的 surface 整屏呈现。验收：桌面 **19/19**、外壳 **55/55**、应用内容 **25/25**、
+Logo **14/14**、Wayland **28/28**、wlshow **9/9**，两套外观门禁 **0 像素**，启动呈现未变。
+
+**开发中（下一条版本线，尚未发布）：** vsync/交换链呈现器、Wayland surface 协议剩余部分
+（frame 回调、damage 追踪、多客户端、真实 seat 输入）、把 Wayland surface 嵌入桌面窗口，
+以及继续按既定方向做视觉打磨。
 
 ---
 
@@ -206,7 +220,7 @@ qemu-system-x86_64 \
 
 ### Shell
 
-共 87 条命令，`help` 可查看完整列表。
+共 89 条命令，`help` 可查看完整列表。
 
 | 分组 | 命令 |
 |---|---|
@@ -215,16 +229,26 @@ qemu-system-x86_64 \
 | 用户 | `login` `su` `sudo` `whoami` `id` `passwd` `users` `useradd` `userdel` |
 | 网络 | `ping` `dhcp` `dns` `nslookup` `wget` `tcpecho` `tcpsend` `tcpserve` `tcpapi` `tcpstat` `netstat` |
 | 硬件 | `usbinfo` `kbdstat` `mouseinfo` `beep` `hdatest` `hdavol` `ac97vol` `sb16test` |
-| 显示 / GUI | `startgui` `guislint` `guishell` `vga2d` `vmsvga` |
-| ring 3 | `run` `ushell` `ring3` `ring3test` `unixtest` `shmtest` `fdpass` `systest` `pipetest` |
+| 显示 / GUI | `startgui` `startgui-classic` `guislint` `guishell` `wlshow` `vga2d` `vmsvga` |
+| ring 3 | `run` `wlclient` `ushell` `ring3` `ring3test` `unixtest` `shmtest` `fdpass` `systest` `pipetest` |
 
 ### GUI
 
-- `startgui` 打开原创桌面，包含六个应用：Task Manager、Calculator、About SutureOS、
-  Image Viewer（BMP/QOI）、Text Editor、Switch User。
-- 窗口支持拖动、最小化/最大化/还原、关闭、双击标题栏最大化；四个应用固定在任务栏。
-- `guislint` 渲染 Rust UI 原型的单帧画面；`guishell` 运行其可交互桌面外壳原型
-  （窗口、任务栏、开始菜单、过渡动画）。
+- `startgui` 打开 **Rust 桌面外壳**：圆角窗口叠在轻亚克力底上，任务栏带 SutureOS Logo 开始按钮与
+  实时时钟，开始菜单用拟物化伪 3D Fluent 图标；窗口支持拖动、最小化/最大化/还原（4 帧几何过渡）、
+  关闭、双击最大化与键盘焦点。
+- 每扇窗显示自己的应用内容：设置项、实时 uptime/CPU% + 进度条、图片查看器（棋盘格 + 真实
+  SutureOS Logo 3×）、带行号的编辑器缓冲。
+- `startgui-classic` 打开原 C 桌面（六个应用），它的外观基线单独冻结在
+  `docs/baseline/base_gui_classic.png`。
+- `guislint` 渲染 Rust UI 原型的单帧画面；`guishell` 直接运行同一外壳；`wlshow` 把最后 commit 的
+  Wayland surface 整屏呈现（先 `run wlclient`）。
+- `guishell` 里焦点窗口同时拥有键盘：可打印字符进入它的输入行、`Enter` 提交到串口、
+  `Backspace` 退格、`Tab` 在可见窗口间切换焦点；窗口阴影按 alpha 合成到下层（壁纸或其他窗口）。
+- 原创 SutureOS Logo（`logo/` 素材阶梯，由 `scripts/mklogo_assets.py` 编译为
+  `kernel/gui/logo_assets.c`）已接入 Rust 外壳：开始按钮 24px 图标、开始菜单头部 48px 图标、
+  关机动画使用 768px 档；PNG 阶梯的 alpha 通道会保留并在外壳里做混合。在 `guishell` 按
+  **`F10`** 会播放反向 Logo 动画并经 ACPI S5 关机。内核运行时不解析 PNG，启动呈现不变。
 
 ### 用户与权限
 

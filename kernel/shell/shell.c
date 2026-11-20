@@ -120,9 +120,11 @@ static const struct shell_cmd g_commands[] = {
     {"exit",    shell_cmd_exit,    "Exit shell"},
     {"reboot",  shell_cmd_reboot,  "Reboot the system"},
     {"shutdown",shell_cmd_shutdown,"Shutdown the system"},
-    {"startgui",shell_cmd_startgui,"Start GUI interface (fallback to terminal on failure)"},
+    {"startgui",shell_cmd_startgui,"Start the SutureOS desktop (Rust shell; 'startgui classic' = C desktop)"},
+    {"startgui-classic",shell_cmd_startgui_classic,"Start the original C desktop (legacy, used by its own tests)"},
     {"guislint",shell_cmd_guislint,"Render one Slint prototype frame (Stage 0, ESC returns)"},
     {"guishell",shell_cmd_guishell,"Desktop shell prototype: windows + taskbar + start menu (ESC returns)"},
+    {"wlshow",shell_cmd_wlshow,"Show the last committed Wayland surface (run `run wlclient` first)"},
     {"ls",      shell_cmd_ls,      "List directory contents"},
     {"cd",      shell_cmd_cd,      "Change directory"},
     {"pwd",     shell_cmd_pwd,     "Print working directory"},
@@ -608,8 +610,11 @@ int shell_cmd_shutdown(int argc, char **argv) {
     return 0;
 }
 
-int shell_cmd_startgui(int argc, char **argv) {
-    (void)argc; (void)argv;
+/* The original C desktop (six apps, taskbar, start menu). v0.59.0: it is no
+ * longer the default desktop — `startgui` now starts the Rust shell — but it is
+ * kept intact as `startgui-classic` so its own acceptance suites, the frozen
+ * C-desktop appearance gate and the pointer self-test keep working. */
+static int startgui_classic(int argc, char **argv) {
     if (argc > 1 && argv[1] != NULL && strcmp(argv[1], "test") == 0) {
         extern void gui_arm_pointer_selftest(void);
         gui_arm_pointer_selftest();
@@ -650,6 +655,48 @@ int shell_cmd_startgui(int argc, char **argv) {
     }
     shell_puts(g_shell.prompt);
     return ret;
+}
+
+/* v0.59.0: `startgui` starts the Rust desktop shell (rounded windows, acrylic,
+ * taskbar, start menu). The frozen C desktop moved to `startgui-classic`; if the
+ * Rust object is not linked the command falls back to it honestly instead of
+ * pretending to start a desktop. */
+int shell_cmd_startgui(int argc, char **argv) {
+    extern int slint_gui_run_shell(void);
+    extern int slint_gui_linked(void);
+    extern void console_screen_enable(int on);
+    extern int term_available(void);
+    extern void term_clear(void);
+    extern void fbcon_clear(void);
+
+    if (argc > 1 && argv[1] != NULL &&
+        (strcmp(argv[1], "classic") == 0 || strcmp(argv[1], "test") == 0)) {
+        return startgui_classic(argc, argv);
+    }
+    if (!slint_gui_linked()) {
+        shell_puts("startgui: Rust GUI object not linked, using the C desktop\n");
+        return startgui_classic(argc, argv);
+    }
+    shell_scroll_message("Starting SutureOS desktop...");
+    console_screen_enable(0);
+    const int r = slint_gui_run_shell();
+    console_screen_enable(1);
+    if (term_available()) term_clear();
+    else fbcon_clear();
+    if (r != 0) shell_printf("startgui: desktop loop failed (error %d)\n", r);
+    shell_puts("Desktop exited, returning to terminal\n");
+    {
+        extern int persist_present(void);
+        extern int persist_flush(void);
+        if (persist_present()) (void)persist_flush();
+    }
+    shell_puts(g_shell.prompt);
+    return r;
+}
+
+/* Explicit alias for the legacy C desktop (documented in the README). */
+int shell_cmd_startgui_classic(int argc, char **argv) {
+    return startgui_classic(argc, argv);
 }
 
 /* Slint GUI prototype (Stage 0): render ONE static frame with the Rust GUI stack
