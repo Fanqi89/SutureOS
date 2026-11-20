@@ -134,11 +134,75 @@ void mbos_kbd_init(void)
     kb_caps = false;
 }
 
+/* ==================== decoded-scancode mirror ====================
+ * The wl_keyboard event source (kernel/ipc/wl_server.c) needs the real key
+ * stream, but mbos_kbd_poll() is the shell's / GUI's polling path and keeps its
+ * exact semantics.  Every scancode is therefore *also* pushed into this ring,
+ * and the Wayland server pops from it inside its own pump.  A full ring drops
+ * the newest entry and only costs a Wayland event - never a shell/GUI key. */
+static struct {
+    uint8_t  sc;
+    uint32_t tick;
+} g_kbd_mirror[MBOS_KBD_MIRROR_SIZE];
+static volatile uint32_t g_kbd_mirror_head;      /* producer */
+static volatile uint32_t g_kbd_mirror_tail;      /* consumer */
+static volatile uint32_t g_kbd_mirror_dropped;
+extern volatile uint64_t g_tick_count;
+
+static void mirror_push(uint8_t sc)
+{
+    const uint32_t head = g_kbd_mirror_head;
+    const uint32_t next = (head + 1u) % MBOS_KBD_MIRROR_SIZE;
+
+    if (next == g_kbd_mirror_tail) {             /* full: drop the newest */
+        g_kbd_mirror_dropped++;
+        return;
+    }
+    g_kbd_mirror[head].sc = sc;
+    g_kbd_mirror[head].tick = (uint32_t)g_tick_count;
+    g_kbd_mirror_head = next;
+}
+
+void mbos_kbd_mirror_reset(void)
+{
+    g_kbd_mirror_head = 0;
+    g_kbd_mirror_tail = 0;
+    g_kbd_mirror_dropped = 0;
+}
+
+int mbos_kbd_mirror_pop(uint8_t *sc, uint32_t *tick)
+{
+    const uint32_t tail = g_kbd_mirror_tail;
+
+    if (tail == g_kbd_mirror_head) return 0;
+    if (sc) *sc = g_kbd_mirror[tail].sc;
+    if (tick) *tick = g_kbd_mirror[tail].tick;
+    g_kbd_mirror_tail = (tail + 1u) % MBOS_KBD_MIRROR_SIZE;
+    return 1;
+}
+
+uint32_t mbos_kbd_mirror_dropped(void)
+{
+    return g_kbd_mirror_dropped;
+}
+
+uint32_t mbos_kbd_mod_state(void)
+{
+    uint32_t m = kb_mode & (MBOS_KBD_SHIFT | MBOS_KBD_CTRL | MBOS_KBD_ALT);
+
+    if (kb_caps) m |= MBOS_KBD_CAPS_BIT;
+    return m;
+}
+
 int mbos_kbd_decode(uint8_t scancode)
 {
     const uint8_t sc = scancode;
     uint8_t mod;
     char base, shifted;
+
+    /* Mirror first: every byte the decoder sees (make and break) is published
+     * to the Wayland input ring as well.  Nothing below changes. */
+    mirror_push(sc);
 
     /* E0 prefix: remember it for the next byte, produce nothing */
     if (MBOS_KBD_IS_ESCAPE(sc)) {

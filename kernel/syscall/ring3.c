@@ -372,6 +372,13 @@ extern const uint8_t _binary_wlprobe_bin_size[];
 extern const uint8_t _binary_wlclient_bin_start[];
 extern const uint8_t _binary_wlclient_bin_end[];
 extern const uint8_t _binary_wlclient_bin_size[];
+/* Multi-client batch: the *second* ring-3 Wayland client (user/apps/wltwo.c).
+ * It opens two connections, publishes two differently sized/scaled surfaces,
+ * uses wl_region + wl_subcompositor, and collects live wl_keyboard/wl_pointer
+ * events; `run wltwo` is the acceptance. */
+extern const uint8_t _binary_wltwo_bin_start[];
+extern const uint8_t _binary_wltwo_bin_end[];
+extern const uint8_t _binary_wltwo_bin_size[];
 
 typedef struct {
     const char *name;
@@ -401,6 +408,7 @@ static const user_program_t g_programs[] = {
     { "rdf", _binary_rdf_bin_start, _binary_rdf_bin_size },
     { "wlprobe", _binary_wlprobe_bin_start, _binary_wlprobe_bin_size },
     { "wlclient", _binary_wlclient_bin_start, _binary_wlclient_bin_size },
+    { "wltwo", _binary_wltwo_bin_start, _binary_wltwo_bin_size },
 };
 
 /* ---- execve support ----

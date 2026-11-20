@@ -13,7 +13,8 @@
 #include <stitch/string.h>
 
 #include "mb_mouse.h"      /* the kernel's PS/2 pointer state for wl_pointer    */
-#include "time_source.h"   /* monotonic ms for wl_pointer.motion(time)          */
+#include "mb_kbd.h"        /* the decoded-scancode mirror: wl_keyboard source   */
+#include "time_source.h"   /* monotonic ms for wl_pointer/wl_keyboard time      */
 #include "memfd.h"
 #include "scm_fd.h"
 #include "unix_socket.h"
@@ -34,8 +35,33 @@
 
 /* wl_pointer event opcodes (server -> client) */
 #define WL_POINTER_EV_ENTER   0u
+#define WL_POINTER_EV_LEAVE   1u
 #define WL_POINTER_EV_MOTION  2u
 #define WL_POINTER_EV_BUTTON  3u
+#define WL_POINTER_EV_FRAME   5u          /* wl_pointer version >= 5          */
+
+/* wl_keyboard event opcodes (server -> client) */
+#define WL_KB_EV_KEYMAP       0u
+#define WL_KB_EV_ENTER        1u
+#define WL_KB_EV_LEAVE        2u
+#define WL_KB_EV_KEY          3u
+#define WL_KB_EV_MODIFIERS    4u
+
+/* wl_keyboard.keymap format: the spec's own "no keymap" value.  This kernel has
+ * no XKB data, so the keymap event carries no descriptor and says so, and the
+ * evdev keycodes in wl_keyboard.key are the mapping the client must use. */
+#define WL_KB_KEYMAP_NO_KEYMAP 0u
+#define WL_KB_KEY_STATE_RELEASED 0u
+#define WL_KB_KEY_STATE_PRESSED  1u
+
+/* wl_surface request opcodes that this server implements (wayland.xml) */
+#define WL_SURFACE_SET_OPAQUE_REGION 4u
+#define WL_SURFACE_SET_INPUT_REGION  5u
+#define WL_SURFACE_COMMIT            6u
+#define WL_SURFACE_SET_BUFFER_TRANSFORM 7u
+#define WL_SURFACE_SET_BUFFER_SCALE  8u
+#define WL_SURFACE_DAMAGE_BUFFER     9u   /* NOT 7: 7 is set_buffer_transform   */
+#define WL_SURFACE_OFFSET            10u
 
 /* object types tracked per connection */
 enum {
@@ -51,7 +77,9 @@ enum {
     OBJ_SEAT,
     OBJ_POINTER,
     OBJ_KEYBOARD,
-    OBJ_REGION
+    OBJ_REGION,
+    OBJ_SUBCOMPOSITOR,
+    OBJ_SUBSURFACE
 };
 
 struct wl_global_def {
@@ -61,10 +89,17 @@ struct wl_global_def {
     int         type;
 };
 
+/* Advertised versions are the ones this server actually honours:
+ *   wl_compositor v4 - v3 adds wl_surface.set_buffer_scale (implemented);
+ *   wl_seat       v7 - v5 adds wl_pointer.frame (emitted only when the client
+ *                      bound the pointer at >= 5, which is what the protocol
+ *                      requires);
+ *   wl_subcompositor v1 - get_subsurface/set_position/set_sync. */
 static const struct wl_global_def g_globals[] = {
-    { "wl_compositor", 1u, 1u, OBJ_COMPOSITOR },
-    { "wl_shm",        1u, 2u, OBJ_SHM },
-    { "wl_seat",       1u, 3u, OBJ_SEAT },
+    { "wl_compositor",    4u, 1u, OBJ_COMPOSITOR },
+    { "wl_shm",           1u, 2u, OBJ_SHM },
+    { "wl_seat",          7u, 3u, OBJ_SEAT },
+    { "wl_subcompositor", 1u, 4u, OBJ_SUBCOMPOSITOR },
 };
 #define WL_GLOBAL_COUNT ((int)(sizeof g_globals / sizeof g_globals[0]))
 
@@ -85,12 +120,34 @@ struct wl_obj {
     uint32_t frame_cb_id;      /* 0 = no frame callback requested             */
     int32_t  damage_x, damage_y, damage_w, damage_h;
     int      damage_valid;
+    /* wl_surface: set_buffer_scale (v3) and the two region slots (v1) */
+    int32_t  scale;            /* 1 unless the client set another value        */
+    uint32_t opaque_region;    /* wl_region id, 0 = none                       */
+    uint32_t input_region;     /* wl_region id, 0 = none                       */
+    int32_t  off_x, off_y;     /* wl_surface.offset (v5)                       */
+    int32_t  transform;        /* set_buffer_transform: recorded, not applied  */
     /* wl_callback */
     int      cb_done;
     uint32_t cb_serial;
-    /* wl_pointer: the synthetic snapshot is emitted on the first pump after
-     * wl_seat.get_pointer, once a surface has been committed. */
+    /* wl_pointer / wl_keyboard: the live event stream state.  `pointer_sent`
+     * means "enter was emitted for the surface this device is on". */
     int      pointer_sent;
+    uint32_t version;          /* version the client bound this object at      */
+    uint32_t entered_surface;  /* surface the device entered (0 = not entered) */
+    int32_t  last_x, last_y;   /* last pointer position (surface-local)        */
+    int32_t  last_buttons;
+    uint32_t last_mods;        /* last modifier mask sent to wl_keyboard       */
+    /* wl_region: running rectangle bookkeeping (count / area / bounding box) */
+    int32_t  rects, sub_rects;
+    int32_t  area;             /* sum(add) - sum(subtract), clamped at 0        */
+    int32_t  r_x, r_y, r_w, r_h;   /* bounding box of the added rects          */
+    /* wl_subsurface: parent/child link, position, sync mode, place-below     */
+    uint32_t child_id;         /* wl_surface id this subsurface belongs to     */
+    uint32_t parent_id;        /* wl_surface id of the parent                  */
+    uint32_t parent_sub_id;    /* the OBJ_SUBSURFACE this surface belongs to   */
+    int32_t  pos_x, pos_y;
+    int      sync_mode;
+    int      place_below;
 };
 
 struct wl_conn {
@@ -101,18 +158,37 @@ struct wl_conn {
     uint32_t in_len;
     uint8_t  out[WL_SERVER_OUT_MAX];
     uint32_t out_len;
+    uint32_t kb_events;
+    uint32_t ptr_events;
 };
 
-static struct wl_conn g_conns[WL_SOCK_MAX_CONNS];
+static struct wl_conn g_conns[WL_SERVER_MAX_CONNS];
 
-/* last committed surface: kept after the client exits (the compositor blits it) */
-static uint8_t  g_last_px[WL_SURFACE_MAX_BYTES];
-static int      g_last_w, g_last_h, g_last_stride;
-static int      g_last_valid;
-static uint32_t g_last_hash;
-static uint32_t g_last_surface_id;   /* wl_surface id of the last commit        */
+/* ===================== per-connection retained surfaces =====================
+ * The commit that wins for a *connection* keeps its own pixel copy here, so a
+ * second client's commit can no longer clobber the first one's frame.  This is
+ * the whole point of the multi-client work: the server used to keep one global
+ * g_last_px, which is why a second client silently replaced the first.
+ *
+ * The buffer is not released when a client exits: the compositor still blits the
+ * last commit through wl_server_latest_surface(), exactly as before. */
+struct wl_keep {
+    int      used;
+    int      conn;                     /* index into g_conns                  */
+    int      w, h, stride, scale;
+    uint32_t serial, hash, surface_id;
+    uint8_t  px[WL_SURFACE_MAX_BYTES];
+};
+
+static struct wl_keep g_keep[WL_SERVER_MAX_CONNS];
+static int      g_latest_keep = -1;    /* index of the most recent commit       */
 static uint32_t g_commits;
-static uint32_t g_serial;            /* monotonic Wayland serial (>= 1)         */
+static uint32_t g_serial;              /* monotonic Wayland serial (>= 1)       */
+static uint32_t g_events_dropped;      /* events dropped because a ring was full */
+static uint32_t g_kb_events;           /* wl_keyboard.key events emitted        */
+static uint32_t g_ptr_events;          /* wl_pointer events emitted             */
+static uint32_t g_ptr_frames;          /* wl_pointer.frame events emitted       */
+static struct wl_obj *g_subsurfaces[8];  /* live wl_subsurface objects (export)  */
 static int      g_started;
 
 /* ===================== little-endian helpers ===================== */
@@ -291,8 +367,10 @@ static void conn_flush(struct wl_conn *c)
 static void conn_queue(struct wl_conn *c, const uint8_t *buf, uint32_t len)
 {
     if (c->out_len + len > WL_SERVER_OUT_MAX) {
+        g_events_dropped++;
         console_printf("[wl] event dropped: client is not reading (%u bytes "
-                       "queued)\n", (uint64_t)c->out_len);
+                       "queued, %u dropped in total)\n", (uint64_t)c->out_len,
+                       (uint64_t)g_events_dropped);
         return;
     }
     memcpy(c->out + c->out_len, buf, len);
@@ -306,6 +384,7 @@ static struct wbuf ev_begin(struct wl_conn *c, uint32_t obj_id, uint16_t opcode,
 {
     struct wbuf b;
 
+    (void)c;                          /* size is patched by ev_end() */
     b.p = scratch;
     b.len = 0;
     b.cap = cap;
@@ -454,6 +533,106 @@ static void emit_pointer_button(struct wl_conn *c, uint32_t pointer_id,
     ev_end(c, &b);
 }
 
+/* wl_pointer.leave(serial, surface): sent when the client releases the pointer
+ * (and when the surface it entered is replaced by a commit that names another
+ * one), so a client always sees enter/leave paired. */
+static void emit_pointer_leave(struct wl_conn *c, uint32_t pointer_id,
+                               uint32_t serial, uint32_t surface_id)
+{
+    uint8_t scratch[32];
+    struct wbuf b = ev_begin(c, pointer_id, WL_POINTER_EV_LEAVE, scratch,
+                             sizeof(scratch));
+
+    wb_u32(&b, serial);
+    wb_u32(&b, surface_id);
+    ev_end(c, &b);
+}
+
+/* wl_pointer.frame(): "this group of events is complete".  Only legal from
+ * wl_pointer version 5 on, so it is emitted only when the client bound the
+ * pointer at >= 5 (the version requested at registry.bind decides). */
+static void emit_pointer_frame(struct wl_conn *c, uint32_t pointer_id)
+{
+    uint8_t scratch[16];
+    struct wbuf b = ev_begin(c, pointer_id, WL_POINTER_EV_FRAME, scratch,
+                             sizeof(scratch));
+
+    ev_end(c, &b);
+    g_ptr_frames++;
+    console_printf("[wl] pointer frame id=%u\n", (uint64_t)pointer_id);
+}
+
+/* ===================== wl_keyboard events ===================== */
+/* keymap(format, fd, size): an fd argument never occupies bytes in the message
+ * buffer (it travels in SCM_RIGHTS), so the buffer holds only format and size.
+ * This kernel has no XKB data, so format = NO_KEYMAP and no descriptor is sent -
+ * the specification's own escape hatch. */
+static void emit_kb_keymap(struct wl_conn *c, uint32_t kb_id)
+{
+    uint8_t scratch[32];
+    struct wbuf b = ev_begin(c, kb_id, WL_KB_EV_KEYMAP, scratch, sizeof(scratch));
+
+    wb_u32(&b, WL_KB_KEYMAP_NO_KEYMAP);
+    wb_u32(&b, 0u);                      /* keymap size: none */
+    ev_end(c, &b);
+}
+
+/* enter(serial, surface, keys): the keys array is u32 size + payload; it is
+ * empty here because the server has no "currently held keys" bookkeeping. */
+static void emit_kb_enter(struct wl_conn *c, uint32_t kb_id, uint32_t serial,
+                          uint32_t surface_id)
+{
+    uint8_t scratch[48];
+    struct wbuf b = ev_begin(c, kb_id, WL_KB_EV_ENTER, scratch, sizeof(scratch));
+
+    wb_u32(&b, serial);
+    wb_u32(&b, surface_id);
+    wb_u32(&b, 0u);                      /* array size: no pressed keys */
+    ev_end(c, &b);
+}
+
+static void emit_kb_leave(struct wl_conn *c, uint32_t kb_id, uint32_t serial,
+                          uint32_t surface_id)
+{
+    uint8_t scratch[32];
+    struct wbuf b = ev_begin(c, kb_id, WL_KB_EV_LEAVE, scratch, sizeof(scratch));
+
+    wb_u32(&b, serial);
+    wb_u32(&b, surface_id);
+    ev_end(c, &b);
+}
+
+/* key(serial, time, key, state): `key` is an evdev keycode (PS/2 set-1 make
+ * code + 8), state 1 = pressed, 0 = released. */
+static void emit_kb_key(struct wl_conn *c, uint32_t kb_id, uint32_t serial,
+                        uint32_t time_ms, uint32_t key, uint32_t state)
+{
+    uint8_t scratch[48];
+    struct wbuf b = ev_begin(c, kb_id, WL_KB_EV_KEY, scratch, sizeof(scratch));
+
+    wb_u32(&b, serial);
+    wb_u32(&b, time_ms);
+    wb_u32(&b, key);
+    wb_u32(&b, state);
+    ev_end(c, &b);
+}
+
+/* modifiers(serial, depressed, latched, locked, group). */
+static void emit_kb_modifiers(struct wl_conn *c, uint32_t kb_id, uint32_t serial,
+                              uint32_t depressed, uint32_t locked)
+{
+    uint8_t scratch[48];
+    struct wbuf b = ev_begin(c, kb_id, WL_KB_EV_MODIFIERS, scratch,
+                             sizeof(scratch));
+
+    wb_u32(&b, serial);
+    wb_u32(&b, depressed);               /* mods_depressed  */
+    wb_u32(&b, 0u);                      /* mods_latched    */
+    wb_u32(&b, locked);                  /* mods_locked     */
+    wb_u32(&b, 0u);                      /* group           */
+    ev_end(c, &b);
+}
+
 /* ===================== FNV-1a ===================== */
 #define FNV_OFFSET 2166136261u
 #define FNV_PRIME  16777619u
@@ -523,30 +702,43 @@ static void commit_surface(struct wl_conn *c, struct wl_obj *surf)
     }
 
     /* Read the pixels out of the shared pool the client handed us: this is the
-     * SCM_RIGHTS + memfd path actually delivering bytes to the server. */
-    for (y = 0; y < buf->h; y++) {
-        const uint32_t off = (uint32_t)buf->offset +
-                             (uint32_t)y * (uint32_t)buf->stride;
-        const uint32_t n = (uint32_t)buf->w * 4u;
+     * SCM_RIGHTS + memfd path actually delivering bytes to the server.  They go
+     * into *this connection's* retained copy, so a second client cannot
+     * overwrite them (the old single g_last_px is what made that possible). */
+    {
+        const int ci = (int)(c - g_conns);
+        struct wl_keep *k = &g_keep[ci];
 
-        if (memfd_read(pool->pool_fd, off, row, n) != (int)n) {
-            console_printf("[wl] commit surface=%u: memfd read failed at y=%d\n",
-                           (uint64_t)surf->id, (int64_t)y);
-            return;
+        for (y = 0; y < buf->h; y++) {
+            const uint32_t off = (uint32_t)buf->offset +
+                                 (uint32_t)y * (uint32_t)buf->stride;
+            const uint32_t n = (uint32_t)buf->w * 4u;
+
+            if (memfd_read(pool->pool_fd, off, row, n) != (int)n) {
+                console_printf("[wl] commit surface=%u: memfd read failed at y=%d\n",
+                               (uint64_t)surf->id, (int64_t)y);
+                return;
+            }
+            hash = fnv1a_update(hash, row, n);
+            if (copied + n <= WL_SURFACE_MAX_BYTES) {
+                memcpy(k->px + copied, row, n);
+                copied += n;
+            }
         }
-        hash = fnv1a_update(hash, row, n);
-        if (copied + n <= WL_SURFACE_MAX_BYTES) {
-            memcpy(g_last_px + copied, row, n);
-            copied += n;
+        if (ci >= 0 && ci < WL_SERVER_MAX_CONNS) {
+            k->used = 1;
+            k->conn = ci;
+            k->w = buf->w;
+            k->h = buf->h;
+            k->stride = buf->stride;
+            k->scale = (surf->scale >= 1) ? surf->scale : 1;
+            k->hash = hash;
+            k->surface_id = surf->id;
+            k->serial = g_serial + 1u;      /* g_serial is bumped just below */
+            g_latest_keep = ci;
         }
     }
 
-    g_last_w = buf->w;
-    g_last_h = buf->h;
-    g_last_stride = buf->stride;
-    g_last_hash = hash;
-    g_last_valid = 1;
-    g_last_surface_id = surf->id;
     g_commits++;
     g_serial++;                          /* one serial per commit, monotonic   */
 
@@ -574,6 +766,53 @@ static void commit_surface(struct wl_conn *c, struct wl_obj *surf)
                        (int64_t)buf->h, (int64_t)buf->stride, (uint64_t)hash,
                        (uint64_t)copied, (int64_t)pool->pool_fd,
                        (uint64_t)g_serial);
+    }
+
+    /* scale / regions / subsurface are reported on their own line (appended
+     * fields would break the existing commit-line parsers, and the acceptance
+     * scripts read that line verbatim). */
+    {
+        const uint32_t scale = (surf->scale >= 1) ? (uint32_t)surf->scale : 1u;
+        struct wl_obj *op = find_obj(c, surf->opaque_region);
+        struct wl_obj *in = find_obj(c, surf->input_region);
+        struct wl_obj *sub = (surf->parent_sub_id != 0u)
+                                 ? find_obj(c, surf->parent_sub_id) : NULL;
+
+        console_printf("[wl] surface state surface=%u scale=%u logical=%dx%d "
+                       "opaque_area=%d input_area=%d subsurface_id=%u\n",
+                       (uint64_t)surf->id, (uint64_t)scale,
+                       (int64_t)(buf->w / (int32_t)scale),
+                       (int64_t)(buf->h / (int32_t)scale),
+                       op ? (int64_t)op->area : (int64_t)0,
+                       in ? (int64_t)in->area : (int64_t)0,
+                       sub ? (uint64_t)sub->id : 0u);
+        if (sub != NULL) {
+            console_printf("[wl] subsurface state id=%u surface=%u parent=%u "
+                           "pos=%d,%d sync=%d below=%d\n", (uint64_t)sub->id,
+                           (uint64_t)surf->id, (uint64_t)sub->parent_id,
+                           (int64_t)sub->pos_x, (int64_t)sub->pos_y,
+                           (int64_t)sub->sync_mode, (int64_t)sub->place_below);
+        }
+    }
+
+    /* Every retained surface, so the host can verify that two clients kept
+     * *different* pixels instead of the last one winning. */
+    {
+        int i, n = 0;
+
+        console_printf("[wl] kept surfaces:");
+        for (i = 0; i < WL_SERVER_MAX_CONNS; i++) {
+            if (!g_keep[i].used) continue;
+            n++;
+            console_printf(" [%d] conn=%d surface=%u %dx%d stride=%d scale=%d "
+                           "serial=%u hash=%08x", (int64_t)i,
+                           (int64_t)g_keep[i].conn,
+                           (uint64_t)g_keep[i].surface_id, (int64_t)g_keep[i].w,
+                           (int64_t)g_keep[i].h, (int64_t)g_keep[i].stride,
+                           (int64_t)g_keep[i].scale, (uint64_t)g_keep[i].serial,
+                           (uint64_t)g_keep[i].hash);
+        }
+        console_printf(" total=%d latest=%d\n", (int64_t)n, (int64_t)g_latest_keep);
     }
 
     surf->attach_x = 0;                  /* commit consumes the attachment offset */
@@ -661,6 +900,11 @@ static void dispatch_registry(struct wl_conn *c, uint16_t opcode, struct rbuf *r
     }
     o = add_obj(c, new_id, g->type);
     if (o == NULL) return;
+    /* The client asks for a version; the server grants min(requested, global).
+     * That granted version is what gates version-dependent events
+     * (wl_pointer.frame is v5, wl_surface.set_buffer_scale is v3). */
+    o->version = (version < g->version) ? version : g->version;
+    if (o->version == 0u) o->version = 1u;
     console_printf("[wl] bind id=%u interface=\"%s\" version=%u\n",
                    (uint64_t)new_id, g->iface, (uint64_t)version);
     if (g->type == OBJ_SEAT) {
@@ -682,10 +926,15 @@ static void dispatch_compositor(struct wl_conn *c, uint16_t opcode,
     }
     if (opcode == 1u) {                  /* wl_compositor.create_region */
         const uint32_t id = rb_u32(r);
+        struct wl_obj *reg;
+
         if (r->err) return;
-        console_printf("[wl] create_region id=%u (regions are not composited "
-                       "by this server)\n", (uint64_t)id);
-        (void)add_obj(c, id, OBJ_REGION);   /* inert: regions are not composited */
+        reg = add_obj(c, id, OBJ_REGION);
+        if (reg == NULL) return;
+        /* Semantics only: the rectangle list is accumulated and reported, but
+         * nothing is clipped on screen (this server has no composite pass). */
+        console_printf("[wl] create_region id=%u (rectangles are recorded and "
+                       "reported, not composited)\n", (uint64_t)id);
         return;
     }
     console_printf("[wl] wl_compositor: unsupported opcode %u\n",
@@ -791,7 +1040,7 @@ static void dispatch_surface(struct wl_conn *c, struct wl_obj *surf,
         break;
     }
     case 2u:                             /* wl_surface.damage(x,y,w,h) */
-    case 7u:                             /* wl_surface.damage_buffer(x,y,w,h) */
+    case WL_SURFACE_DAMAGE_BUFFER:       /* wl_surface.damage_buffer(x,y,w,h) */
     {
         const int32_t x = rb_i32(r);
         const int32_t y = rb_i32(r);
@@ -832,6 +1081,74 @@ static void dispatch_surface(struct wl_conn *c, struct wl_obj *surf,
                        (int64_t)surf->damage_w, (int64_t)surf->damage_h);
         break;
     }
+    case WL_SURFACE_SET_OPAQUE_REGION:   /* wl_surface.set_opaque_region(region) */
+    case WL_SURFACE_SET_INPUT_REGION:    /* wl_surface.set_input_region(region)  */
+    {
+        const uint32_t region_id = rb_u32(r);
+        struct wl_obj *reg = find_obj(c, region_id);
+
+        if (r->err) return;
+        if (region_id != 0u && (reg == NULL || reg->type != OBJ_REGION)) {
+            console_printf("[wl] surface %s surface=%u: region %u is not a "
+                           "wl_region\n",
+                           (opcode == WL_SURFACE_SET_OPAQUE_REGION) ? "opaque"
+                                                                     : "input",
+                           (uint64_t)surf->id, (uint64_t)region_id);
+            return;
+        }
+        if (opcode == WL_SURFACE_SET_OPAQUE_REGION)
+            surf->opaque_region = region_id;
+        else
+            surf->input_region = region_id;
+        console_printf("[wl] surface.%s surface=%u region=%u (area=%d rects=%d)\n",
+                       (opcode == WL_SURFACE_SET_OPAQUE_REGION) ? "set_opaque_region"
+                                                                : "set_input_region",
+                       (uint64_t)surf->id, (uint64_t)region_id,
+                       reg ? (int64_t)reg->area : (int64_t)0,
+                       reg ? (int64_t)reg->rects : (int64_t)0);
+        break;
+    }
+    case WL_SURFACE_SET_BUFFER_TRANSFORM: /* recorded, not applied */
+    {
+        const int32_t tr = rb_i32(r);
+
+        if (r->err) return;
+        surf->transform = tr;
+        console_printf("[wl] surface.set_buffer_transform surface=%u "
+                       "transform=%d (recorded, not applied)\n",
+                       (uint64_t)surf->id, (int64_t)tr);
+        break;
+    }
+    case WL_SURFACE_SET_BUFFER_SCALE:    /* wl_surface.set_buffer_scale(scale) */
+    {
+        const int32_t scale = rb_i32(r);
+
+        if (r->err) return;
+        if (scale < 1) {
+            console_printf("[wl] surface.set_buffer_scale surface=%u: invalid "
+                           "scale %d (must be >= 1)\n", (uint64_t)surf->id,
+                           (int64_t)scale);
+            emit_display_error(c, surf->id, WL_ERR_INVALID_METHOD,
+                               "wl_surface.set_buffer_scale needs scale >= 1");
+            return;
+        }
+        surf->scale = scale;
+        console_printf("[wl] surface.set_buffer_scale surface=%u scale=%d\n",
+                       (uint64_t)surf->id, (int64_t)scale);
+        break;
+    }
+    case WL_SURFACE_OFFSET:              /* wl_surface.offset(x, y) */
+    {
+        const int32_t x = rb_i32(r);
+        const int32_t y = rb_i32(r);
+
+        if (r->err) return;
+        surf->off_x = x;
+        surf->off_y = y;
+        console_printf("[wl] surface.offset surface=%u %d,%d\n",
+                       (uint64_t)surf->id, (int64_t)x, (int64_t)y);
+        break;
+    }
     case 3u: {                           /* wl_surface.frame(new_id) */
         const uint32_t id = rb_u32(r);
         struct wl_obj *cb;
@@ -845,16 +1162,191 @@ static void dispatch_surface(struct wl_conn *c, struct wl_obj *surf,
                        "next commit)\n", (uint64_t)surf->id, (uint64_t)id);
         break;
     }
-    case 6u:                             /* wl_surface.commit */
+    case WL_SURFACE_COMMIT:              /* wl_surface.commit */
         commit_surface(c, surf);
         break;
     default:
-        console_printf("[wl] wl_surface: unsupported opcode %u "
-                       "(regions/scaling are not implemented)\n",
+        console_printf("[wl] wl_surface: unsupported opcode %u\n",
                        (uint64_t)opcode);
         emit_display_error(c, surf->id, WL_ERR_INVALID_METHOD,
                            "wl_surface request is not implemented by this server");
         break;
+    }
+}
+
+/* wl_region: rectangles are recorded, not composited (this server has no
+ * clipping path).  The running totals are what the commit line and the
+ * acceptance verify: add grows the area, subtract shrinks it. */
+static void dispatch_region(struct wl_conn *c, struct wl_obj *reg,
+                            uint16_t opcode, struct rbuf *r)
+{
+    if (opcode == 0u) {                  /* wl_region.destroy */
+        console_printf("[wl] region.destroy id=%u (rects=%d subs=%d area=%d)\n",
+                       (uint64_t)reg->id, (int64_t)reg->rects,
+                       (int64_t)reg->sub_rects, (int64_t)reg->area);
+        destroy_obj(c, reg);
+        return;
+    }
+    if (opcode == 1u || opcode == 2u) {  /* add / subtract (x, y, w, h) */
+        const int32_t x = rb_i32(r);
+        const int32_t y = rb_i32(r);
+        const int32_t w = rb_i32(r);
+        const int32_t h = rb_i32(r);
+        const int32_t area = (w > 0 && h > 0) ? (w * h) : 0;
+
+        if (r->err) return;
+        if (opcode == 1u) {
+            const int32_t x1 = (reg->rects == 0) ? x + w
+                                                 : ((reg->r_x + reg->r_w > x + w)
+                                                        ? reg->r_x + reg->r_w : x + w);
+            const int32_t y1 = (reg->rects == 0) ? y + h
+                                                 : ((reg->r_y + reg->r_h > y + h)
+                                                        ? reg->r_y + reg->r_h : y + h);
+            const int32_t x0 = (reg->rects == 0) ? x
+                                                 : (reg->r_x < x ? reg->r_x : x);
+            const int32_t y0 = (reg->rects == 0) ? y
+                                                 : (reg->r_y < y ? reg->r_y : y);
+
+            reg->rects++;
+            reg->area += area;
+            reg->r_x = x0;
+            reg->r_y = y0;
+            reg->r_w = x1 - x0;
+            reg->r_h = y1 - y0;
+        } else {
+            reg->sub_rects++;
+            reg->area -= area;
+            if (reg->area < 0) reg->area = 0;
+        }
+        console_printf("[wl] region id=%u %s %d,%d %dx%d -> rects=%d subs=%d "
+                       "area=%d bbox=%d,%d %dx%d\n", (uint64_t)reg->id,
+                       (opcode == 1u) ? "add" : "subtract", (int64_t)x,
+                       (int64_t)y, (int64_t)w, (int64_t)h, (int64_t)reg->rects,
+                       (int64_t)reg->sub_rects, (int64_t)reg->area,
+                       (int64_t)reg->r_x, (int64_t)reg->r_y, (int64_t)reg->r_w,
+                       (int64_t)reg->r_h);
+        return;
+    }
+    console_printf("[wl] wl_region(id=%u): unsupported opcode %u\n",
+                   (uint64_t)reg->id, (uint64_t)opcode);
+    emit_display_error(c, reg->id, WL_ERR_INVALID_METHOD,
+                       "wl_region request is not implemented by this server");
+}
+
+/* wl_subcompositor: get_subsurface(child_surface, parent_surface).  The link is
+ * recorded and exported; pixels are not composited (no compositor yet). */
+static void dispatch_subcompositor(struct wl_conn *c, struct wl_obj *comp,
+                                   uint16_t opcode, struct rbuf *r)
+{
+    if (opcode == 0u) {                  /* get_subsurface(new_id, surface, parent) */
+        const uint32_t new_id = rb_u32(r);
+        const uint32_t surface_id = rb_u32(r);
+        const uint32_t parent_id = rb_u32(r);
+        struct wl_obj *child, *parent, *sub;
+        int i, slot = -1;
+
+        if (r->err) return;
+        child = find_obj(c, surface_id);
+        parent = find_obj(c, parent_id);
+        if (child == NULL || child->type != OBJ_SURFACE ||
+            parent == NULL || parent->type != OBJ_SURFACE) {
+            console_printf("[wl] get_subsurface: surface=%u parent=%u: both must "
+                           "be live wl_surface objects\n", (uint64_t)surface_id,
+                           (uint64_t)parent_id);
+            emit_display_error(c, comp->id, WL_ERR_INVALID_METHOD,
+                               "get_subsurface needs two live wl_surface objects");
+            return;
+        }
+        sub = add_obj(c, new_id, OBJ_SUBSURFACE);
+        if (sub == NULL) return;
+        sub->version = comp->version;
+        sub->child_id = surface_id;
+        sub->parent_id = parent_id;
+        sub->pos_x = 0;
+        sub->pos_y = 0;
+        sub->sync_mode = 1;              /* subsurfaces start in sync mode */
+        child->parent_sub_id = new_id;
+        for (i = 0; i < (int)(sizeof g_subsurfaces / sizeof g_subsurfaces[0]); i++) {
+            if (g_subsurfaces[i] == NULL) { slot = i; break; }
+        }
+        if (slot >= 0) g_subsurfaces[slot] = sub;
+        console_printf("[wl] subcompositor.get_subsurface id=%u surface=%u "
+                       "parent=%u pos=0,0 sync=1\n", (uint64_t)new_id,
+                       (uint64_t)surface_id, (uint64_t)parent_id);
+        return;
+    }
+    if (opcode == 1u) {                  /* wl_subcompositor.destroy */
+        console_printf("[wl] subcompositor.destroy id=%u\n", (uint64_t)comp->id);
+        destroy_obj(c, comp);
+        return;
+    }
+    console_printf("[wl] wl_subcompositor(id=%u): unsupported opcode %u\n",
+                   (uint64_t)comp->id, (uint64_t)opcode);
+    emit_display_error(c, comp->id, WL_ERR_INVALID_METHOD,
+                       "wl_subcompositor request is not implemented");
+}
+
+static void sub_forget(struct wl_obj *sub)
+{
+    int i;
+
+    for (i = 0; i < (int)(sizeof g_subsurfaces / sizeof g_subsurfaces[0]); i++) {
+        if (g_subsurfaces[i] == sub) g_subsurfaces[i] = NULL;
+    }
+}
+
+static void dispatch_subsurface(struct wl_conn *c, struct wl_obj *sub,
+                                uint16_t opcode, struct rbuf *r)
+{
+    switch (opcode) {
+    case 0u:                             /* wl_subsurface.destroy */
+        console_printf("[wl] subsurface.destroy id=%u surface=%u parent=%u "
+                       "pos=%d,%d\n", (uint64_t)sub->id,
+                       (uint64_t)sub->child_id, (uint64_t)sub->parent_id,
+                       (int64_t)sub->pos_x, (int64_t)sub->pos_y);
+        sub_forget(sub);
+        destroy_obj(c, sub);
+        return;
+    case 1u: {                           /* set_position(x, y) */
+        const int32_t x = rb_i32(r);
+        const int32_t y = rb_i32(r);
+
+        if (r->err) return;
+        sub->pos_x = x;
+        sub->pos_y = y;
+        console_printf("[wl] subsurface.set_position id=%u surface=%u parent=%u "
+                       "pos=%d,%d\n", (uint64_t)sub->id,
+                       (uint64_t)sub->child_id, (uint64_t)sub->parent_id,
+                       (int64_t)x, (int64_t)y);
+        return;
+    }
+    case 2u:                             /* place_above(sibling) */
+    case 3u: {                           /* place_below(sibling) */
+        const uint32_t sibling = rb_u32(r);
+
+        if (r->err) return;
+        sub->place_below = (opcode == 3u) ? 1 : 0;
+        console_printf("[wl] subsurface.%s id=%u sibling=%u (recorded)\n",
+                       (opcode == 3u) ? "place_below" : "place_above",
+                       (uint64_t)sub->id, (uint64_t)sibling);
+        return;
+    }
+    case 4u:                             /* set_sync */
+        sub->sync_mode = 1;
+        console_printf("[wl] subsurface.set_sync id=%u surface=%u\n",
+                       (uint64_t)sub->id, (uint64_t)sub->child_id);
+        return;
+    case 5u:                             /* set_desync */
+        sub->sync_mode = 0;
+        console_printf("[wl] subsurface.set_desync id=%u surface=%u\n",
+                       (uint64_t)sub->id, (uint64_t)sub->child_id);
+        return;
+    default:
+        console_printf("[wl] wl_subsurface(id=%u): unsupported opcode %u\n",
+                       (uint64_t)sub->id, (uint64_t)opcode);
+        emit_display_error(c, sub->id, WL_ERR_INVALID_METHOD,
+                           "wl_subsurface request is not implemented");
+        return;
     }
 }
 
@@ -869,15 +1361,26 @@ static void dispatch_seat(struct wl_conn *c, struct wl_obj *seat,
 
         if (p == NULL) return;
         p->pointer_sent = 0;
-        console_printf("[wl] seat.get_pointer id=%u (real wl_pointer: enter/"
-                       "motion snapshot from the kernel mouse on the next "
-                       "pump)\n", (uint64_t)id);
+        p->version = seat->version;
+        console_printf("[wl] seat.get_pointer id=%u (real wl_pointer stream: "
+                       "enter/motion/button from the kernel mouse, frame=%s)\n",
+                       (uint64_t)id,
+                       (seat->version >= 5u) ? "yes" : "no (bound < v5)");
         return;
     }
     if (opcode == 1u) {                  /* wl_seat.get_keyboard(new_id) */
-        if (add_obj(c, id, OBJ_KEYBOARD) == NULL) return;
-        console_printf("[wl] seat.get_keyboard id=%u (inert: keyboard events "
-                       "are not routed by this server yet)\n", (uint64_t)id);
+        struct wl_obj *kb = add_obj(c, id, OBJ_KEYBOARD);
+
+        if (kb == NULL) return;
+        kb->version = seat->version;
+        kb->entered_surface = 0;
+        /* A fresh client starts from a fresh key stream: drop whatever the
+         * mirror ring collected before it asked for a keyboard (boot-time key
+         * activity, the shell's own typing). */
+        mbos_kbd_mirror_reset();
+        console_printf("[wl] seat.get_keyboard id=%u (real wl_keyboard: evdev "
+                       "keycodes from the kernel's decoded scancode mirror; "
+                       "keymap=NO_KEYMAP)\n", (uint64_t)id);
         return;
     }
     if (opcode == 2u) {                  /* wl_seat.release */
@@ -907,6 +1410,19 @@ static void dispatch_pointer(struct wl_conn *c, struct wl_obj *ptr,
         return;
     }
     if (opcode == 1u) {                  /* wl_pointer.release */
+        /* enter and leave are paired: a client that entered the surface always
+         * sees the leave before the object goes away. */
+        if (ptr->pointer_sent && ptr->entered_surface != 0u) {
+            emit_pointer_leave(c, ptr->id, ++g_serial, ptr->entered_surface);
+            console_printf("[wl] pointer leave id=%u surface=%u serial=%u\n",
+                           (uint64_t)ptr->id, (uint64_t)ptr->entered_surface,
+                           (uint64_t)g_serial);
+            if (ptr->version >= 5u) emit_pointer_frame(c, ptr->id);
+            ptr->pointer_sent = 0;
+            ptr->entered_surface = 0;
+            c->ptr_events++;
+            g_ptr_events++;
+        }
         console_printf("[wl] pointer.release id=%u\n", (uint64_t)ptr->id);
         destroy_obj(c, ptr);
         return;
@@ -917,51 +1433,209 @@ static void dispatch_pointer(struct wl_conn *c, struct wl_obj *ptr,
                        "wl_pointer request is not implemented by this server");
 }
 
-/* First pump after wl_seat.get_pointer: publish the kernel's current pointer
- * state as wl_pointer.enter + wl_pointer.motion (and a button if one is held).
- * This is a synthetic *snapshot*: SutureOS has one task and no async input
- * queue for clients, so the compositor cannot stream real motion events yet.
- * Coordinates are clamped into the committed surface so the client receives a
- * value that is actually inside the buffer it handed over. */
-static void pointer_emit_pending(struct wl_conn *c)
+/* Send + log wl_keyboard.modifiers for one keyboard object. */
+static void send_kb_modifiers(struct wl_conn *c, struct wl_obj *o, uint32_t mods,
+                              const char *why)
+{
+    g_serial++;
+    emit_kb_modifiers(c, o->id, g_serial, (mods & MBOS_KBD_SHIFT) ? 1u : 0u,
+                      (mods & MBOS_KBD_CAPS_BIT) ? 1u : 0u);
+    o->last_mods = mods;
+    console_printf("[wl] keyboard modifiers id=%u serial=%u shift=%u ctrl=%u "
+                   "alt=%u caps=%u (%s)\n", (uint64_t)o->id, (uint64_t)g_serial,
+                   (uint64_t)((mods & MBOS_KBD_SHIFT) ? 1u : 0u),
+                   (uint64_t)((mods & MBOS_KBD_CTRL) ? 1u : 0u),
+                   (uint64_t)((mods & MBOS_KBD_ALT) ? 1u : 0u),
+                   (uint64_t)((mods & MBOS_KBD_CAPS_BIT) ? 1u : 0u), why);
+}
+
+/* ===================== input pump =====================
+ * Two real event streams, sourced from the kernel's PS/2 devices:
+ *
+ *   wl_keyboard: kernel/drivers/mb_kbd.c mirrors every decoded scancode into a
+ *     ring.  The pump first drains the PS/2 controller into the decoder
+ *     (mbos_kbd_poll -> mbos_kbd_decode, the same path the shell uses), then
+ *     turns each mirrored make/break code into wl_keyboard.key with state 1/0
+ *     and an evdev keycode (set-1 scancode + 8, the standard mapping).
+ *
+ *   wl_pointer: mbos_mouse_poll() updates the kernel's pointer state; the pump
+ *     then emits enter once, motion whenever the position changed, button on
+ *     both edges (0x110 left / 0x111 right / 0x112 middle) and one
+ *     wl_pointer.frame per group when the client bound the pointer at >= 5.
+ *
+ * Crucially the PS/2 ports are only drained when *this* connection asked for
+ * that capability.  A client without a wl_keyboard (e.g. `run wlclient`) can
+ * therefore not swallow keys the shell or the GUI is waiting for. */
+static void input_pump(struct wl_conn *c)
 {
     int i;
-
-    if (!g_last_valid || g_last_surface_id == 0u) return;   /* need a surface */
+    int has_kb = 0;
+    int has_ptr = 0;
+    uint32_t time_ms;
 
     for (i = 0; i < WL_SERVER_MAX_OBJECTS; i++) {
-        struct wl_obj *o = &c->objs[i];
-        int mx, my, buttons, x, y;
-        uint32_t time_ms;
+        if (c->objs[i].type == OBJ_KEYBOARD) has_kb = 1;
+        if (c->objs[i].type == OBJ_POINTER) has_ptr = 1;
+    }
+    if (!has_kb && !has_ptr) return;
 
-        if (o->type != OBJ_POINTER || o->pointer_sent) continue;
+    time_ms = (uint32_t)(time_source_now_ns() / 1000000ull);
 
+    /* ---------------- wl_keyboard ---------------- */
+    if (has_kb) {
+        int sc;
+        uint8_t mirored_sc;
+        uint32_t tick;
+
+        while ((sc = mbos_kbd_poll()) >= 0)
+            (void)mbos_kbd_decode((uint8_t)sc);          /* feeds the mirror */
+
+        while (mbos_kbd_mirror_pop(&mirored_sc, &tick)) {
+            /* E0-prefixed keys arrive as two codes; skip the prefix byte itself
+             * (it has no key of its own) and forward the rest. */
+            if (mirored_sc == 0xE0u) continue;
+            for (i = 0; i < WL_SERVER_MAX_OBJECTS; i++) {
+                struct wl_obj *o = &c->objs[i];
+                const uint32_t state = MBOS_KBD_IS_RELEASE(mirored_sc)
+                                           ? WL_KB_KEY_STATE_RELEASED
+                                           : WL_KB_KEY_STATE_PRESSED;
+                const uint32_t key = (uint32_t)(mirored_sc & 0x7Fu) + 8u;
+                uint32_t mods;
+
+                if (o->type != OBJ_KEYBOARD) continue;
+                g_serial++;
+                emit_kb_key(c, o->id, g_serial, tick, key, state);
+                g_kb_events++;
+                c->kb_events++;
+                console_printf("[wl] keyboard key id=%u serial=%u time=%u "
+                               "key=%u (sc=0x%x) state=%u\n", (uint64_t)o->id,
+                               (uint64_t)g_serial, (uint64_t)tick, (uint64_t)key,
+                               (uint64_t)mirored_sc, (uint64_t)state);
+                mods = mbos_kbd_mod_state();
+                if (mods != o->last_mods) {
+                    send_kb_modifiers(c, o, mods, "changed");
+                }
+            }
+        }
+
+        /* keyboard enter, once a surface of *this* connection exists (emitted
+         * after the keys already queued in the mirror ring: the very first pump
+         * may therefore deliver one key event - the keyup of the shell's Enter -
+         * before wl_keyboard.enter. Documented limitation.) */
+        /* keyboard enter, once a surface of *this* connection exists */
+        for (i = 0; i < WL_SERVER_MAX_OBJECTS; i++) {
+            struct wl_obj *o = &c->objs[i];
+            const int ci = (int)(c - g_conns);
+            const struct wl_keep *k;
+
+            if (o->type != OBJ_KEYBOARD || o->entered_surface != 0u) continue;
+            if (ci < 0 || ci >= WL_SERVER_MAX_CONNS) continue;
+            k = &g_keep[ci];
+            if (!k->used) continue;
+            emit_kb_keymap(c, o->id);
+            g_serial++;
+            emit_kb_enter(c, o->id, g_serial, k->surface_id);
+            o->entered_surface = k->surface_id;
+            console_printf("[wl] keyboard enter id=%u surface=%u serial=%u "
+                           "(keymap=NO_KEYMAP, evdev keycodes)\n",
+                           (uint64_t)o->id, (uint64_t)k->surface_id,
+                           (uint64_t)g_serial);
+            send_kb_modifiers(c, o, mbos_kbd_mod_state(), "enter");
+        }
+
+        /* Keys are only delivered once the keyboard is entered on a surface (a
+         * wl_keyboard.key before wl_keyboard.enter would be out of order). */
+    }
+
+    /* ---------------- wl_pointer ---------------- */
+    if (has_ptr) {
+        int mx, my, buttons;
+
+        mbos_mouse_poll();                 /* drain the PS/2 aux port */
         mx = mbos_mouse_x();
         my = mbos_mouse_y();
         buttons = mbos_mouse_buttons();
-        x = mx;
-        y = my;
-        if (x < 0) x = 0;
-        if (y < 0) y = 0;
-        if (x >= g_last_w) x = g_last_w - 1;
-        if (y >= g_last_h) y = g_last_h - 1;
-        time_ms = (uint32_t)(time_source_now_ns() / 1000000ull);
 
-        g_serial++;                      /* enter carries a fresh serial */
-        emit_pointer_enter(c, o->id, g_serial, g_last_surface_id, x, y);
-        console_printf("[wl] pointer enter id=%u surface=%u %d,%d (kernel mouse "
-                       "%d,%d serial=%u)\n", (uint64_t)o->id,
-                       (uint64_t)g_last_surface_id, (int64_t)x, (int64_t)y,
-                       (int64_t)mx, (int64_t)my, (uint64_t)g_serial);
-        emit_pointer_motion(c, o->id, time_ms, x, y);
-        console_printf("[wl] pointer motion id=%u time=%u %d,%d\n",
-                       (uint64_t)o->id, (uint64_t)time_ms, (int64_t)x, (int64_t)y);
-        if (buttons & 1) {               /* BTN_LEFT = 0x110, PRESSED = 1 */
-            emit_pointer_button(c, o->id, g_serial, time_ms, 0x110u, 1u);
-            console_printf("[wl] pointer button id=%u button=0x110 state=1\n",
-                           (uint64_t)o->id);
+        for (i = 0; i < WL_SERVER_MAX_OBJECTS; i++) {
+            struct wl_obj *o = &c->objs[i];
+            const int ci = (int)(c - g_conns);
+            const struct wl_keep *k;
+            int x, y, changed, btn_changed;
+
+            if (o->type != OBJ_POINTER) continue;
+            if (ci < 0 || ci >= WL_SERVER_MAX_CONNS) continue;
+            k = &g_keep[ci];
+            if (!k->used) continue;        /* need this client's own surface */
+
+            x = mx;
+            y = my;
+            if (x < 0) x = 0;
+            if (y < 0) y = 0;
+            if (x >= k->w) x = k->w - 1;
+            if (y >= k->h) y = k->h - 1;
+
+            if (!o->pointer_sent) {
+                g_serial++;
+                emit_pointer_enter(c, o->id, g_serial, k->surface_id, x, y);
+                console_printf("[wl] pointer enter id=%u surface=%u %d,%d "
+                               "(kernel mouse %d,%d serial=%u)\n",
+                               (uint64_t)o->id, (uint64_t)k->surface_id,
+                               (int64_t)x, (int64_t)y, (int64_t)mx,
+                               (int64_t)my, (uint64_t)g_serial);
+                emit_pointer_motion(c, o->id, time_ms, x, y);
+                console_printf("[wl] pointer motion id=%u time=%u %d,%d\n",
+                               (uint64_t)o->id, (uint64_t)time_ms, (int64_t)x,
+                               (int64_t)y);
+                o->pointer_sent = 1;
+                o->entered_surface = k->surface_id;
+                o->last_x = x;
+                o->last_y = y;
+                o->last_buttons = buttons;
+                c->ptr_events += 2;
+                g_ptr_events += 2;
+                if (o->version >= 5u) emit_pointer_frame(c, o->id);
+                continue;
+            }
+
+            changed = (x != o->last_x || y != o->last_y);
+            btn_changed = (buttons != o->last_buttons);
+
+            if (changed) {
+                emit_pointer_motion(c, o->id, time_ms, x, y);
+                console_printf("[wl] pointer motion id=%u time=%u %d,%d\n",
+                               (uint64_t)o->id, (uint64_t)time_ms, (int64_t)x,
+                               (int64_t)y);
+                o->last_x = x;
+                o->last_y = y;
+                c->ptr_events++;
+                g_ptr_events++;
+            }
+            if (btn_changed) {
+                /* Both edges, per button: BTN_LEFT 0x110, BTN_RIGHT 0x111,
+                 * BTN_MIDDLE 0x112 (evdev codes), state 1 = pressed. */
+                static const int bit[3] = { 1, 2, 4 };
+                static const uint32_t code[3] = { 0x110u, 0x111u, 0x112u };
+                int b;
+
+                for (b = 0; b < 3; b++) {
+                    const int was = (o->last_buttons & bit[b]) ? 1 : 0;
+                    const int now = (buttons & bit[b]) ? 1 : 0;
+
+                    if (was == now) continue;
+                    g_serial++;
+                    emit_pointer_button(c, o->id, g_serial, time_ms, code[b],
+                                        now ? 1u : 0u);
+                    console_printf("[wl] pointer button id=%u button=0x%x "
+                                   "state=%u\n", (uint64_t)o->id,
+                                   (uint64_t)code[b], (uint64_t)(now ? 1u : 0u));
+                    c->ptr_events++;
+                    g_ptr_events++;
+                }
+                o->last_buttons = buttons;
+            }
+            if ((changed || btn_changed) && o->version >= 5u)
+                emit_pointer_frame(c, o->id);
         }
-        o->pointer_sent = 1;
     }
 }
 
@@ -993,12 +1667,34 @@ static void dispatch(struct wl_conn *c, const uint8_t *msg, uint32_t size)
     case OBJ_SHM:         dispatch_shm(c, opcode, &r); break;
     case OBJ_POOL:        dispatch_pool(c, o, opcode, &r); break;
     case OBJ_SURFACE:     dispatch_surface(c, o, opcode, &r); break;
+    case OBJ_REGION:      dispatch_region(c, o, opcode, &r); break;
+    case OBJ_SUBCOMPOSITOR: dispatch_subcompositor(c, o, opcode, &r); break;
+    case OBJ_SUBSURFACE:  dispatch_subsurface(c, o, opcode, &r); break;
     case OBJ_SEAT:        dispatch_seat(c, o, opcode, &r); break;
     case OBJ_POINTER:     dispatch_pointer(c, o, opcode, &r); break;
     case OBJ_BUFFER:
         if (opcode == 0u) {
             console_printf("[wl] buffer.destroy id=%u\n", (uint64_t)o->id);
             destroy_obj(c, o);
+        }
+        break;
+    case OBJ_KEYBOARD:
+        if (opcode == 0u) {              /* wl_keyboard.release */
+            if (o->entered_surface != 0u) {
+                emit_kb_leave(c, o->id, ++g_serial, o->entered_surface);
+                console_printf("[wl] keyboard leave id=%u surface=%u serial=%u\n",
+                               (uint64_t)o->id, (uint64_t)o->entered_surface,
+                               (uint64_t)g_serial);
+                o->entered_surface = 0;
+            }
+            console_printf("[wl] keyboard.release id=%u (key events=%u)\n",
+                           (uint64_t)o->id, (uint64_t)c->kb_events);
+            destroy_obj(c, o);
+        } else {
+            console_printf("[wl] wl_keyboard(id=%u): unsupported opcode %u\n",
+                           (uint64_t)o->id, (uint64_t)opcode);
+            emit_display_error(c, o->id, WL_ERR_INVALID_METHOD,
+                               "wl_keyboard only has release");
         }
         break;
     case OBJ_CALLBACK:
@@ -1015,7 +1711,6 @@ static void dispatch(struct wl_conn *c, const uint8_t *msg, uint32_t size)
         }
         break;
     default:
-        /* inert keyboard/region objects: accept and ignore their requests */
         console_printf("[wl] object %u (type %d): request opcode %u ignored\n",
                        (uint64_t)o->id, (int64_t)o->type, (uint64_t)opcode);
         break;
@@ -1028,8 +1723,10 @@ int wl_server_autostart(void)
     if (g_started) return 0;
     g_started = 1;
     console_printf("[wl] minimal Wayland server ready (lazy init: named "
-                   "endpoint \"%s\", %d globals: wl_compositor/wl_shm/wl_seat)\n",
-                   WL_SERVER_NAME, (int64_t)WL_GLOBAL_COUNT);
+                   "endpoint \"%s\", %d globals: wl_compositor/wl_shm/wl_seat/"
+                   "wl_subcompositor, %d client slots)\n",
+                   WL_SERVER_NAME, (int64_t)WL_GLOBAL_COUNT,
+                   (int64_t)WL_SERVER_MAX_CONNS);
     return 0;
 }
 
@@ -1039,12 +1736,13 @@ void wl_server_accept(int server_fd)
     int i;
 
     if (c == NULL) {
-        for (i = 0; i < WL_SOCK_MAX_CONNS; i++) {
+        for (i = 0; i < WL_SERVER_MAX_CONNS; i++) {
             if (!g_conns[i].used) { c = &g_conns[i]; break; }
         }
     }
     if (c == NULL) {
-        console_printf("[wl] accept: connection table full\n");
+        console_printf("[wl] accept: connection table full (%d slots)\n",
+                       (int64_t)WL_SERVER_MAX_CONNS);
         return;
     }
     memset(c, 0, sizeof(*c));
@@ -1053,8 +1751,10 @@ void wl_server_accept(int server_fd)
     c->in_len = 0;
     c->out_len = 0;
     (void)add_obj(c, WL_DISPLAY_ID, OBJ_DISPLAY);
-    console_printf("[wl] protocol state reset for server_fd=%d (wl_display id=%u)\n",
-                   (int64_t)server_fd, (uint64_t)WL_DISPLAY_ID);
+    console_printf("[wl] protocol state reset for server_fd=%d (wl_display id=%u, "
+                   "connection slot %d, %d retained surface(s))\n",
+                   (int64_t)server_fd, (uint64_t)WL_DISPLAY_ID,
+                   (int64_t)(c - g_conns), (int64_t)wl_server_surface_count());
 }
 
 void wl_server_pump(int server_fd)
@@ -1088,32 +1788,113 @@ void wl_server_pump(int server_fd)
         c->in_len -= (uint32_t)size;
     }
 
-    /* A wl_pointer created by wl_seat.get_pointer publishes the kernel's pointer
-     * snapshot on the first pump after its creation (this one, if the request
-     * just arrived, or the next one). */
-    pointer_emit_pending(c);
+    /* Live input: keyboard keys from the PS/2 mirror, pointer motion/buttons
+     * from the kernel mouse.  Only for the capabilities this client bound. */
+    input_pump(c);
 
     conn_flush(c);
 }
 
 int wl_server_latest_surface(int *w, int *h, int *stride, const uint8_t **px)
 {
-    if (!g_last_valid) return 0;
-    if (w) *w = g_last_w;
-    if (h) *h = g_last_h;
-    if (stride) *stride = g_last_stride;
-    if (px) *px = g_last_px;
+    const struct wl_keep *k;
+
+    if (g_latest_keep < 0 || g_latest_keep >= WL_SERVER_MAX_CONNS) return 0;
+    k = &g_keep[g_latest_keep];
+    if (!k->used) return 0;
+    if (w) *w = k->w;
+    if (h) *h = k->h;
+    if (stride) *stride = k->stride;
+    if (px) *px = k->px;
     return 1;
 }
 
 uint32_t wl_server_latest_hash(void)
 {
-    return g_last_hash;
+    const struct wl_keep *k;
+
+    if (g_latest_keep < 0 || g_latest_keep >= WL_SERVER_MAX_CONNS) return 0;
+    k = &g_keep[g_latest_keep];
+    return k->used ? k->hash : 0u;
 }
 
 uint32_t wl_server_commit_count(void)
 {
     return g_commits;
+}
+
+int wl_server_surface_count(void)
+{
+    int i, n = 0;
+
+    for (i = 0; i < WL_SERVER_MAX_CONNS; i++)
+        if (g_keep[i].used) n++;
+    return n;
+}
+
+int wl_server_surface_at(int idx, int *w, int *h, int *stride, int *scale,
+                         uint32_t *serial, const uint8_t **px)
+{
+    int i, n = 0;
+
+    if (idx < 0) return 0;
+    for (i = 0; i < WL_SERVER_MAX_CONNS; i++) {
+        if (!g_keep[i].used) continue;
+        if (n++ != idx) continue;
+        if (w) *w = g_keep[i].w;
+        if (h) *h = g_keep[i].h;
+        if (stride) *stride = g_keep[i].stride;
+        if (scale) *scale = g_keep[i].scale;
+        if (serial) *serial = g_keep[i].serial;
+        if (px) *px = g_keep[i].px;
+        return 1;
+    }
+    return 0;
+}
+
+int wl_server_subsurface_count(void)
+{
+    int i, n = 0;
+
+    for (i = 0; i < (int)(sizeof g_subsurfaces / sizeof g_subsurfaces[0]); i++)
+        if (g_subsurfaces[i] != NULL) n++;
+    return n;
+}
+
+int wl_server_subsurface_at(int idx, int *surface_id, int *parent_id,
+                            int *x, int *y, int *sync_mode)
+{
+    int i, n = 0;
+
+    if (idx < 0) return 0;
+    for (i = 0; i < (int)(sizeof g_subsurfaces / sizeof g_subsurfaces[0]); i++) {
+        const struct wl_obj *sub = g_subsurfaces[i];
+
+        if (sub == NULL) continue;
+        if (n++ != idx) continue;
+        if (surface_id) *surface_id = (int)sub->child_id;
+        if (parent_id) *parent_id = (int)sub->parent_id;
+        if (x) *x = (int)sub->pos_x;
+        if (y) *y = (int)sub->pos_y;
+        if (sync_mode) *sync_mode = sub->sync_mode;
+        return 1;
+    }
+    return 0;
+}
+
+uint32_t wl_server_key_event_count(void)
+{
+    return g_kb_events;
+}
+
+uint32_t wl_server_pointer_event_count(void)
+{
+    return g_ptr_events;
+}
+
+uint32_t wl_server_events_dropped(void)
+{
+    return g_events_dropped;
 }
 
 int wl_server_active(void)

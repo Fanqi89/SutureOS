@@ -23,6 +23,7 @@
 #define MBOS_KBD_SHIFT (1u << 0)
 #define MBOS_KBD_CTRL  (1u << 1)
 #define MBOS_KBD_ALT   (1u << 2)
+#define MBOS_KBD_CAPS_BIT (1u << 3) /* SutureOS: caps state, for wl_keyboard */
 #define MBOS_KBD_E0ESC (1u << 6)
 
 #define MBOS_KBD_LSHIFT 0x2Au
@@ -48,6 +49,23 @@ int mbos_kbd_poll(void);
 /* first-N-keys diagnostics (serial log) */
 void mbos_kbd_key_log_note(int sc, int ch);
 uint32_t mbos_kbd_key_log_count(void);
+
+/* ---- decoded-scancode mirror (the wl_keyboard event source) --------------
+ * Every scancode that reaches mbos_kbd_decode() is also copied into a small
+ * ring here, so kernel/ipc/wl_server.c can turn real PS/2 typing into
+ * wl_keyboard.key events.  The decoder's return value is untouched, so
+ * mbos_kbd_poll()'s caller (shell, GUI) keeps receiving exactly what it did
+ * before: this is a copy, not a steal.  A full ring drops the newest code and
+ * counts it in mbos_kbd_mirror_dropped(). */
+#define MBOS_KBD_MIRROR_SIZE 64
+
+void     mbos_kbd_mirror_reset(void);
+int      mbos_kbd_mirror_pop(uint8_t *sc, uint32_t *tick);   /* 1 = one entry */
+uint32_t mbos_kbd_mirror_dropped(void);
+
+/* Current modifier state (MBOS_KBD_SHIFT | CTRL | ALT | CAPS), for
+ * wl_keyboard.modifiers. */
+uint32_t mbos_kbd_mod_state(void);
 
 /* IRQ1 path: the handler drains 0x60 into a 64-byte scancode ring (so a burst
  * injected faster than the shell polls is no longer lost) and mbos_kbd_poll()
