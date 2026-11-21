@@ -609,6 +609,7 @@ pub fn draw_body(s: &mut Surface<'_>, accent: u32, wx: i32, wy: i32, w: i32, h: 
         ACC_IMAGE => image_body(s, accent, wx, wy, w, h),
         ACC_EDITOR => editor_body(s, accent, wx, wy, w, h),
         ACC_WAYLAND => wayland_window_body(s, accent, wx, wy, w, h),
+        ACC_CALC => calc_body(s, accent, wx, wy, w, h),
         _ => generic_body(s, accent, wx, wy, w, h),
     }
 }
@@ -1036,6 +1037,258 @@ fn image_body(s: &mut Surface<'_>, accent: u32, wx: i32, wy: i32, w: i32, h: i32
 
 /// 文本编辑器: , a current-line highlight and a caret
 /// block, plus a status bar.
+/// 计算器（v0.63）：整数四则运算 + 键盘输入 + 4x4 键盘布局。
+pub const ACC_CALC: u32 = 0xff6a4d;
+
+/* state: accumulator, pending operator, the number being typed, error flag */
+static mut CAL_ACC: i64 = 0;
+static mut CAL_OP: u8 = 0;            /* 0, b'+', b'-', b'*', b'/' */
+static mut CAL_ENTRY: i64 = 0;
+static mut CAL_LEN: u32 = 0;          /* digits typed since the last operator */
+static mut CAL_ERR: bool = false;
+static mut CAL_TXT: [u8; 18] = [0; 18];
+static mut CAL_TXT_LEN: usize = 1;
+
+/// Format a signed integer into `out`, returns the byte length.
+fn cal_fmt(out: &mut [u8; 18], v: i64) -> usize {
+    let mut n = 18usize;
+    let neg = v < 0;
+    let mut u = if neg { (v as i128).unsigned_abs() as u128 } else { v as u128 };
+    if u == 0 {
+        out[17] = b'0';
+        if neg {
+            out[16] = b'-';
+            return 2;
+        }
+        return 1;
+    }
+    while u > 0 && n > 0 {
+        n -= 1;
+        out[n] = b'0' + (u % 10) as u8;
+        u /= 10;
+    }
+    if neg && n > 0 {
+        n -= 1;
+        out[n] = b'-';
+    }
+    let len = 18 - n;
+    /* move to the front so callers can read out[..len] */
+    let mut k = 0usize;
+    while k < len {
+        out[k] = out[n + k];
+        k += 1;
+    }
+    len
+}
+
+unsafe fn cal_refresh() {
+    let txt = &mut *core::ptr::addr_of_mut!(CAL_TXT);
+    let v = if CAL_LEN > 0 { CAL_ENTRY } else { CAL_ACC };
+    let mut buf = [0u8; 18];
+    let n = cal_fmt(&mut buf, v);
+    let mut k = 0usize;
+    while k < n {
+        txt[k] = buf[k];
+        k += 1;
+    }
+    CAL_TXT_LEN = n;
+}
+
+unsafe fn cal_apply() -> bool {
+    if CAL_OP == 0 {
+        CAL_ACC = CAL_ENTRY;
+        return true;
+    }
+    match CAL_OP {
+        b'+' => CAL_ACC = CAL_ACC.saturating_add(CAL_ENTRY),
+        b'-' => CAL_ACC = CAL_ACC.saturating_sub(CAL_ENTRY),
+        b'*' => CAL_ACC = CAL_ACC.saturating_mul(CAL_ENTRY),
+        b'/' => {
+            if CAL_ENTRY == 0 {
+                CAL_ERR = true;
+                CAL_ACC = 0;
+                return false;
+            }
+            CAL_ACC /= CAL_ENTRY;
+        }
+        _ => {}
+    }
+    true
+}
+
+/// Handle one key. `key` is the raw scancode, `ch` the decoded ASCII (0 when the
+/// scancode has no character). Returns true when the key was consumed.
+pub fn calc_key(key: i32, ch: i32) -> bool {
+    let _ = key;
+    unsafe {
+        let c = ch as u32;
+        if c >= b'0' as u32 && c <= b'9' as u32 {
+            if CAL_ERR {
+                CAL_ACC = 0;
+                CAL_OP = 0;
+                CAL_ERR = false;
+                CAL_LEN = 0;
+            }
+            let d = (c - b'0' as u32) as i64;
+            if CAL_LEN == 0 {
+                CAL_ENTRY = d;
+            } else if CAL_ENTRY < 100_000_000 {
+                CAL_ENTRY = CAL_ENTRY * 10 + d;
+            } else {
+                return true;            /* ignore: keep the display readable */
+            }
+            CAL_LEN += 1;
+            cal_refresh();
+            return true;
+        }
+        match c {
+            /* operators */
+            43 | 45 | 42 | 47 => {
+                if CAL_ERR {
+                    return true;
+                }
+                if CAL_LEN > 0 {
+                    cal_apply();
+                    CAL_LEN = 0;
+                } else if CAL_OP == 0 {
+                    CAL_ACC = CAL_ENTRY;
+                }
+                CAL_OP = c as u8;
+                cal_refresh();
+                true
+            }
+            /* '=' finishes the pending operation */
+            61 | 10 | 13 => {
+                if CAL_ERR {
+                    return true;
+                }
+                if CAL_OP != 0 {
+                    let ok = cal_apply();
+                    CAL_OP = 0;
+                    CAL_LEN = 0;
+                    CAL_ENTRY = 0;
+                    cal_refresh();
+                    if ok {
+                        /* the kernel's %d is unsigned: print the sign separately */
+                        if CAL_ACC < 0 {
+                            console_printf(b"[gui-shell] calc result -%d\n\0".as_ptr(),
+                                           (0i64 - CAL_ACC) as i64);
+                        } else {
+                            console_printf(b"[gui-shell] calc result %d\n\0".as_ptr(),
+                                           CAL_ACC);
+                        }
+                    } else {
+                        console_printf(b"[gui-shell] calc error (division by zero)\n\0"
+                                       .as_ptr());
+                    }
+                }
+                true
+            }
+            /* clear */
+            99 | 67 => {
+                CAL_ACC = 0;
+                CAL_ENTRY = 0;
+                CAL_OP = 0;
+                CAL_LEN = 0;
+                CAL_ERR = false;
+                cal_refresh();
+                console_printf(b"[gui-shell] calc clear\n\0".as_ptr());
+                true
+            }
+            _ => {
+                /* Backspace: drop the last typed digit (or clear the error) */
+                if c == 0x08 {
+                    if CAL_LEN > 0 {
+                        CAL_ENTRY /= 10;
+                        CAL_LEN -= 1;
+                        if CAL_LEN == 0 {
+                            CAL_ENTRY = 0;
+                        }
+                    }
+                    CAL_ERR = false;
+                    cal_refresh();
+                    return true;
+                }
+                false
+            }
+        }
+    }
+}
+
+unsafe fn cal_text() -> &'static str {
+    if CAL_ERR {
+        return "err";
+    }
+    let txt: &[u8; 18] = &*core::ptr::addr_of!(CAL_TXT);
+    core::str::from_utf8_unchecked(&txt[..CAL_TXT_LEN])
+}
+
+fn calc_body(s: &mut Surface<'_>, accent: u32, wx: i32, wy: i32, w: i32, h: i32) {
+    unsafe {
+        if CAL_TXT_LEN == 1 && CAL_TXT[0] == 0 {
+            CAL_TXT[0] = b'0';
+            CAL_TXT_LEN = 1;
+        }
+    }
+    let x0 = wx + PAD;
+    let x1 = wx + w - PAD;
+    /* display strip */
+    let dy0 = wy + TITLE_H + 8;
+    let dy1 = dy0 + 44;
+    if x1 - x0 < 40 || dy1 > wy + h - 20 {
+        return;
+    }
+    s.rect_fill(x0, dy0, x1, dy1, 0x1c2028, 0xf0);
+    s.rect_fill(x0, dy0, x1, dy0 + 1, accent, 0x90);
+    let txt = unsafe { cal_text() };
+    let tw = 10 * 2 * txt.len() as i32;
+    let tx = if x1 - tw - 8 > x0 { x1 - tw - 8 } else { x0 + 4 };
+    s.text(tx, dy0 + 12, txt, 0xffe6c8, 0xff, 2);
+
+    /* 4x4 keypad */
+    let keys = [
+        ["7", "8", "9", "/"],
+        ["4", "5", "6", "*"],
+        ["1", "2", "3", "-"],
+        ["C", "0", "=", "+"],
+    ];
+    let grid_y = dy1 + 10;
+    let avail_h = (wy + h - 12) - grid_y;
+    let cell_w = ((x1 - x0) / 4).max(1);
+    let cell_h = (avail_h / 4).max(1);
+    let pad = 4;
+    let mut row = 0usize;
+    while row < 4 {
+        let mut col = 0usize;
+        while col < 4 {
+            let cx0 = x0 + col as i32 * cell_w + pad;
+            let cy0 = grid_y + row as i32 * cell_h + pad;
+            let cx1 = x0 + (col as i32 + 1) * cell_w - pad;
+            let cy1 = grid_y + (row as i32 + 1) * cell_h - pad;
+            let label = keys[row][col];
+            let op = match label {
+                "/" => b'/' as u32,
+                "*" => b'*' as u32,
+                "-" => b'-' as u32,
+                "+" => b'+' as u32,
+                "=" => b'=' as u32,
+                _ => 0,
+            };
+            let pending = unsafe { CAL_OP as u32 } == op && op != 0;
+            let plate = if pending { lighten(accent, 30) } else { 0x2a3140 };
+            s.rect_fill(cx0, cy0, cx1, cy1, plate, 0xff);
+            s.rect_fill(cx0, cy0, cx1, cy0 + 1, 0xffffff, 0x2c);
+            let txt_c = if op != 0 || label == "C" { 0xffd9a8 } else { 0xe8eef8 };
+            let tw = 10 * label.len() as i32;
+            s.text(cx0 + ((cx1 - cx0) - tw) / 2, cy0 + ((cy1 - cy0) - 16) / 2,
+                   label, txt_c, 0xf0, 1);
+            col += 1;
+        }
+        row += 1;
+    }
+    let _ = h;
+}
+
 fn editor_body(s: &mut Surface<'_>, accent: u32, wx: i32, wy: i32, w: i32, h: i32) {
     let x0 = wx + PAD;
     let x1 = wx + w - PAD;

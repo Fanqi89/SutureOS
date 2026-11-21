@@ -84,8 +84,9 @@ is verified against a full repaint pixel by pixel (`damage: identical`; a pointe
 gained **multiple clients** (one retained surface per connection, plus `run wltwo`, a single process
 that opens two connections), a real `wl_keyboard` / `wl_pointer` event stream (press *and* release,
 motion / button / leave / frame), `set_buffer_scale` and region/subsurface semantics; the picture viewer **decodes real images from the FAT32 volume** (BMP *and* QOI,
-Left/Right browses the files, integer zoom, name / size / scale footer), the start menu grew a fifth row that opens the Wayland
-window (the panel height follows the application registry), and the desktop text
+Left/Right browses the files, integer zoom, name / size / scale footer), the start menu lists the **calculator** as a sixth app (integer arithmetic, keyboard
+input, 4x4 keypad) and a fifth row opens the Wayland window (the panel height follows
+the application registry), and the desktop text
 editor became a **real editor** (multi-line buffer, caret and arrow keys, **F5** saves to
 `/mnt/fat/GUIEDIT.TXT`, verified byte for byte from the host), damage merging moved to a **32x32 tile
 grid** (at most 16 rectangles; a quiet 30-frame window measures ~250 tiles / 132 permille with the

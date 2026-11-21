@@ -163,7 +163,7 @@ def main():
         time.sleep(16)
         # start menu -> 4th row (Text Editor): MENU_X+100, MENU_Y+46+3*44+19
         click(q, pos, 25, 745)           # start button
-        click(q, pos, 112, 639)          # v0.62: menu grew a 5th row -> panel 44 px higher
+        click(q, pos, 112, 595)          # v0.63: menu grew a 6th row -> panel 44 px higher
         time.sleep(3)
         press(q, list(TYPED))
         press(q, ['f5'])

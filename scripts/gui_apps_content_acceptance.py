@@ -56,7 +56,7 @@ WIN2 = (210, 430, 360, 240)               # 图片查看器   accent 0xf5a524
 WIN3 = (560, 180, 330, 230)               # 文本编辑器   accent 0xe05a8a
 
 START_BTN = (8, TASKBAR_Y + 5, 34, 28)
-MENU_H = 280                     # v0.62: five rows (Wayland client added)
+MENU_H = 324                     # v0.63: six rows (calculator added)
 MENU_ITEMS_Y = TASKBAR_Y - MENU_H - 8 + 46      # 532
 MENU_ITEM_H = 44
 MENU_X_CLICK = 90

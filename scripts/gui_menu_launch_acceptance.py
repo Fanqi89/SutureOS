@@ -37,7 +37,7 @@ SCREEN_W, SCREEN_H = 1024, 768
 TASKBAR_Y = 730
 MENU_X, MENU_W = 12, 300
 MENU_HEAD_H, MENU_ROW_H, MENU_FOOT_H = 46, 44, 14
-N_ITEMS = 5
+N_ITEMS = 6
 MENU_H = MENU_HEAD_H + N_ITEMS * MENU_ROW_H + MENU_FOOT_H        # 280
 MENU_Y = TASKBAR_Y - MENU_H - 8                                  # 442
 MENU_ITEMS_Y = MENU_Y + MENU_HEAD_H                              # 488
@@ -167,7 +167,7 @@ def boot():
 
 
 ACCS = [(0x4f, 0x8d, 0xff), (0x22, 0xc1, 0xa8), (0xf5, 0xa5, 0x24),
-        (0xe0, 0x5a, 0x8a), (0x7a, 0x5c, 0xff)]
+        (0xe0, 0x5a, 0x8a), (0x7a, 0x5c, 0xff), (0xff, 0x6a, 0x4d)]
 
 
 def main():
@@ -231,7 +231,7 @@ def main():
     # panel top edge: just above MENU_Y it is desktop, just below it is glass.
     above = mean_brightness(px, MENU_X + 40, MENU_Y - 22, MENU_X + 240, MENU_Y - 4)
     inside = mean_brightness(px, MENU_X + 40, MENU_Y + 70, MENU_X + 240, MENU_Y + 130)
-    check('the menu panel grew to five rows (top edge at %d)' % MENU_Y,
+    check('the menu panel grew to six rows (top edge at %d)' % MENU_Y,
           abs(above - inside) > 8.0, 'above %.1f vs inside %.1f' % (above, inside))
     # the frozen 4-row layout put the top edge at 486: the strip above 442 must not
     # look like the old panel anymore
@@ -248,7 +248,7 @@ def main():
         row_hits.append(n)
         if n < 20:
             misses += 1
-    check('all five rows draw their own accent icon', misses == 0,
+    check('all six rows draw their own accent icon', misses == 0,
           'accent px per row: %s' % row_hits)
 
     win = load(SHOT_WIN)

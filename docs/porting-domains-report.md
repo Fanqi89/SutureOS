@@ -271,6 +271,13 @@
     绘制/命中/伤害统一走 `menu_h()/menu_y()/menu_rect()`；伪 3D 图标第 5 种字形；F2 语义
     open→minimize→restore。新门禁 `gui_menu_launch_acceptance.py` **10/10**（面板上边缘像素、
     5 行 accent 图标、点第 5 行启动 + 紫色标题条、F2 两次）。
+- **GUI 第四轮（v0.63，未发布）**：第 6 个应用「计算器」（window 5，菜单第 6 行）——整数四则
+  运算（i64 饱和）、键盘输入、显示条 + 4×4 键盘布局、待定运算符高亮；`=` 打
+  `[gui-shell] calc result N`（负数单独打符号，内核 `%d` 是无符号读）、除零进错误态、
+  `c` 清空。窗口表 5→6 并把散落的"5"收成 `const WINS: usize = 6`（数组/循环/边界/签名一处改）；
+  菜单面板 280→324 px（行 0 从 488 变 444，新行追加在末尾所以旧行号不变）；新 accent
+  `0xff6a4d` + 第 6 种伪 3D 字形。新门禁 `gui_calc_acceptance.py` **10/10**
+  （42 / 81 / -3 / 除零 / 清空 / 显示条与键盘板像素；shift 符号用 QMP `shift`+基础键）。
 - **仍未完成**：真正的 vsync 源（本机没有扫描线中断，60 Hz 是墙上时钟栅格）、
   窗口内键盘焦点、Wayland scaling 的真实合成与"surface 作为真正窗口表面"（无窗口命中/摆放）、
   `wl_keyboard` keymap（内核无 XKB 数据）、多 surface 历史与 buffer 回收、最大/还原过渡的局部重绘。

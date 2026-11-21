@@ -28,7 +28,7 @@ SHOT_MENU = 'build/logo_menu.ppm'
 
 TASKBAR_Y = 768 - 38
 START_BTN = (8, TASKBAR_Y + 5, 34, 28)
-MENU = (12, TASKBAR_Y - 280 - 8, 300, 280)   # MENU_X, MENU_Y, MENU_W, MENU_H
+MENU = (12, TASKBAR_Y - 324 - 8, 300, 324)   # MENU_X, MENU_Y, MENU_W, MENU_H
 
 
 class Qmp:

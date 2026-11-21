@@ -24,6 +24,9 @@ pub const TASKBAR_H: i32 = 38;
 pub const TASKBAR_Y: i32 = SCREEN_H - TASKBAR_H;
 
 const TITLE_H: i32 = 30;
+/* v0.63: one place for the window count. Growing this is still a real change
+ * (every window-indexed array below uses it), but no literal 5 is left to find. */
+const WINS: usize = 6;
 const MENU_W: i32 = 300;
 const MENU_X: i32 = 12;
 /* v0.62: the menu grows with the application registry (4 rows until the Wayland
@@ -122,9 +125,15 @@ const fn win4() -> Win {
     Win { x: 250, y: 330, w: 440, h: 330, nx: 250, ny: 330, nw: 440, nh: 330,
           minimized: false, maximized: false, z: 5, title: "Wayland 客户端", accent: 0x7a5cff, open: false, sox: 0, soy: 0, ax: 250, ay: 330 }
 }
+/* v0.63: 计算器 (window 5). Placed bottom-left so it does not cover the two
+ * default windows at the top; size is what a 4x4 keypad + display needs. */
+const fn win5() -> Win {
+    Win { x: 600, y: 250, w: 300, h: 260, nx: 600, ny: 250, nw: 300, nh: 260,
+          minimized: false, maximized: false, z: 6, title: "计算器", accent: crate::apps::ACC_CALC, open: false, sox: 0, soy: 0, ax: 600, ay: 250 }
+}
 
 struct Shell {
-    wins: [Win; 5],
+    wins: [Win; WINS],
     focus: usize,
     menu_open: bool,
     dragging: bool,
@@ -170,8 +179,8 @@ struct Shell {
     /* v0.58.0: per-window keyboard focus. Every window owns a small editable
      * line; printable keys go to the focused window, Enter commits it to the
      * serial log, Backspace deletes one character. */
-    input: [[u8; 33]; 5],
-    ilen: [u32; 5],
+    input: [[u8; 33]; WINS],
+    ilen: [u32; WINS],
     /* v0.58.0: true maximise/restore transition. `scale_from`/`scale_to` are
      * lerped over SCALE_TOTAL frames; the geometry itself already sits at its
      * target so hit-testing stays honest during the animation. */
@@ -184,10 +193,11 @@ struct Shell {
      * next frame has to re-rasterise its window layer and repaint that rect. */
     dirty_editor: bool,
     dirty_image: bool,
+    dirty_calc: bool,
 }
 
 static mut SHELL: Shell = Shell {
-    wins: [win0(), win1(), win2(), win3(), win4()],
+    wins: [win0(), win1(), win2(), win3(), win4(), win5()],
     focus: 1,
     menu_open: false,
     dragging: false,
@@ -226,8 +236,8 @@ static mut SHELL: Shell = Shell {
     prof_win: 0,
     prof_bar: 0,
     prof_total: 0,
-    input: [[0; 33]; 5],
-    ilen: [0; 5],
+    input: [[0; 33]; WINS],
+    ilen: [0; WINS],
     scale_frames: 0,
     scale_idx: -1,
     scale_from: [0; 4],
@@ -235,6 +245,7 @@ static mut SHELL: Shell = Shell {
     scale_kind: 0,
     dirty_editor: false,
     dirty_image: false,
+    dirty_calc: false,
 };
 
 // ---------------------------------------------------------------- caches
@@ -907,7 +918,7 @@ struct Snap {
     intro_frames: u32,
     intro_idx: i32,
     scale_frames: u32,
-    wins: [WinSnap; 5],
+    wins: [WinSnap; WINS],
 }
 
 impl Snap {
@@ -932,12 +943,12 @@ impl Snap {
             intro_frames: 0,
             intro_idx: -1,
             scale_frames: 0,
-            wins: [WinSnap::empty(); 5],
+            wins: [WinSnap::empty(); WINS],
         }
     }
 
     fn visible_rect(&self, idx: i32) -> Rect {
-        if idx < 0 || idx >= 5 {
+        if idx < 0 || idx >= WINS as i32 {
             return Rect::EMPTY;
         }
         let w = self.wins[idx as usize];
@@ -974,12 +985,12 @@ const WC_MARGIN_L: i32 = 8;
 const WC_MARGIN_T: i32 = 14;
 const WC_MARGIN_R: i32 = 12;
 const WC_MARGIN_B: i32 = 16;
-static mut WIN_CACHE: [[u32; WC_STRIDE * WC_H]; 5] = [[0; WC_STRIDE * WC_H]; 5];
-static mut WIN_KEY: [i32; 5] = [i32::MIN; 5];
+static mut WIN_CACHE: [[u32; WC_STRIDE * WC_H]; WINS] = [[0; WC_STRIDE * WC_H]; WINS];
+static mut WIN_KEY: [i32; WINS] = [i32::MIN; WINS];
 /* v0.58.0: the cached window body size. The layer is normally blitted 1:1, but
  * the maximise/restore transition samples it scaled, so the source size has to
  * be known even after the window geometry already jumped to its target. */
-static mut LAYER_WH: [(i32, i32); 5] = [(0, 0); 5];
+static mut LAYER_WH: [(i32, i32); WINS] = [(0, 0); WINS];
 /* v0.58.0: nearest-neighbour index tables for the transition pass (one division
  * per column/row instead of one per pixel). */
 static mut SCALED_X: [u16; 1024] = [0; 1024];
@@ -1241,7 +1252,7 @@ fn control_rect(w: &Win) -> (i32, i32, i32, i32) {
 }
 
 /// (x, w) of the taskbar window button `i`, or None when hidden.
-fn wb_rect(wins: &[Win; 5], i: usize) -> Option<(i32, i32)> {
+fn wb_rect(wins: &[Win; WINS], i: usize) -> Option<(i32, i32)> {
     let mut x = 118;
     for k in 0..i {
         if wins[k].open { x += 96 + 8; }
@@ -1252,10 +1263,11 @@ fn wb_rect(wins: &[Win; 5], i: usize) -> Option<(i32, i32)> {
 
 /* v0.59.0: one accent per app, shared by the start-menu row, the window title
  * bar icon and the pseudo-3D plate (matches Win::accent). */
-const APP_ACCENTS: [u32; 5] = [0x4f8dff, 0x22c1a8, 0xf5a524, 0xe05a8a, 0x7a5cff];
+const APP_ACCENTS: [u32; 6] = [0x4f8dff, 0x22c1a8, 0xf5a524, 0xe05a8a, 0x7a5cff,
+                              crate::apps::ACC_CALC];
 
-const MENU_ITEMS: [&str; 5] =
-    ["系统设置", "任务管理器", "图片查看器", "文本编辑器", "Wayland 客户端"];
+const MENU_ITEMS: [&str; 6] =
+    ["系统设置", "任务管理器", "图片查看器", "文本编辑器", "Wayland 客户端", "计算器"];
 
 /// Z above every window: the shell only has 4, so a counter is enough.
 static mut Z_COUNTER: i32 = 100;
@@ -1363,7 +1375,7 @@ fn request_maximize(sh: &mut Shell, idx: usize, want: bool) {
 /// (nearest neighbour, opaque). Used by the maximise/restore transition.
 fn composite_scaled(scene: &mut [u32], stride: usize, slot: usize, r: &Win,
                     clip: Rect) -> bool {
-    if slot >= 5 {
+    if slot >= WINS {
         return false;
     }
     let (sw, shh) = unsafe { (&*core::ptr::addr_of!(LAYER_WH))[slot] };
@@ -1400,7 +1412,7 @@ fn composite_scaled(scene: &mut [u32], stride: usize, slot: usize, r: &Win,
     true
 }
 
-fn hit_win(wins: &[Win; 5], mx: i32, my: i32, focus: i32) -> i32 {
+fn hit_win(wins: &[Win; WINS], mx: i32, my: i32, focus: i32) -> i32 {
     let mut best = -1;
     let mut bestz = -1;
     for (i, w) in wins.iter().enumerate() {
@@ -1672,7 +1684,7 @@ fn draw_taskbar(s: &mut Surface<'_>, sh: &Shell, ctx: &FrameCtx) {
     blit_logo_region(s, logo, LOGO_SMALL_SIZE, 0, 0,
                      LOGO_SMALL_SIZE as i32, LOGO_SMALL_SIZE as i32,
                      start_btn.0 + 5, start_btn.1 + 2);
-    for i in 0..5 {
+    for i in 0..WINS {
         if let Some((bx, bw)) = wb_rect(&sh.wins, i) {
             let hovered = ctx.hover_wb == i as i32;
             let active = sh.focus == i && !sh.wins[i].minimized;
@@ -1745,7 +1757,10 @@ fn draw_focus_line(s: &mut Surface<'_>, sh: &Shell, _ctx: &FrameCtx) {
     /* v0.59.x: the image viewer has no text content, and when it shows a
      * committed Wayland surface the focus hint would sit on top of the client's
      * pixels - skip the editable line for that window. */
-    if w.open && !w.minimized && fi != 2 && fi != 3 && fi != 4
+    /* v0.63: windows that consume the keyboard themselves (picture viewer,
+     * editor, Wayland surface, calculator) must not get the input band - on the
+     * calculator it sat right on top of the 4x4 keypad. */
+    if w.open && !w.minimized && fi != 2 && fi != 3 && fi != 4 && fi != 5
         && y + 20 < w.y + w.h && w.y >= 0 {
         s.rect_fill(w.x + 16, y - 4, w.x + w.w - 16, y + 20, 0x000000, 0x24);
         s.text(w.x + 24, y, "输入:", 0x9fb2cc, 0xd0, 1);
@@ -1771,7 +1786,7 @@ fn draw_focus_line(s: &mut Surface<'_>, sh: &Shell, _ctx: &FrameCtx) {
 /// interpolated rectangle.
 fn draw_scale_transition(s: &mut Surface<'_>, wu: usize, sh: &Shell, ctx: &FrameCtx) {
     let idx = ctx.scale_idx;
-    if idx < 0 || idx >= 5 {
+    if idx < 0 || idx >= WINS as i32 {
         return;
     }
     let w = sh.wins[idx as usize];
@@ -1808,9 +1823,9 @@ fn compose_rect(scene: &mut [u32], wu: usize, sh: &mut Shell, r: Rect, ctx: &Fra
     /* 1. wallpaper */
     copy_wall(&mut s, r);
     /* 2. windows bottom-up (cached body layer + freshly blended shadow) */
-    let mut order = [0usize, 1, 2, 3, 4];
-    for a in 0..4 {
-        for b in (a + 1)..5 {
+    let mut order = [0usize, 1, 2, 3, 4, 5];
+    for a in 0..(WINS - 1) {
+        for b in (a + 1)..WINS {
             if sh.wins[order[b]].z < sh.wins[order[a]].z {
                 order.swap(a, b);
             }
@@ -1861,7 +1876,7 @@ fn compose_rect(scene: &mut [u32], wu: usize, sh: &mut Shell, r: Rect, ctx: &Fra
     /* 4. v0.49.0: 2-frame fade-out before a close/minimize actually happens */
     if ctx.act_alpha > 0 {
         let idx = ctx.act_idx;
-        if idx >= 0 && idx < 5 {
+        if idx >= 0 && idx < WINS as i32 {
             let w = sh.wins[idx as usize];
             if w.open && !w.minimized {
                 s.rect_fill(w.x, w.y, w.x + w.w, w.y + w.h, 0x000000, ctx.act_alpha);
@@ -1871,7 +1886,7 @@ fn compose_rect(scene: &mut [u32], wu: usize, sh: &mut Shell, r: Rect, ctx: &Fra
     /* 5. v0.48.0: 3-frame open fade (also used after minimise/restore) */
     if ctx.intro_alpha > 0 {
         let idx = ctx.intro_idx;
-        if idx >= 0 && idx < 5 {
+        if idx >= 0 && idx < WINS as i32 {
             let w = sh.wins[idx as usize];
             if w.open {
                 s.rect_fill(w.x, w.y, w.x + w.w, w.y + w.h, 0x000000, ctx.intro_alpha);
@@ -2022,7 +2037,7 @@ fn diff_damage(prev: &Snap, sh: &Shell, ctx: &FrameCtx) -> Damage {
         d.add(cursor_rect(ctx.mx, ctx.my));
     }
     /* windows: geometry, visibility, stacking */
-    for i in 0..5 {
+    for i in 0..WINS {
         let a = prev.wins[i];
         let b = WinSnap::of(&sh.wins[i]);
         if a.visible() != b.visible() || a.x != b.x || a.y != b.y || a.w != b.w
@@ -2037,7 +2052,7 @@ fn diff_damage(prev: &Snap, sh: &Shell, ctx: &FrameCtx) -> Damage {
         || prev.hover_start != ctx.hover_start
         || prev.clock != ctx.clock
         || prev.focus != sh.focus as i32;
-    for i in 0..5 {
+    for i in 0..WINS {
         if prev.wins[i].open != sh.wins[i].open
             || prev.wins[i].minimized != sh.wins[i].minimized
         {
@@ -2069,7 +2084,7 @@ fn diff_damage(prev: &Snap, sh: &Shell, ctx: &FrameCtx) -> Damage {
     }
     /* a new Wayland commit re-rasterises the image viewer's layer */
     if prev.wl_epoch != crate::apps::wl_epoch() {
-        for i in 0..5 {
+        for i in 0..WINS {
             let w = sh.wins[i];
             if w.open && !w.minimized && w.accent == crate::apps::ACC_IMAGE {
                 d.add(WinSnap::of(&w).rect().expand(SHADOW_MARGIN));
@@ -2078,7 +2093,7 @@ fn diff_damage(prev: &Snap, sh: &Shell, ctx: &FrameCtx) -> Damage {
     }
     /* task manager live values (uptime / CPU% / heartbeat: 500 ms tick) */
     if prev.live_tick != ctx.live_tick {
-        for i in 0..5 {
+        for i in 0..WINS {
             let w = sh.wins[i];
             if w.open && !w.minimized && is_taskman(&w) {
                 let mut lr = [Rect::EMPTY; 3];
@@ -2094,14 +2109,14 @@ fn diff_damage(prev: &Snap, sh: &Shell, ctx: &FrameCtx) -> Damage {
     if prev.act_frames > 0 {
         d.add(prev.visible_rect(prev.act_idx));
     }
-    if ctx.act_alpha > 0 && ctx.act_idx >= 0 && ctx.act_idx < 5 {
+    if ctx.act_alpha > 0 && ctx.act_idx >= 0 && ctx.act_idx < WINS as i32 {
         let w = sh.wins[ctx.act_idx as usize];
         d.add(WinSnap::of(&w).rect().expand(SHADOW_MARGIN));
     }
     if prev.intro_frames > 0 {
         d.add(prev.visible_rect(prev.intro_idx));
     }
-    if ctx.intro_alpha > 0 && ctx.intro_idx >= 0 && ctx.intro_idx < 5 {
+    if ctx.intro_alpha > 0 && ctx.intro_idx >= 0 && ctx.intro_idx < WINS as i32 {
         let w = sh.wins[ctx.intro_idx as usize];
         d.add(WinSnap::of(&w).rect().expand(SHADOW_MARGIN));
     }
@@ -2193,8 +2208,8 @@ const ORACLE_EVERY: u32 = 20;
 
 /// Snapshot the frame that is about to become "the frame on screen".
 fn take_snap(sh: &Shell, ctx: &FrameCtx) -> Snap {
-    let mut wins = [WinSnap::empty(); 5];
-    for i in 0..5 {
+    let mut wins = [WinSnap::empty(); WINS];
+    for i in 0..WINS {
         wins[i] = WinSnap::of(&sh.wins[i]);
     }
     let mut input_hash = sh.ilen[sh.focus] as i32;
@@ -2290,7 +2305,7 @@ pub unsafe fn shell_step(
     let hover_start = mx_c >= start_btn.0 && mx_c < start_btn.0 + start_btn.2
         && my_c >= start_btn.1 && my_c < start_btn.1 + start_btn.3;
     let mut hover_wb = -1;
-    for i in 0..5 {
+    for i in 0..WINS {
         if let Some((bx, bw)) = wb_rect(&sh.wins, i) {
             if mx_c >= bx && mx_c < bx + bw && my_c >= TASKBAR_Y + 5
                 && my_c < TASKBAR_Y + TASKBAR_H - 5
@@ -2342,7 +2357,7 @@ pub unsafe fn shell_step(
             } else {
                 /* taskbar window buttons */
                 let mut handled = false;
-                for i in 0..5 {
+                for i in 0..WINS {
                     if let Some((bx, bw)) = wb_rect(&sh.wins, i) {
                         if cx >= bx && cx < bx + bw && cy >= TASKBAR_Y + 5 &&
                            cy < TASKBAR_Y + TASKBAR_H - 5 {
@@ -2464,8 +2479,8 @@ pub unsafe fn shell_step(
         let fi = sh.focus;
         if ch == 0x09 {
             let mut n = fi;
-            for _ in 0..5 {
-                n = (n + 1) % 5;
+            for _ in 0..WINS {
+                n = (n + 1) % WINS;
                 if sh.wins[n].open && !sh.wins[n].minimized {
                     break;
                 }
@@ -2505,6 +2520,17 @@ pub unsafe fn shell_step(
                 }
                 sh.dirty_editor = true;
                 log2(c"editor key", key as i32, ch as i32);
+            }
+        } else if sh.wins[fi].open && !sh.wins[fi].minimized
+            && sh.wins[fi].accent == crate::apps::ACC_CALC {
+            /* v0.63: the calculator consumes digits, operators, '=', 'c' and
+             * Backspace; anything else falls through to the input band. */
+            if crate::apps::calc_key(key, ch) {
+                unsafe {
+                    WIN_KEY[5] = i32::MIN;
+                }
+                sh.dirty_calc = true;
+                log2(c"calc key", key as i32, ch as i32);
             }
         } else if sh.wins[fi].open && !sh.wins[fi].minimized
             && sh.wins[fi].accent == crate::apps::ACC_IMAGE {
@@ -2609,14 +2635,14 @@ pub unsafe fn shell_step(
         live_tick: (crate::shell_tick() / 100u64) as u32,
         live_now: (crate::shell_tick() / 100u64) as u32 * 1000,
     };
-    if sh.act_frames > 0 && sh.act_idx >= 0 && sh.act_idx < 5 {
+    if sh.act_frames > 0 && sh.act_idx >= 0 && sh.act_idx < WINS as i32 {
         let w0 = sh.wins[sh.act_idx as usize];
         if w0.open && !w0.minimized {
             ctx.act_alpha = if sh.act_frames == 2 { 0x2cu32 } else { 0x64u32 };
             ctx.act_idx = sh.act_idx;
         }
     }
-    if sh.intro_frames > 0 && sh.intro_idx >= 0 && sh.intro_idx < 5 {
+    if sh.intro_frames > 0 && sh.intro_idx >= 0 && sh.intro_idx < WINS as i32 {
         let w0 = sh.wins[sh.intro_idx as usize];
         if w0.open {
             ctx.intro_alpha = match sh.intro_frames {
@@ -2630,7 +2656,7 @@ pub unsafe fn shell_step(
     if sh.menu_intro > 0 {
         ctx.menu_alpha = if sh.menu_intro == 2 { 0x50u32 } else { 0x24u32 };
     }
-    if sh.scale_frames > 0 && sh.scale_idx >= 0 && sh.scale_idx < 5 {
+    if sh.scale_frames > 0 && sh.scale_idx >= 0 && sh.scale_idx < WINS as i32 {
         let idx = sh.scale_idx as usize;
         let w0 = sh.wins[idx];
         if w0.open && !w0.minimized {
@@ -2651,6 +2677,11 @@ pub unsafe fn shell_step(
     // ---- damage: what changed since the frame that is on screen? ----
     let prev = &*core::ptr::addr_of!(SNAP);
     let mut dmg = diff_damage(prev, sh, &ctx);
+    if sh.dirty_calc && sh.wins[5].open && !sh.wins[5].minimized {
+        /* a keystroke moves no rect: inject the calculator window's damage */
+        dmg.add(WinSnap::of(&sh.wins[5]).rect().expand(SHADOW_MARGIN));
+        sh.dirty_calc = false;
+    }
     if sh.dirty_image && sh.wins[2].open && !sh.wins[2].minimized {
         /* browsing moves no rect either: inject the window's damage explicitly */
         dmg.add(WinSnap::of(&sh.wins[2]).rect().expand(SHADOW_MARGIN));
@@ -2668,7 +2699,7 @@ pub unsafe fn shell_step(
             WLOG_TILES_MAX = tc;
         }
     }
-    if dropped_win >= 0 && dropped_win < 5 {
+    if dropped_win >= 0 && dropped_win < WINS as i32 {
         dmg.add(WinSnap::of(&sh.wins[dropped_win as usize]).rect().expand(SHADOW_MARGIN));
     }
     let animating = ctx.act_alpha > 0 || ctx.intro_alpha > 0 || ctx.menu_alpha > 0
@@ -2746,7 +2777,7 @@ pub unsafe fn shell_step(
 
     // ---- structural change? then re-verify against a full repaint ----
     let mut structural = false;
-    for i in 0..5 {
+    for i in 0..WINS {
         if prev.wins[i].open != sh.wins[i].open
             || prev.wins[i].minimized != sh.wins[i].minimized
         {
@@ -2803,7 +2834,7 @@ pub unsafe fn shell_step(
     sh.prof_win += compose_ticks;
     /* the dragged window renders from its cached home-anchored layer: no
      * re-rasterise per frame (v0.50.0 behaviour, now inside the damage compose) */
-    if sh.dragging && sh.drag_idx < 5 {
+    if sh.dragging && sh.drag_idx < WINS {
         let dw = sh.wins[sh.drag_idx];
         if unsafe { WIN_KEY[sh.drag_idx] } == layer_key(&dw, sh.drag_idx) {
             sh.prof_drag_reuse += 1;
@@ -3132,6 +3163,7 @@ fn glyph_for_accent(accent: u32) -> i32 {
         0xf5a524 => 2,
         0xe05a8a => 3,
         0x7a5cff => 4,
+        crate::apps::ACC_CALC => 5,
         _ => 0,
     }
 }
@@ -3193,6 +3225,10 @@ fn draw_app_icon(s: &mut Surface<'_>, x: i32, y: i32, size: i32, accent: u32,
             s.rect_fill(gx - g, gy - g + 1, gx - g + 1, gy + g - 1, 0xffffff, 0xd0);
             s.rect_fill(gx + g - 1, gy - g + 1, gx + g, gy + g - 1, 0xffffff, 0xd0);
             s.rect_fill(gx - 2, gy, gx + 2, gy + 2, 0xffffff, 0xc0);
+        }
+        5 => {                       /* calculator: two "=" bars */
+            s.rect_fill(gx - g, gy - 3, gx + g, gy - 1, 0xffffff, 0xd8);
+            s.rect_fill(gx - g, gy + 2, gx + g, gy + 4, 0xffffff, 0xd8);
         }
         4 => {                       /* wayland client: a surface + a pointer dot */
             s.rect_fill(gx - g, gy - g, gx + g, gy - g + 1, 0xffffff, 0xd0);

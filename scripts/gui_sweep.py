@@ -40,6 +40,7 @@ SUITE = [
     ('gui_editor_live_acceptance.py', 'editorlive'),
     ('gui_menu_launch_acceptance.py', 'menulaunch'),
     ('gui_image_browse_acceptance.py', 'imgbrowse'),
+    ('gui_calc_acceptance.py', 'calc'),
     ('desktop_acceptance.py', 'desktop'),
     ('gui_apps_content_acceptance.py', 'apps_content'),
     ('gui_baseline_shot.py', 'appearance_new'),
