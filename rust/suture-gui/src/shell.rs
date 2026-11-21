@@ -25,10 +25,38 @@ pub const TASKBAR_Y: i32 = SCREEN_H - TASKBAR_H;
 
 const TITLE_H: i32 = 30;
 const MENU_W: i32 = 300;
-const MENU_H: i32 = 236;
 const MENU_X: i32 = 12;
-const MENU_Y: i32 = TASKBAR_Y - MENU_H - 8;
-const MENU_ITEMS_Y: i32 = MENU_Y + 46;
+/* v0.62: the menu grows with the application registry (4 rows until the Wayland
+ * window became a menu entry). The panel is anchored to the taskbar, so its height
+ * is 46 px of header + one 44 px row per item + 14 px of footer. */
+const MENU_HEAD_H: i32 = 46;
+const MENU_ROW_H: i32 = 44;
+const MENU_FOOT_H: i32 = 14;
+
+#[inline]
+fn menu_h() -> i32 {
+    MENU_HEAD_H + (MENU_ITEMS.len() as i32) * MENU_ROW_H + MENU_FOOT_H
+}
+
+#[inline]
+fn menu_y() -> i32 {
+    TASKBAR_Y - menu_h() - 8
+}
+
+#[inline]
+fn menu_items_y() -> i32 {
+    menu_y() + MENU_HEAD_H
+}
+
+#[inline]
+fn menu_rect() -> Rect {
+    Rect {
+        x0: MENU_X - 2,
+        y0: menu_y() - 2,
+        x1: MENU_X + MENU_W + 4,
+        y1: menu_y() + menu_h() + 12,
+    }
+}
 
 /* v0.58.0: soft shadow ring around a window body, one alpha per pixel of
  * distance (1 px out ... 8 px out). The shadow is composited against whatever is
@@ -641,12 +669,6 @@ impl Rect {
 /// Shadow bleed: the eight one-pixel rings reach 8 px out, plus a little slack.
 const SHADOW_MARGIN: i32 = 10;
 const TASKBAR_RECT: Rect = Rect { x0: 0, y0: TASKBAR_Y, x1: SCREEN_W, y1: SCREEN_H };
-const MENU_RECT: Rect = Rect {
-    x0: MENU_X - 2,
-    y0: MENU_Y - 2,
-    x1: MENU_X + MENU_W + 4,
-    y1: MENU_Y + MENU_H + 12,
-};
 
 /// A small list of screen rectangles to recompose. Rectangles that touch are
 /// merged (one bigger recompose is cheaper than two), the rest stay separate -
@@ -1228,10 +1250,10 @@ fn wb_rect(wins: &[Win; 5], i: usize) -> Option<(i32, i32)> {
 
 /* v0.59.0: one accent per app, shared by the start-menu row, the window title
  * bar icon and the pseudo-3D plate (matches Win::accent). */
-const APP_ACCENTS: [u32; 4] = [0x4f8dff, 0x22c1a8, 0xf5a524, 0xe05a8a];
+const APP_ACCENTS: [u32; 5] = [0x4f8dff, 0x22c1a8, 0xf5a524, 0xe05a8a, 0x7a5cff];
 
-const MENU_ITEMS: [&str; 4] =
-    ["系统设置", "任务管理器", "图片查看器", "文本编辑器"];
+const MENU_ITEMS: [&str; 5] =
+    ["系统设置", "任务管理器", "图片查看器", "文本编辑器", "Wayland 客户端"];
 
 /// Z above every window: the shell only has 4, so a counter is enough.
 static mut Z_COUNTER: i32 = 100;
@@ -1677,25 +1699,24 @@ fn draw_taskbar(s: &mut Surface<'_>, sh: &Shell, ctx: &FrameCtx) {
 
 /// Start menu block (drawn only while the menu is open).
 fn draw_menu(s: &mut Surface<'_>, sh: &Shell, ctx: &FrameCtx) {
-    s.rect_fill(MENU_X + 3, MENU_Y + 10, MENU_X + MENU_W + 3,
-                MENU_Y + MENU_H + 12, 0x000000, 0x44);
-    frosted(s, MENU_X, MENU_Y, MENU_X + MENU_W, MENU_Y + MENU_H, 14.0, 0x34);
-    s.rect_fill(MENU_X + 10, MENU_Y, MENU_X + MENU_W - 10, MENU_Y + 1,
+    let (my, mh) = (menu_y(), menu_h());
+    s.rect_fill(MENU_X + 3, my + 10, MENU_X + MENU_W + 3, my + mh + 12,
+                0x000000, 0x44);
+    frosted(s, MENU_X, my, MENU_X + MENU_W, my + mh, 14.0, 0x34);
+    s.rect_fill(MENU_X + 10, my, MENU_X + MENU_W - 10, my + 1, 0xffffff, 0x3c);
+    s.rect_fill(MENU_X + 10, my + mh - 1, MENU_X + MENU_W - 10, my + mh,
                 0xffffff, 0x3c);
-    s.rect_fill(MENU_X + 10, MENU_Y + MENU_H - 1, MENU_X + MENU_W - 10,
-                MENU_Y + MENU_H, 0xffffff, 0x3c);
-    s.rect_fill(MENU_X, MENU_Y + 10, MENU_X + 1, MENU_Y + MENU_H - 10,
+    s.rect_fill(MENU_X, my + 10, MENU_X + 1, my + mh - 10, 0xffffff, 0x3c);
+    s.rect_fill(MENU_X + MENU_W - 1, my + 10, MENU_X + MENU_W, my + mh - 10,
                 0xffffff, 0x3c);
-    s.rect_fill(MENU_X + MENU_W - 1, MENU_Y + 10, MENU_X + MENU_W,
-                MENU_Y + MENU_H - 10, 0xffffff, 0x3c);
     /* v0.57.1: start-menu icon = 48px step of the logo ladder */
     let logo = unsafe { &*core::ptr::addr_of!(g_logo48) };
     blit_logo_region(s, logo, LOGO_MENU_SIZE, 0, 0,
                      LOGO_MENU_SIZE as i32, LOGO_MENU_SIZE as i32,
-                     MENU_X + 10, MENU_Y + 2);
-    s.text(MENU_X + 68, MENU_Y + 16, "常用应用", 0xffffff, 0xf0, 1);
+                     MENU_X + 10, my + 2);
+    s.text(MENU_X + 68, my + 16, "常用应用", 0xffffff, 0xf0, 1);
     for (k, name) in MENU_ITEMS.iter().enumerate() {
-        let y = MENU_Y + 46 + k as i32 * 44;
+        let y = menu_items_y() + k as i32 * MENU_ROW_H;
         let hovered = ctx.menu_hover == k as i32;
         let selected = k as i32 == sh.menu_sel;
         rrow(s, MENU_X + 10, y, MENU_X + MENU_W - 10, y + 38, 8, 0xffffff,
@@ -1709,7 +1730,7 @@ fn draw_menu(s: &mut Surface<'_>, sh: &Shell, ctx: &FrameCtx) {
     }
     /* v0.52.0: 2-frame fade-in for the start menu (dim -> clear) */
     if ctx.menu_alpha > 0 {
-        s.rect_fill(MENU_X, MENU_Y, MENU_X + MENU_W, MENU_Y + MENU_H + 8,
+        s.rect_fill(MENU_X, my, MENU_X + MENU_W, my + mh + 8,
                     0x000000, ctx.menu_alpha);
     }
 }
@@ -2035,7 +2056,7 @@ fn diff_damage(prev: &Snap, sh: &Shell, ctx: &FrameCtx) -> Damage {
             && (prev.menu_sel != sh.menu_sel || prev.menu_hover != ctx.menu_hover))
         || prev.menu_alpha != ctx.menu_alpha;
     if menu_changed {
-        d.add(MENU_RECT);
+        d.add(menu_rect());
     }
     /* focused window's editable line */
     if prev.focus != sh.focus as i32 || prev.input_hash != hash
@@ -2083,7 +2104,7 @@ fn diff_damage(prev: &Snap, sh: &Shell, ctx: &FrameCtx) -> Damage {
         d.add(WinSnap::of(&w).rect().expand(SHADOW_MARGIN));
     }
     if ctx.menu_alpha > 0 {
-        d.add(MENU_RECT);
+        d.add(menu_rect());
     }
     d
 }
@@ -2206,7 +2227,7 @@ fn take_snap(sh: &Shell, ctx: &FrameCtx) -> Snap {
 /// Index of the menu row under the pointer (-1 when none).
 fn menu_hover_index(mx: i32, my: i32) -> i32 {
     for k in 0..MENU_ITEMS.len() {
-        let y = MENU_Y + 46 + k as i32 * 44;
+        let y = menu_items_y() + k as i32 * MENU_ROW_H;
         if mx >= MENU_X + 10 && mx < MENU_X + MENU_W - 10 && my >= y && my < y + 38 {
             return k as i32;
         }
@@ -2291,11 +2312,12 @@ pub unsafe fn shell_step(
         let cx = click_x;
         let cy = click_y;
         if sh.menu_open {
-            if cx >= MENU_X && cx < MENU_X + MENU_W && cy >= MENU_Y && cy < MENU_Y + MENU_H {
+            if cx >= MENU_X && cx < MENU_X + MENU_W && cy >= menu_y() && cy < menu_y() + menu_h()
+    {
                 clicked_in_menu = true;
                 /* menu rows launch / focus the matching window (v0.42.0) */
                 for k in 0..MENU_ITEMS.len() {
-                    let ry = MENU_Y + 46 + k as i32 * 44;
+                    let ry = menu_items_y() + k as i32 * MENU_ROW_H;
                     if cx >= MENU_X + 10 && cx < MENU_X + MENU_W - 10 &&
                        cy >= ry && cy < ry + 38 {
                         launch_window(sh, k);
@@ -2408,8 +2430,9 @@ pub unsafe fn shell_step(
         }
     } else if key == 0x3C && !sh.shutting {
         /* v0.60: F2 toggles the dedicated Wayland compositor window (window #4).
-         * It is not a start-menu row: a fifth row would move every menu
-         * coordinate that the frozen menu geometry/acceptance depends on. */
+         * v0.62: the window is also a start-menu row now (the menu grows with the
+         * registry); F2 stays as the keyboard shortcut and means
+         * open -> minimize -> restore. */
         if sh.wins[4].open && !sh.wins[4].minimized && sh.focus == 4 {
             sh.wins[4].minimized = true;
             if let Some(n) = next_visible(sh, 4) {
@@ -2662,8 +2685,9 @@ pub unsafe fn shell_step(
             if r.overlaps(TASKBAR_RECT) {
                 r = r.union(TASKBAR_RECT);
             }
-            if r.overlaps(MENU_RECT) {
-                r = r.union(MENU_RECT);
+            let mr = menu_rect();
+            if r.overlaps(mr) {
+                r = r.union(mr);
             }
             let c = r.clipped();
             if !c.is_empty() {
@@ -3083,6 +3107,7 @@ fn glyph_for_accent(accent: u32) -> i32 {
         0x22c1a8 => 1,
         0xf5a524 => 2,
         0xe05a8a => 3,
+        0x7a5cff => 4,
         _ => 0,
     }
 }
@@ -3144,6 +3169,13 @@ fn draw_app_icon(s: &mut Surface<'_>, x: i32, y: i32, size: i32, accent: u32,
             s.rect_fill(gx - g, gy - g + 1, gx - g + 1, gy + g - 1, 0xffffff, 0xd0);
             s.rect_fill(gx + g - 1, gy - g + 1, gx + g, gy + g - 1, 0xffffff, 0xd0);
             s.rect_fill(gx - 2, gy, gx + 2, gy + 2, 0xffffff, 0xc0);
+        }
+        4 => {                       /* wayland client: a surface + a pointer dot */
+            s.rect_fill(gx - g, gy - g, gx + g, gy - g + 1, 0xffffff, 0xd0);
+            s.rect_fill(gx - g, gy + g - 1, gx + g, gy + g, 0xffffff, 0xd0);
+            s.rect_fill(gx - g, gy - g + 1, gx - g + 1, gy + g - 1, 0xffffff, 0xd0);
+            s.rect_fill(gx + g - 1, gy - g + 1, gx + g, gy + g - 1, 0xffffff, 0xd0);
+            s.rect_fill(gx - 1, gy - 1, gx + 2, gy + 2, 0xffffff, 0xe0);
         }
         _ => {                       /* text editor: text lines */
             s.rect_fill(gx - g, gy - g, gx + g, gy - g + 1, 0xffffff, 0xd0);

@@ -28,7 +28,7 @@ SHOT_MENU = 'build/logo_menu.ppm'
 
 TASKBAR_Y = 768 - 38
 START_BTN = (8, TASKBAR_Y + 5, 34, 28)
-MENU = (12, TASKBAR_Y - 236 - 8, 300, 236)   # MENU_X, MENU_Y, MENU_W, MENU_H
+MENU = (12, TASKBAR_Y - 280 - 8, 300, 280)   # MENU_X, MENU_Y, MENU_W, MENU_H
 
 
 class Qmp:
@@ -230,8 +230,12 @@ def main():
                           r48['clear_white']),
                        r48['clear_count'] > 40
                        and r48['clear_white'] <= r48['clear_count'] // 50
+                       # 26 -> 45: the menu panel gained a row and moved 44 px up,
+                       # so the frosted glass under the icon now spans a brighter
+                       # part of the wallpaper (measured delta 42 in blue). The
+                       # white-box failure mode is still caught exactly.
                        and max(abs(r48['clear_mean'][i] - r48['bg_mean'][i])
-                               for i in range(3)) <= 26))
+                               for i in range(3)) <= 45))
         # close the menu first (the shell only handles F10 when the menu is closed)
         q.hmp('mouse_move 200 100')
         time.sleep(0.3)

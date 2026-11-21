@@ -254,6 +254,15 @@
     unix 对端不报 EOF）→ 改为按输入设备归属判定，`source=shell` 时桌面 pump 必须跑。
   - `wl_win_semantics_acceptance.py` **30/30**（窗口矩形/局部坐标逐条验算、真实拖动后坐标跟随、
     enter/motion/leave、焦点门控、keymap 三方 hash、buffer 生命周期）。
+- **GUI 第三轮（v0.62，未发布）**：
+  - 图片查看器读真实文件：Rust 侧 BMP 解码（24/32bpp、自底/自顶向上、≤256×256 静态缓冲）+
+    `vfs_read_file("/mnt/fat/IMG.BMP")`（`lemis_heap_free` 释放），整数最近邻缩放居中，页脚
+    `IMG.BMP · 32×32 · scale 4`；失败回退 Logo、Wayland surface 仍优先。验收沿夹具四象限取色
+    红/绿/蓝/白逐点比对（解码→缩放→上屏端到端）。
+  - 开始菜单第 5 行 = Wayland 客户端；面板几何改为 `46 + 项数×44 + 14`（236→280，整体上移 44），
+    绘制/命中/伤害统一走 `menu_h()/menu_y()/menu_rect()`；伪 3D 图标第 5 种字形；F2 语义
+    open→minimize→restore。新门禁 `gui_menu_launch_acceptance.py` **10/10**（面板上边缘像素、
+    5 行 accent 图标、点第 5 行启动 + 紫色标题条、F2 两次）。
 - **仍未完成**：真正的 vsync 源（本机没有扫描线中断，60 Hz 是墙上时钟栅格）、
   窗口内键盘焦点、Wayland scaling 的真实合成与"surface 作为真正窗口表面"（无窗口命中/摆放）、
   `wl_keyboard` keymap（内核无 XKB 数据）、多 surface 历史与 buffer 回收、最大/还原过渡的局部重绘。

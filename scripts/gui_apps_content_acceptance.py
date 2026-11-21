@@ -10,9 +10,10 @@ values really are live:
   2. 任务管理器's uptime / CPU % text CHANGES between two dumps 3 s apart (this
      is what proves `apps::draw_live` plus the once-a-second idle-fingerprint
      refresh: the cached window layer itself stays static);
-  3. 图片查看器 (launched from the start menu) shows a dark checkerboard canvas
-     with the real 48x48 logo nearest-neighbour scaled 3x (bright pixels on a
-     dark matte) plus the file-name caption and the "48x48 · 3x" footer;
+  3. 图片查看器 (launched from the start menu) decodes /mnt/fat/IMG.BMP - a real
+     32x32 file with red/green/blue/white quadrants - and draws it with an integer
+     zoom on a dark matte, with a caption naming the file, its size and the zoom
+     factor (v0.62: this window used to paint a hard-coded logo);
   4. 文本编辑器 (also launched from the start menu) shows its four numbered
      code lines (a real buffer since v0.61) and the accent caret at the end of the
      seeded second line;
@@ -55,7 +56,7 @@ WIN2 = (210, 430, 360, 240)               # 图片查看器   accent 0xf5a524
 WIN3 = (560, 180, 330, 230)               # 文本编辑器   accent 0xe05a8a
 
 START_BTN = (8, TASKBAR_Y + 5, 34, 28)
-MENU_H = 236
+MENU_H = 280                     # v0.62: five rows (Wayland client added)
 MENU_ITEMS_Y = TASKBAR_Y - MENU_H - 8 + 46      # 532
 MENU_ITEM_H = 44
 MENU_X_CLICK = 90
@@ -427,46 +428,56 @@ def main():
         click_menu_item(2)
         check('menu launched window 2 (image viewer)', wait_for('[gui-shell] menu launch 2', 90))
         img = None
+        # v0.62: the picture viewer decodes /mnt/fat/IMG.BMP (32x32, four colour
+        # quadrants, see mkfat32_testimg.py) instead of painting the logo. The
+        # integer zoom is min(fit) and the block is centred on the canvas, so the
+        # sample points below are computed exactly like apps::image_body does.
+        IMG_FILE_W = 32
+        IMG_FILE_H = 32
         if ok_base:
             cx0 = WIN2[0] + PAD
             cy0 = WIN2[1] + IMG_CANVAS_Y
-            lx = cx0 + (WIN2[2] - 2 * PAD - IMG_LOGO) // 2
+            avail_w = WIN2[2] - 2 * PAD
+            avail_h = WIN2[3] - 26 - TITLE_H - 30
+            IMG_SCALE = max(1, min(avail_w // IMG_FILE_W, avail_h // IMG_FILE_H))
+            IMG_DW = IMG_FILE_W * IMG_SCALE
             img = dump_until('image',
-                             lambda px: count_colorful(px, lx, cy0, lx + IMG_LOGO,
-                                                       cy0 + IMG_LOGO, 40) > 800)
+                             lambda px: count_colorful(px, cx0, cy0, cx0 + avail_w,
+                                                       cy0 + avail_h, 40) > 2000)
         if img is not None:
             ipx = img.load()
             cx0 = WIN2[0] + PAD
             cy0 = WIN2[1] + IMG_CANVAS_Y
-            lx = cx0 + (WIN2[2] - 2 * PAD - IMG_LOGO) // 2
-            # checkerboard: two dark tones, clearly darker than the window body
-            tones = {}
-            for y in range(cy0 + 4, cy0 + 60, 2):
-                for x in range(cx0 + 4, cx0 + 70, 2):
-                    tones[ipx[x, y]] = tones.get(ipx[x, y], 0) + 1
-            dark_mean = mean_brightness(ipx, cx0 + 4, cy0 + 4, cx0 + 70, cy0 + 60)
-            check('image: checkerboard matte is dark (well below the body)',
-                  dark_mean < 130, 'canvas mean %.1f (window body ~170)' % dark_mean)
-            check('image: checkerboard has two alternating tones',
-                  len(tones) >= 2 and len(sorted(tones.values())[-2:]) == 2
-                  and sorted(tones.values())[-2] > 30,
-                  'tones %s' % sorted(tones.items(), key=lambda kv: -kv[1])[:4])
-            # the logo itself: coloured pixels inside the 144x144 block (the
-            # white PNG matte is keyed out, the glyph is teal/orange)
-            bright = count_bright(ipx, lx, cy0, lx + IMG_LOGO, cy0 + IMG_LOGO, 480)
-            colorful = count_colorful(ipx, lx, cy0, lx + IMG_LOGO, cy0 + IMG_LOGO, 40)
-            lit = count_max_above(ipx, lx, cy0, lx + IMG_LOGO, cy0 + IMG_LOGO, 120)
-            check('image: real 48px logo drawn at 3x (lit + coloured px)',
-                  bright > 40 and colorful > 1200 and lit > 1500,
-                  '%d lit / %d bright / %d coloured px in the 144x144 block'
-                  % (lit, bright, colorful))
-            check('image: logo sits on the checkerboard (no white tile)',
-                  mean_brightness(ipx, lx, cy0, lx + IMG_LOGO, cy0 + 20) < 150,
-                  'top band mean %.1f'
-                  % mean_brightness(ipx, lx, cy0, lx + IMG_LOGO, cy0 + 20))
+            avail_w = WIN2[2] - 2 * PAD
+            avail_h = WIN2[3] - 26 - TITLE_H - 30
+            IMG_SCALE = max(1, min(avail_w // IMG_FILE_W, avail_h // IMG_FILE_H))
+            IMG_DW = IMG_FILE_W * IMG_SCALE
+            lx = cx0 + (avail_w - IMG_DW) // 2
+            ly = cy0 + (avail_h - IMG_DW) // 2
+            # one sample at the centre of each quadrant of the real file
+            quads = [
+                ('red', lx + IMG_DW // 4, ly + IMG_DW // 4, (255, 0, 0)),
+                ('green', lx + 3 * IMG_DW // 4, ly + IMG_DW // 4, (0, 255, 0)),
+                ('blue', lx + IMG_DW // 4, ly + 3 * IMG_DW // 4, (0, 0, 255)),
+                ('white', lx + 3 * IMG_DW // 4, ly + 3 * IMG_DW // 4, (255, 255, 255)),
+            ]
+            got = []
+            hits = 0
+            for (name, qx, qy, want) in quads:
+                px = ipx[qx, qy]
+                near = all(abs(px[i] - want[i]) <= 24 for i in range(3))
+                hits += 1 if near else 0
+                got.append('%s%s@%d,%d' % (name, '=' + str(px) if not near else '=ok',
+                                           qx, qy))
+            check('image: real IMG.BMP quadrants decoded and drawn (32x32 @ %dx)'
+                  % IMG_SCALE, hits == 4, '; '.join(got))
+            check('image: the picture block keeps the dark matte around it',
+                  mean_brightness(ipx, cx0 + 2, cy0 + 2, cx0 + 40, cy0 + 40) < 120,
+                  'matte mean %.1f' % mean_brightness(ipx, cx0 + 2, cy0 + 2,
+                                                      cx0 + 40, cy0 + 40))
             cap = count_bright(ipx, cx0, WIN2[1] + IMG_CAPTION_Y,
                                cx0 + 240, WIN2[1] + IMG_CAPTION_Y + 16, 560)
-            check('image: file-name caption present', cap > 40,
+            check('image: caption names the real file', cap > 40,
                   '%d caption px' % cap)
 
         # ---- (4) 文本编辑器: three numbered lines + caret -------------------

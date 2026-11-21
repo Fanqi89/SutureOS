@@ -76,6 +76,9 @@ extern "C" {
     fn wl_server_latest_surface(w: *mut i32, h: *mut i32, stride: *mut i32,
                                 px: *mut *const u8) -> i32;
     fn wl_server_commit_count() -> u32;
+    /* kernel/vfs/vfs.c: whole-file read, heap buffer the caller frees. */
+    fn vfs_read_file(path: *const u8, len: *mut usize) -> *mut u8;
+    fn lemis_heap_free(p: *mut u8);
     /* v0.60 (task-5): every connection keeps its own last committed surface. */
     fn wl_server_surface_count() -> i32;
     fn wl_server_surface_at(idx: i32, w: *mut i32, h: *mut i32, stride: *mut i32,
@@ -669,6 +672,113 @@ fn taskman_body(s: &mut Surface<'_>, accent: u32, wx: i32, wy: i32, w: i32, _h: 
 /// 图片查看器: a dark checkerboard "transparent" canvas with the real 48 px
 /// logo nearest-neighbour scaled 3x (144x144) centred on it, a file-name
 /// caption above and the "48x48 · 3x" footer below.
+/* ---------------------------------------------------------------- BMP file
+ * v0.61: the viewer shows a real file. Everything is static (the crate has no
+ * allocator): one 256x256 pixel buffer is plenty for the fixture and for the
+ * kind of small bitmaps a FAT32 volume in this system carries. */
+const IMG_MAX_W: usize = 256;
+const IMG_MAX_H: usize = 256;
+static mut IMG_PX: [u32; IMG_MAX_W * IMG_MAX_H] = [0; IMG_MAX_W * IMG_MAX_H];
+static mut IMG_W: i32 = 0;
+static mut IMG_H: i32 = 0;
+static mut IMG_TRIED: bool = false;
+static mut IMG_OK: bool = false;
+
+#[inline]
+fn rd_u16(b: &[u8], o: usize) -> u32 {
+    (b[o] as u32) | ((b[o + 1] as u32) << 8)
+}
+
+#[inline]
+fn rd_u32(b: &[u8], o: usize) -> u32 {
+    (b[o] as u32)
+        | ((b[o + 1] as u32) << 8)
+        | ((b[o + 2] as u32) << 16)
+        | ((b[o + 3] as u32) << 24)
+}
+
+/// Read and decode /mnt/fat/IMG.BMP once. Returns false (and remembers that) when
+/// there is no readable BMP, so the caller can fall back without hitting the disk
+/// on every repaint.
+unsafe fn img_load() -> bool {
+    if IMG_TRIED {
+        return IMG_OK;
+    }
+    IMG_TRIED = true;
+    let mut len: usize = 0;
+    let p = vfs_read_file(b"/mnt/fat/IMG.BMP\0".as_ptr(), &mut len);
+    if p.is_null() {
+        console_printf(b"[gui-shell] image: /mnt/fat/IMG.BMP not found\n\0".as_ptr());
+        return false;
+    }
+    let ok = {
+        let b = core::slice::from_raw_parts(p, len);
+        if b.len() < 54 || b[0] != b'B' || b[1] != b'M' {
+            false
+        } else {
+            let data_off = rd_u32(b, 10) as usize;
+            let w = rd_u32(b, 18) as i32;
+            let h_signed = rd_u32(b, 22) as i32;
+            let bpp = rd_u16(b, 28) as i32;
+            let comp = rd_u32(b, 30);
+            let h = if h_signed < 0 { -h_signed } else { h_signed };
+            let bytes_pp = bpp as usize / 8;
+            if (bpp != 24 && bpp != 32)
+                || comp != 0
+                || w <= 0
+                || h <= 0
+                || w as usize > IMG_MAX_W
+                || h as usize > IMG_MAX_H
+            {
+                console_printf(
+                    b"[gui-shell] image: unsupported BMP %dx%d bpp=%d comp=%d\n\0".as_ptr(),
+                    w,
+                    h,
+                    bpp,
+                    comp,
+                );
+                false
+            } else {
+                let stride = (w as usize * bytes_pp + 3) & !3usize;
+                if data_off + stride * h as usize > b.len() {
+                    false
+                } else {
+                    let bottom_up = h_signed > 0;
+                    let dst = &mut *core::ptr::addr_of_mut!(IMG_PX);
+                    let mut row = 0usize;
+                    while row < h as usize {
+                        let src_row = if bottom_up { h as usize - 1 - row } else { row };
+                        let base = data_off + src_row * stride;
+                        let mut x = 0usize;
+                        while x < w as usize {
+                            let o = base + x * bytes_pp;
+                            dst[row * IMG_MAX_W + x] = ((b[o + 2] as u32) << 16)
+                                | ((b[o + 1] as u32) << 8)
+                                | (b[o] as u32);
+                            x += 1;
+                        }
+                        row += 1;
+                    }
+                    IMG_W = w;
+                    IMG_H = h;
+                    true
+                }
+            }
+        }
+    };
+    lemis_heap_free(p);
+    IMG_OK = ok;
+    if ok {
+        console_printf(
+            b"[gui-shell] image: loaded %dx%d from /mnt/fat/IMG.BMP (%d bytes)\n\0".as_ptr(),
+            IMG_W,
+            IMG_H,
+            len as i32,
+        );
+    }
+    ok
+}
+
 fn image_body(s: &mut Surface<'_>, accent: u32, wx: i32, wy: i32, w: i32, h: i32) {
     /* v0.59.x: a committed Wayland surface wins over the logo preview - that is
      * the compositor integration (ring-3 client's shm buffer shown in a window). */
@@ -677,6 +787,61 @@ fn image_body(s: &mut Surface<'_>, accent: u32, wx: i32, wy: i32, w: i32, h: i32
     }
     let x0 = wx + PAD;
     let x1 = wx + w - PAD;
+    let have_img = unsafe { img_load() };
+    if have_img {
+        let (iw, ih) = unsafe { (IMG_W, IMG_H) };
+        text(s, x0, wy + TITLE_H + 8, "IMG.BMP", TEXT_MID, 0xf0);
+        let cy0 = wy + TITLE_H + 30;
+        let avail_w = x1 - x0;
+        let avail_h = (wy + h - 26) - cy0;
+        if avail_w < 8 || avail_h < 8 {
+            return;
+        }
+        let mut scale = (avail_w / iw).min(avail_h / ih);
+        if scale < 1 {
+            scale = 1;
+        }
+        let dw = iw * scale;
+        let dh = ih * scale;
+        let ox = x0 + (avail_w - dw) / 2;
+        let oy = cy0 + (avail_h - dh) / 2;
+        /* matte behind the picture so a small image does not float on glass */
+        s.rect_fill(x0, cy0, x1, cy0 + avail_h, 0x2a3038, 0xff);
+        s.rect_fill(ox - 1, oy - 1, ox + dw + 1, oy, accent, 0x80);
+        s.rect_fill(ox - 1, oy + dh, ox + dw + 1, oy + dh + 1, accent, 0x80);
+        s.rect_fill(ox - 1, oy, ox, oy + dh, accent, 0x80);
+        s.rect_fill(ox + dw, oy, ox + dw + 1, oy + dh, accent, 0x80);
+        let px = unsafe { &*core::ptr::addr_of!(IMG_PX) };
+        let mut dy = 0i32;
+        while dy < dh {
+            let sy = (dy / scale) as usize;
+            let mut dx = 0i32;
+            while dx < dw {
+                let sx = (dx / scale) as usize;
+                let c = px[sy * IMG_MAX_W + sx];
+                s.put((ox + dx) as usize, (oy + dy) as usize, c);
+                dx += 1;
+            }
+            dy += 1;
+        }
+        /* caption: the real file name, its size and the zoom factor */
+        let cy_cap = cy0 + avail_h + 6;
+        let alpha = 0xe4u32;
+        let mut b1 = [0u8; 12];
+        let mut b2 = [0u8; 12];
+        let mut b3 = [0u8; 12];
+        let s_w = u32_str(&mut b1, iw as u32);
+        let s_h = u32_str(&mut b2, ih as u32);
+        let s_sc = u32_str(&mut b3, scale as u32);
+        let mut cx = text_at(s, x0, cy_cap, "IMG.BMP  \u{00b7}  ", TEXT_LOW, alpha);
+        cx = text_at(s, cx, cy_cap, s_w, TEXT_LOW, alpha);
+        cx = text_at(s, cx, cy_cap, "x", TEXT_LOW, alpha);
+        cx = text_at(s, cx, cy_cap, s_h, TEXT_LOW, alpha);
+        cx = text_at(s, cx, cy_cap, "  \u{00b7}  scale ", TEXT_LOW, alpha);
+        let _ = text_at(s, cx, cy_cap, s_sc, TEXT_LOW, alpha);
+        let _ = w;
+        return;
+    }
     text(s, x0, wy + TITLE_H + 8, "SutureOS_logo_1536.png", TEXT_MID, 0xf0);
     let cy0 = wy + TITLE_H + 30;
     let logo = 144;
