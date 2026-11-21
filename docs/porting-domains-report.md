@@ -255,6 +255,10 @@
   - `wl_win_semantics_acceptance.py` **30/30**（窗口矩形/局部坐标逐条验算、真实拖动后坐标跟随、
     enter/motion/leave、焦点门控、keymap 三方 hash、buffer 生命周期）。
 - **GUI 第三轮（v0.62，未发布）**：
+  - 图片查看器双解码 + 浏览：BMP（24/32bpp BIFF）与 QOI（RGB/RGBA 全 opcode）都解析，
+    图片窗口持有焦点时 Left/Right 切换文件（`image_shift`，失效窗口层缓存并注入 damage），
+    页脚写实际解码的文件名/尺寸/倍数；`gui_image_browse_acceptance.py` 9/9（两格式四象限像素 +
+    caption 跟随 + 退格回 BMP）。顺手修 `%s` 用非 NUL 结尾 `&str` 导致串口读出整段桌面文字的 bug。
   - 图片查看器读真实文件：Rust 侧 BMP 解码（24/32bpp、自底/自顶向上、≤256×256 静态缓冲）+
     `vfs_read_file("/mnt/fat/IMG.BMP")`（`lemis_heap_free` 释放），整数最近邻缩放居中，页脚
     `IMG.BMP · 32×32 · scale 4`；失败回退 Logo、Wayland surface 仍优先。验收沿夹具四象限取色

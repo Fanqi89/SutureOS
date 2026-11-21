@@ -183,6 +183,7 @@ struct Shell {
     /* v0.61: the editor's text changed since the last damage computation, so the
      * next frame has to re-rasterise its window layer and repaint that rect. */
     dirty_editor: bool,
+    dirty_image: bool,
 }
 
 static mut SHELL: Shell = Shell {
@@ -233,6 +234,7 @@ static mut SHELL: Shell = Shell {
     scale_to: [0; 4],
     scale_kind: 0,
     dirty_editor: false,
+    dirty_image: false,
 };
 
 // ---------------------------------------------------------------- caches
@@ -2504,6 +2506,23 @@ pub unsafe fn shell_step(
                 sh.dirty_editor = true;
                 log2(c"editor key", key as i32, ch as i32);
             }
+        } else if sh.wins[fi].open && !sh.wins[fi].minimized
+            && sh.wins[fi].accent == crate::apps::ACC_IMAGE {
+            /* v0.62: the picture viewer owns Left/Right - it browses the supported
+             * files on the volume (BMP / QOI) and re-decodes the chosen one. Any
+             * other key falls through to the one-line input band below, so the
+             * existing "input win=N" behaviour is untouched. */
+            if key == 0x4b || key == 0x4d {
+                let dir = if key == 0x4b { -1 } else { 1 };
+                if crate::apps::image_shift(dir) {
+                    unsafe {
+                        WIN_KEY[2] = i32::MIN;
+                    }
+                    sh.dirty_image = true;
+                    /* 1 = next, 2 = previous (log args are read as unsigned) */
+                    log2(c"image shift", if dir > 0 { 1 } else { 2 }, 0);
+                }
+            }
         } else if sh.wins[fi].open && !sh.wins[fi].minimized {
             let len = sh.ilen[fi] as usize;
             if ch == 0x0a || ch == 0x0d {
@@ -2632,6 +2651,11 @@ pub unsafe fn shell_step(
     // ---- damage: what changed since the frame that is on screen? ----
     let prev = &*core::ptr::addr_of!(SNAP);
     let mut dmg = diff_damage(prev, sh, &ctx);
+    if sh.dirty_image && sh.wins[2].open && !sh.wins[2].minimized {
+        /* browsing moves no rect either: inject the window's damage explicitly */
+        dmg.add(WinSnap::of(&sh.wins[2]).rect().expand(SHADOW_MARGIN));
+        sh.dirty_image = false;
+    }
     if sh.dirty_editor && sh.wins[3].open && !sh.wins[3].minimized {
         /* a keystroke moves no rect, so it has to be injected here explicitly */
         dmg.add(WinSnap::of(&sh.wins[3]).rect().expand(SHADOW_MARGIN));

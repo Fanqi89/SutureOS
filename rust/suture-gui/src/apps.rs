@@ -672,17 +672,29 @@ fn taskman_body(s: &mut Surface<'_>, accent: u32, wx: i32, wy: i32, w: i32, _h: 
 /// 图片查看器: a dark checkerboard "transparent" canvas with the real 48 px
 /// logo nearest-neighbour scaled 3x (144x144) centred on it, a file-name
 /// caption above and the "48x48 · 3x" footer below.
-/* ---------------------------------------------------------------- BMP file
- * v0.61: the viewer shows a real file. Everything is static (the crate has no
- * allocator): one 256x256 pixel buffer is plenty for the fixture and for the
- * kind of small bitmaps a FAT32 volume in this system carries. */
+/* ------------------------------------------------------------- image files
+ * v0.62: the viewer shows real files from the FAT32 volume, and it can show two
+ * formats: BMP (24/32bpp BIFF) and QOI ("Quite OK Image"). Left/Right in the
+ * window switch between the supported files, so the acceptance can prove both
+ * decoders on the same window.
+ *
+ * Everything is static (the crate has no allocator): one 256x256 pixel buffer is
+ * plenty for the fixtures and for the small bitmaps such a volume carries. */
 const IMG_MAX_W: usize = 256;
 const IMG_MAX_H: usize = 256;
 static mut IMG_PX: [u32; IMG_MAX_W * IMG_MAX_H] = [0; IMG_MAX_W * IMG_MAX_H];
 static mut IMG_W: i32 = 0;
 static mut IMG_H: i32 = 0;
-static mut IMG_TRIED: bool = false;
-static mut IMG_OK: bool = false;
+static mut IMG_IDX: usize = usize::MAX;         /* usize::MAX = nothing loaded */
+static mut IMG_NAME: [u8; 16] = [0; 16];
+static mut IMG_NAME_LEN: usize = 0;
+
+const IMG_COUNT: usize = 2;
+const IMG_PATHS: [&[u8]; IMG_COUNT] = [b"/mnt/fat/IMG.BMP\0", b"/mnt/fat/IMG.QOI\0"];
+const IMG_NAMES: [&str; IMG_COUNT] = ["IMG.BMP", "IMG.QOI"];
+/* NUL-terminated copies for console_printf("%s"): a `&str` has no terminator
+ * and the kernel would print whatever follows it in memory. */
+const IMG_NAMES_C: [&[u8]; IMG_COUNT] = [b"IMG.BMP\0", b"IMG.QOI\0"];
 
 #[inline]
 fn rd_u16(b: &[u8], o: usize) -> u32 {
@@ -697,100 +709,238 @@ fn rd_u32(b: &[u8], o: usize) -> u32 {
         | ((b[o + 3] as u32) << 24)
 }
 
-/// Read and decode /mnt/fat/IMG.BMP once. Returns false (and remembers that) when
-/// there is no readable BMP, so the caller can fall back without hitting the disk
-/// on every repaint.
-unsafe fn img_load() -> bool {
-    if IMG_TRIED {
-        return IMG_OK;
+#[inline]
+fn rd_be32(b: &[u8], o: usize) -> u32 {
+    ((b[o] as u32) << 24)
+        | ((b[o + 1] as u32) << 16)
+        | ((b[o + 2] as u32) << 8)
+        | (b[o + 3] as u32)
+}
+
+#[inline]
+fn pack_rgb(r: u8, g: u8, b: u8) -> u32 {
+    ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+}
+
+/// Decode a BMP into IMG_PX. Only uncompressed 24/32bpp BIFF: that is what the
+/// volume carries and what a 32bpp framebuffer can blit without conversion.
+unsafe fn bmp_decode(b: &[u8]) -> bool {
+    if b.len() < 54 || b[0] != b'B' || b[1] != b'M' {
+        return false;
     }
-    IMG_TRIED = true;
+    let data_off = rd_u32(b, 10) as usize;
+    let w = rd_u32(b, 18) as i32;
+    let h_signed = rd_u32(b, 22) as i32;
+    let bpp = rd_u16(b, 28) as i32;
+    if rd_u32(b, 30) != 0 || w <= 0 || h_signed == 0 {
+        return false;
+    }
+    let h = if h_signed < 0 { -h_signed } else { h_signed };
+    let bytes_pp = bpp as usize / 8;
+    if (bpp != 24 && bpp != 32)
+        || w as usize > IMG_MAX_W
+        || h as usize > IMG_MAX_H
+    {
+        return false;
+    }
+    let stride = (w as usize * bytes_pp + 3) & !3usize;
+    if data_off + stride * h as usize > b.len() {
+        return false;
+    }
+    let bottom_up = h_signed > 0;
+    let dst = &mut *core::ptr::addr_of_mut!(IMG_PX);
+    let mut row = 0usize;
+    while row < h as usize {
+        let src_row = if bottom_up { h as usize - 1 - row } else { row };
+        let base = data_off + src_row * stride;
+        let mut x = 0usize;
+        while x < w as usize {
+            let o = base + x * bytes_pp;
+            dst[row * IMG_MAX_W + x] = pack_rgb(b[o + 2], b[o + 1], b[o]);
+            x += 1;
+        }
+        row += 1;
+    }
+    IMG_W = w;
+    IMG_H = h;
+    true
+}
+
+/// Decode a QOI file into IMG_PX (the full opcode set, RGB/RGBA, 3 or 4 channels).
+unsafe fn qoi_decode(b: &[u8]) -> bool {
+    if b.len() < 22 || &b[0..4] != b"qoif" {
+        return false;
+    }
+    let w = rd_be32(b, 4) as i32;
+    let h = rd_be32(b, 8) as i32;
+    let channels = b[12];
+    if (channels != 3 && channels != 4) || w <= 0 || h <= 0 {
+        return false;
+    }
+    if w as usize > IMG_MAX_W || h as usize > IMG_MAX_H {
+        return false;
+    }
+    let wu = w as usize;
+    let total = wu * h as usize;
+    let dst = &mut *core::ptr::addr_of_mut!(IMG_PX);
+    let mut index = [[0u8, 0u8, 0u8, 255u8]; 64];
+    let mut px = [0u8, 0u8, 0u8, 255u8];
+    let mut p = 14usize;
+    let mut i = 0usize;
+    while i < total {
+        if p >= b.len() {
+            return false;
+        }
+        let b1 = b[p];
+        p += 1;
+        let mut run = 1usize;
+        if b1 == 0xfe {
+            if p + 3 > b.len() {
+                return false;
+            }
+            px[0] = b[p];
+            px[1] = b[p + 1];
+            px[2] = b[p + 2];
+            p += 3;
+        } else if b1 == 0xff {
+            if p + 4 > b.len() {
+                return false;
+            }
+            px[0] = b[p];
+            px[1] = b[p + 1];
+            px[2] = b[p + 2];
+            px[3] = b[p + 3];
+            p += 4;
+        } else {
+            match b1 >> 6 {
+                0 => {
+                    px = index[(b1 & 0x3f) as usize];
+                }
+                1 => {
+                    let d = b1 & 0x3f;
+                    px[0] = px[0].wrapping_add(((d >> 4) & 3).wrapping_sub(2));
+                    px[1] = px[1].wrapping_add(((d >> 2) & 3).wrapping_sub(2));
+                    px[2] = px[2].wrapping_add((d & 3).wrapping_sub(2));
+                }
+                2 => {
+                    if p >= b.len() {
+                        return false;
+                    }
+                    let b2 = b[p];
+                    p += 1;
+                    let dg = (b1 & 0x3f).wrapping_sub(32);
+                    let dr = ((b2 >> 4) & 0x0f).wrapping_sub(8);
+                    let db = (b2 & 0x0f).wrapping_sub(8);
+                    px[0] = px[0].wrapping_add(dg).wrapping_add(dr);
+                    px[1] = px[1].wrapping_add(dg);
+                    px[2] = px[2].wrapping_add(dg).wrapping_add(db);
+                }
+                _ => {
+                    run = (b1 & 0x3f) as usize + 1;
+                }
+            }
+            let hi = ((px[0] as usize) * 3
+                + (px[1] as usize) * 5
+                + (px[2] as usize) * 7
+                + (px[3] as usize) * 11)
+                % 64;
+            index[hi] = px;
+        }
+        let mut k = 0usize;
+        while k < run && i < total {
+            dst[(i / wu) * IMG_MAX_W + (i % wu)] = pack_rgb(px[0], px[1], px[2]);
+            i += 1;
+            k += 1;
+        }
+    }
+    IMG_W = w;
+    IMG_H = h;
+    true
+}
+
+/// Load one supported file by index. On success the caption name is recorded, so
+/// the window can never claim a file it did not decode.
+unsafe fn img_load_idx(idx: usize) -> bool {
     let mut len: usize = 0;
-    let p = vfs_read_file(b"/mnt/fat/IMG.BMP\0".as_ptr(), &mut len);
+    let p = vfs_read_file(IMG_PATHS[idx].as_ptr(), &mut len);
     if p.is_null() {
-        console_printf(b"[gui-shell] image: /mnt/fat/IMG.BMP not found\n\0".as_ptr());
+        console_printf(b"[gui-shell] image: %s not found\n\0".as_ptr(),
+                       IMG_NAMES_C[idx].as_ptr());
         return false;
     }
     let ok = {
         let b = core::slice::from_raw_parts(p, len);
-        if b.len() < 54 || b[0] != b'B' || b[1] != b'M' {
-            false
-        } else {
-            let data_off = rd_u32(b, 10) as usize;
-            let w = rd_u32(b, 18) as i32;
-            let h_signed = rd_u32(b, 22) as i32;
-            let bpp = rd_u16(b, 28) as i32;
-            let comp = rd_u32(b, 30);
-            let h = if h_signed < 0 { -h_signed } else { h_signed };
-            let bytes_pp = bpp as usize / 8;
-            if (bpp != 24 && bpp != 32)
-                || comp != 0
-                || w <= 0
-                || h <= 0
-                || w as usize > IMG_MAX_W
-                || h as usize > IMG_MAX_H
-            {
-                console_printf(
-                    b"[gui-shell] image: unsupported BMP %dx%d bpp=%d comp=%d\n\0".as_ptr(),
-                    w,
-                    h,
-                    bpp,
-                    comp,
-                );
-                false
-            } else {
-                let stride = (w as usize * bytes_pp + 3) & !3usize;
-                if data_off + stride * h as usize > b.len() {
-                    false
-                } else {
-                    let bottom_up = h_signed > 0;
-                    let dst = &mut *core::ptr::addr_of_mut!(IMG_PX);
-                    let mut row = 0usize;
-                    while row < h as usize {
-                        let src_row = if bottom_up { h as usize - 1 - row } else { row };
-                        let base = data_off + src_row * stride;
-                        let mut x = 0usize;
-                        while x < w as usize {
-                            let o = base + x * bytes_pp;
-                            dst[row * IMG_MAX_W + x] = ((b[o + 2] as u32) << 16)
-                                | ((b[o + 1] as u32) << 8)
-                                | (b[o] as u32);
-                            x += 1;
-                        }
-                        row += 1;
-                    }
-                    IMG_W = w;
-                    IMG_H = h;
-                    true
-                }
-            }
+        let decoded = if idx == 0 { bmp_decode(b) } else { qoi_decode(b) };
+        if decoded {
+            console_printf(
+                b"[gui-shell] image: loaded %s %dx%d (%d bytes)\n\0".as_ptr(),
+                IMG_NAMES_C[idx].as_ptr(), IMG_W, IMG_H, len as i32);
         }
+        decoded
     };
     lemis_heap_free(p);
-    IMG_OK = ok;
     if ok {
-        console_printf(
-            b"[gui-shell] image: loaded %dx%d from /mnt/fat/IMG.BMP (%d bytes)\n\0".as_ptr(),
-            IMG_W,
-            IMG_H,
-            len as i32,
-        );
+        IMG_IDX = idx;
+        let name = IMG_NAMES[idx].as_bytes();
+        let mut k = 0usize;
+        while k < name.len() && k < 15 {
+            IMG_NAME[k] = name[k];
+            k += 1;
+        }
+        IMG_NAME_LEN = k;
     }
     ok
 }
 
+/// Switch to the next (dir > 0) or previous (dir < 0) supported file. Returns true
+/// when a different file was decoded - the shell then invalidates the window layer.
+pub fn image_shift(dir: i32) -> bool {
+    unsafe {
+        let start = if IMG_IDX == usize::MAX { 0 } else { IMG_IDX };
+        let mut step = 1usize;
+        while step <= IMG_COUNT {
+            let idx = if dir >= 0 {
+                (start + step) % IMG_COUNT
+            } else {
+                (start + IMG_COUNT - step) % IMG_COUNT
+            };
+            if idx != IMG_IDX && img_load_idx(idx) {
+                return true;
+            }
+            step += 1;
+        }
+        false
+    }
+}
+
+/// True when the window is currently showing a decoded file.
+pub fn image_ready() -> bool {
+    unsafe { IMG_IDX != usize::MAX }
+}
+
+fn img_name() -> &'static str {
+    unsafe { core::str::from_utf8_unchecked(&IMG_NAME[..IMG_NAME_LEN]) }
+}
+
 fn image_body(s: &mut Surface<'_>, accent: u32, wx: i32, wy: i32, w: i32, h: i32) {
-    /* v0.59.x: a committed Wayland surface wins over the logo preview - that is
-     * the compositor integration (ring-3 client's shm buffer shown in a window). */
+    /* a committed Wayland surface wins over any file preview - that is the
+     * compositor integration (ring-3 client's shm buffer shown in a window). */
     if wayland_surface_body(s, accent, wx, wy, w, h) {
         return;
     }
+    unsafe {
+        if IMG_IDX == usize::MAX {
+            /* first paint: load the first supported file once */
+            let _ = img_load_idx(0) || img_load_idx(1);
+        }
+    }
     let x0 = wx + PAD;
     let x1 = wx + w - PAD;
-    let have_img = unsafe { img_load() };
+    let have_img = image_ready();
     if have_img {
         let (iw, ih) = unsafe { (IMG_W, IMG_H) };
-        text(s, x0, wy + TITLE_H + 8, "IMG.BMP", TEXT_MID, 0xf0);
+        let name = img_name();
+        text(s, x0, wy + TITLE_H + 8, name, TEXT_MID, 0xf0);
         let cy0 = wy + TITLE_H + 30;
         let avail_w = x1 - x0;
         let avail_h = (wy + h - 26) - cy0;
@@ -824,7 +974,7 @@ fn image_body(s: &mut Surface<'_>, accent: u32, wx: i32, wy: i32, w: i32, h: i32
             }
             dy += 1;
         }
-        /* caption: the real file name, its size and the zoom factor */
+        /* caption: real name, decoded size, zoom factor, and the hint for browsing */
         let cy_cap = cy0 + avail_h + 6;
         let alpha = 0xe4u32;
         let mut b1 = [0u8; 12];
@@ -833,12 +983,14 @@ fn image_body(s: &mut Surface<'_>, accent: u32, wx: i32, wy: i32, w: i32, h: i32
         let s_w = u32_str(&mut b1, iw as u32);
         let s_h = u32_str(&mut b2, ih as u32);
         let s_sc = u32_str(&mut b3, scale as u32);
-        let mut cx = text_at(s, x0, cy_cap, "IMG.BMP  \u{00b7}  ", TEXT_LOW, alpha);
+        let mut cx = text_at(s, x0, cy_cap, name, TEXT_LOW, alpha);
+        cx = text_at(s, cx, cy_cap, "  \u{00b7}  ", TEXT_LOW, alpha);
         cx = text_at(s, cx, cy_cap, s_w, TEXT_LOW, alpha);
         cx = text_at(s, cx, cy_cap, "x", TEXT_LOW, alpha);
         cx = text_at(s, cx, cy_cap, s_h, TEXT_LOW, alpha);
         cx = text_at(s, cx, cy_cap, "  \u{00b7}  scale ", TEXT_LOW, alpha);
-        let _ = text_at(s, cx, cy_cap, s_sc, TEXT_LOW, alpha);
+        cx = text_at(s, cx, cy_cap, s_sc, TEXT_LOW, alpha);
+        let _ = text_at(s, cx, cy_cap, "  \u{00b7}  \u{2190}\u{2192}", TEXT_LOW, 0x88);
         let _ = w;
         return;
     }
@@ -854,11 +1006,6 @@ fn image_body(s: &mut Surface<'_>, accent: u32, wx: i32, wy: i32, w: i32, h: i32
     s.rect_fill(x0 - 1, cy1, x1 + 1, cy1 + 1, accent, 0x70);
     s.rect_fill(x0 - 1, cy0, x0, cy1, accent, 0x70);
     s.rect_fill(x1, cy0, x1 + 1, cy1, accent, 0x70);
-    /* checkerboard: 8 px cells, two dark slate tones (the classic "no alpha"
-     * matte). Values picked so the matte reads clearly darker than the window
-     * body (mean ~91 vs ~170) while the window as a whole stays a painted
-     * surface - the shell's own "launched window is painted" gate samples this
-     * area and requires a mean brightness above 75. */
     let cw = x1 - x0;
     let cells = cw / 8;
     for row in 0..(logo / 8) {
@@ -869,30 +1016,25 @@ fn image_body(s: &mut Surface<'_>, accent: u32, wx: i32, wy: i32, w: i32, h: i32
             s.rect_fill(cx0, cyy, cx0 + 8, cyy + 8, c, 0xff);
         }
     }
-    /* the real 48x48 logo, nearest neighbour 3x, centred on the canvas */
     let lx = x0 + (cw - logo) / 2;
-    let ly = cy0;
     for dy in 0..logo {
         let sy = (dy / 3) as usize;
         for dx in 0..logo {
             let sx = (dx / 3) as usize;
             let src = unsafe { g_logo48[sy * 48 + sx] } & 0x00ff_ffff;
-            /* The logo bitmaps are 0xAARRGGBB (alpha preserved); their
-             * transparent pixels are 0x00FFFFFF, so keying near-white out here
-             * makes the checkerboard matte show through the glyph's holes. */
             let r = (src >> 16) & 0xff;
             let g = (src >> 8) & 0xff;
             let b = src & 0xff;
             if r >= 244 && g >= 244 && b >= 244 {
                 continue;
             }
-            s.put((lx + dx) as usize, (ly + dy) as usize, src);
+            s.put((lx + dx) as usize, (cy0 + dy) as usize, src);
         }
     }
-    text(s, x0, cy1 + 6, "48x48 ・ 3x", TEXT_LOW, 0xe4);
+    text(s, x0, cy1 + 6, "no IMG.BMP / IMG.QOI on the volume", TEXT_LOW, 0xe4);
 }
 
-/// 文本编辑器: three numbered code lines, a current-line highlight and a caret
+/// 文本编辑器: , a current-line highlight and a caret
 /// block, plus a status bar.
 fn editor_body(s: &mut Surface<'_>, accent: u32, wx: i32, wy: i32, w: i32, h: i32) {
     let x0 = wx + PAD;

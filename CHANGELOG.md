@@ -8,6 +8,23 @@ in the repository.
 
 ## [Unreleased]
 
+### 图片查看器：BMP + QOI 双解码与左右切换（v0.62 未发布）
+
+- 上一轮只能显示 BMP。这个 FAT32 夹具里其实有两个真实文件（`IMG.BMP` 24bpp BIFF、
+  `IMG.QOI` "Quite OK Image" RGB 码流），现在都给解析：`apps.rs` 新增 QOI 解码器
+  （RGB/RGBA 全 opcode：INDEX/DIFF/LUMA/RUN，3 或 4 通道，magic `qoif`，上限 256×256），
+  文件按扩展名选解码器，页脚永远写"真的解出来的那个文件"的名字、尺寸和整数缩放倍数。
+- **左右方向键浏览**：图片窗口拿到键盘焦点时 `Left/Right` 调 `image_shift(±1)` 切到下一个/
+  上一个受支持文件并重新解码，外壳把该窗口层缓存置失效、并注入该窗口的 damage
+  （与编辑器用的是同一套 `dirty_*` 钩子；其它键仍落回原来的一行输入带，`input win=N` 行为未动）。
+  这同时补上一个真实缺口：此前只有编辑器窗口消费键盘，其它窗口的按键全部变成输入带文字。
+- 新增 `scripts/gui_image_browse_acceptance.py` **9/9**：从开始菜单打开图片窗口 →
+  日志/像素双证 `IMG.BMP` 四象限 → `Right` → `IMG.QOI` 四象限（证明 QOI 解码）→
+  标题/页脚像素差证明 caption 跟着文件变 → `Left` → 回到 BMP（caption 差 0.00）。
+- 顺手修的两个日志 bug：`console_printf("%s", IMG_NAMES[idx].as_ptr())` 用 `&str` 指针给 `%s`，
+  **不是 NUL 结尾** → 一路读到后面内存，实测把整个桌面文字打进串口；改为 NUL 结尾的字节串。
+  `image shift` 日志原本把 `-1` 打成 `4294967295`（参数按无符号读），改成 1=下一张 / 2=上一张。
+
 ### Wayland 资源与协议收尾（v0.62 未发布）
 
 - **完整 US keymap**：精简布局补上数字行 `1`–`0` 及全部 Shift 符号与 `-=[];',./\` 反引号，
@@ -31,15 +48,15 @@ in the repository.
 - `scripts/wl_win_semantics_acceptance.py` 从 30 项扩到 **38/38**（repeat_info×3、memfd live×5）。
   回归：wl_server 28/28、wl_protocol 29/29、wl_multi 40/40、wl_semantics 38/38、wl_show 9/9、
   wl_window 11/11、wl_probe 14/14、unix 18/18、shm 18/18、fdpass 21/21。
-- **最终验收（同一份 ISO，一次连续 `gui_sweep.py` 全量 26 门全绿）**：静态 21/21、
+- **最终验收（同一份 ISO，一次连续 `gui_sweep.py` 全量 27 门全绿）**：静态 21/21、
   交互 13/13、外壳 55/55、交换链 30/30、合成器 28/28、C 桌面任务栏 9/9、
-  编辑器实时落盘 12/12、**开始菜单 10/10**、桌面 19/19、应用内容 23/23、两套外观门禁 0 像素、
+  编辑器实时落盘 12/12、**开始菜单 10/10**、**图片浏览 9/9**、桌面 19/19、应用内容 23/23、两套外观门禁 0 像素、
   Logo 14/14、wl_server 28/28、wl_protocol 29/29、wl_multi 40/40、
   **wl_semantics 38/38（0 skip）**、wl_show 9/9、wl 窗口 11/11、wlprobe 14/14、
   GUI 中文 4/4、图片查看器 PASS、C 编辑器 5/5、unix 18/18、shm 18/18、fdpass 21/21；
   开机自检 16/16、符号 **1435 全局 / 0 冲突（144 对象）**；
-  产物 `kernel.elf` 6,559,584 B、`sutureos.iso` 23,726,080 B
-  （sha256 `7a8575ae41d5df5d22b0c1c6af115a0c7bddb771c24e05d05cad76504689c21f`，未发布）。
+  产物 `kernel.elf` 6,563,968 B、`sutureos.iso` 23,738,368 B
+  （sha256 `8841e708965da3e27775e9fa81128a3f9aa4028bc353316afdcf4ccdda90d708`，未发布）。
   说明：本轮此前有一次 22/26 的 `sweep`，其中 shell/editorlive/wl_server/wl_multi 四门失败——
   当时队友的 Wayland 回归正在并行跑 QEMU，2 核机器上双实例争抢导致假失败；单独重跑四门全绿，
   随后在无并行负载下跑出上面这一次 26/26。
