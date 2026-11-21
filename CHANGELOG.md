@@ -10,6 +10,44 @@ in the repository.
 
 （下一批 GUI / 系统改动记在这里。）
 
+## [v0.66.0-alpha] — 2026-11-22
+
+发布正文见 `docs/release-notes-v0.66.0-alpha.md`。本版把桌面编辑器做实（48×64 缓冲、滚动视口、
+撤销/重做），并修掉一个会让 Ctrl 快捷键悄悄失效的输入层竞态。
+
+### 桌面编辑器：缓冲 / 视口 / 撤销重做（v0.66）
+
+- **缓冲**：`ED_LINES 10→48`、`ED_COLS 38→64`（3 KiB）。窗口只有 8 行可视高度（330×230 扣标题栏
+  与状态栏：`(230-34-40)/18 = 8`），新增 `ED_TOP` 视口起点、`ED_VIEW`（当前帧实画行数）、
+  `editor_scroll(delta)`；右侧 3 px 滚动条，状态栏 `Ln x/y Col c ・ F5 ・ ^Z/^Y`；
+  `editor_move` 增加 7=PageUp / 8=PageDown，所有移动后自动把视口拉回光标。
+- **撤销 / 重做**：4 级整缓冲快照（缓冲 + 每行长度 + 光标，3 KiB/级，undo/redo 各 4 级在 .bss）。
+  `ED_LAST_KIND` 把连续同类操作合并成一步（连打一段字算一次、连按退格算一次），光标移动切分历史，
+  任何新编辑清空 redo 栈。日志 `editor undo <剩余>` / `editor redo <剩余>` / `editor undo empty`。
+- **视口可观测**：`ed_ensure_visible()` 以前改 `ED_TOP` 不打日志，门禁看不见滚动；现在每次变化都打
+  `[gui-shell] editor scroll <top>`（含「跟随光标」的自动滚动）。
+- **滚轮**：焦点在编辑器时一格 = 3 行视口滚动（与菜单/图片查看器同一符号约定），不移动光标。
+- 门禁 `scripts/gui_editor_live_acceptance.py` 重写为 **18/18**。
+
+### 输入层：Ctrl 快捷键的竞态（v0.66，真 bug）
+
+- **现象**：按 Ctrl+Z 不撤销，反而在正文里插入 `z`（宿主解析出来的文件是 `abczzyzz`）。
+- **根因**：外壳每帧只取一次 `mbos_kbd_mod_state()` 快照，而 QMP 把 `ctrl down / z down / z up /
+  ctrl up` 一次性发完；等外壳从按键队列里取出这封信，Ctrl 早已释放 → mods=0。
+- **修法**：在 **PS/2 解码器**里把 Ctrl+字母折成经典 ASCII 控制码（Ctrl+Z=0x1A、Ctrl+Y=0x19、
+  Ctrl+S=0x13）——修饰键状态由**同一个字节**生效，不存在跨帧竞态；外壳按控制码路由
+  `editor_undo / editor_redo / editor_save`。ABI 同时增加 `mods`（SHIFT/CTRL/ALT），日志
+  `editor ctrl <sc> <ch>` 让门禁能断言「是修饰键而不是字母」。
+
+**最终验收（同一份 ISO，一次连续 `scripts/gui_sweep.py` 全量 32 门全绿）**：静态 21/21、交互 13/13、
+外壳 55/55、交换链 30/30、合成器 28/28、C 桌面任务栏 9/9、**编辑器落盘 18/18**、开始菜单 10/10、
+图片浏览 9/9、计算器 28/28、滚轮 9/9、vsync 探测 17/17、键盘归属 13/13、菜单滚动 13/13、桌面 19/19、
+应用内容 23/23、两套外观门禁 0 像素、Logo 14/14、wl_server 28/28、wl_protocol 29/29、wl_multi 40/40、
+wl_semantics 38/38、wl_show 9/9、wl 窗口 11/11、wlprobe 14/14、GUI 中文 4/4、图片查看器 PASS、
+C 编辑器 5/5、unix 18/18、shm 18/18、fdpass 21/21；开机自检 16/16；
+符号扫描 1453 全局 / 0 冲突（145 对象）；产物 `kernel.elf` 6,622,528 B、
+`sutureos.iso` 23,853,056 B（sha256 `dba9fd866690843ed9ef9e6fcee830bff3f862ee6d722ffb7be342fa748dfc2c`）。
+
 ## [v0.65.0-alpha] — 2026-11-22
 
 发布正文见 `docs/release-notes-v0.65.0-alpha.md`。本版两件事：**PS/2 滚轮真的接进桌面**（菜单一格一行、

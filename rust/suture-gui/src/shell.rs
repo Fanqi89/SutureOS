@@ -1561,8 +1561,50 @@ pub fn key_owner_mask() -> i32 {
     mask
 }
 
-/// v0.64: editor keys (was an inline if-chain branch in `shell_step`).
-fn editor_keys(key: i32, ch: i32) -> bool {
+/// v0.65: editor keys (was an inline if-chain branch in `shell_step`).
+/// v0.66: Ctrl+Z / Ctrl+Y / Ctrl+S and PageUp/PageDown; the modifier mask comes
+/// from the kernel's PS/2 decoder (`mbos_kbd_mod_state`).
+fn editor_keys(mods: i32, key: i32, ch: i32) -> bool {
+    /* v0.66: the PS/2 decoder already folded Ctrl+<letter> into an ASCII control
+     * code, so the shortcut does not depend on a modifier snapshot at all. */
+    match ch {
+        0x1a => {                                    /* Ctrl+Z */
+            crate::apps::editor_undo();
+            unsafe {
+                WIN_KEY[3] = i32::MIN;
+            }
+            log2(c"editor ctrl", key, ch);
+            return true;
+        }
+        0x19 => {                                    /* Ctrl+Y */
+            crate::apps::editor_redo();
+            unsafe {
+                WIN_KEY[3] = i32::MIN;
+            }
+            log2(c"editor ctrl", key, ch);
+            return true;
+        }
+        0x13 => {                                    /* Ctrl+S */
+            editor_save();
+            log2(c"editor ctrl", key, ch);
+            return true;
+        }
+        _ => {}
+    }
+    /* bit0 = ctrl (MBOS_KBD_CTRL), bit1 = alt, bit2 = shift */
+    if (mods & 1) != 0 {
+        match key {
+            0x2c => crate::apps::editor_undo(),      /* Ctrl+Z */
+            0x15 => crate::apps::editor_redo(),      /* Ctrl+Y */
+            0x1f => editor_save(),                   /* Ctrl+S */
+            _ => return false,        /* Ctrl+<other> must not insert a letter */
+        }
+        unsafe {
+            WIN_KEY[3] = i32::MIN;
+        }
+        log2(c"editor ctrl", key, mods);
+        return true;
+    }
     let mut handled = true;
     match key {
         0x4b => crate::apps::editor_move(1),     /* left  */
@@ -1571,6 +1613,8 @@ fn editor_keys(key: i32, ch: i32) -> bool {
         0x50 => crate::apps::editor_move(4),     /* down  */
         0x47 => crate::apps::editor_move(5),     /* home  */
         0x4f => crate::apps::editor_move(6),     /* end   */
+        0x49 => crate::apps::editor_move(7),     /* pgup  */
+        0x51 => crate::apps::editor_move(8),     /* pgdn  */
         0x3f => editor_save(),                   /* F5    */
         _ => {
             if ch == 0x08 || ch == 0x0a || ch == 0x0d || (ch >= 0x20 && ch < 0x7f) {
@@ -1622,9 +1666,10 @@ fn image_keys(key: i32, ch: i32) -> bool {
 
 /// v0.64: run the focused window's handler and flag the layer/damage work it
 /// implies. Returns true when the window's pixels changed.
-fn dispatch_owned_key(sh: &mut Shell, owner: &KeyOwner, key: i32, ch: i32) -> bool {
+fn dispatch_owned_key(sh: &mut Shell, owner: &KeyOwner, mods: i32, key: i32,
+                      ch: i32) -> bool {
     let changed = match owner.sink {
-        KeySink::Editor => editor_keys(key, ch),
+        KeySink::Editor => editor_keys(mods, key, ch),
         KeySink::Calc => calc_keys(key, ch),
         KeySink::Image => image_keys(key, ch),
         KeySink::None => false,
@@ -2682,6 +2727,7 @@ pub unsafe fn shell_step(
     ch: i32,
     clock_hhmm: i32,
     wheel: i32,
+    mods: i32,
 ) -> u32 {
     if fb.is_null() || w <= 0 || h <= 0 || pitch_px < w {
         return 0;
@@ -2870,6 +2916,14 @@ pub unsafe fn shell_step(
             let fi = sh.focus;
             if sh.wins[fi].open && !sh.wins[fi].minimized {
                 if let Some(owner) = key_owner_for(fi, sh.wins[fi].accent) {
+                    if owner.sink == KeySink::Editor {
+                        /* three rows per notch, same sign convention as the menu */
+                        crate::apps::editor_scroll(if wheel < 0 { -3 } else { 3 });
+                        unsafe {
+                            WIN_KEY[3] = i32::MIN;
+                        }
+                        sh.dirty_editor = true;
+                    }
                     if owner.sink == KeySink::Image {
                         /* PS/2 Z: negative (wheel up) = previous file */
                         let dir = if wheel < 0 { -1 } else { 1 };
@@ -2982,7 +3036,7 @@ pub unsafe fn shell_step(
              * runs its handler; an unregistered one gets the one-line input
              * band that its acceptance still exercises. */
             if let Some(owner) = key_owner_for(fi, sh.wins[fi].accent) {
-                dispatch_owned_key(sh, owner, key, ch);
+                dispatch_owned_key(sh, owner, mods, key, ch);
             } else {
                 let len = sh.ilen[fi] as usize;
                 if ch == 0x0a || ch == 0x0d {

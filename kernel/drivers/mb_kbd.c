@@ -244,6 +244,13 @@ int mbos_kbd_decode(uint8_t scancode)
     /* case folding: letters use caps XOR shift, everything else shift only */
     {
         bool shift_on = (kb_mode & MBOS_KBD_SHIFT) != 0;
+
+        /* v0.66: Ctrl+<letter> becomes the classic ASCII control code (Ctrl+Z =
+         * 0x1A, Ctrl+Y = 0x19, Ctrl+S = 0x13). Decoding it here is race-free: a
+         * consumer that only sampled the modifier mask a frame later would see
+         * Ctrl already released (both edges arrive in the same burst). */
+        if ((kb_mode & MBOS_KBD_CTRL) != 0 && base >= 'a' && base <= 'z')
+            return (int)(unsigned char)(base & 0x1f);
         if (base >= 'a' && base <= 'z')
             shift_on = shift_on != kb_caps;
         return (int)(unsigned char)(shift_on ? shifted : base);

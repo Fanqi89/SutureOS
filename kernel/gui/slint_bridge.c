@@ -31,7 +31,8 @@ extern uint32_t suture_gui_shell_step(uint32_t *fb, int32_t w, int32_t h,
                                       int32_t buttons, int32_t click_x,
                                       int32_t click_y, int32_t click_btn,
                                       uint32_t now_ms, int32_t key, int32_t ch,
-                                      int32_t clock_hhmm, int32_t wheel);
+                                      int32_t clock_hhmm, int32_t wheel,
+                                      int32_t mods);
 extern int32_t suture_gui_shell_exit(void);
 
 /* v0.64: present-side vertical retrace. kernel/gui/vsync.c provides the real
@@ -288,6 +289,7 @@ int slint_gui_run_shell(void)
     extern int mbos_mouse_x(void), mbos_mouse_y(void), mbos_mouse_buttons(void);
     extern int mbos_mouse_take_click(int *, int *, int *);
     extern int mbos_mouse_take_wheel(void);
+    extern uint32_t mbos_kbd_mod_state(void);
     extern void mbos_mouse_move_to(int x, int y);
     extern int mbos_kbd_poll(void);
     extern volatile uint64_t g_tick_count;
@@ -361,6 +363,8 @@ int slint_gui_run_shell(void)
         if (mouse) (void)mbos_mouse_take_click(&cx, &cy, &cb);
         /* v0.65: PS/2 wheel (IntelliMouse 4-byte packets); 0 for 3-byte mice */
         const int wheel = mouse ? mbos_mouse_take_wheel() : 0;
+        /* v0.66: modifier mask (MBOS_KBD_SHIFT/CTRL/ALT bits) for the editor */
+        const int mods = (int)mbos_kbd_mod_state();
 
         int sc;
         while ((sc = mbos_kbd_poll()) >= 0) {
@@ -403,7 +407,7 @@ int slint_gui_run_shell(void)
         const uint32_t now_ms = (uint32_t)((g_tick_count - start) * 10u);
         (void)suture_gui_shell_step(fb, (int32_t)w, (int32_t)h, (int32_t)pitch_px,
                                     mx, my, buttons, cx, cy, cb, now_ms, key, chr,
-                                    clock_hhmm, wheel);
+                                    clock_hhmm, wheel, mods);
         frames++;
         /* v0.64: the start menu's exit row asks the runner to leave the desktop
          * (the same exit ESC performs, checked one frame later). */

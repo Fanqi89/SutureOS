@@ -298,18 +298,50 @@ fn wayland_window_body(s: &mut Surface<'_>, accent: u32, wx: i32, wy: i32, w: i3
  * listing. The buffer lives here (window content belongs to this module); the
  * shell's key router calls `editor_key`/`editor_move`, and F5 asks for
  * `editor_snapshot()` which the shell writes to /mnt/fat/GUIEDIT.TXT through the
- * kernel VFS. Colours/geometry are unchanged integer drawing. */
+ * kernel VFS. Colours/geometry are unchanged integer drawing.
+ *
+ * v0.66: the buffer grew to 48x64 with a scrolling viewport (the window still
+ * shows ~10 rows), undo/redo (four full snapshots) and a scrollbar. */
 
-pub const ED_LINES: usize = 10;
-pub const ED_COLS: usize = 38;
+pub const ED_LINES: usize = 48;
+pub const ED_COLS: usize = 64;
+/// How many undo levels a full-buffer snapshot is worth (4 x 3 KiB in .bss).
+const ED_UNDO_DEPTH: usize = 4;
 
 static mut ED_BUF: [[u8; ED_COLS]; ED_LINES] = [[0u8; ED_COLS]; ED_LINES];
 static mut ED_LEN: [usize; ED_LINES] = [0usize; ED_LINES];
 static mut ED_ROWS: usize = 0;
 static mut ED_LINE: usize = 0;
 static mut ED_COL: usize = 0;
+/// v0.66: first visible row of the scrolling viewport.
+static mut ED_TOP: usize = 0;
+/// Rows the window body managed to draw last frame (set by `editor_body`).
+static mut ED_VIEW: usize = 10;
 static mut ED_EPOCH: i32 = 0;
 static mut ED_READY: bool = false;
+/// Last mutation kind, for undo coalescing (0 none, 1 char, 2 delete, 3 enter).
+static mut ED_LAST_KIND: u8 = 0;
+
+/* v0.66: undo/redo. A snapshot is the whole buffer, the per-row lengths and the
+ * caret; four of each fit comfortably in .bss (8 x 3 KiB). */
+static mut ED_UNDO: [[u8; ED_LINES * ED_COLS]; ED_UNDO_DEPTH] =
+    [[0u8; ED_LINES * ED_COLS]; ED_UNDO_DEPTH];
+static mut ED_UNDO_LEN: [[u8; ED_LINES]; ED_UNDO_DEPTH] = [[0u8; ED_LINES]; ED_UNDO_DEPTH];
+static mut ED_UNDO_META: [[u16; 3]; ED_UNDO_DEPTH] = [[0u16; 3]; ED_UNDO_DEPTH];
+static mut ED_UNDO_N: usize = 0;
+static mut ED_REDO: [[u8; ED_LINES * ED_COLS]; ED_UNDO_DEPTH] =
+    [[0u8; ED_LINES * ED_COLS]; ED_UNDO_DEPTH];
+static mut ED_REDO_LEN: [[u8; ED_LINES]; ED_UNDO_DEPTH] = [[0u8; ED_LINES]; ED_UNDO_DEPTH];
+static mut ED_REDO_META: [[u16; 3]; ED_UNDO_DEPTH] = [[0u16; 3]; ED_UNDO_DEPTH];
+static mut ED_REDO_N: usize = 0;
+
+const ED_LOG_INIT: &[u8] = b"[gui-shell] editor init lines=48 cols=64\n\0";
+const ED_LOG_SCROLL: &[u8] = b"[gui-shell] editor scroll %d\n\0";
+const ED_LOG_UNDO: &[u8] = b"[gui-shell] editor undo %d\n\0";
+const ED_LOG_UNDO_EMPTY: &[u8] = b"[gui-shell] editor undo empty\n\0";
+const ED_LOG_REDO: &[u8] = b"[gui-shell] editor redo %d\n\0";
+const ED_LOG_REDO_EMPTY: &[u8] = b"[gui-shell] editor redo empty\n\0";
+const ED_LOG_CARET: &[u8] = b"[gui-shell] editor caret %d %d\n\0";
 
 unsafe fn ed_seed(row: usize, text: &[u8]) {
     let n = text.len().min(ED_COLS);
@@ -319,6 +351,77 @@ unsafe fn ed_seed(row: usize, text: &[u8]) {
         k += 1;
     }
     ED_LEN[row] = n;
+}
+
+/// Copy the live buffer into one undo/redo slot.
+unsafe fn ed_store(buf: *mut u8, lens: *mut u8, meta: *mut u16) {
+    let mut r = 0usize;
+    while r < ED_LINES {
+        let mut k = 0usize;
+        while k < ED_COLS {
+            *buf.add(r * ED_COLS + k) = ED_BUF[r][k];
+            k += 1;
+        }
+        *lens.add(r) = ED_LEN[r].min(ED_COLS) as u8;
+        r += 1;
+    }
+    *meta.add(0) = ED_ROWS as u16;
+    *meta.add(1) = ED_LINE as u16;
+    *meta.add(2) = ED_COL as u16;
+}
+
+/// Load one undo/redo slot back into the live buffer.
+unsafe fn ed_load(buf: *const u8, lens: *const u8, meta: *const u16) {
+    let mut r = 0usize;
+    while r < ED_LINES {
+        let mut k = 0usize;
+        while k < ED_COLS {
+            ED_BUF[r][k] = *buf.add(r * ED_COLS + k);
+            k += 1;
+        }
+        ED_LEN[r] = (*lens.add(r)) as usize;
+        r += 1;
+    }
+    ED_ROWS = (*meta.add(0) as usize).min(ED_LINES);
+    if ED_ROWS == 0 {
+        ED_ROWS = 1;
+    }
+    ED_LINE = (*meta.add(1) as usize).min(ED_ROWS - 1);
+    ED_COL = (*meta.add(2) as usize).min(ED_LEN[ED_LINE]);
+    ED_TOP = 0;
+    ed_ensure_visible();
+}
+
+unsafe fn ed_ensure_visible() {
+    let view = if ED_VIEW == 0 { 1 } else { ED_VIEW };
+    let before = ED_TOP;
+    if ED_LINE < ED_TOP {
+        ED_TOP = ED_LINE;
+    }
+    if ED_LINE >= ED_TOP + view {
+        ED_TOP = ED_LINE + 1 - view;
+    }
+    let max_top = if ED_ROWS > view { ED_ROWS - view } else { 0 };
+    if ED_TOP > max_top {
+        ED_TOP = max_top;
+    }
+    if ED_TOP != before {
+        /* v0.66: the viewport followed the caret (wheel/page moves log too) */
+        console_printf(ED_LOG_SCROLL.as_ptr(), ED_TOP as i64);
+    }
+}
+
+/// Snapshot the state before a mutation. Consecutive operations of the same kind
+/// (a typing run, a backspace run) collapse into one undo step.
+unsafe fn ed_maybe_snapshot(kind: u8) {
+    if ED_LAST_KIND == kind {
+        return;
+    }
+    ED_LAST_KIND = kind;
+    ed_store(ED_UNDO[ED_UNDO_N].as_mut_ptr(), ED_UNDO_LEN[ED_UNDO_N].as_mut_ptr(),
+             ED_UNDO_META[ED_UNDO_N].as_mut_ptr());
+    ED_UNDO_N = (ED_UNDO_N + 1).min(ED_UNDO_DEPTH);
+    ED_REDO_N = 0;                       /* a new edit invalidates the redo path */
 }
 
 /// Lazily seed the buffer with the listing v0.59 shipped, so the window looks the
@@ -336,7 +439,9 @@ unsafe fn ed_init() {
     ed_seed(3, b"}");
     ED_LINE = 1;
     ED_COL = ED_LEN[1];
+    ED_TOP = 0;
     ED_EPOCH = 1;
+    console_printf(ED_LOG_INIT.as_ptr());
 }
 
 /// Monotonic counter the shell mixes into its damage decision (a keystroke has to
@@ -349,6 +454,79 @@ pub fn editor_caret() -> (i32, i32, i32) {
     unsafe {
         ed_init();
         (ED_LINE as i32, ED_COL as i32, ED_ROWS as i32)
+    }
+}
+
+/// v0.66: rows currently visible in the window (the body reports it each frame).
+pub fn editor_top() -> i32 {
+    unsafe {
+        ed_init();
+        ED_TOP as i32
+    }
+}
+
+/// v0.66: scroll the viewport without moving the caret (mouse wheel / PgUp-PgDn).
+pub fn editor_scroll(delta: i32) {
+    unsafe {
+        ed_init();
+        let view = if ED_VIEW == 0 { 1 } else { ED_VIEW };
+        let max_top = if ED_ROWS > view { ED_ROWS - view } else { 0 };
+        let mut t = ED_TOP as i32 + delta;
+        if t < 0 {
+            t = 0;
+        }
+        if t as usize > max_top {
+            t = max_top as i32;
+        }
+        if t as usize != ED_TOP {
+            ED_TOP = t as usize;
+            ED_EPOCH = ED_EPOCH.wrapping_add(1);
+            console_printf(ED_LOG_SCROLL.as_ptr(), ED_TOP as i64);
+        }
+    }
+}
+
+/// v0.66: restore the previous snapshot (the current state becomes the redo one).
+pub fn editor_undo() {
+    unsafe {
+        ed_init();
+        if ED_UNDO_N == 0 {
+            console_printf(ED_LOG_UNDO_EMPTY.as_ptr());
+            return;
+        }
+        if ED_REDO_N < ED_UNDO_DEPTH {
+            ed_store(ED_REDO[ED_REDO_N].as_mut_ptr(), ED_REDO_LEN[ED_REDO_N].as_mut_ptr(),
+                     ED_REDO_META[ED_REDO_N].as_mut_ptr());
+            ED_REDO_N += 1;
+        }
+        ED_UNDO_N -= 1;
+        ed_load(ED_UNDO[ED_UNDO_N].as_ptr(), ED_UNDO_LEN[ED_UNDO_N].as_ptr(),
+                ED_UNDO_META[ED_UNDO_N].as_ptr());
+        ED_LAST_KIND = 0;
+        ED_EPOCH = ED_EPOCH.wrapping_add(1);
+        console_printf(ED_LOG_UNDO.as_ptr(), ED_UNDO_N as i64);
+    }
+}
+
+/// v0.66: replay the state that the last undo replaced.
+pub fn editor_redo() {
+    unsafe {
+        ed_init();
+        if ED_REDO_N == 0 {
+            console_printf(ED_LOG_REDO_EMPTY.as_ptr());
+            return;
+        }
+        if ED_UNDO_N < ED_UNDO_DEPTH {
+            ed_store(ED_UNDO[ED_UNDO_N].as_mut_ptr(), ED_UNDO_LEN[ED_UNDO_N].as_mut_ptr(),
+                     ED_UNDO_META[ED_UNDO_N].as_mut_ptr());
+            ED_UNDO_N += 1;
+        }
+        ED_REDO_N -= 1;
+        ed_load(ED_REDO[ED_REDO_N].as_ptr(), ED_REDO_LEN[ED_REDO_N].as_ptr(),
+                ED_REDO_META[ED_REDO_N].as_ptr());
+        ED_LAST_KIND = 0;
+        ED_EPOCH = ED_EPOCH.wrapping_add(1);
+        console_printf(ED_LOG_REDO.as_ptr(), ED_REDO_N as i64);
     }
 }
 
@@ -385,6 +563,9 @@ pub fn editor_key(ch: u8) {
     unsafe {
         ed_init();
         if ch == 0x08 {
+            if ED_COL > 0 || ED_LINE > 0 {
+                ed_maybe_snapshot(2);
+            }
             if ED_COL > 0 {
                 ed_delete_at(ED_LINE, ED_COL - 1);
                 ED_COL -= 1;
@@ -417,6 +598,7 @@ pub fn editor_key(ch: u8) {
             }
         } else if ch == 0x0a || ch == 0x0d {
             if ED_ROWS < ED_LINES {
+                ed_maybe_snapshot(3);
                 /* split: text right of the caret moves to the new row */
                 let cur = ED_LINE;
                 let len = ED_LEN[cur];
@@ -442,19 +624,23 @@ pub fn editor_key(ch: u8) {
             }
         } else if ch >= 0x20 && ch < 0x7f {
             if ED_LEN[ED_LINE] < ED_COLS {
+                ed_maybe_snapshot(1);
                 ed_shift_right(ED_LINE, ED_COL, 1);
                 ED_BUF[ED_LINE][ED_COL] = ch;
                 ED_COL += 1;
             }
         }
+        ed_ensure_visible();
         ED_EPOCH = ED_EPOCH.wrapping_add(1);
     }
 }
 
-/// Caret movement: 1 left, 2 right, 3 up, 4 down, 5 home, 6 end.
+/// Caret movement: 1 left, 2 right, 3 up, 4 down, 5 home, 6 end, 7 page up,
+/// 8 page down (v0.66: the viewport follows the caret).
 pub fn editor_move(kind: i32) {
     unsafe {
         ed_init();
+        let view = if ED_VIEW == 0 { 1 } else { ED_VIEW };
         match kind {
             1 => {
                 if ED_COL > 0 {
@@ -485,8 +671,29 @@ pub fn editor_move(kind: i32) {
                 }
             }
             5 => ED_COL = 0,
-            _ => ED_COL = ED_LEN[ED_LINE],
+            6 => ED_COL = ED_LEN[ED_LINE],
+            7 => {
+                /* page up: move the caret one window up (and clamp it) */
+                if ED_LINE >= view {
+                    ED_LINE -= view;
+                } else {
+                    ED_LINE = 0;
+                }
+                ED_COL = ED_COL.min(ED_LEN[ED_LINE]);
+            }
+            _ => {
+                if ED_LINE + view < ED_ROWS {
+                    ED_LINE += view;
+                } else {
+                    ED_LINE = ED_ROWS - 1;
+                }
+                ED_COL = ED_COL.min(ED_LEN[ED_LINE]);
+            }
         }
+        ED_LAST_KIND = 0;               /* the next character starts a new undo group */
+        ed_ensure_visible();
+        ED_EPOCH = ED_EPOCH.wrapping_add(1);
+        console_printf(ED_LOG_CARET.as_ptr(), ED_LINE as i64, ED_COL as i64);
     }
 }
 
@@ -622,7 +829,7 @@ fn settings_body(s: &mut Surface<'_>, accent: u32, wx: i32, wy: i32, w: i32, h: 
     let rows: [(&str, &str); 3] = [
         ("账户与登录", "alice"),
         ("显示与外观", "1024x768 ・ 32bpp"),
-        ("关于本机", "SutureOS 0.65.0-alpha"),
+        ("关于本机", "SutureOS 0.66.0-alpha"),
     ];
     let pill = lighten(accent, 10);
     let mut y = wy + TITLE_H + 20;
@@ -2076,23 +2283,33 @@ fn editor_body(s: &mut Surface<'_>, accent: u32, wx: i32, wy: i32, w: i32, h: i3
     if y0 + 3 * 18 + 42 > wy + h {
         return;                     /* small window: no room for the listing */
     }
-    let visible = (((wy + h - 34 - y0) / 18).max(1) as i32).min(rows);
+    let rows_u = rows.max(1) as usize;
+    let visible = (((wy + h - 34 - y0) / 18).max(1) as usize).min(rows_u);
+    /* v0.66: tell the scroll logic how many rows fit, then draw from ED_TOP */
+    let start = unsafe {
+        ED_VIEW = visible;
+        ed_ensure_visible();
+        ED_TOP
+    };
+    let view = visible;
     /* line-number gutter */
-    s.rect_fill(x0, y0, x0 + 26, y0 + 18 * visible, 0x000000, 0x34);
-    let mut row = 0i32;
-    while row < visible {
-        let ly = y0 + 4 + row * 18;
-        if row == cur_line {
-            /* current line highlight (the caret line) */
-            s.rect_fill(x0 + 26, ly - 1, x1, ly + 17, 0xffffff, 0x0a);
+    s.rect_fill(x0, y0, x0 + 28, y0 + 18 * view as i32, 0x000000, 0x34);
+    let mut row = 0usize;
+    while row < view {
+        let erow = start + row;
+        if erow >= rows_u {
+            break;
         }
-        /* one-digit line numbers (the buffer is capped at ED_LINES = 10) */
-        let mut nb = [b'0'; 1];
-        nb[0] = b'0' + ((row + 1) % 10) as u8;
-        let label = core::str::from_utf8(&nb[..]).unwrap_or("?");
-        text(s, x0 + 14, ly, label, TEXT_LOW, 0xc0);
-        let (line, len) = unsafe { (&ED_BUF[row as usize], ED_LEN[row as usize]) };
-        let mut tx = x0 + 34;
+        let ly = y0 + 4 + row as i32 * 18;
+        if erow == cur_line as usize {
+            /* current line highlight (the caret line) */
+            s.rect_fill(x0 + 28, ly - 1, x1, ly + 17, 0xffffff, 0x0a);
+        }
+        let mut nb = [0u8; 12];
+        let label = u32_str(&mut nb, (erow + 1) as u32);
+        text(s, x0 + 4, ly, label, TEXT_LOW, 0xc0);
+        let (line, len) = unsafe { (&ED_BUF[erow], ED_LEN[erow]) };
+        let mut tx = x0 + 36;
         let mut k = 0usize;
         while k < len {
             let ch = line[k] as char;
@@ -2102,11 +2319,26 @@ fn editor_body(s: &mut Surface<'_>, accent: u32, wx: i32, wy: i32, w: i32, h: i3
                 break;
             }
         }
-        if row == cur_line {
-            let cx = x0 + 34 + cur_col.min(len as i32) * 10;
+        if erow == cur_line as usize {
+            let cx = x0 + 36 + cur_col.min(len as i32) * 10;
             s.rect_fill(cx, ly, cx + 2, ly + 16, accent, 0xf0);
         }
         row += 1;
+    }
+    /* v0.66: scrollbar (only when the buffer is taller than the window) */
+    if rows_u > view {
+        let tx0 = x1 - 3;
+        let tx1 = x1 - 1;
+        let track_h = 18 * view as i32;
+        s.rect_fill(tx0, y0, tx1, y0 + track_h, 0x000000, 0x38);
+        let thumb_h = (track_h * view as i32 / rows as i32).max(14);
+        let max_top = (rows_u - view) as i32;
+        let ny = if max_top > 0 {
+            y0 + (track_h - thumb_h) * start as i32 / max_top
+        } else {
+            y0
+        };
+        s.rect_fill(tx0, ny, tx1, ny + thumb_h, accent, 0xa8);
     }
     /* status bar along the window's bottom edge: Ln/Col + how to save */
     let sy = wy + h - 26;
@@ -2115,15 +2347,16 @@ fn editor_body(s: &mut Surface<'_>, accent: u32, wx: i32, wy: i32, w: i32, h: i3
     let mut b0 = [0u8; 12];
     let mut b1 = [0u8; 12];
     let mut b2 = [0u8; 12];
+    let mut b3 = [0u8; 12];
     let mut x = x0 + 2;
     x = text_at(s, x, sy, "Ln ", TEXT_LOW, 0xd0);
     x = text_at(s, x, sy, u32_str(&mut b0, (cur_line + 1) as u32), TEXT_LOW, 0xd0);
-    x = text_at(s, x, sy, ", Col ", TEXT_LOW, 0xd0);
-    x = text_at(s, x, sy, u32_str(&mut b1, (cur_col + 1) as u32), TEXT_LOW, 0xd0);
-    x = text_at(s, x, sy, " ・ ", TEXT_LOW, 0xc8);
-    x = text_at(s, x, sy, u32_str(&mut b2, rows as u32), TEXT_LOW, 0xd0);
-    x = text_at(s, x, sy, " 行 ・ F5 保存", TEXT_LOW, 0xc8);
-    let _ = x;
+    x = text_at(s, x, sy, "/", TEXT_LOW, 0xc0);
+    x = text_at(s, x, sy, u32_str(&mut b1, rows as u32), TEXT_LOW, 0xd0);
+    x = text_at(s, x, sy, " Col ", TEXT_LOW, 0xd0);
+    x = text_at(s, x, sy, u32_str(&mut b2, (cur_col + 1) as u32), TEXT_LOW, 0xd0);
+    x = text_at(s, x, sy, " ・ F5 ・ ^Z/^Y", TEXT_LOW, 0xc8);
+    let _ = (x, b3);
 }
 
 /// Unknown accent: a plain labeled body, so a future window never looks broken.
