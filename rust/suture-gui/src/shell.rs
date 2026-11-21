@@ -414,7 +414,13 @@ static mut ACCUM: Damage = Damage::new();
 /// latency is what the dropped-frame accounting is based on.
 static mut READY_PRODUCED_NS: u64 = 0;
 /// Upper bound on the damage list (each entry costs a rect blit + a compose).
-const MAX_DAMAGE: usize = 6;
+/* v0.61: damage merging works on a 32x32 tile grid (see `impl Damage`) and the
+ * rebuilt rectangle list may be longer than the old six-block cap. */
+const MAX_DAMAGE: usize = 16;
+const DAMAGE_TILE: i32 = 32;
+const DAMAGE_TW: usize = 32;                    /* 1024 / 32 */
+const DAMAGE_TH: usize = 24;                    /* 768 / 32 */
+const DAMAGE_WORDS: usize = (DAMAGE_TW * DAMAGE_TH + 63) / 64;   /* 12 */
 
 /// True when the current time reached the next 60 Hz boundary.
 #[inline]
@@ -648,6 +654,10 @@ const MENU_RECT: Rect = Rect {
 /// made the v0.43 prototype repaint the whole screen for a menu click.
 #[derive(Clone, Copy)]
 struct Damage {
+    /* v0.61: tile bitmap (32x24 tiles of 32x32 px) is the source of truth; `r`/`n`
+     * are rebuilt from it after every add so the consumers (present, cursor fast
+     * path, stats, oracle) do not need to know about tiles. */
+    tiles: [u64; DAMAGE_WORDS],
     r: [Rect; MAX_DAMAGE],
     n: usize,
     full: bool,
@@ -655,10 +665,12 @@ struct Damage {
 
 impl Damage {
     const fn new() -> Damage {
-        Damage { r: [Rect::EMPTY; MAX_DAMAGE], n: 0, full: false }
+        Damage { tiles: [0u64; DAMAGE_WORDS], r: [Rect::EMPTY; MAX_DAMAGE],
+                 n: 0, full: false }
     }
 
     fn clear(&mut self) {
+        self.tiles = [0u64; DAMAGE_WORDS];
         self.n = 0;
         self.full = false;
     }
@@ -670,16 +682,22 @@ impl Damage {
     fn full_screen(&mut self) {
         self.full = true;
         self.n = 0;
+        self.tiles = [0u64; DAMAGE_WORDS];
     }
 
-    /// Two rectangles are merged when their bounding box costs no more than the
-    /// two of them plus a small slack: that covers overlapping and adjacent
-    /// rectangles, which is what a moving window produces.
     #[inline]
-    fn should_merge(a: Rect, b: Rect) -> bool {
-        a.union(b).area() <= a.area() + b.area() + 4096
+    fn tile_set(&mut self, col: usize, row: usize) {
+        let i = row * DAMAGE_TW + col;
+        self.tiles[i >> 6] |= 1u64 << (i & 63);
     }
 
+    #[inline]
+    fn tile_get(&self, col: usize, row: usize) -> bool {
+        let i = row * DAMAGE_TW + col;
+        (self.tiles[i >> 6] >> (i & 63)) & 1 != 0
+    }
+
+    /// Mark every tile the (clipped) rectangle touches, then rebuild the rects.
     fn add(&mut self, r0: Rect) {
         if self.full {
             return;
@@ -688,66 +706,120 @@ impl Damage {
         if r.is_empty() {
             return;
         }
-        for i in 0..self.n {
-            let cur = self.r[i];
-            if Damage::should_merge(cur, r) {
-                self.r[i] = cur.union(r);
-                self.coalesce();
-                return;
+        let c0 = (r.x0 / DAMAGE_TILE).max(0) as usize;
+        let c1 = ((((r.x1 + DAMAGE_TILE - 1) / DAMAGE_TILE) as usize)).min(DAMAGE_TW);
+        let r_0 = (r.y0 / DAMAGE_TILE).max(0) as usize;
+        let r_1 = ((((r.y1 + DAMAGE_TILE - 1) / DAMAGE_TILE) as usize)).min(DAMAGE_TH);
+        let mut row = r_0;
+        while row < r_1 {
+            let mut col = c0;
+            while col < c1 {
+                self.tile_set(col, row);
+                col += 1;
             }
+            row += 1;
         }
-        if self.n < MAX_DAMAGE {
-            self.r[self.n] = r;
-            self.n += 1;
-        } else {
-            /* list full: one bounding box (correctness over cost) */
-            let mut u = r;
-            for i in 0..self.n {
-                u = u.union(self.r[i]);
-            }
-            self.r[0] = u;
-            self.n = 1;
-        }
+        self.rebuild();
     }
 
-    fn coalesce(&mut self) {
-        loop {
-            let mut merged = false;
-            let mut i = 0usize;
-            while i < self.n {
-                let mut j = i + 1;
-                while j < self.n {
-                    let a = self.r[i];
-                    let b = self.r[j];
-                    if Damage::should_merge(a, b) {
-                        self.r[i] = a.union(b);
-                        self.r[j] = self.r[self.n - 1];
-                        self.n -= 1;
-                        merged = true;
-                        break;
+    /// Greedy scan: per tile row, runs of set tiles are merged with the previous
+    /// row's runs when the column span matches exactly, which is what turns a
+    /// window-sized block into one rectangle and keeps distant hot spots apart.
+    fn rebuild(&mut self) {
+        let mut out = [Rect::EMPTY; MAX_DAMAGE];
+        let mut n = 0usize;
+        /* open runs of the previous row: (c0, c1, index into out) */
+        let mut open = [(0usize, 0usize, 0usize); MAX_DAMAGE];
+        let mut open_n = 0usize;
+        let mut row = 0usize;
+        while row < DAMAGE_TH {
+            let mut runs = [(0usize, 0usize); MAX_DAMAGE];
+            let mut runs_n = 0usize;
+            let mut col = 0usize;
+            while col < DAMAGE_TW {
+                if self.tile_get(col, row) {
+                    let c0 = col;
+                    while col < DAMAGE_TW && self.tile_get(col, row) {
+                        col += 1;
                     }
-                    j += 1;
+                    if runs_n < MAX_DAMAGE {
+                        runs[runs_n] = (c0, col);
+                        runs_n += 1;
+                    } else {
+                        runs[MAX_DAMAGE - 1].1 = col;   /* fold overflow */
+                    }
+                } else {
+                    col += 1;
                 }
-                if merged {
-                    break;
-                }
-                i += 1;
             }
-            if !merged {
-                break;
+            let mut next = [(0usize, 0usize, 0usize); MAX_DAMAGE];
+            let mut next_n = 0usize;
+            let mut k = 0usize;
+            while k < runs_n {
+                let (c0, c1) = runs[k];
+                let mut done = false;
+                let mut o = 0usize;
+                while o < open_n {
+                    let (o0, o1, idx) = open[o];
+                    if !done && o0 == c0 && o1 == c1 {
+                        out[idx].y1 = ((row + 1) as i32) * DAMAGE_TILE;
+                        if next_n < MAX_DAMAGE {
+                            next[next_n] = (c0, c1, idx);
+                            next_n += 1;
+                        }
+                        done = true;
+                    }
+                    o += 1;
+                }
+                if !done {
+                    let nr = Rect::new((c0 as i32) * DAMAGE_TILE,
+                                       (row as i32) * DAMAGE_TILE,
+                                       (c1 as i32) * DAMAGE_TILE,
+                                       ((row + 1) as i32) * DAMAGE_TILE);
+                    let idx;
+                    if n < MAX_DAMAGE {
+                        idx = n;
+                        out[n] = nr;
+                        n += 1;
+                    } else {
+                        /* rectangle cap reached: fold into the last one (always
+                         * conservative - a bigger repaint, never a missed one) */
+                        idx = MAX_DAMAGE - 1;
+                        out[idx] = out[idx].union(nr);
+                    }
+                    if next_n < MAX_DAMAGE {
+                        next[next_n] = (c0, c1, idx);
+                        next_n += 1;
+                    }
+                }
+                k += 1;
+            }
+            open = next;
+            open_n = next_n;
+            row += 1;
+        }
+        self.r = out;
+        self.n = n;
+    }
+
+    /// Tiles currently set (statistics only).
+    fn tile_count(&self) -> usize {
+        let mut c = 0usize;
+        for row in 0..DAMAGE_TH {
+            for col in 0..DAMAGE_TW {
+                if self.tile_get(col, row) {
+                    c += 1;
+                }
             }
         }
+        c
     }
 
     fn area(&self) -> i64 {
         if self.full {
             return SCREEN_W as i64 * SCREEN_H as i64;
         }
-        let mut a = 0i64;
-        for i in 0..self.n {
-            a += self.r[i].area();
-        }
-        a
+        self.tile_count() as i64 * (DAMAGE_TILE as i64) * (DAMAGE_TILE as i64)
     }
 }
 
@@ -859,6 +931,8 @@ static mut WLOG_IVL_N: u32 = 0;
 static mut WLOG_JIT_SUM: u32 = 0;
 static mut WLOG_LAT_SUM: u32 = 0;
 static mut WLOG_LAT_MAX: u32 = 0;
+/* v0.61: peak number of 32x32 damage tiles in the current 30-frame window */
+static mut WLOG_TILES_MAX: i32 = 0;
 /// Diagnostics for the damage oracle: the rectangle list of the frame it
 /// is about to verify (logged on a mismatch).
 static mut ORACLE_INFO: [i32; 9] = [0; 9];
@@ -918,6 +992,8 @@ fn log0(msg: &core::ffi::CStr) {
 extern "C" {
     /* kernel/vfs: write a whole file (the editor's F5 save path) */
     fn vfs_write_file(path: *const u8, buf: *const u8, len: u32) -> i32;
+    /* kernel/ipc/wl_server.c (weak: no-op until the server defines it) */
+    fn wl_server_desktop_pump();
 }
 
 /// v0.61: F5 in the editor window saves the buffer to /mnt/fat/GUIEDIT.TXT.
@@ -2162,6 +2238,10 @@ pub unsafe fn shell_step(
         build_caches();
         log0(c"caches built (wallpaper + frosted source)");
     }
+    /* v0.61: let the kernel's Wayland server map the pointer into the retained
+     * surface (the desktop window IS the compositor surface). No-op while no
+     * surface is retained; the server logs the same lines as the live path. */
+    wl_server_desktop_pump();
     let (wu, hu) = (w as usize, h as usize);
     let sh = &mut *core::ptr::addr_of_mut!(SHELL);
     if !sh.started {
@@ -2534,6 +2614,13 @@ pub unsafe fn shell_step(
         dmg.add(WinSnap::of(&sh.wins[3]).rect().expand(SHADOW_MARGIN));
         sh.dirty_editor = false;
     }
+    {
+        /* v0.61 statistics: how many 32x32 tiles this frame really touched */
+        let tc = dmg.tile_count() as i32;
+        if tc > WLOG_TILES_MAX {
+            WLOG_TILES_MAX = tc;
+        }
+    }
     if dropped_win >= 0 && dropped_win < 5 {
         dmg.add(WinSnap::of(&sh.wins[dropped_win as usize]).rect().expand(SHADOW_MARGIN));
     }
@@ -2556,9 +2643,10 @@ pub unsafe fn shell_step(
 
     /* the cursor-only fast path (v0.45.0) is now just "the damage is two small
      * rectangles"; keep counting it so the frame-rate checks stay comparable */
-    let cursor_only = !dmg.full
-        && dmg.n > 0
-        && dmg.area() <= 4 * ((CUR_W + 2) as i64) * ((CUR_H + 2) as i64);
+    /* v0.61: the tile grid rounds a 28x32 cursor to one or two 32x32 tiles, so
+     * the "cursor-only" decision counts tiles instead of pixels (a diagonal
+     * move can touch up to four tiles and must still take the fast path). */
+    let cursor_only = !dmg.full && dmg.n > 0 && dmg.tile_count() <= 4;
 
     /* a full repaint is required for the first frame, during the maximise /
      * restore transition, and whenever the base buffer is not a complete frame */
@@ -2810,9 +2898,10 @@ hist=%d,%d,%d,%d,%d,%d\n\0"
         );
         if WLOG_ORACLE > 0 {
             console_printf(
-                b"[gui-shell] damage: identical oracle=%d frames=%d rects=%d permille=%d\n\0"
+                b"[gui-shell] damage: identical oracle=%d frames=%d rects=%d tiles=%d permille=%d\n\0"
                     .as_ptr(),
-                WLOG_ORACLE as i32, WLOG_FRAMES as i32, nrects as i32, permille);
+                WLOG_ORACLE as i32, WLOG_FRAMES as i32, nrects as i32,
+                WLOG_TILES_MAX, permille);
         }
         sh.prof_frames = 0;
         sh.prof_full = 0;
@@ -2825,6 +2914,7 @@ hist=%d,%d,%d,%d,%d,%d\n\0"
         WLOG_JIT_SUM = 0;
         WLOG_LAT_SUM = 0;
         WLOG_LAT_MAX = 0;
+        WLOG_TILES_MAX = 0;
         WLOG_FRAMES = 0;
         WLOG_FULL = 0;
         WLOG_DMG = 0;

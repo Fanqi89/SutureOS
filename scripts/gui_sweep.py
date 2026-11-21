@@ -37,6 +37,7 @@ SUITE = [
     ('guishell_swap_acceptance.py', 'swap'),
     ('guishell_damage_acceptance.py', 'damage'),
     ('apps_taskbar_acceptance.py', 'apps_taskbar'),
+    ('gui_editor_live_acceptance.py', 'editorlive'),
     ('desktop_acceptance.py', 'desktop'),
     ('gui_apps_content_acceptance.py', 'apps_content'),
     ('gui_baseline_shot.py', 'appearance_new'),

@@ -381,6 +381,23 @@ def main():
             proc.kill()
 
     log = log_text()
+    # ---- v0.61 tile-grid damage merging ----
+    import re as _re
+    dm = _re.findall(r'damage: identical oracle=(\d+) frames=(\d+) rects=(\d+) tiles=(\d+) permille=(\d+)', txt)
+    check('damage log exposes the tile statistics', len(dm) > 0,
+          '%d line(s)' % len(dm))
+    if dm:
+        max_rects = max(int(m[2]) for m in dm)
+        max_tiles = max(int(m[3]) for m in dm)
+        check('the tile grid is actually used (tiles > 0)', max_tiles > 0,
+              'peak tiles=%d' % max_tiles)
+        check('rectangle rebuild stays within the 16-rect cap', max_rects <= 16,
+              'peak rects=%d' % max_rects)
+        series = [int(m[3]) for m in dm]
+        check('tile merging keeps typical damage work small (a quiet window <= 300 tiles)',
+              any(v <= 300 for v in series), 'tiles series=%s' % series)
+        check('no tile count exceeds the 768-tile grid', max_tiles <= 768,
+              'peak tiles=%d' % max_tiles)
     check('no kernel PANIC', 'PANIC' not in log)
 
     passed = sum(1 for _, ok, _ in checks if ok)

@@ -42,6 +42,11 @@ extern uint32_t suture_gui_interactive_step(uint32_t *fb, int32_t w, int32_t h,
 extern uint32_t suture_gui_swap_report(void);
 
 /* Weak fallbacks: overridden by the Rust staticlib when it is linked in. */
+/* v0.61: called once per desktop frame. The Wayland server provides the strong
+ * definition (kernel/ipc/wl_server.c); this weak stub keeps the kernel linkable
+ * and makes the call a no-op when the server has nothing retained. */
+__attribute__((weak)) void wl_server_desktop_pump(void) { }
+
 __attribute__((weak)) uint32_t suture_gui_version(void) { return 0; }
 __attribute__((weak)) uint32_t suture_gui_selftest_render(uint32_t *fb, int32_t w,
                                                           int32_t h, int32_t pitch_px) {
