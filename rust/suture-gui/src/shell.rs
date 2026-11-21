@@ -146,7 +146,7 @@ const fn win4() -> Win {
 const fn win5() -> Win {
     /* v0.64: the calculator grew (fixed-point decimals + memory keys) so the
      * keypad is 5x6 now and needs 320x330. */
-    Win { x: 600, y: 210, w: 320, h: 330, nx: 600, ny: 210, nw: 320, nh: 330,
+    Win { x: 600, y: 210, w: 320, h: 360, nx: 600, ny: 210, nw: 320, nh: 360,
           minimized: false, maximized: false, z: 6, title: "计算器", accent: crate::apps::ACC_CALC, open: false, sox: 0, soy: 0, ax: 600, ay: 210 }
 }
 
@@ -2681,6 +2681,7 @@ pub unsafe fn shell_step(
     key: i32,
     ch: i32,
     clock_hhmm: i32,
+    wheel: i32,
 ) -> u32 {
     if fb.is_null() || w <= 0 || h <= 0 || pitch_px < w {
         return 0;
@@ -2848,6 +2849,43 @@ pub unsafe fn shell_step(
         }
         sh.press_ms = now;
     }
+    /* v0.65: PS/2 wheel. Positive = away from the user (scroll up). The menu
+     * scrolls one row per notch, the picture viewer browses one file; every
+     * other surface ignores it (the editor has no scrollback yet). */
+    if wheel != 0 && !sh.shutting {
+        /* the kernel's %d reads an int64: print the delta explicitly so a
+         * negative notch is not logged as 4294967295 */
+        unsafe {
+            console_printf(b"[gui-shell] wheel %d menu=%d\n\0".as_ptr(),
+                           wheel as i64, if sh.menu_open { 1i64 } else { 0i64 });
+        }
+        if sh.menu_open {
+            /* PS/2 Z convention: negative = away from the user (scroll up) */
+            let mut n = wheel.clamp(-3, 3);
+            while n != 0 {
+                let _ = menu_scroll_by(sh, if n < 0 { -1 } else { 1 });
+                n += if n < 0 { 1 } else { -1 };
+            }
+        } else {
+            let fi = sh.focus;
+            if sh.wins[fi].open && !sh.wins[fi].minimized {
+                if let Some(owner) = key_owner_for(fi, sh.wins[fi].accent) {
+                    if owner.sink == KeySink::Image {
+                        /* PS/2 Z: negative (wheel up) = previous file */
+                        let dir = if wheel < 0 { -1 } else { 1 };
+                        if crate::apps::image_shift(dir) {
+                            unsafe {
+                                WIN_KEY[2] = i32::MIN;
+                            }
+                            sh.dirty_image = true;
+                            log2(c"image shift", if dir > 0 { 1 } else { 2 }, 0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // keyboard: menu navigation (v0.43.0). Scancodes are PS/2 set-1 make codes.
     if sh.menu_open {
         match key {
@@ -2866,6 +2904,13 @@ pub unsafe fn shell_step(
                 }
                 log2(c"menu sel", sh.menu_sel, 0);
                 menu_scroll_into_view(sh);
+            }
+            /* v0.65: PageUp/PageDown scroll a whole page without moving the
+             * selection, so the list can be paged while keeping the cursor. */
+            0x49 | 0x51 => {
+                let page = menu_visible_rows() as i32;
+                let dir = if key == 0x49 { -page } else { page };
+                let _ = menu_scroll_by(sh, dir);
             }
             /* v0.64: Home/End jump to the first/last registry row */
             0x47 => {

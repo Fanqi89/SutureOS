@@ -41,6 +41,7 @@ SUITE = [
     ('gui_menu_launch_acceptance.py', 'menulaunch'),
     ('gui_image_browse_acceptance.py', 'imgbrowse'),
     ('gui_calc_acceptance.py', 'calc'),
+    ('gui_wheel_acceptance.py', 'wheel'),
     ('gui_vsync_present_acceptance.py', 'vsync_present'),
     ('gui_keyowners_acceptance.py', 'keyowners'),
     ('gui_menu_scroll_acceptance.py', 'menuscroll'),

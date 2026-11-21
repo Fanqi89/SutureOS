@@ -670,9 +670,10 @@ pub unsafe extern "C" fn suture_gui_shell_step(
     key: i32,
     ch: i32,
     clock_hhmm: i32,
+    wheel: i32,
 ) -> u32 {
     shell::shell_step(fb, w, h, pitch_px, mx, my, buttons, click_x, click_y,
-                      click_btn, now_ms, key, ch, clock_hhmm)
+                      click_btn, now_ms, key, ch, clock_hhmm, wheel)
 }
 
 /// Log the swap-chain counters once (`guishell swapstat`). Returns presents.

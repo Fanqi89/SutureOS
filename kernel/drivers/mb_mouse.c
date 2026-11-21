@@ -40,8 +40,23 @@
 static int      g_present;          /* 1 once the mouse answered           */
 static int      g_x = 512, g_y = 384;   /* cursor position (pixels)        */
 static int      g_buttons;          /* current button mask (bit0/1/2)      */
-static uint8_t  g_packet[3];
+/* v0.65: an IntelliMouse (device id 3/4) sends 4-byte packets; the 4th byte
+ * carries the wheel nibble (bits 4..7, 4-bit two's complement) and the extra
+ * buttons. A plain 3-byte mouse keeps working - g_packet_size decides. */
+static uint8_t  g_packet[4];
 static int      g_packet_len;
+static int      g_packet_size = 3;
+static int      g_device_id = -1;   /* 0 = 3-byte, 3 = wheel, 4 = 5-button */
+static int      g_wheel;            /* accumulated Z since the last take() */
+static uint32_t g_wheel_events;     /* diagnostics                          */
+
+/* v0.65: button transitions are queued instead of only sampled. The compositor
+ * pump replays the queue, so a press+release pair between two pump iterations is
+ * no longer invisible (it was: the QMP monitor sends both edges in one burst). */
+#define BTN_QUEUE 16
+static int      g_btnq[BTN_QUEUE];
+static int      g_btnq_head, g_btnq_tail;
+static uint32_t g_btnq_dropped;
 
 /* Edge-triggered clicks, so a click is never lost between two GUI frames. */
 #define CLICK_QUEUE 16
@@ -115,6 +130,36 @@ static int mouse_cmd(uint8_t cmd)
     return (ack == 0xFA) ? 0 : -1;       /* 0xFE = resend, treated as failure */
 }
 
+/* Send one data byte to the aux device and wait for its ACK. */
+static int mouse_data(uint8_t data)
+{
+    uint8_t ack = 0;
+
+    if (ps2_write_cmd(0xD4) != 0)
+        return -1;
+    if (ps2_write_data(data) != 0)
+        return -1;
+    if (ps2_read_byte(&ack) != 0)
+        return -1;
+    return (ack == 0xFA) ? 0 : -1;
+}
+
+/* Read the aux device id (0xF2). Returns -1 when the reply is unusable. */
+static int mouse_read_id(void)
+{
+    uint8_t ack = 0, id = 0;
+
+    if (ps2_write_cmd(0xD4) != 0)
+        return -1;
+    if (ps2_write_data(0xF2) != 0)
+        return -1;
+    if (ps2_read_byte(&ack) != 0 || ack != 0xFA)
+        return -1;
+    if (ps2_read_byte(&id) != 0)
+        return -1;
+    return (int)id;
+}
+
 int mbos_mouse_init(void)
 {
     uint8_t cfg = 0;
@@ -165,6 +210,38 @@ int mbos_mouse_init(void)
         }
     }
 
+    /* 3b) v0.65: try to switch a wheel mouse into 4-byte packets.
+     *
+     * The standard IntelliMouse handshake is "disable reporting, then send the
+     * magic sample rates 200/100/80"; a device that understands it changes its
+     * id to 3 (wheel) or 4 (5-button) and starts sending a 4th byte. A plain
+     * 3-byte mouse ignores all of it and keeps id 0 - in that case we stay on
+     * 3-byte packets instead of mis-framing every packet. */
+    {
+        int id = -1;
+
+        if (mouse_cmd(0xF5) == 0
+            && mouse_cmd(0xF3) == 0 && mouse_data(200) == 0
+            && mouse_cmd(0xF3) == 0 && mouse_data(100) == 0
+            && mouse_cmd(0xF3) == 0 && mouse_data(80) == 0) {
+            id = mouse_read_id();
+        }
+        g_device_id = id;
+        g_packet_size = (id == 3 || id == 4) ? 4 : 3;
+        /* restore a sane sample rate + resolution and re-enable reporting */
+        (void)mouse_cmd(0xF3);
+        (void)mouse_data(100);
+        (void)mouse_cmd(0xE8);
+        (void)mouse_data(0);
+        (void)mouse_cmd(0xE6);          /* 1:1 scaling */
+        (void)mouse_cmd(0xF4);
+        console_printf("[mouse] device id=0x%x (%s) packet=%d bytes\n",
+                       (uint64_t)(id < 0 ? 0xFF : id),
+                       (id == 3) ? "wheel" : (id == 4) ? "5-button" :
+                       (id == 0) ? "3-byte" : "unknown",
+                       g_packet_size);
+    }
+
     /* 4) drain anything the device already queued (identity reply, moves) */
     for (int i = 0; i < 64 && (inb(PS2_STAT) & STAT_OBF) != 0; i++) {
         (void)inb(PS2_DATA);
@@ -209,7 +286,7 @@ int mbos_mouse_take_click(int *x, int *y, int *button)
 
 /* Decode one 3-byte packet. Shared by the 8042 polling path and the self-test
  * hook, so `startgui test` exercises exactly the code real hardware drives. */
-static void mouse_handle_packet(const uint8_t* p)
+static void mouse_handle_packet(const uint8_t* p, int len)
 {
     const uint8_t flags = p[0];
     if ((flags & 0x08u) == 0) {          /* byte0 bit3 must be set in a packet */
@@ -229,8 +306,31 @@ static void mouse_handle_packet(const uint8_t* p)
     g_x += dx;
     g_y -= dy;                           /* PS/2 Y grows upwards, screen grows down */
 
+    /* v0.65: 4th byte = | Z (4..7, two's complement) | extra buttons (0..3) */
+    if (len >= 4) {
+        const int z = (int)((int8_t)p[3] >> 4);
+        if (z != 0) {
+            /* keep the raw notch visible in the serial log: the shell only sees
+             * whatever survives the 8042 queue and its own one-per-frame take */
+            console_printf("[mouse] wheel z=%d\n", (int64_t)z);
+            g_wheel += z;
+            if (g_wheel > 64) g_wheel = 64;
+            if (g_wheel < -64) g_wheel = -64;
+            g_wheel_events++;
+        }
+    }
+
     const int buttons = flags & 0x07u;
     const int pressed  = buttons & ~g_buttons;
+    if (buttons != g_buttons) {
+        const int next = (g_btnq_head + 1) % BTN_QUEUE;
+        if (next == g_btnq_tail) {      /* full: drop the oldest transition */
+            g_btnq_tail = (g_btnq_tail + 1) % BTN_QUEUE;
+            g_btnq_dropped++;
+        }
+        g_btnq[g_btnq_head] = buttons;
+        g_btnq_head = next;
+    }
     g_buttons = buttons;
 
     if (pressed != 0) {
@@ -252,11 +352,11 @@ void mbos_mouse_feed_byte(uint8_t b)
         return;                         /* no mouse: drop it, keep the keyboard alive */
     }
     g_packet[g_packet_len++] = b;
-    if (g_packet_len < 3) {
+    if (g_packet_len < g_packet_size) {
         return;
     }
     g_packet_len = 0;
-    mouse_handle_packet(g_packet);
+    mouse_handle_packet(g_packet, g_packet_size);
 }
 
 /* Self-test hook: feed a synthetic packet through the real decoder. */
@@ -265,7 +365,8 @@ void mbos_mouse_inject_packet(const uint8_t* p)
     if (p == NULL) {
         return;
     }
-    mouse_handle_packet(p);
+    /* the self-test hook always feeds classic 3-byte packets */
+    mouse_handle_packet(p, 3);
 }
 
 /* Called once per frame (and from any idle loop that wants live input). */
@@ -290,13 +391,68 @@ void mbos_mouse_poll(void)
 
         uint8_t b = inb(PS2_DATA);
         g_packet[g_packet_len++] = b;
-        if (g_packet_len < 3) {
+        if (g_packet_len < g_packet_size) {
             continue;
         }
         g_packet_len = 0;
-        mouse_handle_packet(g_packet);
+        mouse_handle_packet(g_packet, g_packet_size);
     }
 }
+
+/* v0.65: one-shot wheel delta (positive = away from the user / scroll up),
+ * accumulated since the last call. 0 when the device has no wheel. */
+int mbos_mouse_take_wheel(void)
+{
+    const int d = g_wheel;
+    g_wheel = 0;
+    return d;
+}
+
+/* v0.65: syntactic packet self-test. QEMU's PS/2 model only delivers
+ * wheel-up to the guest (three probes: wheel-down produces no packet at all),
+ * so the +1 direction is proven here through the exact same decoder that real
+ * hardware drives. */
+int mbos_mouse_wheel_selftest(void)
+{
+    static const uint8_t up[4]   = { 0x08, 0x00, 0x00, 0x10 };  /* z = +1 */
+    static const uint8_t down[4] = { 0x08, 0x00, 0x00, 0xF0 };  /* z = -1 */
+    int ok = 1;
+
+    (void)mbos_mouse_take_wheel();              /* start from a clean slate */
+    mouse_handle_packet(up, 4);
+    if (mbos_mouse_take_wheel() != 1) {
+        ok = 0;
+    }
+    mouse_handle_packet(down, 4);
+    if (mbos_mouse_take_wheel() != -1) {
+        ok = 0;
+    }
+    mouse_handle_packet(up, 4);
+    mouse_handle_packet(up, 4);
+    if (mbos_mouse_take_wheel() != 2) {         /* accumulation across packets */
+        ok = 0;
+    }
+    console_printf("[mouse] wheel selftest: z=+1, z=-1, accumulate -> %s\n",
+                   ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+/* v0.65: pop one queued button mask (one entry per transition), 0 when empty. */
+int mbos_mouse_take_button(int *mask)
+{
+    if (g_btnq_tail == g_btnq_head) {
+        return 0;
+    }
+    if (mask != NULL) {
+        *mask = g_btnq[g_btnq_tail];
+    }
+    g_btnq_tail = (g_btnq_tail + 1) % BTN_QUEUE;
+    return 1;
+}
+
+int mbos_mouse_device_id(void) { return g_device_id; }
+int mbos_mouse_packet_size(void) { return g_packet_size; }
+uint32_t mbos_mouse_wheel_events(void) { return g_wheel_events; }
 
 int mbos_mouse_x(void) { return g_x; }
 int mbos_mouse_y(void) { return g_y; }
@@ -360,15 +516,19 @@ void mbos_mouse_diagnose(void)
         console_puts("[mouse] config byte read FAILED\n");
     }
     if (id_ok) {
-        console_printf("[mouse] device id=0x%x (%s)\n", (uint64_t)id,
+        console_printf("[mouse] device id=0x%x (%s, packet=%d bytes, wheel=%d)\n",
+                       (uint64_t)id,
                        (id == 0) ? "standard 3-byte mouse" :
-                       (id == 3) ? "wheel mouse" : "other");
+                       (id == 3) ? "wheel mouse" :
+                       (id == 4) ? "5-button mouse" : "other",
+                       g_packet_size, g_wheel_events ? 1 : 0);
     } else {
         console_puts("[mouse] device id read FAILED\n");
     }
     console_printf("[mouse] present=%d packets=%u dropped=%u obf=%u aux=%u "
-                   "pos=%d,%d buttons=%d\n",
+                   "pos=%d,%d buttons=%d btnq_dropped=%u\n",
                    (int64_t)g_present, (uint64_t)g_packets, (uint64_t)g_dropped,
                    (uint64_t)g_obf_seen, (uint64_t)g_aux_seen,
-                   (int64_t)g_x, (int64_t)g_y, (int64_t)g_buttons);
+                   (int64_t)g_x, (int64_t)g_y, (int64_t)g_buttons,
+                   (uint64_t)g_btnq_dropped);
 }

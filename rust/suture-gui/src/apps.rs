@@ -622,7 +622,7 @@ fn settings_body(s: &mut Surface<'_>, accent: u32, wx: i32, wy: i32, w: i32, h: 
     let rows: [(&str, &str); 3] = [
         ("账户与登录", "alice"),
         ("显示与外观", "1024x768 ・ 32bpp"),
-        ("关于本机", "SutureOS 0.64.0-alpha"),
+        ("关于本机", "SutureOS 0.65.0-alpha"),
     ];
     let pill = lighten(accent, 10);
     let mut y = wy + TITLE_H + 20;
@@ -1053,11 +1053,15 @@ const CAL_SCALE: i64 = 10_000;
 const CAL_DEC: i32 = 4;
 /// 键入长度上限（含 '.' 与 '-'）；`MR`/百分比写回的规范化文本可以更长。
 const CAL_MAXLEN: usize = 12;
-const CAL_ROWS: i32 = 6;
+const CAL_ROWS: i32 = 7;
 const CAL_COLS: i32 = 5;
+/// v0.65: parenthesis nesting limit (each level keeps one accumulator + operator).
+const CAL_DEPTH: usize = 8;
+/// Display columns the strip can show at 2x (10 px per ASCII glyph, 288 px wide).
+const CAL_DISPLAY_COLS: usize = 13;
 /// 计算器窗口的标准尺寸（与 shell.rs 的 `win5` 一致）：键槽中心与布局上报按它算。
 const CAL_WIN_W: i32 = 320;
-const CAL_WIN_H: i32 = 330;
+const CAL_WIN_H: i32 = 360;
 /// 显示条高度，以及显示条与键盘板的间距。
 const CAL_DISP_H: i32 = 44;
 const CAL_GAP: i32 = 10;
@@ -1070,13 +1074,16 @@ const CAL_GAP: i32 = 10;
 /// | 1  | 2  | 3  | -  | %   |
 /// | 0  | .  | =  | +  | 00  |
 /// | CE | AC | √  | x2 | 1/x |
-const CAL_KEYS: [[&str; 5]; 6] = [
+const CAL_KEYS: [[&str; 5]; 7] = [
     ["MC", "MR", "M+", "M-", "C"],
     ["7", "8", "9", "/", "DEL"],
     ["4", "5", "6", "*", "±"],
     ["1", "2", "3", "-", "%"],
     ["0", ".", "=", "+", "00"],
     ["CE", "AC", "√", "x2", "1/x"],
+    /* v0.65: parentheses. The three trailing cells are intentionally empty (the
+     * body skips empty labels), which keeps the 5-column layout intact. */
+    ["(", ")", "", "", ""],
 ];
 
 /* state: accumulator, pending operator, the operand being typed, error flag */
@@ -1087,6 +1094,13 @@ static mut CAL_EDIT_LEN: u32 = 0;      /* 0 = nothing typed since the operator *
 static mut CAL_ERR: bool = false;
 static mut CAL_MEM: i64 = 0;
 static mut CAL_MEM_HAS: bool = false;
+/* v0.65: parentheses (one saved accumulator + operator per level) */
+static mut CAL_ACC_STK: [i64; CAL_DEPTH] = [0; CAL_DEPTH];
+static mut CAL_OP_STK: [u8; CAL_DEPTH] = [0; CAL_DEPTH];
+static mut CAL_DEPTH_USED: usize = 0;
+/* v0.65: repeat-equals state (last settled operator and its right operand) */
+static mut CAL_LAST_OP: u8 = 0;
+static mut CAL_LAST_RHS: i64 = 0;
 static mut CAL_LAYOUT_LOGGED: bool = false;
 static mut CAL_TXT: [u8; 24] = [b'0'; 24];
 static mut CAL_TXT_LEN: usize = 1;
@@ -1107,6 +1121,11 @@ const CAL_LOG_MEM_CLEAR: &[u8] = b"[gui-shell] calc mem clear\n\0";
 const CAL_LOG_DIV0: &[u8] = b"[gui-shell] calc error (division by zero)\n\0";
 const CAL_LOG_TAP: &[u8] = b"[gui-shell] calc tap %d\n\0";
 const CAL_LOG_LAYOUT: &[u8] = b"[gui-shell] calc layout rows=%d cols=%d slots=%d grid=%d,%d cell=%d,%d\n\0";
+const CAL_LOG_PAREN: &[u8] = b"[gui-shell] calc paren %d\n\0";
+const CAL_LOG_REPEAT: &[u8] = b"[gui-shell] calc repeat %d\n\0";
+/* v0.65: the exact text painted on the strip after a settle - lets the gate
+ * prove digit grouping ("1,000,000") without OCR'ing the framebuffer. */
+const CAL_LOG_SHOW: &[u8] = b"[gui-shell] calc show %s\n\0";
 
 /// Format a scaled value with up to 4 decimals, trailing zeros stripped and no
 /// decimal point on integers. Returns the byte length.
@@ -1332,6 +1351,45 @@ unsafe fn cal_set_entry(v: i64) {
     CAL_EDIT_LEN = k as u32;
 }
 
+/// v0.65: format with ',' every three integer digits. Returns 0 when the
+/// grouped form would not fit the display strip (the caller falls back).
+unsafe fn cal_fmt_group(out: &mut [u8; 24], v: i64) -> usize {
+    let mut plain = [0u8; 24];
+    let n = cal_fmt(&mut plain, v);
+    let neg = n > 0 && plain[0] == b'-';
+    let start = if neg { 1usize } else { 0 };
+    let mut ip = 0usize;
+    while start + ip < n && plain[start + ip] != b'.' {
+        ip += 1;
+    }
+    let extra = if ip > 3 { (ip - 1) / 3 } else { 0 };
+    if n + extra > CAL_DISPLAY_COLS {
+        return 0;
+    }
+    let mut k = 0usize;
+    if neg {
+        out[0] = b'-';
+        k = 1;
+    }
+    let mut i = 0usize;
+    while i < ip {
+        out[k] = plain[start + i];
+        k += 1;
+        i += 1;
+        let left = ip - i;
+        if left > 0 && left % 3 == 0 {
+            out[k] = b',';
+            k += 1;
+        }
+    }
+    while start + ip < n {
+        out[k] = plain[start + ip];
+        k += 1;
+        ip += 1;
+    }
+    k
+}
+
 unsafe fn cal_refresh() {
     let txt = &mut *core::ptr::addr_of_mut!(CAL_TXT);
     if CAL_EDIT_LEN > 0 {
@@ -1343,8 +1401,13 @@ unsafe fn cal_refresh() {
         }
         CAL_TXT_LEN = k;
     } else {
+        /* v0.65: settled values get digit grouping; if it does not fit the
+         * strip (CAL_DISPLAY_COLS) the plain form is used instead */
         let mut buf = [0u8; 24];
-        let n = cal_fmt(&mut buf, CAL_ACC);
+        let mut n = cal_fmt_group(&mut buf, CAL_ACC);
+        if n == 0 {
+            n = cal_fmt(&mut buf, CAL_ACC);
+        }
         let mut k = 0usize;
         while k < n {
             txt[k] = buf[k];
@@ -1378,6 +1441,55 @@ unsafe fn cal_apply() -> bool {
     true
 }
 
+/// v0.65: open a parenthesis level. Anything typed so far is settled first, so
+/// `2+3*(` means "2+3, then a fresh sub-expression" (the model is strictly
+/// left-to-right, exactly like the flat accumulator it replaces).
+unsafe fn cal_lparen() {
+    if CAL_ERR {
+        cal_reset_after_error();
+    }
+    if CAL_DEPTH_USED >= CAL_DEPTH {
+        return;
+    }
+    if CAL_EDIT_LEN > 0 {
+        if !cal_apply() {
+            cal_set_error();
+            return;
+        }
+        cal_edit_clear();
+    }
+    CAL_ACC_STK[CAL_DEPTH_USED] = CAL_ACC;
+    CAL_OP_STK[CAL_DEPTH_USED] = CAL_OP;
+    CAL_DEPTH_USED += 1;
+    CAL_ACC = 0;
+    CAL_OP = 0;
+    CAL_EDIT_LEN = 0;
+    cal_refresh();
+    console_printf(CAL_LOG_PAREN.as_ptr(), CAL_DEPTH_USED as i64);
+}
+
+/// v0.65: close a parenthesis level: settle the inner expression, restore the
+/// outer accumulator/operator and leave the inner value as the pending operand.
+unsafe fn cal_rparen() {
+    if CAL_ERR || CAL_DEPTH_USED == 0 {
+        return;
+    }
+    if CAL_EDIT_LEN > 0 {
+        if !cal_apply() {
+            cal_set_error();
+            return;
+        }
+        cal_edit_clear();
+    }
+    let inner = CAL_ACC;
+    CAL_DEPTH_USED -= 1;
+    CAL_ACC = CAL_ACC_STK[CAL_DEPTH_USED];
+    CAL_OP = CAL_OP_STK[CAL_DEPTH_USED];
+    cal_set_entry(inner);
+    cal_refresh();
+    console_printf(CAL_LOG_PAREN.as_ptr(), CAL_DEPTH_USED as i64);
+}
+
 unsafe fn cal_set_error() {
     CAL_ERR = true;
     CAL_ACC = 0;
@@ -1392,6 +1504,10 @@ unsafe fn cal_reset_after_error() {
     CAL_ACC = 0;
     CAL_OP = 0;
     CAL_EDIT_LEN = 0;
+    /* v0.65: a clear also drops every open parenthesis and the repeat state */
+    CAL_DEPTH_USED = 0;
+    CAL_LAST_OP = 0;
+    CAL_LAST_RHS = 0;
 }
 
 /* ---------------- entry editing ---------------- */
@@ -1523,23 +1639,55 @@ unsafe fn cal_equals() {
     if CAL_ERR {
         return;
     }
+    /* v0.65: `=` auto-closes any parenthesis the user left open */
+    while CAL_DEPTH_USED > 0 {
+        cal_rparen();
+        if CAL_ERR {
+            return;
+        }
+    }
     if CAL_OP != 0 {
+        let op = CAL_OP;
+        let rhs = cal_entry();
+        let ok = cal_apply();
+        CAL_OP = 0;
+        cal_edit_clear();
+        if ok {
+            /* remember it so the next bare '=' repeats this operation */
+            CAL_LAST_OP = op;
+            CAL_LAST_RHS = rhs;
+            cal_refresh();
+            cal_log_value(CAL_ACC);
+            cal_log_show();
+        } else {
+            cal_set_error();
+        }
+    } else if CAL_EDIT_LEN > 0 {
+        /* "42=" just settles the typed number (no repeat state) */
+        let v = cal_entry();
+        CAL_ACC = v;
+        cal_edit_clear();
+        CAL_LAST_OP = 0;
+        cal_refresh();
+        cal_log_value(v);
+        cal_log_show();
+    } else if CAL_LAST_OP != 0 {
+        /* v0.65: repeat-equals: apply the last `acc OP rhs` again */
+        let op = CAL_LAST_OP;
+        let rhs = CAL_LAST_RHS;
+        CAL_OP = op;
+        cal_set_entry(rhs);
         let ok = cal_apply();
         CAL_OP = 0;
         cal_edit_clear();
         if ok {
             cal_refresh();
             cal_log_value(CAL_ACC);
+            cal_log_show();
+            console_printf(CAL_LOG_REPEAT.as_ptr(), op as i64);
         } else {
             cal_set_error();
         }
-    } else if CAL_EDIT_LEN > 0 {
-        /* "42=" just settles the typed number */
-        let v = cal_entry();
-        CAL_ACC = v;
-        cal_edit_clear();
-        cal_refresh();
-        cal_log_value(v);
     }
 }
 
@@ -1702,6 +1850,15 @@ pub fn calc_key(key: i32, ch: i32) -> bool {
                 cal_percent();
                 true
             }
+            /* v0.65: parentheses */
+            b'(' => {
+                cal_lparen();
+                true
+            }
+            b')' => {
+                cal_rparen();
+                true
+            }
             b'c' | b'C' => {
                 cal_clear();
                 true
@@ -1810,9 +1967,25 @@ pub fn calc_tap(slot: i32) -> bool {
         "1/x" => unsafe {
             cal_unary(3);
         },
+        "(" => unsafe {
+            cal_lparen();
+        },
+        ")" => unsafe {
+            cal_rparen();
+        },
         _ => {}
     }
     true
+}
+
+/// Log the current display text, NUL-terminated for the kernel's %s.
+unsafe fn cal_log_show() {
+    let txt = &mut *core::ptr::addr_of_mut!(CAL_TXT);
+    let n = CAL_TXT_LEN;
+    if n < txt.len() {
+        txt[n] = 0;
+        console_printf(CAL_LOG_SHOW.as_ptr(), txt.as_ptr());
+    }
 }
 
 unsafe fn cal_text() -> &'static str {
@@ -1861,6 +2034,10 @@ fn calc_body(s: &mut Surface<'_>, accent: u32, wx: i32, wy: i32, w: i32, h: i32)
         let mut col = 0i32;
         while col < CAL_COLS {
             let label = CAL_KEYS[row as usize][col as usize];
+            if label.is_empty() {
+                col += 1;
+                continue;           /* v0.65: blank cell, no plate and no hit */
+            }
             let gx = x0 + col * cw;
             let gyy = wy + gy + row * ch;
             let pad = 4;

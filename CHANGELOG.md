@@ -10,6 +10,61 @@ in the repository.
 
 （下一批 GUI / 系统改动记在这里。）
 
+## [v0.65.0-alpha] — 2026-11-22
+
+发布正文见 `docs/release-notes-v0.65.0-alpha.md`。本版两件事：**PS/2 滚轮真的接进桌面**（菜单一格一行、
+图片查看器翻页、PageUp/PageDown 翻页），以及**计算器补上括号 / 连按等号 / 千分位**。
+
+### PS/2 滚轮全链路（v0.65）
+
+- **根因**：`mb_mouse.c` 把包长度写死 3 字节，而 IntelliMouse 模式发 4 字节包 → 第 4 字节被当成下一包
+  首字节，整条流失去同步，滚轮事件全被丢弃。
+- **修法**：加标准 IntelliMouse 握手（`0xF5` 停止上报 → 魔术采样率 200/100/80 → `0xF2` 重读 id），
+  id=3/4 才切 4 字节包；第 4 字节按 4 位补码取 Z（`(int8_t)b >> 4`）累加（±64 夹紧），
+  `mbos_mouse_take_wheel()` 每帧取一次；`mouseinfo` 打印 `device id=0x3 (wheel) packet=4 bytes`。
+- **外壳接线**：`suture_gui_shell_step()` 新增 `wheel` 参数（C 侧每帧 `take_wheel()`）；菜单打开时
+  一格一行（单帧最多 3 格，`menu scroll`）、图片查看器聚焦时上滚=上一张/下滚=下一张
+  （`image shift 2/1` + `image: loaded …`）；日志 `[gui-shell] wheel <delta> menu=<0/1>`。
+  PageUp/PageDown 一次翻「可视行数」。
+- **实测结论（重要）**：QEMU 11.1 的 PS/2 模型**只投递 wheel-up（z=−1），wheel-down 不产生任何包**
+  （三次独立探针，见 `docs/wheel.md`）→ 所以端到端只验证上滚方向；正方向由内核 `mouseinfo wheel`
+  用**合成 4 字节包走真实解码器**覆盖（z=+1 / z=−1 / 跨包累加 → PASS）。PS/2 约定「负=远离用户（上滚）」，
+  第一版写反了，是门禁抓到并修正的。
+- 新门禁 `scripts/gui_wheel_acceptance.py` **9/9**：id=0x3 / 4 字节包、合成包双向自检 PASS、
+  菜单滚轮回到第 0 行、图片查看器滚轮切到 `IMG.QOI`、滚动后第 7 行真的画在最后一格（灰 352 px）。
+
+### 计算器：括号 / 重复等号 / 千分位（v0.65）
+
+- **括号**：8 层栈（每层存一份累加器+运算符）；`(` 压栈开子式、`)` 结算子式并把结果当外层操作数、
+  `=` 自动闭合未闭合的层；严格左到右（与既有平面模型一致，不假装有优先级）。日志 `calc paren <深度>`。
+- **重复等号**：记住 `last_op/last_rhs`，裸 `=` 重复应用（`5+3=`→8、`=`→11、`=`→14），日志 `calc repeat`；
+  `42=`（只采纳键入值）与清屏/`AC`/错误不设置重复态。
+- **千分位**：结算值按三位加 `,`（`1,000,000`），超过 13 列自动退回纯数字；键入过程保持原样。
+  新增 `calc show <text>` 日志，门禁逐字核对而不是 OCR。
+- **键板 6 行 → 7 行 / 35 槽**（新行放 `(` `)`，其余空槽不绘制不响应），窗口 330 → **360 px**
+  （格子仍 36 px 高）；`calc_layout()` = `(7, 5, 16, 92, 57, 36)`。
+- 门禁 `scripts/gui_calc_acceptance.py` 扩到 **28/28**（v0.64 的 21 项全保留 + 括号键盘/键板、
+  重复等号三连、千分位、35 槽与 36 px 格高）。
+
+### Wayland 输入：按键变化改成边沿队列（v0.65）
+
+- **现象**：`scripts/wl_multi_acceptance.py` 偶发 33/40，`wl_pointer.button` press/release 一条都没有，
+  连带 `pointer.leave`、客户端 `RESULT PASS`、宿主 `WLTWO.BIN` 逐字节比对都挂。
+- **根因**：Wayland 泵每轮只**采样一次** `mbos_mouse_buttons()`，两轮之间发生的 press+release 就永远看不到；
+  而 QMP monitor 的 `mouse_button 1;mouse_button 0` 是紧贴着发的（v0.64 那次通过只是时序运气）。
+- **修法**：`mb_mouse.c` 把每次按键变化入队（16 项，溢出丢最旧），新增 `mbos_mouse_take_button()`
+  逐条取出；`wl_server.c` 的桌面泵与终端泵都按队列**回放**每次转换（终端泵每轮取一次、每个 pointer
+  对象各自回放）。修复后同一门禁单独跑 **40/40**，全量 sweep 里也 **40/40**。
+
+**最终验收（同一份 ISO，一次连续 `scripts/gui_sweep.py` 全量 32 门全绿）**：静态 21/21、交互 13/13、
+外壳 55/55、交换链 30/30、合成器 28/28、C 桌面任务栏 9/9、编辑器落盘 12/12、开始菜单 10/10、
+图片浏览 9/9、**计算器 28/28**、**滚轮 9/9**、**vsync 探测 17/17**、键盘归属 13/13、菜单滚动 13/13、
+桌面 19/19、应用内容 23/23、两套外观门禁 0 像素、Logo 14/14、wl_server 28/28、wl_protocol 29/29、
+**wl_multi 40/40**、wl_semantics 38/38、wl_show 9/9、wl 窗口 11/11、wlprobe 14/14、GUI 中文 4/4、
+图片查看器 PASS、C 编辑器 5/5、unix 18/18、shm 18/18、fdpass 21/21；
+开机自检 16/16；符号扫描 1453 全局 / 0 冲突（145 对象）；产物 `kernel.elf` 6,620,552 B、
+`sutureos.iso` 23,848,960 B（sha256 `3317a38ae2ac4c3b88635d31de0d4b9e6b8a41b7077d546b46026de3155684fb`）。
+
 ## [v0.64.0-alpha] — 2026-11-21
 
 发布正文见 `docs/release-notes-v0.64.0-alpha.md`。本版四件事：开始菜单能长到 7 行以上（可视 6 行 +

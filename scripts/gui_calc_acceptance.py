@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""SutureOS calculator acceptance (v0.64): decimals, percent, memory, mouse.
-
-The desktop's sixth application is a calculator (window 5, start-menu row 6). This
-gate proves it end to end with real PS/2 keyboard and real mouse clicks:
+"""SutureOS calculator acceptance (v0.65): decimals, percent, memory, parens,
+repeat-equals, digit grouping and mouse input.
 
   * open it from the start menu ("menu launch 5"),
-  * "[gui-shell] calc layout rows=6 cols=5 slots=30 grid=.. cell=.." is logged,
+  * "[gui-shell] calc layout rows=7 cols=5 slots=35 grid=16,92 cell=57,36",
   * keyboard / fixed point (4 decimals):
         12.5+30.25=  -> calc value 427500
         9*9=         -> calc value 810000
@@ -15,8 +13,13 @@ gate proves it end to end with real PS/2 keyboard and real mouse clicks:
         8/0=         -> calc error (division by zero)
         50+10%=      -> calc value 550000        (percent of the accumulator)
         200*10%=     -> calc value 200000        (percent of the operand)
+  * v0.65 parentheses:
+        (2+3)*4=     -> calc value 200000        + "calc paren 1" / "calc paren 0"
+        50/(2+3)=    -> calc value 100000
+  * v0.65 repeat-equals: 5+3= , = , =  -> 80000, 110000, 140000 + "calc repeat 43"
+  * v0.65 digit grouping: 999999+1= -> calc show 1,000,000
   * mouse: clicking 7 + 8 = on the pad emits "calc tap" lines and computes 15,
-  * memory: M+ / AC / MR / MC with "calc mem plus/recall/clear" lines,
+  * memory: M+ / C / MR / MC with "calc mem plus/recall/clear" lines,
   * the display strip and the keypad really are painted (pixels, not just logs),
   * the calculator owns the keyboard (no "input win=5" band),
   * no kernel PANIC.
@@ -48,10 +51,10 @@ MENU_ITEMS_Y = MENU_Y + MENU_HEAD_H                                # 444
 CALC_ROW = 5                                                       # 计算器
 START_BTN = (25, 745)
 
-CALC_X, CALC_Y = 600, 210
-CAL_ROWS, CAL_COLS = 6, 5
+CALC_X, CALC_Y, CALC_H = 600, 210, 360
+CAL_ROWS, CAL_COLS = 7, 5
 # window-relative pad geometry (apps.rs: PAD=16, TITLE_H=30, display 44, gap 10)
-CAL_GRID = (16, 92, 57, 37)
+CAL_GRID = (16, 92, 57, 36)
 CAL_DISP_Y = 38                                                    # TITLE_H + 8
 CAL_DISP_H = 44
 
@@ -61,7 +64,8 @@ LABELS = [['MC', 'MR', 'M+', 'M-', 'C'],
           ['4', '5', '6', '*', '±'],
           ['1', '2', '3', '-', '%'],
           ['0', '.', '=', '+', '00'],
-          ['CE', 'AC', '√', 'x2', '1/x']]
+          ['CE', 'AC', '√', 'x2', '1/x'],
+          ['(', ')', '', '', '']]
 
 LAYOUT_RE = re.compile(
     r'\[gui-shell\] calc layout rows=(\d+) cols=(\d+) slots=(\d+) '
@@ -114,7 +118,8 @@ class Qmp:
 
 QCODE = {' ': 'spc', '-': 'minus', '.': 'dot', '/': 'slash',
          ',': 'comma', '=': 'equal', '\n': 'ret'}
-SHIFTED = {'+': ['shift', 'equal'], '*': ['shift', '8'], '%': ['shift', '5']}
+SHIFTED = {'+': ['shift', 'equal'], '*': ['shift', '8'], '%': ['shift', '5'],
+           '(': ['shift', '9'], ')': ['shift', '0']}
 
 
 def press(q, keys, delay=0.16):
@@ -206,26 +211,53 @@ def main():
         click(q, pos, *START_BTN)
         click(q, pos, MENU_X + 100, MENU_ITEMS_Y + CALC_ROW * MENU_ROW_H + 19, settle=2.2)
 
+        # -------------------------------------------------- arithmetic (v0.64)
         press(q, list('12.5+30.25='))
-        time.sleep(0.8)
+        time.sleep(0.7)
         press(q, list('9*9='))
-        time.sleep(0.8)
+        time.sleep(0.7)
         press(q, list('7-10='))
-        time.sleep(0.8)
+        time.sleep(0.7)
         press(q, list('1/4='))
-        time.sleep(0.8)
+        time.sleep(0.7)
         press(q, list('8/0='))
-        time.sleep(0.8)
+        time.sleep(0.7)
         press(q, list('c'))
-        time.sleep(0.8)
+        time.sleep(0.6)
         press(q, list('50+10%='))
-        time.sleep(0.8)
+        time.sleep(0.7)
         press(q, list('c'))
-        time.sleep(0.8)
+        time.sleep(0.6)
         press(q, list('200*10%='))
+        time.sleep(0.7)
+        press(q, list('c'))
+        time.sleep(0.6)
+
+        # ------------------------------------------------- parentheses (v0.65)
+        press(q, list('(2+3)*4='))
         time.sleep(0.8)
         press(q, list('c'))
+        time.sleep(0.5)
+        press(q, list('50/(2+3)='))
         time.sleep(0.8)
+        press(q, list('c'))
+        time.sleep(0.5)
+
+        # ------------------------------------------------ repeat-equals (v0.65)
+        press(q, list('5+3='))
+        time.sleep(0.6)
+        press(q, list('='))
+        time.sleep(0.6)
+        press(q, list('='))
+        time.sleep(0.6)
+        press(q, list('c'))
+        time.sleep(0.5)
+
+        # ---------------------------------------------------- grouping (v0.65)
+        press(q, list('999999+1='))
+        time.sleep(0.8)
+        press(q, list('c'))
+        time.sleep(0.5)
 
         # ---------------------------------------------------- mouse keypad path
         for label in ('7', '+', '8', '='):
@@ -238,6 +270,14 @@ def main():
         click(q, pos, *slot_screen('MR'), settle=1.0)
         click(q, pos, *slot_screen('MC'), settle=1.0)
         click(q, pos, *slot_screen('MR'), settle=1.0)
+        time.sleep(1.0)
+        # ------------------------------------------- parentheses via the keypad
+        click(q, pos, *slot_screen('('), settle=0.8)
+        click(q, pos, *slot_screen('1'), settle=0.6)
+        click(q, pos, *slot_screen('+'), settle=0.6)
+        click(q, pos, *slot_screen('2'), settle=0.6)
+        click(q, pos, *slot_screen(')'), settle=0.8)
+        click(q, pos, *slot_screen('='), settle=1.0)
         time.sleep(1.0)
         q.cmd('quit')
     finally:
@@ -255,7 +295,7 @@ def main():
     if m:
         rows, cols, slots = int(m.group(1)), int(m.group(2)), int(m.group(3))
         grid = (int(m.group(4)), int(m.group(5)), int(m.group(6)), int(m.group(7)))
-        check('the pad is the 6x5 / 30-slot one this gate clicks',
+        check('the pad is the 7x5 / 35-slot one this gate clicks',
               (rows, cols, slots) == (CAL_ROWS, CAL_COLS, CAL_ROWS * CAL_COLS),
               'rows=%d cols=%d slots=%d' % (rows, cols, slots))
         check('the pad geometry matches the coordinates used for the clicks',
@@ -271,10 +311,36 @@ def main():
           'calc error (division by zero)' in text)
     check('percent of the accumulator (50+10%)', 'calc value 550000' in text)
     check('percent of the operand (200*10%)', 'calc value 200000' in text)
-    check('clear resets the display', text.count('calc clear') >= 3,
+    check('clear resets the display', text.count('calc clear') >= 5,
           'calc clear x%d' % text.count('calc clear'))
+
+    # ------------------------------------------------------------ parentheses
+    check('parentheses push/pop a level', 'calc paren 1' in text and
+          text.count('calc paren 0') >= 1,
+          'paren 1 x%d / paren 0 x%d'
+          % (text.count('calc paren 1'), text.count('calc paren 0')))
+    check('(2+3)*4 evaluates left-to-right with one level', 'calc value 200000' in text)
+    check('50/(2+3) closes the level before dividing', 'calc value 100000' in text)
+    check('the keypad parentheses work too',
+          'calc tap 30' in text and 'calc tap 31' in text
+          and 'calc value 30000' in text,
+          'tap 30/31 + value 30000 (%d paren lines)' % text.count('calc paren'))
+
+    # ---------------------------------------------------------- repeat-equals
+    check('repeat-equals keeps applying the last operation',
+          'calc value 80000' in text and 'calc value 110000' in text and
+          'calc value 140000' in text,
+          '80k/110k/140k')
+    check('each repeat is logged', text.count('calc repeat 43') >= 2,
+          'calc repeat 43 x%d' % text.count('calc repeat 43'))
+
+    # --------------------------------------------------------------- grouping
+    check('settled values are grouped with thousands separators',
+          'calc show 1,000,000' in text, 'calc show 1,000,000')
+
+    # ------------------------------------------------------------------ mouse
     check('mouse taps reach the keypad handlers',
-          text.count('calc tap') >= 8, 'calc tap x%d' % text.count('calc tap'))
+          text.count('calc tap') >= 12, 'calc tap x%d' % text.count('calc tap'))
     check('mouse taps computed 7 + 8 = 15', 'calc value 150000' in text)
     check('M+ stored the value', 'calc mem plus 150000' in text,
           'calc mem plus 150000')
@@ -297,7 +363,7 @@ def main():
     check('the display strip shows the computed digits (bright pixels)', bright > 60,
           'bright px %d' % bright)
     colors = set()
-    for y in range(CALC_Y + 100, CALC_Y + 320, 3):
+    for y in range(CALC_Y + 100, CALC_Y + CALC_H - 10, 3):
         for x in range(CALC_X + 20, CALC_X + 300, 3):
             colors.add(px[x, y])
     check('the keypad plates are painted (many distinct colours)',

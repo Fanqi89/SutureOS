@@ -538,6 +538,12 @@ int shell_cmd_mouseinfo(int argc, char **argv) {
     extern void mbos_mouse_diagnose(void);
     extern int  mbos_mouse_present(void);
     extern void mbos_mouse_poll(void);
+    extern int  mbos_mouse_wheel_selftest(void);
+
+    /* v0.65: `mouseinfo wheel` runs the synthetic 4-byte packet self-test */
+    if (argc > 1 && argv[1] != NULL && argv[1][0] == 'w') {
+        return mbos_mouse_wheel_selftest();
+    }
     (void)argc; (void)argv;
 
     if (!mbos_mouse_present()) {

@@ -2132,22 +2132,26 @@ void wl_server_desktop_pump(void)
         changed = 1;
     }
 
-    if (buttons != g_desk_buttons) {
+    {
+        /* v0.65: replay every queued transition (edge) instead of sampling once */
         static const int bit[3] = { 1, 2, 4 };
         static const uint32_t code[3] = { 0x110u, 0x111u, 0x112u };
-        int b;
+        int mask, prev = g_desk_buttons, b;
 
-        for (b = 0; b < 3; b++) {
-            const int was = (g_desk_buttons & bit[b]) ? 1 : 0;
-            const int now = (buttons & bit[b]) ? 1 : 0;
+        while (mbos_mouse_take_button(&mask)) {
+            for (b = 0; b < 3; b++) {
+                const int was = (prev & bit[b]) ? 1 : 0;
+                const int now = (mask & bit[b]) ? 1 : 0;
 
-            if (was == now) continue;
-            console_printf("[wl] pointer button id=0 button=0x%x state=%u\n",
-                           (uint64_t)code[b], (uint64_t)(now ? 1u : 0u));
-            g_desk_events++;
+                if (was == now) continue;
+                console_printf("[wl] pointer button id=0 button=0x%x state=%u\n",
+                               (uint64_t)code[b], (uint64_t)(now ? 1u : 0u));
+                g_desk_events++;
+            }
+            prev = mask;
+            changed = 1;
         }
-        g_desk_buttons = buttons;
-        changed = 1;
+        g_desk_buttons = prev;
     }
 
     desktop_beat(1, mx, my, lx, ly, inside, changed);
@@ -2276,11 +2280,23 @@ static void input_pump(struct wl_conn *c)
     /* ---------------- wl_pointer ---------------- */
     if (has_ptr) {
         int mx, my, buttons;
+        int btn_seq[16];
+        int btn_n;
 
         mbos_mouse_poll();                 /* drain the PS/2 aux port */
         mx = mbos_mouse_x();
         my = mbos_mouse_y();
         buttons = mbos_mouse_buttons();
+        /* v0.65: take the queued button transitions once for this iteration; every
+         * pointer object replays them (a press+release burst would otherwise be
+         * sampled away). */
+        {
+            int mask;
+            btn_n = 0;
+            while (btn_n < 16 && mbos_mouse_take_button(&mask)) {
+                btn_seq[btn_n++] = mask;
+            }
+        }
 
         for (i = 0; i < WL_SERVER_MAX_OBJECTS; i++) {
             struct wl_obj *o = &c->objs[i];
@@ -2366,7 +2382,7 @@ static void input_pump(struct wl_conn *c)
             }
 
             changed = (lx != o->last_x || ly != o->last_y);
-            btn_changed = (buttons != o->last_buttons);
+            btn_changed = (btn_n > 0 || buttons != o->last_buttons);
 
             if (changed) {
                 emit_pointer_motion(c, o->id, time_ms, lx, ly);
@@ -2387,26 +2403,33 @@ static void input_pump(struct wl_conn *c)
             }
             if (btn_changed) {
                 /* Both edges, per button: BTN_LEFT 0x110, BTN_RIGHT 0x111,
-                 * BTN_MIDDLE 0x112 (evdev codes), state 1 = pressed. */
+                 * BTN_MIDDLE 0x112 (evdev codes), state 1 = pressed. Every queued
+                 * transition is replayed so a press+release burst is not lost. */
                 static const int bit[3] = { 1, 2, 4 };
                 static const uint32_t code[3] = { 0x110u, 0x111u, 0x112u };
-                int b;
+                int seq, b;
+                int prev = o->last_buttons;
 
-                for (b = 0; b < 3; b++) {
-                    const int was = (o->last_buttons & bit[b]) ? 1 : 0;
-                    const int now = (buttons & bit[b]) ? 1 : 0;
+                for (seq = 0; seq < btn_n; seq++) {
+                    const int mask = btn_seq[seq];
 
-                    if (was == now) continue;
-                    g_serial++;
-                    emit_pointer_button(c, o->id, g_serial, time_ms, code[b],
-                                        now ? 1u : 0u);
-                    console_printf("[wl] pointer button id=%u button=0x%x "
-                                   "state=%u\n", (uint64_t)o->id,
-                                   (uint64_t)code[b], (uint64_t)(now ? 1u : 0u));
-                    c->ptr_events++;
-                    g_ptr_events++;
+                    for (b = 0; b < 3; b++) {
+                        const int was = (prev & bit[b]) ? 1 : 0;
+                        const int now = (mask & bit[b]) ? 1 : 0;
+
+                        if (was == now) continue;
+                        g_serial++;
+                        emit_pointer_button(c, o->id, g_serial, time_ms, code[b],
+                                            now ? 1u : 0u);
+                        console_printf("[wl] pointer button id=%u button=0x%x "
+                                       "state=%u\n", (uint64_t)o->id,
+                                       (uint64_t)code[b], (uint64_t)(now ? 1u : 0u));
+                        c->ptr_events++;
+                        g_ptr_events++;
+                    }
+                    prev = mask;
                 }
-                o->last_buttons = buttons;
+                o->last_buttons = prev;
             }
             if ((changed || btn_changed) && o->version >= 5u)
                 emit_pointer_frame(c, o->id);
