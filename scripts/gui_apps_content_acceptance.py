@@ -13,8 +13,9 @@ values really are live:
   3. 图片查看器 (launched from the start menu) shows a dark checkerboard canvas
      with the real 48x48 logo nearest-neighbour scaled 3x (bright pixels on a
      dark matte) plus the file-name caption and the "48x48 · 3x" footer;
-  4. 文本编辑器 (also launched from the start menu) shows its three numbered
-     code lines and the accent caret block;
+  4. 文本编辑器 (also launched from the start menu) shows its four numbered
+     code lines (a real buffer since v0.61) and the accent caret at the end of the
+     seeded second line;
   5. the four window bodies are pixel-wise distinct from each other;
   6. no kernel PANIC and the boot self-tests are still 16/16.
 
@@ -73,8 +74,11 @@ IMG_CANVAS_Y = TITLE_H + 30
 IMG_LOGO = 144
 ED_Y0 = TITLE_H + 10                      # first code line - 4
 ED_LINE_DY = 18
-ED_LINE3 = '    n += 1;'                   # third code line (caret goes after it)
-ED_LINE3_W = 10 * len(ED_LINE3)           # ASCII advance at scale 1
+# v0.61: the editor owns a real buffer (apps::ED_*), seeded with four lines and the
+# caret at the END OF THE SECOND line - that is where the first keystroke lands.
+ED_CARET_LINE = 1
+ED_CARET_TEXT = '    let mut n = 42;'
+ED_CARET_W = 10 * len(ED_CARET_TEXT)      # ASCII advance at scale 1
 
 
 class Qmp:
@@ -478,18 +482,20 @@ def main():
         if ed is not None:
             epx = ed.load()
             line_px = []
-            for i in range(3):
+            for i in range(4):
                 ly = WIN3[1] + ED_Y0 + 4 + i * ED_LINE_DY
                 line_px.append(count_bright(epx, WIN3[0] + PAD + 34, ly,
                                             WIN3[0] + WIN3[2] - PAD, ly + 16, 520))
-            check('editor: three numbered code lines painted',
-                  all(n > 25 for n in line_px),
+            check('editor: four numbered code lines painted (real buffer)',
+                  all(n > 10 for n in line_px),
                   'bright px per line: %s' % (line_px,))
-            caret_x = WIN3[0] + PAD + 34 + ED_LINE3_W
-            caret_y = WIN3[1] + ED_Y0 + 4 + 2 * ED_LINE_DY
+            caret_x = WIN3[0] + PAD + 34 + ED_CARET_W
+            caret_y = WIN3[1] + ED_Y0 + 4 + ED_CARET_LINE * ED_LINE_DY
             warm = count_warm(epx, caret_x, caret_y, caret_x + 8, caret_y + 16, 60)
-            check('editor: accent caret block present', warm > 40,
-                  '%d warm px in the caret cell' % warm)
+            # v0.61: the caret is a real 2x16 text cursor (32 px), not the old
+            # 8x16 block, so the threshold follows the shape
+            check('editor: accent caret block sits at the end of the seeded line',
+                  warm > 20, '%d warm px in the caret cell' % warm)
 
         # ---- (5) the four window bodies are pixel-wise distinct ------------
         if ok_base and img is not None and ed is not None:
