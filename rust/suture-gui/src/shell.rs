@@ -152,6 +152,9 @@ struct Shell {
     scale_from: [i32; 4],
     scale_to: [i32; 4],
     scale_kind: i32,
+    /* v0.61: the editor's text changed since the last damage computation, so the
+     * next frame has to re-rasterise its window layer and repaint that rect. */
+    dirty_editor: bool,
 }
 
 static mut SHELL: Shell = Shell {
@@ -201,6 +204,7 @@ static mut SHELL: Shell = Shell {
     scale_from: [0; 4],
     scale_to: [0; 4],
     scale_kind: 0,
+    dirty_editor: false,
 };
 
 // ---------------------------------------------------------------- caches
@@ -911,6 +915,33 @@ fn ticks() -> u64 {
 fn log0(msg: &core::ffi::CStr) {
     unsafe { console_printf(b"[gui-shell] %s\n\0".as_ptr(), msg.as_ptr()) };
 }
+extern "C" {
+    /* kernel/vfs: write a whole file (the editor's F5 save path) */
+    fn vfs_write_file(path: *const u8, buf: *const u8, len: u32) -> i32;
+}
+
+/// v0.61: F5 in the editor window saves the buffer to /mnt/fat/GUIEDIT.TXT.
+/// The bytes come from `apps::editor_snapshot`, the write goes straight to the
+/// kernel VFS, and the serial line carries both counts so the acceptance can
+/// check the host-side file byte for byte.
+fn editor_save() {
+    let mut buf = [0u8; 512];
+    let n = crate::apps::editor_snapshot(&mut buf);
+    if n == 0 {
+        unsafe {
+            console_printf(b"[gui-shell] editor save FAILED (buffer too small)\n\0".as_ptr());
+        }
+        return;
+    }
+    let rc = unsafe {
+        vfs_write_file(b"/mnt/fat/GUIEDIT.TXT\0".as_ptr(), buf.as_ptr(), n as u32)
+    };
+    unsafe {
+        console_printf(b"[gui-shell] editor saved %d bytes rc=%d\n\0".as_ptr(),
+                       n as i32, rc);
+    }
+}
+
 fn log2(msg: &core::ffi::CStr, a: i32, b: i32) {
     unsafe { console_printf(b"[gui-shell] %s %d %d\n\0".as_ptr(), msg.as_ptr(), a, b) };
 }
@@ -1615,7 +1646,8 @@ fn draw_focus_line(s: &mut Surface<'_>, sh: &Shell, _ctx: &FrameCtx) {
     /* v0.59.x: the image viewer has no text content, and when it shows a
      * committed Wayland surface the focus hint would sit on top of the client's
      * pixels - skip the editable line for that window. */
-    if w.open && !w.minimized && fi != 2 && fi != 4 && y + 20 < w.y + w.h && w.y >= 0 {
+    if w.open && !w.minimized && fi != 2 && fi != 3 && fi != 4
+        && y + 20 < w.y + w.h && w.y >= 0 {
         s.rect_fill(w.x + 16, y - 4, w.x + w.w - 16, y + 20, 0x000000, 0x24);
         s.text(w.x + 24, y, "输入:", 0x9fb2cc, 0xd0, 1);
         let x0 = w.x + 24 + 46 + 8;
@@ -1708,6 +1740,8 @@ fn compose_rect(scene: &mut [u32], wu: usize, sh: &mut Shell, r: Rect, ctx: &Fra
                 sh.prof_cache_miss += 1;
             } else {
                 draw_window(&mut s, &win, true);
+                crate::apps::draw_live(&mut s, win.accent, win.x, win.y, win.w,
+                                       win.h, ctx.live_now);
                 continue;
             }
         } else {
@@ -1716,14 +1750,12 @@ fn compose_rect(scene: &mut [u32], wu: usize, sh: &mut Shell, r: Rect, ctx: &Fra
         draw_window_shadow(&mut s, &win);
         let scene_ref = &mut s.px[..];
         composite_window_layer(scene_ref, wu, i, &win, r);
-    }
-    /* 3. v0.59.0: live per-window content (task manager counters) is painted
-     * after the cached window layers, so the layers stay static. */
-    for &i in order.iter() {
-        let win = sh.wins[i];
-        if !win.open || win.minimized {
-            continue;
-        }
+        /* 3. live per-window content (task manager counters + heartbeat dot) is
+         * painted right after ITS layer, inside the bottom-up loop: a window
+         * above it then covers it like any other content. Painting the whole live
+         * pass after the loop (the v0.59 behaviour) let the task manager's
+         * heartbeat dot show through the editor window - the layer caches stay
+         * static either way. */
         crate::apps::draw_live(&mut s, win.accent, win.x, win.y, win.w, win.h,
                                ctx.live_now);
     }
@@ -2338,6 +2370,37 @@ pub unsafe fn shell_step(
                 sh.focus = n;
                 log2(c"focus cycle", n as i32, 0);
             }
+        } else if sh.wins[fi].open && !sh.wins[fi].minimized
+            && sh.wins[fi].accent == crate::apps::ACC_EDITOR {
+            /* v0.61: the editor window owns a real buffer. Printable keys,
+             * Backspace and Enter edit it; the arrow/Home/End keys move the
+             * caret; F5 saves it to FAT32. The one-line input band stays for the
+             * other windows, so their acceptance (input win=N) is untouched. */
+            let mut handled = true;
+            match key {
+                0x4b => crate::apps::editor_move(1),     /* left  */
+                0x4d => crate::apps::editor_move(2),     /* right */
+                0x48 => crate::apps::editor_move(3),     /* up    */
+                0x50 => crate::apps::editor_move(4),     /* down  */
+                0x47 => crate::apps::editor_move(5),     /* home  */
+                0x4f => crate::apps::editor_move(6),     /* end   */
+                0x3f => editor_save(),                   /* F5    */
+                _ => {
+                    if ch == 0x08 || ch == 0x0a || ch == 0x0d
+                        || (ch >= 0x20 && ch < 0x7f) {
+                        crate::apps::editor_key(ch as u8);
+                    } else {
+                        handled = false;
+                    }
+                }
+            }
+            if handled {
+                unsafe {
+                    WIN_KEY[3] = i32::MIN;
+                }
+                sh.dirty_editor = true;
+                log2(c"editor key", key as i32, ch as i32);
+            }
         } else if sh.wins[fi].open && !sh.wins[fi].minimized {
             let len = sh.ilen[fi] as usize;
             if ch == 0x0a || ch == 0x0d {
@@ -2466,6 +2529,11 @@ pub unsafe fn shell_step(
     // ---- damage: what changed since the frame that is on screen? ----
     let prev = &*core::ptr::addr_of!(SNAP);
     let mut dmg = diff_damage(prev, sh, &ctx);
+    if sh.dirty_editor && sh.wins[3].open && !sh.wins[3].minimized {
+        /* a keystroke moves no rect, so it has to be injected here explicitly */
+        dmg.add(WinSnap::of(&sh.wins[3]).rect().expand(SHADOW_MARGIN));
+        sh.dirty_editor = false;
+    }
     if dropped_win >= 0 && dropped_win < 5 {
         dmg.add(WinSnap::of(&sh.wins[dropped_win as usize]).rect().expand(SHADOW_MARGIN));
     }
@@ -3102,4 +3170,26 @@ fn draw_window(s: &mut Surface<'_>, w: &Win, with_shadow: bool) {
             *d = (0, 0, 0, 0);
         }
     }
+}
+
+// ---------------------------------------------------------------- exports (v0.61)
+
+/// Screen rectangle of the dedicated Wayland window, for the kernel's Wayland
+/// server: it converts the PS/2 pointer into surface-local coordinates and only
+/// emits `wl_pointer` enter/motion while the pointer is inside this rectangle.
+/// `None` while the window is hidden (no pointer events then).
+pub fn wayland_rect() -> Option<(i32, i32, i32, i32)> {
+    let sh = unsafe { &*core::ptr::addr_of!(SHELL) };
+    let w = sh.wins[4];
+    if !w.open || w.minimized {
+        return None;
+    }
+    Some((w.x, w.y, w.w, w.h))
+}
+
+/// 1 while the Wayland window is the focused window (and no menu is stealing the
+/// keyboard), so the server only forwards `wl_keyboard` events in that case.
+pub fn wayland_focused() -> bool {
+    let sh = unsafe { &*core::ptr::addr_of!(SHELL) };
+    sh.wins[4].open && !sh.wins[4].minimized && sh.focus == 4 && !sh.menu_open
 }

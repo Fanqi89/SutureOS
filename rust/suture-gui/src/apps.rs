@@ -289,6 +289,229 @@ fn wayland_window_body(s: &mut Surface<'_>, accent: u32, wx: i32, wy: i32, w: i3
     }
 }
 
+// ---------------------------------------------------------------- editor buffer
+
+/* v0.61: the editor window owns a REAL multi-line buffer instead of a baked-in
+ * listing. The buffer lives here (window content belongs to this module); the
+ * shell's key router calls `editor_key`/`editor_move`, and F5 asks for
+ * `editor_snapshot()` which the shell writes to /mnt/fat/GUIEDIT.TXT through the
+ * kernel VFS. Colours/geometry are unchanged integer drawing. */
+
+pub const ED_LINES: usize = 10;
+pub const ED_COLS: usize = 38;
+
+static mut ED_BUF: [[u8; ED_COLS]; ED_LINES] = [[0u8; ED_COLS]; ED_LINES];
+static mut ED_LEN: [usize; ED_LINES] = [0usize; ED_LINES];
+static mut ED_ROWS: usize = 0;
+static mut ED_LINE: usize = 0;
+static mut ED_COL: usize = 0;
+static mut ED_EPOCH: i32 = 0;
+static mut ED_READY: bool = false;
+
+unsafe fn ed_seed(row: usize, text: &[u8]) {
+    let n = text.len().min(ED_COLS);
+    let mut k = 0;
+    while k < n {
+        ED_BUF[row][k] = text[k];
+        k += 1;
+    }
+    ED_LEN[row] = n;
+}
+
+/// Lazily seed the buffer with the listing v0.59 shipped, so the window looks the
+/// same before the first keystroke (and every earlier pixel assertion still has
+/// real text to find).
+unsafe fn ed_init() {
+    if ED_READY {
+        return;
+    }
+    ED_READY = true;
+    ED_ROWS = 4;
+    ed_seed(0, b"fn main() {");
+    ed_seed(1, b"    let mut n = 42;");
+    ed_seed(2, b"    n += 1;");
+    ed_seed(3, b"}");
+    ED_LINE = 1;
+    ED_COL = ED_LEN[1];
+    ED_EPOCH = 1;
+}
+
+/// Monotonic counter the shell mixes into its damage decision (a keystroke has to
+/// repaint the editor window even though no rect/geometry moved).
+pub fn editor_epoch() -> i32 {
+    unsafe { ED_EPOCH }
+}
+
+pub fn editor_caret() -> (i32, i32, i32) {
+    unsafe {
+        ed_init();
+        (ED_LINE as i32, ED_COL as i32, ED_ROWS as i32)
+    }
+}
+
+unsafe fn ed_shift_right(row: usize, from: usize, n: usize) {
+    let len = ED_LEN[row];
+    if n == 0 || from > len || len == ED_COLS {
+        return;                     /* from == len is a plain append at the end */
+    }
+    let n = n.min(ED_COLS - len);
+    let mut k = len;
+    while k > from {
+        ED_BUF[row][k + n - 1] = ED_BUF[row][k - 1];
+        k -= 1;
+    }
+    ED_LEN[row] = len + n;
+}
+
+unsafe fn ed_delete_at(row: usize, at: usize) {
+    let len = ED_LEN[row];
+    if at >= len {
+        return;
+    }
+    let mut k = at;
+    while k + 1 < len {
+        ED_BUF[row][k] = ED_BUF[row][k + 1];
+        k += 1;
+    }
+    ED_LEN[row] = len - 1;
+    ED_BUF[row][len - 1] = 0;
+}
+
+/// One keystroke from the shell: printable ASCII, Backspace (0x08) or Enter.
+pub fn editor_key(ch: u8) {
+    unsafe {
+        ed_init();
+        if ch == 0x08 {
+            if ED_COL > 0 {
+                ed_delete_at(ED_LINE, ED_COL - 1);
+                ED_COL -= 1;
+            } else if ED_LINE > 0 {
+                /* join with the previous line (classic editor behaviour) */
+                let prev = ED_LINE - 1;
+                let plen = ED_LEN[prev];
+                let cur = ED_LINE;
+                let clen = ED_LEN[cur];
+                let mut k = 0;
+                while k < clen && plen + k < ED_COLS {
+                    ED_BUF[prev][plen + k] = ED_BUF[cur][k];
+                    k += 1;
+                }
+                ED_LEN[prev] = (plen + clen).min(ED_COLS);
+                /* close the gap: shift the remaining rows up one */
+                let mut r = cur;
+                while r + 1 < ED_ROWS {
+                    ED_LEN[r] = ED_LEN[r + 1];
+                    ed_seed(r, core::slice::from_raw_parts(ED_BUF[r + 1].as_ptr(),
+                                                           ED_LEN[r + 1]));
+                    r += 1;
+                }
+                if ED_ROWS > 1 {
+                    ED_ROWS -= 1;
+                    ED_LEN[ED_ROWS] = 0;
+                }
+                ED_LINE = prev;
+                ED_COL = plen;
+            }
+        } else if ch == 0x0a || ch == 0x0d {
+            if ED_ROWS < ED_LINES {
+                /* split: text right of the caret moves to the new row */
+                let cur = ED_LINE;
+                let len = ED_LEN[cur];
+                let head = ED_COL.min(len);
+                let tail = len - head;
+                let mut r = ED_ROWS;
+                while r > cur + 1 {
+                    ED_LEN[r] = ED_LEN[r - 1];
+                    ed_seed(r, core::slice::from_raw_parts(ED_BUF[r - 1].as_ptr(),
+                                                           ED_LEN[r - 1]));
+                    r -= 1;
+                }
+                ED_ROWS += 1;
+                let mut k = 0;
+                while k < tail && k < ED_COLS {
+                    ED_BUF[cur + 1][k] = ED_BUF[cur][head + k];
+                    k += 1;
+                }
+                ED_LEN[cur + 1] = tail.min(ED_COLS);
+                ED_LEN[cur] = head;
+                ED_LINE = cur + 1;
+                ED_COL = 0;
+            }
+        } else if ch >= 0x20 && ch < 0x7f {
+            if ED_LEN[ED_LINE] < ED_COLS {
+                ed_shift_right(ED_LINE, ED_COL, 1);
+                ED_BUF[ED_LINE][ED_COL] = ch;
+                ED_COL += 1;
+            }
+        }
+        ED_EPOCH = ED_EPOCH.wrapping_add(1);
+    }
+}
+
+/// Caret movement: 1 left, 2 right, 3 up, 4 down, 5 home, 6 end.
+pub fn editor_move(kind: i32) {
+    unsafe {
+        ed_init();
+        match kind {
+            1 => {
+                if ED_COL > 0 {
+                    ED_COL -= 1;
+                } else if ED_LINE > 0 {
+                    ED_LINE -= 1;
+                    ED_COL = ED_LEN[ED_LINE];
+                }
+            }
+            2 => {
+                if ED_COL < ED_LEN[ED_LINE] {
+                    ED_COL += 1;
+                } else if ED_LINE + 1 < ED_ROWS {
+                    ED_LINE += 1;
+                    ED_COL = 0;
+                }
+            }
+            3 => {
+                if ED_LINE > 0 {
+                    ED_LINE -= 1;
+                    ED_COL = ED_COL.min(ED_LEN[ED_LINE]);
+                }
+            }
+            4 => {
+                if ED_LINE + 1 < ED_ROWS {
+                    ED_LINE += 1;
+                    ED_COL = ED_COL.min(ED_LEN[ED_LINE]);
+                }
+            }
+            5 => ED_COL = 0,
+            _ => ED_COL = ED_LEN[ED_LINE],
+        }
+    }
+}
+
+/// Copy the buffer into `out` as lines joined by '\n' plus a trailing newline.
+/// Returns the byte count (0 when `out` is too small - the caller reports that
+/// honestly instead of saving a truncated file).
+pub fn editor_snapshot(out: &mut [u8]) -> usize {
+    unsafe {
+        ed_init();
+        let mut n = 0usize;
+        for row in 0..ED_ROWS {
+            for k in 0..ED_LEN[row] {
+                if n + 1 >= out.len() {
+                    return 0;
+                }
+                out[n] = ED_BUF[row][k];
+                n += 1;
+            }
+            if n + 1 >= out.len() {
+                return 0;
+            }
+            out[n] = b'\n';
+            n += 1;
+        }
+        n
+    }
+}
+
 // ---------------------------------------------------------------- helpers
 
 /// Format a `u32` into a borrowed `&str` (no allocation, no libc).
@@ -510,36 +733,58 @@ fn editor_body(s: &mut Surface<'_>, accent: u32, wx: i32, wy: i32, w: i32, h: i3
     let x0 = wx + PAD;
     let x1 = wx + w - PAD;
     let y0 = wy + TITLE_H + 10;
-    /* Three lines of a source file (the fragment a viewer shows before the
-     * first scroll), so every line carries real text - a lone closing brace
-     * would be nearly empty and would make "all three lines are drawn" a very
-     * weak pixel assertion. */
-    let lines: [&str; 3] = ["fn main() {", "    let mut n = 42;", "    n += 1;"];
-    let nums: [&str; 3] = ["1", "2", "3"];
+    let (cur_line, cur_col, rows) = editor_caret();
     if y0 + 3 * 18 + 42 > wy + h {
         return;                     /* small window: no room for the listing */
     }
+    let visible = (((wy + h - 34 - y0) / 18).max(1) as i32).min(rows);
     /* line-number gutter */
-    s.rect_fill(x0, y0, x0 + 26, y0 + 62, 0x000000, 0x34);
-    for i in 0..3usize {
-        let ly = y0 + 4 + i as i32 * 18;
-        if i == 2 {
-            /* the caret sits on the current (third) line */
+    s.rect_fill(x0, y0, x0 + 26, y0 + 18 * visible, 0x000000, 0x34);
+    let mut row = 0i32;
+    while row < visible {
+        let ly = y0 + 4 + row * 18;
+        if row == cur_line {
+            /* current line highlight (the caret line) */
             s.rect_fill(x0 + 26, ly - 1, x1, ly + 17, 0xffffff, 0x0a);
         }
-        text(s, x0 + 14, ly, nums[i], TEXT_LOW, 0xc0);
-        text(s, x0 + 34, ly, lines[i], TEXT_HI, 0xf0);
+        /* one-digit line numbers (the buffer is capped at ED_LINES = 10) */
+        let mut nb = [b'0'; 1];
+        nb[0] = b'0' + ((row + 1) % 10) as u8;
+        let label = core::str::from_utf8(&nb[..]).unwrap_or("?");
+        text(s, x0 + 14, ly, label, TEXT_LOW, 0xc0);
+        let (line, len) = unsafe { (&ED_BUF[row as usize], ED_LEN[row as usize]) };
+        let mut tx = x0 + 34;
+        let mut k = 0usize;
+        while k < len {
+            let ch = line[k] as char;
+            tx += s.char_ascii(tx, ly, ch, TEXT_HI, 0xf0, 1);
+            k += 1;
+            if tx > x1 - 12 {
+                break;
+            }
+        }
+        if row == cur_line {
+            let cx = x0 + 34 + cur_col.min(len as i32) * 10;
+            s.rect_fill(cx, ly, cx + 2, ly + 16, accent, 0xf0);
+        }
+        row += 1;
     }
-    /* caret block at the end of the third line (the "current column") */
-    let caret_y = y0 + 4 + 2 * 18;
-    let caret_x = x0 + 34 + text_w(lines[2]);
-    s.rect_fill(caret_x, caret_y, caret_x + 8, caret_y + 16, accent, 0xf0);
-    /* status bar along the window's bottom edge: the shell's focus line sits
-     * 100..124 px below the title strip, so the two never cross */
+    /* status bar along the window's bottom edge: Ln/Col + how to save */
     let sy = wy + h - 26;
     s.rect_fill(x0, sy - 7, x1, sy - 6, 0xffffff, 0x1c);
     s.rect_fill(x0, sy - 5, x1, sy + 18, 0x000000, 0x1c);
-    text(s, x0 + 2, sy, "UTF-8  LF  Ln 3, Col 13", TEXT_LOW, 0xd0);
+    let mut b0 = [0u8; 12];
+    let mut b1 = [0u8; 12];
+    let mut b2 = [0u8; 12];
+    let mut x = x0 + 2;
+    x = text_at(s, x, sy, "Ln ", TEXT_LOW, 0xd0);
+    x = text_at(s, x, sy, u32_str(&mut b0, (cur_line + 1) as u32), TEXT_LOW, 0xd0);
+    x = text_at(s, x, sy, ", Col ", TEXT_LOW, 0xd0);
+    x = text_at(s, x, sy, u32_str(&mut b1, (cur_col + 1) as u32), TEXT_LOW, 0xd0);
+    x = text_at(s, x, sy, " ・ ", TEXT_LOW, 0xc8);
+    x = text_at(s, x, sy, u32_str(&mut b2, rows as u32), TEXT_LOW, 0xd0);
+    x = text_at(s, x, sy, " 行 ・ F5 保存", TEXT_LOW, 0xc8);
+    let _ = x;
 }
 
 /// Unknown accent: a plain labeled body, so a future window never looks broken.

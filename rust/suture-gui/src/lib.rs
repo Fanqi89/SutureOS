@@ -686,3 +686,25 @@ pub unsafe extern "C" fn suture_gui_swap_report() -> u32 {
 pub extern "C" fn shell_tick() -> u64 {
     unsafe { g_tick_count }
 }
+
+#[no_mangle]
+pub extern "C" fn suture_gui_wayland_rect(x: *mut i32, y: *mut i32,
+                                          w: *mut i32, h: *mut i32) -> i32 {
+    match crate::shell::wayland_rect() {
+        Some((rx, ry, rw, rh)) => {
+            unsafe {
+                *x = rx;
+                *y = ry;
+                *w = rw;
+                *h = rh;
+            }
+            1
+        }
+        None => 0,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn suture_gui_wayland_focused() -> i32 {
+    crate::shell::wayland_focused() as i32
+}
