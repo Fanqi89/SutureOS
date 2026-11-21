@@ -8,6 +8,46 @@ in the repository.
 
 ## [Unreleased]
 
+### Wayland 资源与协议收尾（v0.62 未发布）
+
+- **完整 US keymap**：精简布局补上数字行 `1`–`0` 及全部 Shift 符号与 `-=[];',./\` 反引号，
+  数字/标点显式 `TWO_LEVEL`、字母 `ALPHABETIC`；仍是 `format=1 XKB_V1` 一段文本，
+  从 2614 B 增到 **3936 B**（3–6 KiB 带内）。**四层一致**：服务端 `keymap prepared` 行、
+  `wl_keyboard.keymap` 事件行、`wltwo` 读回、**宿主脚本内嵌同一文本独立重算**，FNV-1a 均为
+  `48c3b318`。
+- **`wl_keyboard.repeat_info(rate, delay)`**：keymap 之后、enter 之前下发 `rate=30 delay=400`
+  （字符/秒、毫秒），客户端打印并与服务端数值比对（协议 v≥4 才发）。
+- **memfd 引用计数与回收**：`kernel/ipc/memfd.c` 新增 `memfd_ref/memfd_unref/memfd_live_count`
+  （既有语义零改动），服务器在 pool/buffer/连接三个释放点减引用，归零才关；导出
+  `wl_server_memfd_live()`，每个生命周期事件打 `[wl] memfd live=N (reason)`。实测序列
+  `3 →(keymap released) 2 →(buffer destroyed) 2 →(最后一个 buffer) 1 →(连接释放) 0`——
+  pool 销毁时若仍有活 buffer **不降**，连接释放后**回 0**。
+  - 两个关键决策：①本内核 SCM_RIGHTS 传的是同一编码号、socket 层没有引用计数，所以描述符是
+    **移交**（`create_pool` 不再额外 ref，服务器接管创建者那份引用），否则永远到不了 0；
+    ②ring-3 退出后 unix 对端不报 EOF，桌面 pump 里把"桌面窗口在屏时仍标 used 的槽"判为死槽并
+    `conn_release`（`[wl] desktop pump: reclaiming stale connection slot N`）——这既让 memfd 真能
+    回 0，也顺手修掉槽位永久泄漏。该判断依赖"单任务内核"前提，代码注释已写明多任务客户端到位后
+    必须换成真正的 liveness 检查。
+- `scripts/wl_win_semantics_acceptance.py` 从 30 项扩到 **38/38**（repeat_info×3、memfd live×5）。
+  回归：wl_server 28/28、wl_protocol 29/29、wl_multi 40/40、wl_semantics 38/38、wl_show 9/9、
+  wl_window 11/11、wl_probe 14/14、unix 18/18、shm 18/18、fdpass 21/21。
+- **最终验收（同一份 ISO，一次连续 `gui_sweep.py` 全量 26 门全绿）**：静态 21/21、
+  交互 13/13、外壳 55/55、交换链 30/30、合成器 28/28、C 桌面任务栏 9/9、
+  编辑器实时落盘 12/12、**开始菜单 10/10**、桌面 19/19、应用内容 23/23、两套外观门禁 0 像素、
+  Logo 14/14、wl_server 28/28、wl_protocol 29/29、wl_multi 40/40、
+  **wl_semantics 38/38（0 skip）**、wl_show 9/9、wl 窗口 11/11、wlprobe 14/14、
+  GUI 中文 4/4、图片查看器 PASS、C 编辑器 5/5、unix 18/18、shm 18/18、fdpass 21/21；
+  开机自检 16/16、符号 **1435 全局 / 0 冲突（144 对象）**；
+  产物 `kernel.elf` 6,559,584 B、`sutureos.iso` 23,726,080 B
+  （sha256 `7a8575ae41d5df5d22b0c1c6af115a0c7bddb771c24e05d05cad76504689c21f`，未发布）。
+  说明：本轮此前有一次 22/26 的 `sweep`，其中 shell/editorlive/wl_server/wl_multi 四门失败——
+  当时队友的 Wayland 回归正在并行跑 QEMU，2 核机器上双实例争抢导致假失败；单独重跑四门全绿，
+  随后在无并行负载下跑出上面这一次 26/26。
+
+- 如实限制：keymap 只**发送**不解释（内核无 XKB 引擎，客户端只做 hash 校验；无 dead key、
+  无多布局）；repeat_info 只**告知**（不做自动重复）；关闭但仍被映射的 memfd 不归还物理页
+  （`mapped` 标志，上限 4 对象 × 64 页 = 1 MiB，避免服务器 close 后客户端 mapping 变 use-after-free）。
+
 ### GUI 第三轮（v0.62 未发布）：图片查看器读真实文件 + 开始菜单第五行
 
 - **图片查看器打开真实文件**：看板里最后一个"画死图"的窗口。新增 Rust 侧 BMP 解码

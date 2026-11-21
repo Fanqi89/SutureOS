@@ -282,7 +282,9 @@ static unsigned g_globals_seen;
 static unsigned g_name_compositor, g_name_shm, g_name_seat, g_name_subcomp;
 static unsigned g_releases;
 
-static int      g_kb_keymap, g_kb_enter, g_kb_modifiers;
+static int      g_kb_keymap, g_kb_enter, g_kb_modifiers, g_kb_repeat;
+static int      g_repeat_rate;
+static unsigned g_repeat_delay;
 static unsigned g_kb_press, g_kb_release;
 static unsigned g_kb_codes[8];
 static int      g_kb_code_count;
@@ -392,6 +394,12 @@ static int pump(struct conn *c, int verbose)
                            key, state);
             } else if (op == 4u) {
                 g_kb_modifiers++;
+            } else if (op == 5u) {       /* repeat_info(rate, delay) */
+                g_kb_repeat = 1;
+                g_repeat_rate = (int)get32(c->rx + 8);
+                g_repeat_delay = get32(c->rx + 12);
+                printf("[wltwo]   event keyboard.repeat_info rate=%d delay=%u "
+                       "(chars/s, ms)\n", g_repeat_rate, g_repeat_delay);
             }
         } else if (obj == ID_PTR) {
             if (op == 0u) {
@@ -856,6 +864,9 @@ int main(int argc, char **argv)
     check(g_ptr_leave, "wl_pointer.leave received after the release");
     check(g_releases >= 3u, "three wl_buffer.release events");
     check(g_keymap_ok, "keymap text read out of the SCM_RIGHTS memfd");
+    check(g_kb_repeat && g_repeat_rate >= 20 && g_repeat_rate <= 40 &&
+          g_repeat_delay >= 200 && g_repeat_delay <= 600,
+          "wl_keyboard.repeat_info in the expected band");
 
     /* ---- 8. buffer lifecycle ------------------------------------------- *
      * wl_shm_pool.destroy keeps the descriptor alive for the buffers it already
@@ -905,6 +916,7 @@ int main(int argc, char **argv)
     printf("[wltwo] frames: A %dx%d scale=%d hash=%08x bytes=%d, B %dx%d "
            "scale=%d hash=%08x bytes=%d\n", A_W, A_H, A_SCALE, hash_a, A_BYTES,
            B_W, B_H, B_SCALE, hash_b, B_BYTES);
+    printf("[wltwo] repeat: rate=%d delay=%u\n", g_repeat_rate, g_repeat_delay);
     printf("[wltwo] keymap: format=%u size=%u fd=%d hash=%08x\n",
            g_keymap_format, g_keymap_size, g_keymap_fd, g_keymap_hash);
     printf("[wltwo] lifecycle: pool destroyed, create_buffer refused, buffer "

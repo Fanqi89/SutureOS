@@ -134,7 +134,7 @@ def run_qemu():
                     os.path.join(ROOT, 'scripts', 'qemu_boot.ps1'),
                     '-SerialLog', 'build/serial_wlmulti.log',
                     '-ArgFile', 'build/qemu_wlmulti.args',
-                    '-BootWaitSeconds', '110', '-MonitorPort', '45831',
+                    '-BootWaitSeconds', '150', '-MonitorPort', '45831',
                     '-Keys', KEYS, '-KeyDelayMs', '1200',
                     '-AfterKeysSeconds', '30',
                     '-MonitorCmds', MONITOR_CMDS,

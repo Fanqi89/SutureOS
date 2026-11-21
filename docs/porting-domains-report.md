@@ -259,6 +259,10 @@
     `vfs_read_file("/mnt/fat/IMG.BMP")`（`lemis_heap_free` 释放），整数最近邻缩放居中，页脚
     `IMG.BMP · 32×32 · scale 4`；失败回退 Logo、Wayland surface 仍优先。验收沿夹具四象限取色
     红/绿/蓝/白逐点比对（解码→缩放→上屏端到端）。
+  - Wayland 资源与协议收尾：完整 US keymap 3936 B（数字行 + 全部 Shift 符号，四处 hash
+    `48c3b318`）、`wl_keyboard.repeat_info(30, 400)`、memfd 引用计数（`memfd_ref/unref/live_count`
+    + `wl_server_memfd_live()`，live 序列 3→2→2→1→0，连接释放回 0）；桌面 pump 增加"死槽回收"，
+    依赖单任务内核前提并已注明。
   - 开始菜单第 5 行 = Wayland 客户端；面板几何改为 `46 + 项数×44 + 14`（236→280，整体上移 44），
     绘制/命中/伤害统一走 `menu_h()/menu_y()/menu_rect()`；伪 3D 图标第 5 种字形；F2 语义
     open→minimize→restore。新门禁 `gui_menu_launch_acceptance.py` **10/10**（面板上边缘像素、

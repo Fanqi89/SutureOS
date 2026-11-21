@@ -142,6 +142,11 @@ void wl_server_buffer_stats(int *created, int *released, int *destroyed);
 /* Releases skipped because the buffer had not been re-attached since the last one. */
 uint32_t wl_server_buffer_stats_skipped(void);
 
+/* memfd objects the server currently holds: one per live wl_shm_pool plus one for
+ * the XKB keymap while a keyboard is alive.  Reaches 0 again once every client
+ * released its pools/buffers and disconnected (v0.62 reference counting). */
+int wl_server_memfd_live(void);
+
 /* 1 once the server has started (a name is bound / a client connected). */
 int wl_server_active(void);
 

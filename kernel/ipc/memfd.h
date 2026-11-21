@@ -49,6 +49,16 @@ int memfd_unmap(uint64_t vaddr, uint64_t len);
 int memfd_write(int fd, uint64_t off, const void *src, uint64_t len);
 int memfd_read(int fd, uint64_t off, void *dst, uint64_t len);
 
+/* Reference counting for the SCM_RIGHTS handover path (v0.62).
+ *
+ * A fresh object starts with one reference (whoever created it).  Every receiver
+ * that keeps the descriptor calls memfd_ref(); the last memfd_unref() releases the
+ * slot so the object can be created again.  Pages go back to the frame pool only
+ * when nothing maps the object any more - a live mapping would keep using them. */
+int memfd_ref(int fd);         /* -> new count (>= 1) or -errno */
+int memfd_unref(int fd);       /* -> remaining count, 0 when the slot was freed */
+int memfd_live_count(void);    /* objects currently alive (0..MEMFD_MAX_OBJECTS) */
+
 /* Kernel self-test: create/resize/map twice/write-read across both mappings. */
 int memfd_selftest(void);
 

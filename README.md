@@ -91,7 +91,7 @@ editor became a **real editor** (multi-line buffer, caret and arrow keys, **F5**
 grid** (at most 16 rectangles; a quiet 30-frame window measures ~250 tiles / 132 permille with the
 oracle still at 0 mismatches), Wayland also gained **placement semantics** (pointer events are converted into surface-local
 coordinates from the window rectangle, enter only while inside, keyboard gated by window focus),
-a **real keymap delivered over memfd + SCM_RIGHTS**, and buffer/pool lifetime rules - with two real
+a **full US keymap (3936 B) delivered over memfd + SCM_RIGHTS**, `wl_keyboard.repeat_info`, and memfd reference accounting that returns to zero once the buffer / pool / connection are gone, and buffer/pool lifetime rules - with two real
 bugs fixed on the way (a leaked connection slot and a desktop pump that always returned early);
 and there is a dedicated **Wayland window opened with `F2`** (it shows a hint card instead of the logo when no client has
 committed). The look was polished a second time (wallpaper depth and vignette, icon rim light, accent

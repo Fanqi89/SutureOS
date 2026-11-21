@@ -46,6 +46,13 @@
 #define WL_KB_EV_LEAVE        2u
 #define WL_KB_EV_KEY          3u
 #define WL_KB_EV_MODIFIERS    4u
+#define WL_KB_EV_REPEAT_INFO  5u          /* wl_keyboard version >= 4          */
+
+/* wl_keyboard.repeat_info(rate, delay): rate is characters per second (a
+ * negative rate disables repeat), delay is the milliseconds before the first
+ * repeat.  30 chars/s and 400 ms is a typical desktop default. */
+#define WL_KB_REPEAT_RATE   30
+#define WL_KB_REPEAT_DELAY  400u
 
 /* wl_keyboard.keymap format: the spec's own "no keymap" value.  This kernel has
  * no XKB data, so the keymap event carries no descriptor and says so, and the
@@ -171,15 +178,34 @@ struct wl_conn {
 
 static struct wl_conn g_conns[WL_SERVER_MAX_CONNS];
 
+/* v0.62 helpers, defined with the other memfd accounting code further down: they
+ * are also used by conn_release/every pool path above their definition. */
+static void log_memfd_live(const char *why);
+static void keymap_unuse(const char *why);
+
 /* v0.61: drop a connection slot once its client is gone. The retained surfaces in
  * g_keep[] are deliberately left alone - the desktop keeps showing the last frame
  * of an exited client (that is what "retained" means here). */
 static void conn_release(struct wl_conn *c)
 {
+    int i;
+
     if (c == NULL || !c->used) return;
     console_printf("[wl] client disconnected server_fd=%d "
                    "(connection slot %d released, retained surfaces kept)\n",
                    (int64_t)c->server_fd, (int64_t)(c - g_conns));
+    /* Hand every descriptor this client made us keep back to the memfd layer. */
+    for (i = 0; i < WL_SERVER_MAX_OBJECTS; i++) {
+        struct wl_obj *o = &c->objs[i];
+
+        if (o->type == OBJ_POOL && o->pool_fd >= 0) {
+            (void)memfd_unref(o->pool_fd);
+            o->pool_fd = -1;
+            log_memfd_live("pool released (connection gone)");
+        } else if (o->type == OBJ_KEYBOARD) {
+            keymap_unuse("connection gone");
+        }
+    }
     memset(c, 0, sizeof(*c));
 }
 
@@ -675,14 +701,19 @@ static const char g_keymap_text[] =
     "xkb_keymap {\n"
     "  xkb_keycodes \"sutureos\" {\n"
     "    minimum=8; maximum=255;\n"
-    "    <ESC>=9; <BKSP>=22; <TAB>=23; <AD01>=24; <AD02>=25; <AD03>=26; <AD04>=27;\n"
-    "    <AD05>=28; <AD06>=29; <AD07>=30; <AD08>=31; <AD09>=32; <AD10>=33;\n"
-    "    <AD11>=34; <AD12>=35; <RTRN>=36; <LCTL>=37; <AC01>=38; <AC02>=39;\n"
-    "    <AC03>=40; <AC04>=41; <AC05>=42; <AC06>=43; <AC07>=44; <AC08>=45;\n"
-    "    <AC09>=46; <AC10>=47; <AC11>=48; <TLDE>=49; <LFSH>=50; <BKSL>=51;\n"
+    "    <ESC>=9;\n"
+    "    <AE01>=10; <AE02>=11; <AE03>=12; <AE04>=13; <AE05>=14; <AE06>=15;\n"
+    "    <AE07>=16; <AE08>=17; <AE09>=18; <AE10>=19; <AE11>=20; <AE12>=21;\n"
+    "    <BKSP>=22; <TAB>=23;\n"
+    "    <AD01>=24; <AD02>=25; <AD03>=26; <AD04>=27; <AD05>=28; <AD06>=29;\n"
+    "    <AD07>=30; <AD08>=31; <AD09>=32; <AD10>=33; <AD11>=34; <AD12>=35;\n"
+    "    <RTRN>=36; <LCTL>=37;\n"
+    "    <AC01>=38; <AC02>=39; <AC03>=40; <AC04>=41; <AC05>=42; <AC06>=43;\n"
+    "    <AC07>=44; <AC08>=45; <AC09>=46; <AC10>=47; <AC11>=48;\n"
+    "    <TLDE>=49; <LFSH>=50; <BKSL>=51;\n"
     "    <AB01>=52; <AB02>=53; <AB03>=54; <AB04>=55; <AB05>=56; <AB06>=57;\n"
-    "    <AB07>=58; <AB08>=59; <AB09>=60; <AB10>=61; <RTSH>=62; <LALT>=64;\n"
-    "    <SPCE>=65; <CAPS>=66;\n"
+    "    <AB07>=58; <AB08>=59; <AB09>=60; <AB10>=61;\n"
+    "    <RTSH>=62; <LALT>=64; <SPCE>=65; <CAPS>=66;\n"
     "  };\n"
     "  xkb_types \"complete\" {\n"
     "    type \"ONE_LEVEL\" { modifiers=none; map[none]=Level1; };\n"
@@ -691,43 +722,84 @@ static const char g_keymap_text[] =
     "      modifiers=Shift+Lock; map[Shift]=Level2; map[Lock]=Level2;\n"
     "      map[Shift+Lock]=Level2; map[none]=Level1;\n"
     "    };\n"
+    "    type \"KEYPAD\" { modifiers=NumLock; map[NumLock]=Level2; map[none]=Level1; };\n"
     "  };\n"
     "  xkb_compatibility \"complete\" {\n"
     "    interpret Shift_L { action=SetMods(modifiers=Shift); };\n"
+    "    interpret Shift_R { action=SetMods(modifiers=Shift); };\n"
     "    interpret Caps_Lock { action=LockMods(modifiers=Lock); };\n"
     "    interpret Control_L { action=SetMods(modifiers=Control); };\n"
     "    interpret Alt_L { action=SetMods(modifiers=Mod1); };\n"
     "    interpret Any+Any { action=SetMods(modifiers=modMapMods); };\n"
     "  };\n"
     "  xkb_symbols \"sutureos-us\" {\n"
-    "    name[Group1]=\"SutureOS\";\n"
+    "    name[Group1]=\"SutureOS full US\";\n"
     "    key.type[Group1]=\"ALPHABETIC\";\n"
-    "    key <ESC> { [Escape] }; key <BKSP> { [BackSpace] };\n"
-    "    key <TAB> { [Tab] }; key <RTRN> { [Return] };\n"
-    "    key <LCTL> { [Control_L] }; key <LFSH> { [Shift_L] };\n"
-    "    key <RTSH> { [Shift_R] }; key <LALT> { [Alt_L] };\n"
-    "    key <CAPS> { [Caps_Lock] }; key <SPCE> { [space] };\n"
-    "    key <AD01> { [q, Q] }; key <AD02> { [w, W] }; key <AD03> { [e, E] };\n"
-    "    key <AD04> { [r, R] }; key <AD05> { [t, T] }; key <AD06> { [y, Y] };\n"
-    "    key <AD07> { [u, U] }; key <AD08> { [i, I] }; key <AD09> { [o, O] };\n"
-    "    key <AD10> { [p, P] }; key <AD11> { [bracketleft, braceleft] };\n"
-    "    key <AD12> { [bracketright, braceright] };\n"
-    "    key <AC01> { [a, A] }; key <AC02> { [s, S] }; key <AC03> { [d, D] };\n"
-    "    key <AC04> { [f, F] }; key <AC05> { [g, G] }; key <AC06> { [h, H] };\n"
-    "    key <AC07> { [j, J] }; key <AC08> { [k, K] }; key <AC09> { [l, L] };\n"
-    "    key <AC10> { [semicolon, colon] }; key <AC11> { [apostrophe, quotedbl] };\n"
-    "    key <TLDE> { [grave, asciitilde] }; key <BKSL> { [backslash, bar] };\n"
-    "    key <AB01> { [z, Z] }; key <AB02> { [x, X] }; key <AB03> { [c, C] };\n"
-    "    key <AB04> { [v, V] }; key <AB05> { [b, B] }; key <AB06> { [n, N] };\n"
-    "    key <AB07> { [m, M] }; key <AB08> { [comma, less] };\n"
-    "    key <AB09> { [period, greater] }; key <AB10> { [slash, question] };\n"
+    "    key <ESC> { [ Escape ] };\n"
+    "    key <AE01> { type=\"TWO_LEVEL\", [ 1, exclam ] };\n"
+    "    key <AE02> { type=\"TWO_LEVEL\", [ 2, at ] };\n"
+    "    key <AE03> { type=\"TWO_LEVEL\", [ 3, numbersign ] };\n"
+    "    key <AE04> { type=\"TWO_LEVEL\", [ 4, dollar ] };\n"
+    "    key <AE05> { type=\"TWO_LEVEL\", [ 5, percent ] };\n"
+    "    key <AE06> { type=\"TWO_LEVEL\", [ 6, asciicircum ] };\n"
+    "    key <AE07> { type=\"TWO_LEVEL\", [ 7, ampersand ] };\n"
+    "    key <AE08> { type=\"TWO_LEVEL\", [ 8, asterisk ] };\n"
+    "    key <AE09> { type=\"TWO_LEVEL\", [ 9, parenleft ] };\n"
+    "    key <AE10> { type=\"TWO_LEVEL\", [ 0, parenright ] };\n"
+    "    key <AE11> { type=\"TWO_LEVEL\", [ minus, underscore ] };\n"
+    "    key <AE12> { type=\"TWO_LEVEL\", [ equal, plus ] };\n"
+    "    key <BKSP> { [ BackSpace ] };\n"
+    "    key <TAB> { [ Tab, ISO_Left_Tab ] };\n"
+    "    key <AD01> { [ q, Q ] };\n"
+    "    key <AD02> { [ w, W ] };\n"
+    "    key <AD03> { [ e, E ] };\n"
+    "    key <AD04> { [ r, R ] };\n"
+    "    key <AD05> { [ t, T ] };\n"
+    "    key <AD06> { [ y, Y ] };\n"
+    "    key <AD07> { [ u, U ] };\n"
+    "    key <AD08> { [ i, I ] };\n"
+    "    key <AD09> { [ o, O ] };\n"
+    "    key <AD10> { [ p, P ] };\n"
+    "    key <AD11> { type=\"TWO_LEVEL\", [ bracketleft, braceleft ] };\n"
+    "    key <AD12> { type=\"TWO_LEVEL\", [ bracketright, braceright ] };\n"
+    "    key <RTRN> { [ Return ] };\n"
+    "    key <LCTL> { [ Control_L ] };\n"
+    "    key <AC01> { [ a, A ] };\n"
+    "    key <AC02> { [ s, S ] };\n"
+    "    key <AC03> { [ d, D ] };\n"
+    "    key <AC04> { [ f, F ] };\n"
+    "    key <AC05> { [ g, G ] };\n"
+    "    key <AC06> { [ h, H ] };\n"
+    "    key <AC07> { [ j, J ] };\n"
+    "    key <AC08> { [ k, K ] };\n"
+    "    key <AC09> { [ l, L ] };\n"
+    "    key <AC10> { type=\"TWO_LEVEL\", [ semicolon, colon ] };\n"
+    "    key <AC11> { type=\"TWO_LEVEL\", [ apostrophe, quotedbl ] };\n"
+    "    key <TLDE> { type=\"TWO_LEVEL\", [ grave, asciitilde ] };\n"
+    "    key <LFSH> { [ Shift_L ] };\n"
+    "    key <BKSL> { type=\"TWO_LEVEL\", [ backslash, bar ] };\n"
+    "    key <AB01> { [ z, Z ] };\n"
+    "    key <AB02> { [ x, X ] };\n"
+    "    key <AB03> { [ c, C ] };\n"
+    "    key <AB04> { [ v, V ] };\n"
+    "    key <AB05> { [ b, B ] };\n"
+    "    key <AB06> { [ n, N ] };\n"
+    "    key <AB07> { [ m, M ] };\n"
+    "    key <AB08> { type=\"TWO_LEVEL\", [ comma, less ] };\n"
+    "    key <AB09> { type=\"TWO_LEVEL\", [ period, greater ] };\n"
+    "    key <AB10> { type=\"TWO_LEVEL\", [ slash, question ] };\n"
+    "    key <RTSH> { [ Shift_R ] };\n"
+    "    key <LALT> { [ Alt_L ] };\n"
+    "    key <SPCE> { [ space ] };\n"
+    "    key <CAPS> { [ Caps_Lock ] };\n"
     "  };\n"
     "};\n"
-    "\n";
+;
 
 #define WL_KB_KEYMAP_XKB_V1 1u
 
 static int      g_keymap_fd = -1;
+static uint32_t g_keymap_users;    /* live wl_keyboard objects holding it */
 static uint32_t g_keymap_size;
 static uint32_t g_keymap_hash;
 
@@ -767,6 +839,7 @@ static int keymap_ensure(void)
     console_printf("[wl] keymap prepared: %u bytes in memfd fd=%d fnv1a=%08x "
                    "(format=%u XKB_V1)\n", (uint64_t)len, (int64_t)g_keymap_fd,
                    (uint64_t)g_keymap_hash, (uint64_t)WL_KB_KEYMAP_XKB_V1);
+    log_memfd_live("keymap memfd created");
     return 1;
 }
 
@@ -875,6 +948,47 @@ static uint32_t fnv1a_update(uint32_t h, const uint8_t *p, uint32_t n)
         h *= FNV_PRIME;
     }
     return h;
+}
+
+/* ===================== v0.62: memfd accounting =====================
+ * Every lifecycle event says how many memfd objects are alive, so the acceptance
+ * can follow the count instead of trusting a single final number. */
+static void log_memfd_live(const char *why)
+{
+    console_printf("[wl] memfd live=%d (%s)\n", (int64_t)memfd_live_count(), why);
+}
+
+/* wl_keyboard.repeat_info(rate, delay): how a client should auto-repeat a held
+ * key.  Sent right after the keymap, before enter. */
+static void emit_kb_repeat_info(struct wl_conn *c, uint32_t kb_id)
+{
+    uint8_t scratch[32];
+    struct wbuf b = ev_begin(c, kb_id, WL_KB_EV_REPEAT_INFO, scratch,
+                             sizeof(scratch));
+
+    wb_u32(&b, (uint32_t)WL_KB_REPEAT_RATE);
+    wb_u32(&b, WL_KB_REPEAT_DELAY);
+    ev_end(c, &b);
+    console_printf("[wl] keyboard repeat_info id=%u rate=%d delay=%u (chars/s, ms)\n",
+                   (uint64_t)kb_id, (int64_t)WL_KB_REPEAT_RATE,
+                   (uint64_t)WL_KB_REPEAT_DELAY);
+}
+
+/* The keymap memfd is shared by every live wl_keyboard: count the users and drop
+ * the descriptor (one reference) when the last one goes away.  A later keyboard
+ * simply recreates it through keymap_ensure(). */
+static void keymap_unuse(const char *why)
+{
+    if (g_keymap_users > 0) g_keymap_users--;
+    if (g_keymap_users == 0 && g_keymap_fd >= 0) {
+        const int was = g_keymap_fd;
+
+        memfd_unref(g_keymap_fd);
+        g_keymap_fd = -1;
+        g_keymap_size = 0;
+        console_printf("[wl] keymap released fd=%d (%s)\n", (int64_t)was, why);
+        log_memfd_live("keymap released");
+    }
 }
 
 /* ===================== wl_surface.commit ===================== */
@@ -1220,6 +1334,10 @@ static void dispatch_shm(struct wl_conn *c, uint16_t opcode, struct rbuf *r)
         if (o == NULL) return;
         o->pool_fd = fd;
         o->pool_size = size;
+        /* v0.62: the descriptor is *handed over* (SCM_RIGHTS here passes the same
+         * encoded number, there is no per-fd refcount on the socket side), so the
+         * server takes over the creator's reference and releases it when the pool
+         * is done.  That is what makes memfd live fall back to 0. */
         console_printf("[wl] create_pool id=%u fd=%d size=%d (memfd %d bytes)\n",
                        (uint64_t)id, (int64_t)fd, (int64_t)size,
                        (int64_t)memfd_size(fd));
@@ -1286,6 +1404,8 @@ static void dispatch_pool(struct wl_conn *c, struct wl_obj *pool, uint16_t opcod
         if (pool->child_buffers <= 0) {
             console_printf("[wl] shm_pool.destroy id=%u: no live buffers, object "
                            "released\n", (uint64_t)pool->id);
+            (void)memfd_unref(pool->pool_fd);
+            log_memfd_live("pool released (no live buffers)");
             free_obj(pool);
         }
         return;
@@ -1865,9 +1985,19 @@ void wl_server_desktop_pump(void)
     struct wl_keep *k;
 
     /* Exited clients must not look alive: prune their slots first. */
-    for (i = 0; i < WL_SERVER_MAX_CONNS; i++)
-        if (g_conns[i].used && conn_peer_dead(&g_conns[i]))
-            conn_release(&g_conns[i]);
+    /* v0.62: while the desktop shell owns the screen no ring-3 client can be
+     * pumping (the shell is the single task), so a slot that is still marked
+     * connected is stale.  Reclaiming it here is also where the memfd references
+     * the client held are dropped (ring-3 exit does not report EOF on the unix
+     * peer in this kernel, so conn_peer_dead alone never fires). */
+    for (i = 0; i < WL_SERVER_MAX_CONNS; i++) {
+        if (!g_conns[i].used) continue;
+        if (!conn_peer_dead(&g_conns[i]))
+            console_printf("[wl] desktop pump: reclaiming stale connection slot "
+                           "%d (no client can own the input devices now)\n",
+                           (int64_t)i);
+        conn_release(&g_conns[i]);
+    }
     if (!g_started) return;
 
     /* v0.61: decide ownership by what owns the *input devices*. While the desktop
@@ -2128,6 +2258,8 @@ static void input_pump(struct wl_conn *c)
                 if (!o->keymap_sent) {
                     emit_kb_keymap(c, o->id);        /* format 1 + memfd descriptor */
                     o->keymap_sent = 1;
+                    g_keymap_users++;
+                    if (o->version >= 4u) emit_kb_repeat_info(c, o->id);
                 }
                 g_serial++;
                 emit_kb_enter(c, o->id, g_serial, k->surface_id);
@@ -2339,11 +2471,14 @@ static void dispatch(struct wl_conn *c, const uint8_t *msg, uint32_t size)
                            (uint64_t)o->id, (uint64_t)o->pool_id,
                            (uint64_t)g_buf_released);
             log_buffer_stats();
+            log_memfd_live("buffer destroyed");
             if (pool != NULL && pool->type == OBJ_POOL && pool->child_buffers > 0) {
                 pool->child_buffers--;
                 if (pool->destroyed && pool->child_buffers == 0) {
                     console_printf("[wl] shm_pool.destroy id=%u: last buffer gone, "
                                    "object released\n", (uint64_t)pool->id);
+                    (void)memfd_unref(pool->pool_fd);
+                    log_memfd_live("pool released (last buffer gone)");
                     destroy_obj(c, pool);
                 }
             }
@@ -2364,6 +2499,7 @@ static void dispatch(struct wl_conn *c, const uint8_t *msg, uint32_t size)
             }
             console_printf("[wl] keyboard.release id=%u (key events=%u)\n",
                            (uint64_t)o->id, (uint64_t)c->kb_events);
+            keymap_unuse("keyboard released");
             destroy_obj(c, o);
         } else {
             console_printf("[wl] wl_keyboard(id=%u): unsupported opcode %u\n",
@@ -2603,6 +2739,9 @@ void wl_server_buffer_stats(int *created, int *released, int *destroyed)
 }
 
 uint32_t wl_server_buffer_stats_skipped(void) { return g_buf_release_skipped; }
+
+/* memfd objects the Wayland server currently holds (pools + keymap). */
+int wl_server_memfd_live(void) { return memfd_live_count(); }
 
 uint32_t wl_server_events_dropped(void)
 {

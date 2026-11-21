@@ -37,7 +37,7 @@ LOG = 'build/serial_wl_win_semantics.log'
 # The XKB keymap that kernel/ipc/wl_server.c hands to clients (format 1, XKB_V1).
 # Must stay byte-identical to the C literal; the guest's hash has to match this
 # recomputation.
-KEYMAP_TEXT = 'xkb_keymap {\n  xkb_keycodes "sutureos" {\n    minimum=8; maximum=255;\n    <ESC>=9; <BKSP>=22; <TAB>=23; <AD01>=24; <AD02>=25; <AD03>=26; <AD04>=27;\n    <AD05>=28; <AD06>=29; <AD07>=30; <AD08>=31; <AD09>=32; <AD10>=33;\n    <AD11>=34; <AD12>=35; <RTRN>=36; <LCTL>=37; <AC01>=38; <AC02>=39;\n    <AC03>=40; <AC04>=41; <AC05>=42; <AC06>=43; <AC07>=44; <AC08>=45;\n    <AC09>=46; <AC10>=47; <AC11>=48; <TLDE>=49; <LFSH>=50; <BKSL>=51;\n    <AB01>=52; <AB02>=53; <AB03>=54; <AB04>=55; <AB05>=56; <AB06>=57;\n    <AB07>=58; <AB08>=59; <AB09>=60; <AB10>=61; <RTSH>=62; <LALT>=64;\n    <SPCE>=65; <CAPS>=66;\n  };\n  xkb_types "complete" {\n    type "ONE_LEVEL" { modifiers=none; map[none]=Level1; };\n    type "TWO_LEVEL" { modifiers=Shift; map[Shift]=Level2; map[none]=Level1; };\n    type "ALPHABETIC" {\n      modifiers=Shift+Lock; map[Shift]=Level2; map[Lock]=Level2;\n      map[Shift+Lock]=Level2; map[none]=Level1;\n    };\n  };\n  xkb_compatibility "complete" {\n    interpret Shift_L { action=SetMods(modifiers=Shift); };\n    interpret Caps_Lock { action=LockMods(modifiers=Lock); };\n    interpret Control_L { action=SetMods(modifiers=Control); };\n    interpret Alt_L { action=SetMods(modifiers=Mod1); };\n    interpret Any+Any { action=SetMods(modifiers=modMapMods); };\n  };\n  xkb_symbols "sutureos-us" {\n    name[Group1]="SutureOS";\n    key.type[Group1]="ALPHABETIC";\n    key <ESC> { [Escape] }; key <BKSP> { [BackSpace] };\n    key <TAB> { [Tab] }; key <RTRN> { [Return] };\n    key <LCTL> { [Control_L] }; key <LFSH> { [Shift_L] };\n    key <RTSH> { [Shift_R] }; key <LALT> { [Alt_L] };\n    key <CAPS> { [Caps_Lock] }; key <SPCE> { [space] };\n    key <AD01> { [q, Q] }; key <AD02> { [w, W] }; key <AD03> { [e, E] };\n    key <AD04> { [r, R] }; key <AD05> { [t, T] }; key <AD06> { [y, Y] };\n    key <AD07> { [u, U] }; key <AD08> { [i, I] }; key <AD09> { [o, O] };\n    key <AD10> { [p, P] }; key <AD11> { [bracketleft, braceleft] };\n    key <AD12> { [bracketright, braceright] };\n    key <AC01> { [a, A] }; key <AC02> { [s, S] }; key <AC03> { [d, D] };\n    key <AC04> { [f, F] }; key <AC05> { [g, G] }; key <AC06> { [h, H] };\n    key <AC07> { [j, J] }; key <AC08> { [k, K] }; key <AC09> { [l, L] };\n    key <AC10> { [semicolon, colon] }; key <AC11> { [apostrophe, quotedbl] };\n    key <TLDE> { [grave, asciitilde] }; key <BKSL> { [backslash, bar] };\n    key <AB01> { [z, Z] }; key <AB02> { [x, X] }; key <AB03> { [c, C] };\n    key <AB04> { [v, V] }; key <AB05> { [b, B] }; key <AB06> { [n, N] };\n    key <AB07> { [m, M] }; key <AB08> { [comma, less] };\n    key <AB09> { [period, greater] }; key <AB10> { [slash, question] };\n  };\n};\n\n'
+KEYMAP_TEXT = 'xkb_keymap {\n  xkb_keycodes "sutureos" {\n    minimum=8; maximum=255;\n    <ESC>=9;\n    <AE01>=10; <AE02>=11; <AE03>=12; <AE04>=13; <AE05>=14; <AE06>=15;\n    <AE07>=16; <AE08>=17; <AE09>=18; <AE10>=19; <AE11>=20; <AE12>=21;\n    <BKSP>=22; <TAB>=23;\n    <AD01>=24; <AD02>=25; <AD03>=26; <AD04>=27; <AD05>=28; <AD06>=29;\n    <AD07>=30; <AD08>=31; <AD09>=32; <AD10>=33; <AD11>=34; <AD12>=35;\n    <RTRN>=36; <LCTL>=37;\n    <AC01>=38; <AC02>=39; <AC03>=40; <AC04>=41; <AC05>=42; <AC06>=43;\n    <AC07>=44; <AC08>=45; <AC09>=46; <AC10>=47; <AC11>=48;\n    <TLDE>=49; <LFSH>=50; <BKSL>=51;\n    <AB01>=52; <AB02>=53; <AB03>=54; <AB04>=55; <AB05>=56; <AB06>=57;\n    <AB07>=58; <AB08>=59; <AB09>=60; <AB10>=61;\n    <RTSH>=62; <LALT>=64; <SPCE>=65; <CAPS>=66;\n  };\n  xkb_types "complete" {\n    type "ONE_LEVEL" { modifiers=none; map[none]=Level1; };\n    type "TWO_LEVEL" { modifiers=Shift; map[Shift]=Level2; map[none]=Level1; };\n    type "ALPHABETIC" {\n      modifiers=Shift+Lock; map[Shift]=Level2; map[Lock]=Level2;\n      map[Shift+Lock]=Level2; map[none]=Level1;\n    };\n    type "KEYPAD" { modifiers=NumLock; map[NumLock]=Level2; map[none]=Level1; };\n  };\n  xkb_compatibility "complete" {\n    interpret Shift_L { action=SetMods(modifiers=Shift); };\n    interpret Shift_R { action=SetMods(modifiers=Shift); };\n    interpret Caps_Lock { action=LockMods(modifiers=Lock); };\n    interpret Control_L { action=SetMods(modifiers=Control); };\n    interpret Alt_L { action=SetMods(modifiers=Mod1); };\n    interpret Any+Any { action=SetMods(modifiers=modMapMods); };\n  };\n  xkb_symbols "sutureos-us" {\n    name[Group1]="SutureOS full US";\n    key.type[Group1]="ALPHABETIC";\n    key <ESC> { [ Escape ] };\n    key <AE01> { type="TWO_LEVEL", [ 1, exclam ] };\n    key <AE02> { type="TWO_LEVEL", [ 2, at ] };\n    key <AE03> { type="TWO_LEVEL", [ 3, numbersign ] };\n    key <AE04> { type="TWO_LEVEL", [ 4, dollar ] };\n    key <AE05> { type="TWO_LEVEL", [ 5, percent ] };\n    key <AE06> { type="TWO_LEVEL", [ 6, asciicircum ] };\n    key <AE07> { type="TWO_LEVEL", [ 7, ampersand ] };\n    key <AE08> { type="TWO_LEVEL", [ 8, asterisk ] };\n    key <AE09> { type="TWO_LEVEL", [ 9, parenleft ] };\n    key <AE10> { type="TWO_LEVEL", [ 0, parenright ] };\n    key <AE11> { type="TWO_LEVEL", [ minus, underscore ] };\n    key <AE12> { type="TWO_LEVEL", [ equal, plus ] };\n    key <BKSP> { [ BackSpace ] };\n    key <TAB> { [ Tab, ISO_Left_Tab ] };\n    key <AD01> { [ q, Q ] };\n    key <AD02> { [ w, W ] };\n    key <AD03> { [ e, E ] };\n    key <AD04> { [ r, R ] };\n    key <AD05> { [ t, T ] };\n    key <AD06> { [ y, Y ] };\n    key <AD07> { [ u, U ] };\n    key <AD08> { [ i, I ] };\n    key <AD09> { [ o, O ] };\n    key <AD10> { [ p, P ] };\n    key <AD11> { type="TWO_LEVEL", [ bracketleft, braceleft ] };\n    key <AD12> { type="TWO_LEVEL", [ bracketright, braceright ] };\n    key <RTRN> { [ Return ] };\n    key <LCTL> { [ Control_L ] };\n    key <AC01> { [ a, A ] };\n    key <AC02> { [ s, S ] };\n    key <AC03> { [ d, D ] };\n    key <AC04> { [ f, F ] };\n    key <AC05> { [ g, G ] };\n    key <AC06> { [ h, H ] };\n    key <AC07> { [ j, J ] };\n    key <AC08> { [ k, K ] };\n    key <AC09> { [ l, L ] };\n    key <AC10> { type="TWO_LEVEL", [ semicolon, colon ] };\n    key <AC11> { type="TWO_LEVEL", [ apostrophe, quotedbl ] };\n    key <TLDE> { type="TWO_LEVEL", [ grave, asciitilde ] };\n    key <LFSH> { [ Shift_L ] };\n    key <BKSL> { type="TWO_LEVEL", [ backslash, bar ] };\n    key <AB01> { [ z, Z ] };\n    key <AB02> { [ x, X ] };\n    key <AB03> { [ c, C ] };\n    key <AB04> { [ v, V ] };\n    key <AB05> { [ b, B ] };\n    key <AB06> { [ n, N ] };\n    key <AB07> { [ m, M ] };\n    key <AB08> { type="TWO_LEVEL", [ comma, less ] };\n    key <AB09> { type="TWO_LEVEL", [ period, greater ] };\n    key <AB10> { type="TWO_LEVEL", [ slash, question ] };\n    key <RTSH> { [ Shift_R ] };\n    key <LALT> { [ Alt_L ] };\n    key <SPCE> { [ space ] };\n    key <CAPS> { [ Caps_Lock ] };\n  };\n};\n'
 
 # Window geometry: the "Wayland client" window of the Rust desktop shell.
 WIN_X, WIN_Y, WIN_W, WIN_H = 250, 330, 440, 330
@@ -264,8 +264,8 @@ def main():
               srv_km is not None and srv_km.group(2) == '1' and
               int(srv_km.group(3)) == len(KEYMAP_TEXT.encode('utf-8')),
               srv_km.group(0) if srv_km else 'missing')
-        check('keymap text is 1-3 KiB (a real mini XKB keymap)',
-              1024 <= int(srv_km.group(3)) <= 3072 if srv_km else False,
+        check('keymap text is 3-6 KiB (a full US layout)',
+              3072 <= int(srv_km.group(3)) <= 6144 if srv_km else False,
               ('%s bytes' % srv_km.group(3)) if srv_km else 'missing')
         check('host recomputation matches the server keymap hash',
               srv_km is not None and srv_km.group(5) == '%08x' % keymap_hash and
@@ -278,6 +278,27 @@ def main():
         check('keymap was delivered by wl_keyboard.enter (descriptor path used)',
               '[wl] keyboard keymap id=' in log and 'SCM_RIGHTS' in log,
               'SCM_RIGHTS annotated keymap line')
+
+        # ---- wl_keyboard.repeat_info ----------------------------------
+        rep_srv = re.search(r'\[wl\] keyboard repeat_info id=(\d+) rate=(-?\d+) '
+                            r'delay=(\d+)', log)
+        rep_cli = re.search(r'\[wltwo\]   event keyboard\.repeat_info rate=(-?\d+) '
+                            r'delay=(\d+)', log)
+        check('wl_keyboard.repeat_info(rate, delay) sent to the client',
+              rep_srv is not None,
+              rep_srv.group(0) if rep_srv else 'missing')
+        check('repeat_info values are in the agreed band (rate 20-40, delay '
+              '200-600 ms)',
+              rep_srv is not None and
+              20 <= int(rep_srv.group(2)) <= 40 and
+              200 <= int(rep_srv.group(3)) <= 600,
+              'rate=%s delay=%s' % (rep_srv.group(2), rep_srv.group(3))
+              if rep_srv else 'missing')
+        check('the client received and printed the same repeat_info values',
+              rep_cli is not None and rep_srv is not None and
+              rep_cli.group(1) == rep_srv.group(2) and
+              rep_cli.group(2) == rep_srv.group(3),
+              rep_cli.group(0) if rep_cli else 'missing')
 
         # ---- buffer lifecycle -----------------------------------------
         check('wl_shm_pool.destroy keeps the descriptor for live buffers',
@@ -395,6 +416,37 @@ def main():
                  'GUI drag path not triggered (no desktop pump call site)')
 
         log = log_text()
+        # ---- memfd reference counting ---------------------------------
+        # (read after the desktop phase: the count only reaches 0 once the
+        #  desktop pump reclaims the stale connection slots, which is phase 2)
+        live = [(int(m.group(1)), m.group(2), m.start())
+                for m in re.finditer(r'\[wl\] memfd live=(\d+) \(([^)]*)\)', log)]
+        reasons = [r for _, r, _ in live]
+        vals = [v for v, _, _ in live]
+        check('memfd live counter logged on every lifecycle event',
+              len(live) >= 4 and any('keymap memfd created' in r for r in reasons),
+              '%d line(s): %s'
+              % (len(live), ', '.join('%d(%s)' % (v, r)
+                                      for v, r in list(zip(vals, reasons))[:6])[:170]))
+        peak = max(vals) if vals else -1
+        pool_destroy_at = log.find('[wl] shm_pool.destroy id=')
+        before = [v for v, _, pos in live if pos < pool_destroy_at]
+        after = [v for v, _, pos in live if pos > pool_destroy_at]
+        check('memfd live peaks at pools + keymap (>= 2)', peak >= 2,
+              'peak=%d' % peak)
+        check('destroying a pool with a live buffer does not drop live',
+              bool(before) and bool(after) and before[-1] == after[0],
+              'live before=%s after=%s around the pool.destroy line'
+              % (before[-1] if before else '?', after[0] if after else '?'))
+        dropped = [v for v in after if v < (before[-1] if before else 0)]
+        check('the last buffer destroy releases the pool memfd (live drops)',
+              bool(dropped) and bool(before) and dropped[0] < before[-1],
+              'live %s -> %s'
+              % (before[-1] if before else '?', dropped[0] if dropped else '?'))
+        check('memfd live returns to 0 after the connection is released',
+              bool(vals) and vals[-1] == 0 and 'connection gone' in reasons[-1],
+              'final=%d (%s)' % (vals[-1], reasons[-1]) if vals else 'missing')
+
         check('kernel self-tests still 16/16',
               '[stitch] selftests: 16/16 passed' in log)
         check('no kernel PANIC', 'PANIC' not in log.upper().replace('NO PANIC', ''))

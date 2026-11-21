@@ -74,7 +74,7 @@ Wayland 支持**多客户端**（每连接一份保留的 surface + `run wltwo` 
 `set_buffer_scale` 与 region/subsurface 语义；**图片查看器从 FAT32 读真实 BMP**（`/mnt/fat/IMG.BMP`：解码 + 整数缩放 + 文件名/尺寸/倍数页脚）、开始菜单第 5 行直接打开 Wayland 窗口（面板高度随应用数增长）、**桌面文本编辑器变为真编辑**（多行缓冲区、
 光标与方向键、**F5** 保存到 `/mnt/fat/GUIEDIT.TXT`，宿主逐字节验收）；**damage 改成 32×32 tile
 网格合并**（矩形表上限 16 块，安静窗口约 250 tiles / permille 132，oracle 仍 0 mismatch）；
-Wayland 侧还补上了**窗口摆放语义**（指针事件按窗口矩形换算成 surface 局部坐标、enter 只在窗口内、键盘按窗口焦点门控）、**keymap 通过 memfd+SCM_RIGHTS 真实下发** 与 buffer/pool 生命周期，并修掉「连接槽泄漏」和「桌面 pump 早退」两个真 bug；新增 **`F2`** 打开的独立 **Wayland 窗口**
+Wayland 侧还补上了**窗口摆放语义**（指针事件按窗口矩形换算成 surface 局部坐标、enter 只在窗口内、键盘按窗口焦点门控）、**完整 US keymap（3936 B）通过 memfd+SCM_RIGHTS 真实下发**、`wl_keyboard.repeat_info`、memfd 引用计数在 buffer/pool/连接释放后归零 与 buffer/pool 生命周期，并修掉「连接槽泄漏」和「桌面 pump 早退」两个真 bug；新增 **`F2`** 打开的独立 **Wayland 窗口**
 （无客户端时显示提示卡，不回退 Logo）。外观做了第二轮打磨（壁纸纵深/图标内描边/accent 身份条/
 圆角任务栏与菜单），`docs/baseline/base_gui.png` 已按新外观重生、门禁仍 0 像素。
 仍未做：真正的 vsync 源（本机没有扫描线中断，60 Hz 是墙上时钟栅格）、更细的 damage 合并、

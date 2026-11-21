@@ -4,6 +4,7 @@
 #include <stitch/console.h>
 #include <stitch/string.h>
 #include "mmu.h"          /* mmu_walk, loader_alloc_page, PTE flags, read_cr3 */
+#include "loader.h"       /* loader_free_page: recycle frames of an unref'd object */
 
 #define EINVAL_ 22
 #define ENOMEM_ 12
@@ -11,6 +12,8 @@
 
 typedef struct {
     int    in_use;
+    int    refs;       /* v0.62: references (creator + every SCM_RIGHTS receiver) */
+    int    mapped;     /* v0.62: 1 once a mapping exists (pages must stay alive)  */
     int    pages;
     void  *page[MEMFD_MAX_PAGES];
 } memfd_t;
@@ -28,6 +31,41 @@ static int memfd_decode(int fd, int *slot)
 
 int memfd_is_fd(int fd) { int s; return memfd_decode(fd, &s) == 0; }
 
+/* Size of the reference-counting surface: just enough for the SCM_RIGHTS path. */
+int memfd_live_count(void)
+{
+    int i, n = 0;
+
+    for (i = 0; i < MEMFD_MAX_OBJECTS; i++)
+        if (g_fds[i].in_use) n++;
+    return n;
+}
+
+int memfd_ref(int fd)
+{
+    int slot;
+
+    if (memfd_decode(fd, &slot) != 0) return -EINVAL_;
+    g_fds[slot].refs++;
+    return g_fds[slot].refs;
+}
+
+int memfd_unref(int fd)
+{
+    int slot, i;
+
+    if (memfd_decode(fd, &slot) != 0) return -EINVAL_;
+    if (g_fds[slot].refs > 1) return --g_fds[slot].refs;
+    /* Last reference: release the slot.  Frames are recycled only when nothing
+     * maps the object any more (a live mapping would keep touching them). */
+    if (!g_fds[slot].mapped) {
+        for (i = 0; i < g_fds[slot].pages; i++)
+            loader_free_page(g_fds[slot].page[i]);
+    }
+    memset(&g_fds[slot], 0, sizeof(g_fds[slot]));
+    return 0;
+}
+
 int memfd_create_obj(void)
 {
     int slot;
@@ -37,6 +75,7 @@ int memfd_create_obj(void)
     if (slot >= MEMFD_MAX_OBJECTS) return -EAGAIN_;
     memset(&g_fds[slot], 0, sizeof(g_fds[slot]));
     g_fds[slot].in_use = 1;
+    g_fds[slot].refs = 1;
     return MEMFD_FD_BASE + slot;
 }
 
@@ -98,6 +137,7 @@ int memfd_map(uint64_t vaddr, int fd, uint64_t len, int writable)
         if (!pte) return -ENOMEM_;
         *pte = (uint64_t)(uintptr_t)g_fds[slot].page[i] | flags;
     }
+    g_fds[slot].mapped = 1;          /* keep the frames alive across a close */
     memfd_flush_tlb();
     return 0;
 }
