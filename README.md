@@ -83,8 +83,15 @@ is verified against a full repaint pixel by pixel (`damage: identical`; a pointe
 0.4-0.5 % of the screen, a drag frame costs 0-10 ms where the old full redraw cost ~117 ms). Wayland
 gained **multiple clients** (one retained surface per connection, plus `run wltwo`, a single process
 that opens two connections), a real `wl_keyboard` / `wl_pointer` event stream (press *and* release,
-motion / button / leave / frame), `set_buffer_scale` and region/subsurface semantics, and a dedicated
-**Wayland window opened with `F2`** (it shows a hint card instead of the logo when no client has
+motion / button / leave / frame), `set_buffer_scale` and region/subsurface semantics; the desktop text
+editor became a **real editor** (multi-line buffer, caret and arrow keys, **F5** saves to
+`/mnt/fat/GUIEDIT.TXT`, verified byte for byte from the host), damage merging moved to a **32x32 tile
+grid** (at most 16 rectangles; a quiet 30-frame window measures ~250 tiles / 132 permille with the
+oracle still at 0 mismatches), Wayland also gained **placement semantics** (pointer events are converted into surface-local
+coordinates from the window rectangle, enter only while inside, keyboard gated by window focus),
+a **real keymap delivered over memfd + SCM_RIGHTS**, and buffer/pool lifetime rules - with two real
+bugs fixed on the way (a leaked connection slot and a desktop pump that always returned early);
+and there is a dedicated **Wayland window opened with `F2`** (it shows a hint card instead of the logo when no client has
 committed). The look was polished a second time (wallpaper depth and vignette, icon rim light, accent
 identity bar, rounded taskbar and menu) and `docs/baseline/base_gui.png` was regenerated - the gate is
 still 0 pixels. Still missing: a real vsync source (there is no scan-line interrupt on this machine, so

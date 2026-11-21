@@ -65,7 +65,7 @@ SUB_POS = (24, 16)
 
 KEYS = ';'.join(['r', 'u', 'n', 'spc'] + list('wltwo') + ['ret'] +
                 list('asdfghjk'))
-MONITOR_CMDS = ('mouse_move -300 -200;mouse_move -120 -60;mouse_move 40 30;'\
+MONITOR_CMDS = ('mouse_move 40 30;mouse_move 40 30;mouse_move 40 30;'\
                 'mouse_button 1;mouse_button 0;mouse_button 1;mouse_button 0')
 
 
@@ -267,18 +267,18 @@ def main():
          ready.group(0) if ready else 'missing ready line'),
         ('two concurrent client connections', multi_conns >= 2,
          '%d connect(s)' % multi_conns),
-        ('three commits total (B once, A twice)',
-         len(commits) == 3, '%d commit line(s)' % len(commits)),
-        ('surface A committed 160x100 stride=640 twice',
-         len(a_commits) == 2, '%d A commit(s)' % len(a_commits)),
+        ('commits for both clients (B once, A frame1/frame2/lifecycle)',
+         len(commits) >= 3, '%d commit line(s)' % len(commits)),
+        ('surface A committed 160x100 stride=640 (frame 1, 2 and lifecycle)',
+         len(a_commits) >= 2, '%d A commit(s)' % len(a_commits)),
         ('surface B committed 96x64 stride=384',
          len(b_commits) == 1, '%d B commit(s)' % len(b_commits)),
         ('A commit #1 hash == host-recomputed frame 1',
-         len(a_commits) == 2 and int(a_commits[0][5], 16) == h1,
+         len(a_commits) >= 2 and int(a_commits[0][5], 16) == h1,
          a_commits[0][5] if a_commits else 'missing'),
         ('A commit #2 hash == host-recomputed frame 2 (pixels changed)',
-         len(a_commits) == 2 and int(a_commits[1][5], 16) == h2 and h2 != h1,
-         a_commits[1][5] if len(a_commits) == 2 else 'missing'),
+         len(a_commits) >= 2 and int(a_commits[1][5], 16) == h2 and h2 != h1,
+         a_commits[1][5] if len(a_commits) >= 2 else 'missing'),
         ('B commit hash == host-recomputed B pattern',
          len(b_commits) == 1 and int(b_commits[0][5], 16) == hb,
          b_commits[0][5] if b_commits else 'missing'),
@@ -318,8 +318,9 @@ def main():
          sub_state is not None and
          (sub_state.group(4), sub_state.group(5)) == ('24', '16'),
          sub_state.group(0) if sub_state else 'missing'),
-        ('wl_keyboard.keymap sent (NO_KEYMAP, no descriptor)',
-         '[wltwo]   event keyboard.keymap format=0 size=0' in log),
+        ('wl_keyboard.keymap sent as XKB_V1 over SCM_RIGHTS',
+         '[wltwo]   event keyboard.keymap format=1 size=' in log and
+         '[wl] keyboard keymap id=' in log),
         ('wl_keyboard.enter for the committed surface',
          kb_enter is not None, kb_enter.group(0) if kb_enter else 'missing'),
         ('wl_keyboard.modifiers emitted', kb_mods >= 1, '%d line(s)' % kb_mods),

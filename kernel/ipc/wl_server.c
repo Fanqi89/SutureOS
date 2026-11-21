@@ -148,6 +148,13 @@ struct wl_obj {
     int32_t  pos_x, pos_y;
     int      sync_mode;
     int      place_below;
+    /* wl_keyboard: a real XKB keymap is sent once per keyboard object          */
+    int      keymap_sent;
+    /* wl_buffer lifecycle: one release per attach cycle                        */
+    int      released;
+    /* wl_shm_pool: destroy keeps the descriptor alive for existing buffers     */
+    int      destroyed;
+    int32_t  child_buffers;    /* live wl_buffer objects created from this pool  */
 };
 
 struct wl_conn {
@@ -163,6 +170,27 @@ struct wl_conn {
 };
 
 static struct wl_conn g_conns[WL_SERVER_MAX_CONNS];
+
+/* v0.61: drop a connection slot once its client is gone. The retained surfaces in
+ * g_keep[] are deliberately left alone - the desktop keeps showing the last frame
+ * of an exited client (that is what "retained" means here). */
+static void conn_release(struct wl_conn *c)
+{
+    if (c == NULL || !c->used) return;
+    console_printf("[wl] client disconnected server_fd=%d "
+                   "(connection slot %d released, retained surfaces kept)\n",
+                   (int64_t)c->server_fd, (int64_t)(c - g_conns));
+    memset(c, 0, sizeof(*c));
+}
+
+/* 1 when the peer end is gone (unix_poll_fd reports HUP, or the fd no longer
+ * decodes because the endpoint was already torn down). */
+static int conn_peer_dead(const struct wl_conn *c)
+{
+    const int ev = unix_poll_fd(c->server_fd);
+    if (ev == 0) return 1;
+    return (ev & UNIX_POLLHUP) != 0;
+}
 
 /* ===================== per-connection retained surfaces =====================
  * The commit that wins for a *connection* keeps its own pixel copy here, so a
@@ -190,6 +218,77 @@ static uint32_t g_ptr_events;          /* wl_pointer events emitted             
 static uint32_t g_ptr_frames;          /* wl_pointer.frame events emitted       */
 static struct wl_obj *g_subsurfaces[8];  /* live wl_subsurface objects (export)  */
 static int      g_started;
+
+/* ===================== window placement + focus gate (v0.61) =================
+ * The desktop shell owns the Wayland window; these weak hooks are how it tells
+ * the server where that window is and whether it holds the keyboard.  The weak
+ * definitions right below are the fallbacks for a kernel that does not link the
+ * Rust GUI, so this file keeps building (and keeps the pre-0.61 semantics) on
+ * every tree.
+ *
+ * No #include of the Rust header on purpose: this file must not depend on it. */
+extern int suture_gui_wayland_rect(int *x, int *y, int *w, int *h)
+    __attribute__((weak));
+extern int suture_gui_wayland_focused(void) __attribute__((weak));
+
+#define WL_WIN_DEF_X 250
+#define WL_WIN_DEF_Y 330
+#define WL_WIN_DEF_W 440
+#define WL_WIN_DEF_H 330
+
+/* Fallback window rectangle: the documented default geometry of the "Wayland
+ * client" window, so the placement semantics stay exercisable when there is no
+ * Rust GUI to ask. */
+__attribute__((weak)) int suture_gui_wayland_rect(int *x, int *y, int *w, int *h)
+{
+    if (x) *x = WL_WIN_DEF_X;
+    if (y) *y = WL_WIN_DEF_Y;
+    if (w) *w = WL_WIN_DEF_W;
+    if (h) *h = WL_WIN_DEF_H;
+    return 1;
+}
+
+/* Fallback focus: no window manager information available, so nothing is gated
+ * (this is the pre-0.61 behaviour that the terminal acceptance scripts use). */
+__attribute__((weak)) int suture_gui_wayland_focused(void)
+{
+    return 1;
+}
+
+static int      g_win_ok;              /* a window rectangle is currently known */
+static int      g_win_x, g_win_y, g_win_w, g_win_h;
+static int      g_kb_focused = 1;      /* last focus state acted on             */
+static uint32_t g_kb_gated;            /* key events dropped by the focus gate   */
+static uint32_t g_ptr_leaves;          /* leaves because the pointer left        */
+static uint32_t g_win_changes;         /* window rectangle changes seen         */
+static int      g_win_from_shell;      /* 1 = the rectangle came from the shell  */
+
+/* desktop-side stream state (no live connection: the window is showing a
+ * surface that a client committed earlier) */
+static int      g_desk_calls;          /* frames the shell pumped               */
+static int      g_desk_inside;         /* desktop pointer is on the surface      */
+static int      g_desk_focused = 1;    /* desktop keyboard focus state           */
+static int      g_desk_lx = -1, g_desk_ly = -1;
+static int      g_desk_buttons;
+static uint32_t g_desk_events;         /* enter/motion/button records            */
+static uint32_t g_desk_keys;           /* keys delivered while focused           */
+static uint32_t g_desk_last_beat_calls;
+
+/* wl_buffer lifecycle accounting (exported through wl_server_buffer_stats()) */
+static uint32_t g_buf_created;
+static uint32_t g_buf_released;
+static uint32_t g_buf_destroyed;
+static uint32_t g_buf_release_skipped;
+
+/* One line per lifecycle change so the acceptance can read the counters off the
+ * serial log (wl_server_buffer_stats() is a kernel API with no ring-3 caller). */
+static void log_buffer_stats(void)
+{
+    console_printf("[wl] buffer stats created=%u released=%u destroyed=%u "
+                   "skipped=%u\n", (uint64_t)g_buf_created,
+                   (uint64_t)g_buf_released, (uint64_t)g_buf_destroyed,
+                   (uint64_t)g_buf_release_skipped);
+}
 
 /* ===================== little-endian helpers ===================== */
 static uint32_t rd_u32(const uint8_t *p)
@@ -563,18 +662,148 @@ static void emit_pointer_frame(struct wl_conn *c, uint32_t pointer_id)
 }
 
 /* ===================== wl_keyboard events ===================== */
-/* keymap(format, fd, size): an fd argument never occupies bytes in the message
- * buffer (it travels in SCM_RIGHTS), so the buffer holds only format and size.
- * This kernel has no XKB data, so format = NO_KEYMAP and no descriptor is sent -
- * the specification's own escape hatch. */
+/* The real keymap.  wl_keyboard.keymap carries an XKB keymap as a memfd handed
+ * over with SCM_RIGHTS; format 1 is WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 and the text
+ * is a complete mini keymap for the keycodes this server emits (an X11 keycode is
+ * the evdev code, which is exactly what wl_keyboard.key carries).  Kept small
+ * (~1.4 KiB) and syntactically complete: keycodes/types/compatibility/symbols.
+ *
+ * The identical literal lives in scripts/wl_win_semantics_acceptance.py, which
+ * recomputes the FNV-1a of the descriptor content on the host side; if the two
+ * ever drift, the acceptance fails on the hash comparison instead of passing. */
+static const char g_keymap_text[] =
+    "xkb_keymap {\n"
+    "  xkb_keycodes \"sutureos\" {\n"
+    "    minimum=8; maximum=255;\n"
+    "    <ESC>=9; <BKSP>=22; <TAB>=23; <AD01>=24; <AD02>=25; <AD03>=26; <AD04>=27;\n"
+    "    <AD05>=28; <AD06>=29; <AD07>=30; <AD08>=31; <AD09>=32; <AD10>=33;\n"
+    "    <AD11>=34; <AD12>=35; <RTRN>=36; <LCTL>=37; <AC01>=38; <AC02>=39;\n"
+    "    <AC03>=40; <AC04>=41; <AC05>=42; <AC06>=43; <AC07>=44; <AC08>=45;\n"
+    "    <AC09>=46; <AC10>=47; <AC11>=48; <TLDE>=49; <LFSH>=50; <BKSL>=51;\n"
+    "    <AB01>=52; <AB02>=53; <AB03>=54; <AB04>=55; <AB05>=56; <AB06>=57;\n"
+    "    <AB07>=58; <AB08>=59; <AB09>=60; <AB10>=61; <RTSH>=62; <LALT>=64;\n"
+    "    <SPCE>=65; <CAPS>=66;\n"
+    "  };\n"
+    "  xkb_types \"complete\" {\n"
+    "    type \"ONE_LEVEL\" { modifiers=none; map[none]=Level1; };\n"
+    "    type \"TWO_LEVEL\" { modifiers=Shift; map[Shift]=Level2; map[none]=Level1; };\n"
+    "    type \"ALPHABETIC\" {\n"
+    "      modifiers=Shift+Lock; map[Shift]=Level2; map[Lock]=Level2;\n"
+    "      map[Shift+Lock]=Level2; map[none]=Level1;\n"
+    "    };\n"
+    "  };\n"
+    "  xkb_compatibility \"complete\" {\n"
+    "    interpret Shift_L { action=SetMods(modifiers=Shift); };\n"
+    "    interpret Caps_Lock { action=LockMods(modifiers=Lock); };\n"
+    "    interpret Control_L { action=SetMods(modifiers=Control); };\n"
+    "    interpret Alt_L { action=SetMods(modifiers=Mod1); };\n"
+    "    interpret Any+Any { action=SetMods(modifiers=modMapMods); };\n"
+    "  };\n"
+    "  xkb_symbols \"sutureos-us\" {\n"
+    "    name[Group1]=\"SutureOS\";\n"
+    "    key.type[Group1]=\"ALPHABETIC\";\n"
+    "    key <ESC> { [Escape] }; key <BKSP> { [BackSpace] };\n"
+    "    key <TAB> { [Tab] }; key <RTRN> { [Return] };\n"
+    "    key <LCTL> { [Control_L] }; key <LFSH> { [Shift_L] };\n"
+    "    key <RTSH> { [Shift_R] }; key <LALT> { [Alt_L] };\n"
+    "    key <CAPS> { [Caps_Lock] }; key <SPCE> { [space] };\n"
+    "    key <AD01> { [q, Q] }; key <AD02> { [w, W] }; key <AD03> { [e, E] };\n"
+    "    key <AD04> { [r, R] }; key <AD05> { [t, T] }; key <AD06> { [y, Y] };\n"
+    "    key <AD07> { [u, U] }; key <AD08> { [i, I] }; key <AD09> { [o, O] };\n"
+    "    key <AD10> { [p, P] }; key <AD11> { [bracketleft, braceleft] };\n"
+    "    key <AD12> { [bracketright, braceright] };\n"
+    "    key <AC01> { [a, A] }; key <AC02> { [s, S] }; key <AC03> { [d, D] };\n"
+    "    key <AC04> { [f, F] }; key <AC05> { [g, G] }; key <AC06> { [h, H] };\n"
+    "    key <AC07> { [j, J] }; key <AC08> { [k, K] }; key <AC09> { [l, L] };\n"
+    "    key <AC10> { [semicolon, colon] }; key <AC11> { [apostrophe, quotedbl] };\n"
+    "    key <TLDE> { [grave, asciitilde] }; key <BKSL> { [backslash, bar] };\n"
+    "    key <AB01> { [z, Z] }; key <AB02> { [x, X] }; key <AB03> { [c, C] };\n"
+    "    key <AB04> { [v, V] }; key <AB05> { [b, B] }; key <AB06> { [n, N] };\n"
+    "    key <AB07> { [m, M] }; key <AB08> { [comma, less] };\n"
+    "    key <AB09> { [period, greater] }; key <AB10> { [slash, question] };\n"
+    "  };\n"
+    "};\n"
+    "\n";
+
+#define WL_KB_KEYMAP_XKB_V1 1u
+
+static int      g_keymap_fd = -1;
+static uint32_t g_keymap_size;
+static uint32_t g_keymap_hash;
+
+/* Create the keymap memfd once; returns 1 when a descriptor is available. */
+static int keymap_ensure(void)
+{
+    const uint32_t len = (uint32_t)(sizeof g_keymap_text - 1u);
+
+    if (g_keymap_fd >= 0) return 1;
+    g_keymap_fd = memfd_create_obj();
+    if (g_keymap_fd < 0) {
+        console_printf("[wl] keymap: memfd_create failed (%d)\n",
+                       (int64_t)g_keymap_fd);
+        return 0;
+    }
+    if (memfd_resize(g_keymap_fd, len) != 0 ||
+        memfd_write(g_keymap_fd, 0, g_keymap_text, (int)len) != (int)len) {
+        console_printf("[wl] keymap: cannot fill the memfd (%u bytes)\n",
+                       (uint64_t)len);
+        g_keymap_fd = -1;
+        return 0;
+    }
+    g_keymap_size = len;
+    {
+        /* FNV-1a inline: fnv1a_update() is defined further down (next to
+         * commit_surface), and this helper runs earlier in the file. */
+        const uint8_t *px = (const uint8_t *)g_keymap_text;
+        uint32_t i;
+        uint32_t h = 2166136261u;
+
+        for (i = 0; i < len; i++) {
+            h ^= (uint32_t)px[i];
+            h *= 16777619u;
+        }
+        g_keymap_hash = h;
+    }
+    console_printf("[wl] keymap prepared: %u bytes in memfd fd=%d fnv1a=%08x "
+                   "(format=%u XKB_V1)\n", (uint64_t)len, (int64_t)g_keymap_fd,
+                   (uint64_t)g_keymap_hash, (uint64_t)WL_KB_KEYMAP_XKB_V1);
+    return 1;
+}
+
+
+/* keymap(format, fd, size): the descriptor travels in SCM_RIGHTS and therefore
+ * occupies no bytes on the wire, so the message body is only format + size.  A
+ * real XKB keymap is sent (format 1); only when the memfd cannot be created does
+ * the server fall back to the spec's NO_KEYMAP escape hatch, and it says so. */
 static void emit_kb_keymap(struct wl_conn *c, uint32_t kb_id)
 {
     uint8_t scratch[32];
-    struct wbuf b = ev_begin(c, kb_id, WL_KB_EV_KEYMAP, scratch, sizeof(scratch));
+    struct wbuf b;
 
-    wb_u32(&b, WL_KB_KEYMAP_NO_KEYMAP);
-    wb_u32(&b, 0u);                      /* keymap size: none */
+    if (!keymap_ensure()) {
+        b = ev_begin(c, kb_id, WL_KB_EV_KEYMAP, scratch, sizeof(scratch));
+        wb_u32(&b, WL_KB_KEYMAP_NO_KEYMAP);
+        wb_u32(&b, 0u);
+        ev_end(c, &b);
+        console_printf("[wl] keyboard keymap id=%u: NO_KEYMAP fallback (no memfd)\n",
+                       (uint64_t)kb_id);
+        return;
+    }
+
+    /* Queue the descriptor first: the pump flushes the event bytes at its end, so
+     * the client's next recvmsg() sees the keymap event *and* its descriptor. */
+    if (unix_send_fds(c->server_fd, &g_keymap_fd, 1) != 0)
+        console_printf("[wl] keyboard keymap id=%u: SCM_RIGHTS queue is full\n",
+                       (uint64_t)kb_id);
+
+    b = ev_begin(c, kb_id, WL_KB_EV_KEYMAP, scratch, sizeof(scratch));
+    wb_u32(&b, WL_KB_KEYMAP_XKB_V1);
+    wb_u32(&b, g_keymap_size);
     ev_end(c, &b);
+    console_printf("[wl] keyboard keymap id=%u format=%u size=%u fd=%d fnv1a=%08x "
+                   "(SCM_RIGHTS)\n", (uint64_t)kb_id,
+                   (uint64_t)WL_KB_KEYMAP_XKB_V1, (uint64_t)g_keymap_size,
+                   (int64_t)g_keymap_fd, (uint64_t)g_keymap_hash);
 }
 
 /* enter(serial, surface, keys): the keys array is u32 size + payload; it is
@@ -669,6 +898,13 @@ static void commit_surface(struct wl_conn *c, struct wl_obj *surf)
     if (buf == NULL || buf->type != OBJ_BUFFER) {
         console_printf("[wl] commit surface=%u: buffer %d unknown\n",
                        (uint64_t)surf->id, (int64_t)surf->buffer_id);
+        return;
+    }
+    /* A destroyed buffer is gone for good: the client must create a new one. */
+    if (buf->destroyed) {
+        console_printf("[wl] commit surface=%u refused: buffer %u was destroyed\n",
+                       (uint64_t)surf->id, (uint64_t)buf->id);
+        surf->buffer_id = 0;
         return;
     }
     pool = find_obj(c, (uint32_t)buf->pool_id);
@@ -834,8 +1070,20 @@ static void commit_surface(struct wl_conn *c, struct wl_obj *surf)
         surf->frame_cb_id = 0;
     }
 
-    emit_buffer_release(c, buf->id);
-    console_printf("[wl] buffer.release id=%u\n", (uint64_t)buf->id);
+    /* One release per attach cycle: the attach that put this buffer in use is
+     * what earns the release, so a commit that reuses an already-released buffer
+     * without a fresh attach does not send a second one. */
+    if (buf->released) {
+        g_buf_release_skipped++;
+        console_printf("[wl] buffer.release id=%u skipped (already released, no "
+                       "re-attach)\n", (uint64_t)buf->id);
+    } else {
+        emit_buffer_release(c, buf->id);
+        buf->released = 1;
+        g_buf_released++;
+        console_printf("[wl] buffer.release id=%u\n", (uint64_t)buf->id);
+        log_buffer_stats();
+    }
 }
 
 /* ===================== request dispatch ===================== */
@@ -991,6 +1239,13 @@ static void dispatch_pool(struct wl_conn *c, struct wl_obj *pool, uint16_t opcod
         struct wl_obj *o;
 
         if (r->err) return;
+        /* A destroyed pool cannot mint new buffers, but the buffers it already
+         * made stay usable (their descriptor is still owned by the server). */
+        if (pool->destroyed) {
+            console_printf("[wl] create_buffer id=%u refused: pool %u was "
+                           "destroyed\n", (uint64_t)id, (uint64_t)pool->id);
+            return;
+        }
         o = add_obj(c, id, OBJ_BUFFER);
         if (o == NULL) return;
         o->pool_id = (int32_t)pool->id;
@@ -999,10 +1254,16 @@ static void dispatch_pool(struct wl_conn *c, struct wl_obj *pool, uint16_t opcod
         o->h = h;
         o->stride = stride;
         o->format = (int32_t)format;
+        o->released = 0;
+        o->destroyed = 0;
+        o->child_buffers = 0;
+        pool->child_buffers++;
+        g_buf_created++;
         console_printf("[wl] create_buffer id=%u pool=%u offset=%d %dx%d "
                        "stride=%d format=%u\n", (uint64_t)id, (uint64_t)pool->id,
                        (int64_t)offset, (int64_t)w, (int64_t)h, (int64_t)stride,
                        (uint64_t)format);
+        log_buffer_stats();
         if (format != WL_FMT_XRGB8888)
             console_printf("[wl] create_buffer id=%u: format %u is not XRGB8888,"
                            " the compositor will not blit it\n", (uint64_t)id,
@@ -1010,8 +1271,23 @@ static void dispatch_pool(struct wl_conn *c, struct wl_obj *pool, uint16_t opcod
         return;
     }
     if (opcode == 1u) {                  /* wl_shm_pool.destroy */
-        console_printf("[wl] shm_pool.destroy id=%u\n", (uint64_t)pool->id);
-        destroy_obj(c, pool);
+        if (pool->destroyed) {
+            console_printf("[wl] shm_pool.destroy id=%u ignored (already "
+                           "destroyed)\n", (uint64_t)pool->id);
+            return;
+        }
+        pool->destroyed = 1;
+        pool->pool_size = 0;
+        console_printf("[wl] shm_pool.destroy id=%u (fd=%d kept for %u live "
+                       "buffer(s); create_buffer refused from now on)\n",
+                       (uint64_t)pool->id, (int64_t)pool->pool_fd,
+                       (uint64_t)pool->child_buffers);
+        emit_display_delete_id(c, pool->id);
+        if (pool->child_buffers <= 0) {
+            console_printf("[wl] shm_pool.destroy id=%u: no live buffers, object "
+                           "released\n", (uint64_t)pool->id);
+            free_obj(pool);
+        }
         return;
     }
     console_printf("[wl] wl_shm_pool: unsupported opcode %u\n", (uint64_t)opcode);
@@ -1031,6 +1307,25 @@ static void dispatch_surface(struct wl_conn *c, struct wl_obj *surf,
         const int32_t y = rb_i32(r);
 
         if (r->err) return;
+        if (buffer_id != 0) {
+            struct wl_obj *b = find_obj(c, (uint32_t)buffer_id);
+
+            if (b == NULL || b->type != OBJ_BUFFER) {
+                console_printf("[wl] attach surface=%u refused: buffer %d is not "
+                               "a wl_buffer\n", (uint64_t)surf->id,
+                               (int64_t)buffer_id);
+                surf->buffer_id = 0;
+                break;
+            }
+            if (b->destroyed) {
+                console_printf("[wl] attach surface=%u refused: buffer %d was "
+                               "destroyed\n", (uint64_t)surf->id,
+                               (int64_t)buffer_id);
+                surf->buffer_id = 0;
+                break;
+            }
+            b->released = 0;               /* in use again, so a new release is due */
+        }
         surf->buffer_id = buffer_id;
         surf->attach_x = x;
         surf->attach_y = y;
@@ -1465,12 +1760,276 @@ static void send_kb_modifiers(struct wl_conn *c, struct wl_obj *o, uint32_t mods
  *
  * Crucially the PS/2 ports are only drained when *this* connection asked for
  * that capability.  A client without a wl_keyboard (e.g. `run wlclient`) can
- * therefore not swallow keys the shell or the GUI is waiting for. */
+ * therefore not swallow keys the shell or the GUI is waiting for.
+ *
+ * Placement (v0.61): the streams are *window-relative*.  The desktop shell
+ * reports the Wayland window rectangle through suture_gui_wayland_rect() and the
+ * server converts the kernel's screen-space pointer position into surface-local
+ * coordinates, ((screen - window origin) / buffer scale).  enter/leave follow the
+ * window boundary and motion is only sent inside it; the keyboard stream is gated
+ * on suture_gui_wayland_focused() so typing into another window cannot leak into
+ * the client.  With no window reported (terminal-only run, F2 window closed) the
+ * streams degrade to the original whole-surface semantics, which is what the
+ * older acceptance scripts were written against. */
+
+/* Re-read the window rectangle; logs only when it changes.  `allow_default` is
+ * set on the live-connection path: a client running in the terminal has no shell
+ * window, so its surface is treated as the Wayland window at the documented
+ * default geometry.  The desktop pump passes 0 (no window on screen, nothing to
+ * place).  Returns 1 with the rectangle filled. */
+static int wayland_window(int allow_default, int *x, int *y, int *w, int *h)
+{
+    int nx = 0, ny = 0, nw = 0, nh = 0;
+    int from_shell = 0;
+
+    if (suture_gui_wayland_rect != NULL &&
+        suture_gui_wayland_rect(&nx, &ny, &nw, &nh) == 1 && nw > 0 && nh > 0) {
+        from_shell = 1;
+    } else if (allow_default) {
+        nx = WL_WIN_DEF_X;
+        ny = WL_WIN_DEF_Y;
+        nw = WL_WIN_DEF_W;
+        nh = WL_WIN_DEF_H;
+    } else {
+        if (g_win_ok) {
+            g_win_ok = 0;
+            console_printf("[wl] wayland window closed\n");
+        }
+        g_win_from_shell = 0;
+        return 0;
+    }
+
+    if (!g_win_ok || g_win_from_shell != from_shell || nx != g_win_x ||
+        ny != g_win_y || nw != g_win_w || nh != g_win_h) {
+        g_win_changes++;
+        console_printf("[wl] wayland window %d,%d %dx%d (source=%s, screen -> "
+                       "surface-local mapping active, change=%u)\n", (int64_t)nx,
+                       (int64_t)ny, (int64_t)nw, (int64_t)nh,
+                       from_shell ? "shell" : "default",
+                       (uint64_t)g_win_changes);
+    }
+    g_win_ok = 1;
+    g_win_from_shell = from_shell;
+    g_win_x = nx;
+    g_win_y = ny;
+    g_win_w = nw;
+    g_win_h = nh;
+    if (x) *x = g_win_x;
+    if (y) *y = g_win_y;
+    if (w) *w = g_win_w;
+    if (h) *h = g_win_h;
+    return 1;
+}
+
+/* Keyboard focus for one pump.  While the shell owns the input devices its answer
+ * is authoritative (and drives the gate); without a shell window the client in the
+ * terminal is the only keyboard consumer, so keys keep flowing (pre-0.61
+ * behaviour). */
+static int window_focused(void)
+{
+    if (!g_win_from_shell) return 1;
+    return suture_gui_wayland_focused() != 0;
+}
+
+/* Desktop heartbeat: one line per state change and every ~2 s otherwise, so a
+ * 60 fps shell cannot flood the serial log. */
+static void desktop_beat(int has_win, int x, int y, int lx, int ly, int inside,
+                         int force)
+{
+    if (!force && (g_desk_calls % 120) != 0) return;
+    console_printf("[wl] desktop pump calls=%u events=%u keys=%u gated=%u "
+                   "window=%s%d,%d %dx%d pointer=%d,%d local=%d,%d inside=%d\n",
+                   (uint64_t)g_desk_calls, (uint64_t)g_desk_events,
+                   (uint64_t)g_desk_keys, (uint64_t)g_kb_gated,
+                   has_win ? "" : "none ", (int64_t)g_win_x, (int64_t)g_win_y,
+                   (int64_t)g_win_w, (int64_t)g_win_h, (int64_t)x, (int64_t)y,
+                   (int64_t)lx, (int64_t)ly, (int64_t)(inside ? 1 : 0));
+    g_desk_last_beat_calls = g_desk_calls;
+}
+
+/* ===================== desktop-side input pump (v0.61) =====================
+ * Called once per frame by the Rust desktop shell.  There is no live connection
+ * while the shell owns the screen, so nothing can be written to a socket; what
+ * still matters is *placement*: the window is showing the retained surface of the
+ * last commit, so the server maps the pointer/keyboard onto that surface with
+ * exactly the same rules as the live path and records the result.  That is what
+ * the window-placement acceptance checks, and it is the code a multi-tasking
+ * client reuses unchanged. */
+void wl_server_desktop_pump(void)
+{
+    int i, ci, has_win, mx, my, buttons, scale, sw, sh, inside, lx, ly;
+    int wx = 0, wy = 0, ww = 0, wh = 0;
+    int keys = 0, changed = 0;
+    uint8_t sc_byte;
+    uint32_t tick;
+    struct wl_keep *k;
+
+    /* Exited clients must not look alive: prune their slots first. */
+    for (i = 0; i < WL_SERVER_MAX_CONNS; i++)
+        if (g_conns[i].used && conn_peer_dead(&g_conns[i]))
+            conn_release(&g_conns[i]);
+    if (!g_started) return;
+
+    /* v0.61: decide ownership by what owns the *input devices*. While the desktop
+     * window is on screen the shell owns them and no client can be pumping (this
+     * kernel runs the GUI in the shell thread), so the desktop face runs even when
+     * a dead client's slot was left behind by the ring-3 fd teardown. Without a
+     * shell window a live connection owns both streams: its syscalls pump them. */
+    has_win = wayland_window(0, &wx, &wy, &ww, &wh);
+    if (!has_win) {
+        for (i = 0; i < WL_SERVER_MAX_CONNS; i++)
+            if (g_conns[i].used) return;
+    }
+
+    ci = g_latest_keep;
+    if (ci < 0 || ci >= WL_SERVER_MAX_CONNS) return;
+    k = &g_keep[ci];
+    if (!k->used) return;
+
+    g_desk_calls++;
+
+    /* Keys: the GUI consumes the real PS/2 stream, so nothing is taken from the
+     * controller here; the decoder mirrors every scancode it sees into the ring
+     * and this only drains the mirror to count/gate them. */
+    while (mbos_kbd_mirror_pop(&sc_byte, &tick)) {
+        if (sc_byte == 0xE0u) continue;
+        keys++;
+    }
+
+    if (has_win) {
+        const int focused = window_focused();
+
+        if (focused != g_desk_focused) {
+            console_printf("[wl] keyboard focus %d\n", (int64_t)(focused ? 1 : 0));
+            g_desk_focused = focused;
+            changed = 1;
+        }
+        if (keys) {
+            if (focused) {
+                g_desk_keys += (uint32_t)keys;
+                console_printf("[wl] keyboard key delivered (desktop) count=%d "
+                               "total=%u\n", (int64_t)keys, (uint64_t)g_desk_keys);
+            } else {
+                g_kb_gated += (uint32_t)keys;
+                console_printf("[wl] keyboard key gated (window not focused) "
+                               "gated=%u\n", (uint64_t)g_kb_gated);
+            }
+            changed = 1;
+        }
+    }
+
+    if (!has_win) {
+        if (g_desk_inside) {
+            g_desk_inside = 0;
+            g_desk_lx = g_desk_ly = -1;
+            console_printf("[wl] pointer leave id=0 surface=%u serial=%u "
+                           "(left the wayland window)\n",
+                           (uint64_t)k->surface_id, (uint64_t)++g_serial);
+            g_ptr_leaves++;
+            g_desk_events++;
+            changed = 1;
+        }
+        desktop_beat(0, 0, 0, 0, 0, 0, changed);
+        return;
+    }
+
+    mbos_mouse_poll();
+    mx = mbos_mouse_x();
+    my = mbos_mouse_y();
+    buttons = mbos_mouse_buttons();
+
+    scale = (k->scale >= 1) ? k->scale : 1;
+    sw = k->w / scale;
+    sh = k->h / scale;
+    if (sw < 1) sw = 1;
+    if (sh < 1) sh = 1;
+
+    inside = (mx >= wx && mx < wx + ww && my >= wy && my < wy + wh);
+    lx = (mx - wx) / scale;
+    ly = (my - wy) / scale;
+    if (lx < 0) lx = 0;
+    if (ly < 0) ly = 0;
+    if (lx >= sw) lx = sw - 1;
+    if (ly >= sh) ly = sh - 1;
+
+    if (!inside) {
+        if (g_desk_inside) {
+            g_desk_inside = 0;
+            g_desk_lx = g_desk_ly = -1;
+            g_desk_buttons = buttons;
+            console_printf("[wl] pointer leave id=0 surface=%u serial=%u "
+                           "(left the wayland window)\n",
+                           (uint64_t)k->surface_id, (uint64_t)++g_serial);
+            g_ptr_leaves++;
+            g_desk_events += 2;
+            changed = 1;
+        }
+        desktop_beat(1, mx, my, lx, ly, 0, changed);
+        return;
+    }
+
+    g_serial++;
+    if (!g_desk_inside) {
+        g_desk_inside = 1;
+        console_printf("[wl] pointer enter id=0 surface=%u %d,%d (kernel mouse "
+                       "%d,%d serial=%u)\n", (uint64_t)k->surface_id, (int64_t)lx,
+                       (int64_t)ly, (int64_t)mx, (int64_t)my, (uint64_t)g_serial);
+        console_printf("[wl] pointer motion id=0 time=%u %d,%d\n",
+                       (uint64_t)(time_source_now_ns() / 1000000ull),
+                       (int64_t)lx, (int64_t)ly);
+        console_printf("[wl] pointer window surface=%u window=%d,%d %dx%d "
+                       "local=%d,%d scale=%d kernel=%d,%d\n",
+                       (uint64_t)k->surface_id, (int64_t)wx, (int64_t)wy,
+                       (int64_t)ww, (int64_t)wh, (int64_t)lx, (int64_t)ly,
+                       (int64_t)scale, (int64_t)mx, (int64_t)my);
+        g_desk_lx = lx;
+        g_desk_ly = ly;
+        g_desk_buttons = buttons;
+        g_desk_events += 2;
+        changed = 1;
+    } else if (lx != g_desk_lx || ly != g_desk_ly) {
+        console_printf("[wl] pointer motion id=0 time=%u %d,%d\n",
+                       (uint64_t)(time_source_now_ns() / 1000000ull),
+                       (int64_t)lx, (int64_t)ly);
+        console_printf("[wl] pointer window surface=%u window=%d,%d %dx%d "
+                       "local=%d,%d scale=%d kernel=%d,%d\n",
+                       (uint64_t)k->surface_id, (int64_t)wx, (int64_t)wy,
+                       (int64_t)ww, (int64_t)wh, (int64_t)lx, (int64_t)ly,
+                       (int64_t)scale, (int64_t)mx, (int64_t)my);
+        g_desk_lx = lx;
+        g_desk_ly = ly;
+        g_desk_events++;
+        changed = 1;
+    }
+
+    if (buttons != g_desk_buttons) {
+        static const int bit[3] = { 1, 2, 4 };
+        static const uint32_t code[3] = { 0x110u, 0x111u, 0x112u };
+        int b;
+
+        for (b = 0; b < 3; b++) {
+            const int was = (g_desk_buttons & bit[b]) ? 1 : 0;
+            const int now = (buttons & bit[b]) ? 1 : 0;
+
+            if (was == now) continue;
+            console_printf("[wl] pointer button id=0 button=0x%x state=%u\n",
+                           (uint64_t)code[b], (uint64_t)(now ? 1u : 0u));
+            g_desk_events++;
+        }
+        g_desk_buttons = buttons;
+        changed = 1;
+    }
+
+    desktop_beat(1, mx, my, lx, ly, inside, changed);
+}
+
 static void input_pump(struct wl_conn *c)
 {
     int i;
     int has_kb = 0;
     int has_ptr = 0;
+    int has_win;
+    int wx = 0, wy = 0, ww = 0, wh = 0;
     uint32_t time_ms;
 
     for (i = 0; i < WL_SERVER_MAX_OBJECTS; i++) {
@@ -1481,11 +2040,37 @@ static void input_pump(struct wl_conn *c)
 
     time_ms = (uint32_t)(time_source_now_ns() / 1000000ull);
 
+    /* Placement is re-read once per pump: the shell can move the window (title
+     * bar drag) between two events and the local coordinates must follow it. */
+    has_win = wayland_window(1, &wx, &wy, &ww, &wh);
+
     /* ---------------- wl_keyboard ---------------- */
     if (has_kb) {
         int sc;
         uint8_t mirored_sc;
         uint32_t tick;
+        const int focused = has_win ? window_focused() : 1;
+
+        if (focused != g_kb_focused) {
+            console_printf("[wl] keyboard focus %d\n", (int64_t)(focused ? 1 : 0));
+            g_kb_focused = focused;
+            if (!focused) {
+                /* Focus lost: leave every surface this connection had entered. */
+                for (i = 0; i < WL_SERVER_MAX_OBJECTS; i++) {
+                    struct wl_obj *o = &c->objs[i];
+
+                    if (o->type != OBJ_KEYBOARD || o->entered_surface == 0u)
+                        continue;
+                    g_serial++;
+                    emit_kb_leave(c, o->id, g_serial, o->entered_surface);
+                    console_printf("[wl] keyboard leave id=%u surface=%u serial=%u "
+                                   "(window lost focus)\n", (uint64_t)o->id,
+                                   (uint64_t)o->entered_surface,
+                                   (uint64_t)g_serial);
+                    o->entered_surface = 0;
+                }
+            }
+        }
 
         while ((sc = mbos_kbd_poll()) >= 0)
             (void)mbos_kbd_decode((uint8_t)sc);          /* feeds the mirror */
@@ -1494,6 +2079,15 @@ static void input_pump(struct wl_conn *c)
             /* E0-prefixed keys arrive as two codes; skip the prefix byte itself
              * (it has no key of its own) and forward the rest. */
             if (mirored_sc == 0xE0u) continue;
+            if (!focused) {
+                /* Focus gate: this key belongs to another window.  Drop it, count
+                 * it and say so without flooding the log. */
+                g_kb_gated++;
+                if (g_kb_gated == 1u || (g_kb_gated % 8u) == 0u)
+                    console_printf("[wl] keyboard key gated (window not focused) "
+                                   "gated=%u\n", (uint64_t)g_kb_gated);
+                continue;
+            }
             for (i = 0; i < WL_SERVER_MAX_OBJECTS; i++) {
                 struct wl_obj *o = &c->objs[i];
                 const uint32_t state = MBOS_KBD_IS_RELEASE(mirored_sc)
@@ -1503,6 +2097,7 @@ static void input_pump(struct wl_conn *c)
                 uint32_t mods;
 
                 if (o->type != OBJ_KEYBOARD) continue;
+                if (o->entered_surface == 0u) continue;   /* not entered yet */
                 g_serial++;
                 emit_kb_key(c, o->id, g_serial, tick, key, state);
                 g_kb_events++;
@@ -1518,33 +2113,32 @@ static void input_pump(struct wl_conn *c)
             }
         }
 
-        /* keyboard enter, once a surface of *this* connection exists (emitted
-         * after the keys already queued in the mirror ring: the very first pump
-         * may therefore deliver one key event - the keyup of the shell's Enter -
-         * before wl_keyboard.enter. Documented limitation.) */
-        /* keyboard enter, once a surface of *this* connection exists */
-        for (i = 0; i < WL_SERVER_MAX_OBJECTS; i++) {
-            struct wl_obj *o = &c->objs[i];
-            const int ci = (int)(c - g_conns);
-            const struct wl_keep *k;
+        /* keyboard enter: needs the window focus and a surface this connection
+         * committed.  The keymap (a real XKB memfd) goes out ahead of enter. */
+        if (focused) {
+            for (i = 0; i < WL_SERVER_MAX_OBJECTS; i++) {
+                struct wl_obj *o = &c->objs[i];
+                const int ci = (int)(c - g_conns);
+                const struct wl_keep *k;
 
-            if (o->type != OBJ_KEYBOARD || o->entered_surface != 0u) continue;
-            if (ci < 0 || ci >= WL_SERVER_MAX_CONNS) continue;
-            k = &g_keep[ci];
-            if (!k->used) continue;
-            emit_kb_keymap(c, o->id);
-            g_serial++;
-            emit_kb_enter(c, o->id, g_serial, k->surface_id);
-            o->entered_surface = k->surface_id;
-            console_printf("[wl] keyboard enter id=%u surface=%u serial=%u "
-                           "(keymap=NO_KEYMAP, evdev keycodes)\n",
-                           (uint64_t)o->id, (uint64_t)k->surface_id,
-                           (uint64_t)g_serial);
-            send_kb_modifiers(c, o, mbos_kbd_mod_state(), "enter");
+                if (o->type != OBJ_KEYBOARD || o->entered_surface != 0u) continue;
+                if (ci < 0 || ci >= WL_SERVER_MAX_CONNS) continue;
+                k = &g_keep[ci];
+                if (!k->used) continue;
+                if (!o->keymap_sent) {
+                    emit_kb_keymap(c, o->id);        /* format 1 + memfd descriptor */
+                    o->keymap_sent = 1;
+                }
+                g_serial++;
+                emit_kb_enter(c, o->id, g_serial, k->surface_id);
+                o->entered_surface = k->surface_id;
+                console_printf("[wl] keyboard enter id=%u surface=%u serial=%u "
+                               "(keymap=xkb_v1, evdev keycodes)\n",
+                               (uint64_t)o->id, (uint64_t)k->surface_id,
+                               (uint64_t)g_serial);
+                send_kb_modifiers(c, o, mbos_kbd_mod_state(), "enter");
+            }
         }
-
-        /* Keys are only delivered once the keyboard is entered on a surface (a
-         * wl_keyboard.key before wl_keyboard.enter would be out of order). */
     }
 
     /* ---------------- wl_pointer ---------------- */
@@ -1560,36 +2154,78 @@ static void input_pump(struct wl_conn *c)
             struct wl_obj *o = &c->objs[i];
             const int ci = (int)(c - g_conns);
             const struct wl_keep *k;
-            int x, y, changed, btn_changed;
+            int scale, sw, sh, inside, lx, ly, changed, btn_changed;
 
             if (o->type != OBJ_POINTER) continue;
             if (ci < 0 || ci >= WL_SERVER_MAX_CONNS) continue;
             k = &g_keep[ci];
             if (!k->used) continue;        /* need this client's own surface */
 
-            x = mx;
-            y = my;
-            if (x < 0) x = 0;
-            if (y < 0) y = 0;
-            if (x >= k->w) x = k->w - 1;
-            if (y >= k->h) y = k->h - 1;
+            /* wl_pointer coordinates are surface-local (logical): the window
+             * offset divided by the buffer scale. */
+            scale = (k->scale >= 1) ? k->scale : 1;
+            sw = k->w / scale;
+            sh = k->h / scale;
+            if (sw < 1) sw = 1;
+            if (sh < 1) sh = 1;
+
+            if (has_win) {
+                inside = (mx >= wx && mx < wx + ww && my >= wy && my < wy + wh);
+                lx = (mx - wx) / scale;
+                ly = (my - wy) / scale;
+            } else {
+                inside = 1;                /* no window: whole surface, as before */
+                lx = mx;
+                ly = my;
+            }
+            if (lx < 0) lx = 0;
+            if (ly < 0) ly = 0;
+            if (lx >= sw) lx = sw - 1;
+            if (ly >= sh) ly = sh - 1;
+
+            /* Outside the window: the pointer has left this surface. */
+            if (!inside) {
+                if (o->pointer_sent) {
+                    g_serial++;
+                    emit_pointer_leave(c, o->id, g_serial, o->entered_surface);
+                    console_printf("[wl] pointer leave id=%u surface=%u serial=%u "
+                                   "(left the wayland window)\n",
+                                   (uint64_t)o->id, (uint64_t)o->entered_surface,
+                                   (uint64_t)g_serial);
+                    if (o->version >= 5u) emit_pointer_frame(c, o->id);
+                    o->pointer_sent = 0;
+                    o->entered_surface = 0;
+                    o->last_buttons = buttons;
+                    g_ptr_leaves++;
+                    c->ptr_events += 2;
+                    g_ptr_events += 2;
+                }
+                continue;
+            }
 
             if (!o->pointer_sent) {
                 g_serial++;
-                emit_pointer_enter(c, o->id, g_serial, k->surface_id, x, y);
+                emit_pointer_enter(c, o->id, g_serial, k->surface_id, lx, ly);
                 console_printf("[wl] pointer enter id=%u surface=%u %d,%d "
                                "(kernel mouse %d,%d serial=%u)\n",
                                (uint64_t)o->id, (uint64_t)k->surface_id,
-                               (int64_t)x, (int64_t)y, (int64_t)mx,
-                               (int64_t)my, (uint64_t)g_serial);
-                emit_pointer_motion(c, o->id, time_ms, x, y);
+                               (int64_t)lx, (int64_t)ly, (int64_t)mx, (int64_t)my,
+                               (uint64_t)g_serial);
+                emit_pointer_motion(c, o->id, time_ms, lx, ly);
                 console_printf("[wl] pointer motion id=%u time=%u %d,%d\n",
-                               (uint64_t)o->id, (uint64_t)time_ms, (int64_t)x,
-                               (int64_t)y);
+                               (uint64_t)o->id, (uint64_t)time_ms, (int64_t)lx,
+                               (int64_t)ly);
+                if (has_win)
+                    console_printf("[wl] pointer window surface=%u window=%d,%d "
+                                   "%dx%d local=%d,%d scale=%d kernel=%d,%d\n",
+                                   (uint64_t)k->surface_id, (int64_t)wx,
+                                   (int64_t)wy, (int64_t)ww, (int64_t)wh,
+                                   (int64_t)lx, (int64_t)ly, (int64_t)scale,
+                                   (int64_t)mx, (int64_t)my);
                 o->pointer_sent = 1;
                 o->entered_surface = k->surface_id;
-                o->last_x = x;
-                o->last_y = y;
+                o->last_x = lx;
+                o->last_y = ly;
                 o->last_buttons = buttons;
                 c->ptr_events += 2;
                 g_ptr_events += 2;
@@ -1597,16 +2233,23 @@ static void input_pump(struct wl_conn *c)
                 continue;
             }
 
-            changed = (x != o->last_x || y != o->last_y);
+            changed = (lx != o->last_x || ly != o->last_y);
             btn_changed = (buttons != o->last_buttons);
 
             if (changed) {
-                emit_pointer_motion(c, o->id, time_ms, x, y);
+                emit_pointer_motion(c, o->id, time_ms, lx, ly);
                 console_printf("[wl] pointer motion id=%u time=%u %d,%d\n",
-                               (uint64_t)o->id, (uint64_t)time_ms, (int64_t)x,
-                               (int64_t)y);
-                o->last_x = x;
-                o->last_y = y;
+                               (uint64_t)o->id, (uint64_t)time_ms, (int64_t)lx,
+                               (int64_t)ly);
+                if (has_win)
+                    console_printf("[wl] pointer window surface=%u window=%d,%d "
+                                   "%dx%d local=%d,%d scale=%d kernel=%d,%d\n",
+                                   (uint64_t)k->surface_id, (int64_t)wx,
+                                   (int64_t)wy, (int64_t)ww, (int64_t)wh,
+                                   (int64_t)lx, (int64_t)ly, (int64_t)scale,
+                                   (int64_t)mx, (int64_t)my);
+                o->last_x = lx;
+                o->last_y = ly;
                 c->ptr_events++;
                 g_ptr_events++;
             }
@@ -1674,8 +2317,40 @@ static void dispatch(struct wl_conn *c, const uint8_t *msg, uint32_t size)
     case OBJ_POINTER:     dispatch_pointer(c, o, opcode, &r); break;
     case OBJ_BUFFER:
         if (opcode == 0u) {
-            console_printf("[wl] buffer.destroy id=%u\n", (uint64_t)o->id);
+            struct wl_obj *pool = find_obj(c, (uint32_t)o->pool_id);
+            int si;
+
+            /* Anything still attaching this buffer has to drop it: a destroyed
+             * buffer cannot be committed again. */
+            for (si = 0; si < WL_SERVER_MAX_OBJECTS; si++) {
+                struct wl_obj *sf = &c->objs[si];
+
+                if (sf->type != OBJ_SURFACE) continue;
+                if (sf->buffer_id != (int32_t)o->id) continue;
+                sf->buffer_id = 0;
+                console_printf("[wl] buffer.destroy id=%u: detached from "
+                               "surface=%u\n", (uint64_t)o->id,
+                               (uint64_t)sf->id);
+            }
+            o->destroyed = 1;
+            o->released = 1;
+            g_buf_destroyed++;
+            console_printf("[wl] buffer.destroy id=%u (pool=%u, released=%u)\n",
+                           (uint64_t)o->id, (uint64_t)o->pool_id,
+                           (uint64_t)g_buf_released);
+            log_buffer_stats();
+            if (pool != NULL && pool->type == OBJ_POOL && pool->child_buffers > 0) {
+                pool->child_buffers--;
+                if (pool->destroyed && pool->child_buffers == 0) {
+                    console_printf("[wl] shm_pool.destroy id=%u: last buffer gone, "
+                                   "object released\n", (uint64_t)pool->id);
+                    destroy_obj(c, pool);
+                }
+            }
             destroy_obj(c, o);
+        } else {
+            console_printf("[wl] wl_buffer(id=%u): unsupported opcode %u\n",
+                           (uint64_t)o->id, (uint64_t)opcode);
         }
         break;
     case OBJ_KEYBOARD:
@@ -1766,10 +2441,15 @@ void wl_server_pump(int server_fd)
     conn_flush(c);
 
     /* Drain everything the client has written so far. */
+    int peer_closed = 0;
     while (c->in_len < WL_SERVER_IN_MAX) {
         const int n = unix_read_fd(server_fd, c->in + c->in_len,
                                    WL_SERVER_IN_MAX - c->in_len);
-        if (n <= 0) break;               /* 0 = client closed, -EAGAIN = empty */
+        if (n == 0) {                    /* peer closed: process, then release */
+            peer_closed = 1;
+            break;
+        }
+        if (n < 0) break;                /* -EAGAIN = nothing more */
         c->in_len += (uint32_t)n;
     }
 
@@ -1793,6 +2473,12 @@ void wl_server_pump(int server_fd)
     input_pump(c);
 
     conn_flush(c);
+
+    if (peer_closed) {
+        /* the client is gone: flush whatever it queued, then free the slot so the
+         * table does not leak and the desktop pump can take over */
+        conn_release(c);
+    }
 }
 
 int wl_server_latest_surface(int *w, int *h, int *stride, const uint8_t **px)
@@ -1891,6 +2577,32 @@ uint32_t wl_server_pointer_event_count(void)
 {
     return g_ptr_events;
 }
+
+/* The XKB keymap this server hands to clients: byte count + FNV-1a of the text
+ * (0 before the first keyboard was created). */
+uint32_t wl_server_keymap_size(void) { return g_keymap_size; }
+uint32_t wl_server_keymap_hash(void) { return g_keymap_hash; }
+
+/* Key events the focus gate dropped because the Wayland window was not focused. */
+uint32_t wl_server_keys_gated(void) { return g_kb_gated; }
+
+/* Leaves caused by the pointer leaving the Wayland window. */
+uint32_t wl_server_pointer_leaves(void) { return g_ptr_leaves; }
+
+/* Window rectangle changes seen (>= 2 means the window was moved). */
+uint32_t wl_server_window_changes(void) { return g_win_changes; }
+
+/* wl_buffer lifecycle counters: buffers created, releases sent, buffers
+ * destroyed, and releases skipped because the buffer had not been re-attached.
+ * Any out pointer may be NULL. */
+void wl_server_buffer_stats(int *created, int *released, int *destroyed)
+{
+    if (created) *created = (int)g_buf_created;
+    if (released) *released = (int)g_buf_released;
+    if (destroyed) *destroyed = (int)g_buf_destroyed;
+}
+
+uint32_t wl_server_buffer_stats_skipped(void) { return g_buf_release_skipped; }
 
 uint32_t wl_server_events_dropped(void)
 {

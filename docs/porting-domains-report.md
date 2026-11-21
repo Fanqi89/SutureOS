@@ -225,7 +225,36 @@
   - 修 `mmap(addr=NULL)` 二次映射覆盖前次 PTE 的 bug（memfd A 24576B 与 B 64000B 落重叠区间）：
     `user_map_alloc()` 单调下降游标，memfd 与匿名两支共用；`wltwo` 把它变成常驻断言
     （不重叠 + 第一次映射数据未变），窗口不回收属已知限制。
-- **仍未完成**：真正的 vsync 源（本机没有扫描线中断，60 Hz 是墙上时钟栅格）、damage 合并策略细化、
+- **GUI 第二轮（v0.61，未发布）**：
+  - 桌面文本编辑器真编辑：`apps.rs` 多行缓冲区（10×38）+ `editor_key/editor_move/editor_snapshot`，
+    `editor_body` 画真实缓冲区与光标；焦点在编辑器时按键路由到缓冲区（含方向键/Home/End），
+    **F5 经 `vfs_write_file` 写 `/mnt/fat/GUIEDIT.TXT`**；`gui_editor_live_acceptance.py` **12/12**
+    （真键盘 → F5 → 宿主解析 FAT32 镜像逐字节比对 + "输入可见"像素断言）。
+  - 修活数据穿透：任务管理器 uptime/CPU/心跳点原来在所有窗口层之后绘制，会穿到上层窗口里；
+    改为各窗口活数据紧跟自身层、按 z 序绘制（验收断言该处 cyan 像素为 0）。
+  - damage 合并细化：32×32 tile 位图（32×24）为真源，`add()` 后行扫描 + 纵向合并重建矩形表
+    （上限 16 块，满了折叠进最后一块）；实测安静 30 帧窗口 ~250 tiles / 4 块 / permille 132，
+    含菜单+拖动的窗口 permille 446，oracle 0 mismatch；`guishell_damage_acceptance.py` **28/28**。
+    光标快路径判据随之改为 `tile_count() <= 4`（tile 粒度下斜向移动会触 4 个 tile）。
+  - 桌面 Wayland pump 钩子：GUI 跑在 shell 线程、期间无 ring-3 客户端，服务端原来只在客户端
+    syscall 路径 pump → 桌面上的 Wayland 窗口收不到指针事件；外壳每帧调用弱符号
+    `wl_server_desktop_pump()`（`slint_bridge.c` 空实现），服务端按真实窗口矩形映射指针进保留
+    surface 并打与活路径一致的日志。
+  - Wayland 窗口摆放与输入语义：`wl_pointer` 的 enter/motion/leave 按窗口矩形换算成 surface 局部
+    坐标（`local=(mouse-origin)/scale`，窗口内才发 enter/motion），矩形优先取
+    `suture_gui_wayland_rect()`（`source=shell`），终端客户端场景退化为默认 (250,330,440,330)；
+    `wl_keyboard` 按 `suture_gui_wayland_focused()` 门控并计数被丢的键。
+  - keymap 真实下发：2614 B 精简 XKB 写 memfd → SCM_RIGHTS → `wl_keyboard.keymap(format=1, size, fd)`，
+    客户端 map_shared 后算 FNV-1a，服务端/客户端/宿主三方一致（`43d6be15`）。
+  - buffer 生命周期：release 每 attach 周期只发一次；`wl_buffer.destroy` 后该 surface 不可再 attach；
+    `wl_shm_pool.destroy` 保留 fd（已建 buffer 可继续 commit，但 create_buffer 被拒）；
+    `wl_server_buffer_stats()` 实测 created=2 released=4 destroyed=1。
+  - 两个真 bug：①连接槽泄漏（pump 读到 EOF 只 break，`used` 永远为 1 → 4 槽耗尽 + desktop pump
+    永久早退）→ `conn_release()` 在 EOF 后释放槽并保留 g_keep[] surface；②归属判据错（ring-3 退出后
+    unix 对端不报 EOF）→ 改为按输入设备归属判定，`source=shell` 时桌面 pump 必须跑。
+  - `wl_win_semantics_acceptance.py` **30/30**（窗口矩形/局部坐标逐条验算、真实拖动后坐标跟随、
+    enter/motion/leave、焦点门控、keymap 三方 hash、buffer 生命周期）。
+- **仍未完成**：真正的 vsync 源（本机没有扫描线中断，60 Hz 是墙上时钟栅格）、
   窗口内键盘焦点、Wayland scaling 的真实合成与"surface 作为真正窗口表面"（无窗口命中/摆放）、
   `wl_keyboard` keymap（内核无 XKB 数据）、多 surface 历史与 buffer 回收、最大/还原过渡的局部重绘。
 

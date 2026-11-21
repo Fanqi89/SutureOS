@@ -113,6 +113,35 @@ uint32_t wl_server_key_event_count(void);
 uint32_t wl_server_pointer_event_count(void);
 uint32_t wl_server_events_dropped(void);
 
+/* Desktop-side input pump (v0.61): the Rust desktop shell calls this once per
+ * frame.  When no client connection is alive (the shell owns the screen) the
+ * server still owns the placement of the retained surface the window shows, so it
+ * maps the kernel pointer/keyboard onto that surface with the same rules as the
+ * live path and records the result through the usual `[wl] pointer ...` lines with
+ * id=0.  Returns immediately while a client connection exists (the client's own
+ * syscalls pump the streams then).  Cheap: one rect query, one mouse read and a
+ * bounded mirror drain; no allocation. */
+void wl_server_desktop_pump(void);
+
+/* The XKB keymap handed to clients (wl_keyboard.keymap format 1): byte count and
+ * FNV-1a of the text, 0 before the first keyboard was created. */
+uint32_t wl_server_keymap_size(void);
+uint32_t wl_server_keymap_hash(void);
+
+/* Key events dropped by the focus gate, pointer leaves caused by the pointer
+ * leaving the Wayland window, and window rectangle changes seen (>= 2 means the
+ * window was moved). */
+uint32_t wl_server_keys_gated(void);
+uint32_t wl_server_pointer_leaves(void);
+uint32_t wl_server_window_changes(void);
+
+/* wl_buffer lifecycle counters: buffers created by create_buffer, release events
+ * sent, buffers destroyed.  Any out pointer may be NULL. */
+void wl_server_buffer_stats(int *created, int *released, int *destroyed);
+
+/* Releases skipped because the buffer had not been re-attached since the last one. */
+uint32_t wl_server_buffer_stats_skipped(void);
+
 /* 1 once the server has started (a name is bound / a client connected). */
 int wl_server_active(void);
 

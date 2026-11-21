@@ -105,6 +105,8 @@ static long sc3(long nr, long a, long b, long c)
 #define ID_SUBSURF    13u
 #define ID_REGION     20u
 #define ID_CALLBACK   21u
+#define ID_BUFFER2    30u                    /* second buffer id (lifecycle test) */
+#define ID_POOL2      31u
 
 #define BIN_A "/mnt/fat/WLTWO.BIN"
 #define BIN_B "/mnt/fat/WLTWO2.BIN"
@@ -285,6 +287,12 @@ static unsigned g_kb_press, g_kb_release;
 static unsigned g_kb_codes[8];
 static int      g_kb_code_count;
 
+/* keymap: the descriptor arrives over SCM_RIGHTS and the text is hashed so the
+ * host can recompute the same FNV-1a from its own copy of the keymap. */
+static int      g_keymap_fd = -1;
+static unsigned g_keymap_format, g_keymap_size, g_keymap_hash;
+static int      g_keymap_ok;
+
 static int      g_ptr_enter, g_ptr_leave;
 static unsigned g_ptr_motion, g_ptr_button_press, g_ptr_button_release;
 static unsigned g_ptr_frame;
@@ -341,10 +349,32 @@ static int pump(struct conn *c, int verbose)
             g_releases++;
         } else if (obj == ID_KB) {
             if (op == 0u) {
+                const unsigned fmt = get32(c->rx + 8);
+                const unsigned ksize = get32(c->rx + 12);
+
                 g_kb_keymap = 1;
-                if (verbose)
-                    printf("[wltwo]   event keyboard.keymap format=%u size=%u\n",
-                           get32(c->rx + 8), get32(c->rx + 12));
+                g_keymap_format = fmt;
+                g_keymap_size = ksize;
+                /* always printed: this event is the SCM_RIGHTS keymap evidence */
+                printf("[wltwo]   event keyboard.keymap format=%u size=%u\n",
+                       fmt, ksize);
+                /* format 1 = XKB_V1: the descriptor carries the keymap text.  Map
+                 * it and hash it - the host recomputes the same value. */
+                if (fmt == 1u && ksize > 0u && g_keymap_fd >= 0) {
+                    const long addr = sc2(NR_MAP_SHARED, (long)g_keymap_fd,
+                                          (long)ksize);
+
+                    if (addr > 0) {
+                        g_keymap_hash = fnv1a((const unsigned char *)(uintptr_t)addr,
+                                              ksize);
+                        g_keymap_ok = 1;
+                        printf("[wltwo] keymap fd=%d size=%u hash=%08x\n",
+                               g_keymap_fd, ksize, g_keymap_hash);
+                    } else {
+                        printf("[wltwo] keymap fd=%d map_shared(%u) failed (%ld)\n",
+                               g_keymap_fd, ksize, addr);
+                    }
+                }
             } else if (op == 1u) {
                 g_kb_enter = 1;
                 if (verbose)
@@ -442,6 +472,25 @@ static void fill_b(unsigned char *map)
                 row[x] = 0xFF000000u | (gy << 16) | (gx << 8) | 0x20u;
         }
     }
+}
+
+/* Read one batch while asking the kernel for the SCM_RIGHTS descriptor that
+ * travels with it.  The int 0x80 recv path only pops a descriptor when bytes are
+ * pending, which is exactly the case right after wl_seat.get_keyboard (the server
+ * queues the keymap memfd and then flushes the keymap event). */
+static int recv_with_fd(struct conn *c, int *fd)
+{
+    int got_fd = -1;
+    long n;
+
+    *fd = -1;
+    if (c->rx_len >= sizeof(c->rx)) return 0;
+    n = sc3(NR_RECV_FD, c->fd, (long)(uintptr_t)&got_fd,
+            (long)(uintptr_t)(c->rx + c->rx_len));
+    if (n <= 0) return (int)n;
+    c->rx_len += (unsigned)n;
+    *fd = got_fd;
+    return (int)n;
 }
 
 /* ---------------- client session helpers ---------------------------------- *
@@ -716,6 +765,12 @@ int main(int argc, char **argv)
     {
         const unsigned h2 = fnv1a(map_a, A_BYTES);
 
+        msg_begin(&g_a, ID_SURFACE, 1u);  /* attach again: in use for frame 2 */
+        msg_i32(&g_a, (int)ID_BUFFER);
+        msg_i32(&g_a, 0);
+        msg_i32(&g_a, 0);
+        check(msg_send(&g_a), "A: re-attach the buffer for frame 2");
+
         msg_begin(&g_a, ID_SURFACE, 2u);  /* damage(16,16 32x32) */
         msg_i32(&g_a, DMG_X); msg_i32(&g_a, DMG_Y);
         msg_i32(&g_a, DMG_W); msg_i32(&g_a, DMG_H);
@@ -730,10 +785,31 @@ int main(int argc, char **argv)
     msg_begin(&g_a, ID_SEAT, 1u);        /* wl_seat.get_keyboard(ID_KB) */
     msg_u32(&g_a, ID_KB);
     check(msg_send(&g_a), "A: wl_seat.get_keyboard");
+    /* The keymap descriptor rides with the keymap event: ask for it now, before
+     * anything else is read, and parse whatever arrived in the same batch. */
+    {
+        int tries;
+
+        for (tries = 0; tries < 400 && !g_keymap_ok; tries++) {
+            int fd = -1;
+
+            if (recv_with_fd(&g_a, &fd) > 0) {
+                if (fd >= 0) g_keymap_fd = fd;
+            } else {
+                tiny_delay();
+            }
+            pump(&g_a, 0);
+            if (g_keymap_fd < 0 && (tries % 40) == 0) tiny_delay();
+        }
+        check(g_keymap_fd >= 0, "wl_keyboard.keymap carried a memfd over SCM_RIGHTS");
+        check(g_keymap_ok && g_keymap_format == 1u,
+              "keymap is XKB_V1 (format 1) and its text hashes");
+    }
+
     msg_begin(&g_a, ID_SEAT, 0u);        /* wl_seat.get_pointer(ID_PTR) */
     msg_u32(&g_a, ID_PTR);
     check(msg_send(&g_a), "A: wl_seat.get_pointer");
-    pump(&g_a, 1);                       /* keymap / enter / modifiers */
+    pump(&g_a, 1);                       /* enter / motion / frame */
 
     t0 = sc1(NR_TICKS, 0);
     waited = 0;
@@ -779,14 +855,60 @@ int main(int argc, char **argv)
     check(g_ptr_frame >= 1u, "wl_pointer.frame groups delivered (seat v7)");
     check(g_ptr_leave, "wl_pointer.leave received after the release");
     check(g_releases >= 3u, "three wl_buffer.release events");
+    check(g_keymap_ok, "keymap text read out of the SCM_RIGHTS memfd");
 
-    /* ---- 8. export both frames for host-side verification -------------- */
+    /* ---- 8. buffer lifecycle ------------------------------------------- *
+     * wl_shm_pool.destroy keeps the descriptor alive for the buffers it already
+     * made (attach/commit still work) but refuses create_buffer; wl_buffer.destroy
+     * makes the object unusable (attach is refused and the surface drops it). */
+    msg_begin(&g_a, ID_POOL, 1u);        /* wl_shm_pool.destroy(pool 7) */
+    check(msg_send(&g_a), "A: wl_shm_pool.destroy (existing buffer stays usable)");
+    pump(&g_a, 1);
+
+    msg_begin(&g_a, ID_POOL, 0u);        /* create_buffer on the dead pool */
+    msg_u32(&g_a, ID_POOL2);             /* id (unused by the server on refusal) */
+    msg_i32(&g_a, 0);
+    msg_i32(&g_a, 8);
+    msg_i32(&g_a, 8);
+    msg_i32(&g_a, 32);
+    msg_u32(&g_a, WL_SHM_XRGB8888);
+    check(msg_send(&g_a), "A: create_buffer on the destroyed pool (must be refused)");
+    pump(&g_a, 1);
+
+    msg_begin(&g_a, ID_SURFACE, 1u);     /* attach the existing buffer again */
+    msg_i32(&g_a, (int)ID_BUFFER);
+    msg_i32(&g_a, 0);
+    msg_i32(&g_a, 0);
+    check(msg_send(&g_a), "A: attach after the pool was destroyed");
+    check(commit_surface(&g_a, 1),
+          "A: commit after the pool was destroyed (buffer data still usable)");
+
+    msg_begin(&g_a, ID_BUFFER, 0u);      /* wl_buffer.destroy(buffer 8) */
+    check(msg_send(&g_a), "A: wl_buffer.destroy");
+    pump(&g_a, 1);
+
+    msg_begin(&g_a, ID_SURFACE, 1u);     /* attach the destroyed buffer */
+    msg_i32(&g_a, (int)ID_BUFFER);
+    msg_i32(&g_a, 0);
+    msg_i32(&g_a, 0);
+    check(msg_send(&g_a), "A: attach a destroyed buffer (must be refused)");
+    pump(&g_a, 1);
+
+    msg_begin(&g_a, ID_SURFACE, 6u);     /* commit with nothing attached */
+    check(msg_send(&g_a), "A: commit with no buffer (must be refused)");
+    pump(&g_a, 1);
+
+    /* ---- 9. export both frames for host-side verification -------------- */
     check(write_file(BIN_A, map_a, (unsigned)A_BYTES), "A: wrote " BIN_A);
     check(write_file(BIN_B, map_b, (unsigned)B_BYTES), "B: wrote " BIN_B);
 
     printf("[wltwo] frames: A %dx%d scale=%d hash=%08x bytes=%d, B %dx%d "
            "scale=%d hash=%08x bytes=%d\n", A_W, A_H, A_SCALE, hash_a, A_BYTES,
            B_W, B_H, B_SCALE, hash_b, B_BYTES);
+    printf("[wltwo] keymap: format=%u size=%u fd=%d hash=%08x\n",
+           g_keymap_format, g_keymap_size, g_keymap_fd, g_keymap_hash);
+    printf("[wltwo] lifecycle: pool destroyed, create_buffer refused, buffer "
+           "destroyed, attach refused, empty commit refused\n");
     printf("[wltwo] input: keyboard press=%u release=%u keymap=%d enter=%d "
            "modifiers=%u | pointer enter=%d motion=%u button=%u/%u frame=%u "
            "leave=%d\n", g_kb_press, g_kb_release, g_kb_keymap, g_kb_enter,

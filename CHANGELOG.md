@@ -8,6 +8,52 @@ in the repository.
 
 ## [Unreleased]
 
+### GUI 第二轮（v0.61 未发布）：桌面文本编辑器真编辑 + damage tile 网格 + 活数据遮挡修复
+
+- **桌面文本编辑器真编辑**：`apps.rs` 新增多行缓冲区（10 行 × 38 列）与
+  `editor_key/editor_move/editor_snapshot/editor_caret`；`editor_body` 改画真实缓冲区
+  （行号、当前行高亮、光标块、"Ln x, Col y ・ N 行 ・ F5 保存" 状态栏）。焦点在编辑器窗口时
+  按键路由到缓冲区（可打印字符、Backspace、Enter、左右上下、Home/End），**F5 经内核 VFS
+  `vfs_write_file` 把缓冲区写进 `/mnt/fat/GUIEDIT.TXT`**（串口日志 `editor saved N bytes rc=0`）。
+  新增 `scripts/gui_editor_live_acceptance.py` **12/12**：真 QEMU 真键盘输入 → F5 → 宿主解析
+  FAT32 镜像逐字节比对（不信任客人自述），并断言输入文本在屏幕上可见。
+- **修活数据穿透上层窗口**：任务管理器的 uptime/CPU%/心跳点原本在所有窗口层之后统一绘制，
+  会穿到叠在上面的窗口里（实测心跳点出现在编辑器窗口 (858,342)）。改为每个窗口的活数据紧跟
+  自己的层、按 z 序绘制，上层窗口自然覆盖；验收加像素断言（该处 cyan 像素必须为 0）。
+- **damage 合并细化（tile 网格）**：`Damage` 改为 32×32 tile 位图（32×24）为唯一真源，
+  `add()` 置位后按行扫描 + 纵向合并重建矩形表（上限 16 块，满了折叠进最后一块，只会多画不会漏画），
+  替代原来"最多 6 块、满了退化成整屏包围盒"。实测（30 帧窗口）安静窗口 ~250 tiles / 4 块矩形 /
+  permille 132，含菜单与拖动的窗口 permille 446；oracle 仍 0 mismatch。
+  `guishell_damage_acceptance.py` 扩到 **28/28**。
+  随之修正光标快路径判据：tile 粒度下斜向移动会触到 4 个 tile（4096 px），像素预算会误判，
+  改为 `tile_count() <= 4`。
+- **桌面 Wayland pump 钩子**：本内核 GUI 外壳跑在 shell 线程里，`startgui` 期间不能同时跑 ring-3
+  Wayland 客户端，而服务端只在客户端 syscall 路径里 pump → 桌面上的 Wayland 窗口收不到指针事件。
+  外壳帧循环现在每帧调用弱符号 `wl_server_desktop_pump()`（空实现由 `slint_bridge.c` 提供），
+  服务端据此按真实窗口矩形把指针映射进保留 surface 并打与活路径一致的 enter/motion/leave 日志。
+- **Wayland 窗口摆放与输入语义**：`wl_pointer` 的 enter/motion/leave 改为按 Wayland 窗口在屏幕上
+  的矩形换算成 **surface 局部坐标**（`local = (mouse - window_origin) / buffer_scale`，窗口内才发
+  enter/motion、离开发 leave）；窗口矩形优先取 Rust 外壳的 `suture_gui_wayland_rect()`（桌面运行时
+  `source=shell`），终端里跑活客户端时退化为默认 (250,330,440,330)。键盘按
+  `suture_gui_wayland_focused()` 门控，未聚焦时丢键并计数（`[wl] keyboard key gated ... gated=N`）。
+- **keymap 真实下发**：2614 B 精简 XKB keymap 写进 memfd，通过 SCM_RIGHTS 在
+  `wl_keyboard.keymap(format=1, size=2614, fd=..)` 发给客户端，客户端 map_shared 后算 FNV-1a；
+  服务端、客户端、宿主三方一致（`43d6be15`）。
+- **buffer 生命周期**：release 每 attach 周期只发一次；`wl_buffer.destroy` 后该 surface 不可再
+  attach；`wl_shm_pool.destroy` 保留 fd（已建 buffer 仍可 attach+commit，但 create_buffer 被拒）；
+  新增 `wl_server_buffer_stats()`（实测 created=2 released=4 destroyed=1 skipped=0）。
+- **两个真 bug（桌面 pump 一直跑不起来的根因）**：
+  - **连接槽泄漏**：`wl_server_pump()` 读到 0（对端关闭）只 break，`g_conns[i].used` 永远为 1 →
+    4 槽连接表会耗尽，且"有活连接就 return"的 desktop pump 永久早退。修：`conn_release()` 在 EOF
+    后（先 dispatch 完缓冲请求）释放槽，**保留 g_keep[] 里的 surface**（桌面继续显示最后一帧）。
+  - **归属判据错**：本内核 ring-3 退出后 unix 对端仍不报 EOF，槽看着还活着；改为按"谁拥有输入
+    设备"判定——先取窗口矩形，`source=shell` 时 shell 拥有输入、单任务内核下没有客户端能在 pump，
+    桌面 pump 必须跑；只有终端路径才尊重"活连接独占两条流"。
+- 验收（同一份 ISO）：静态 **21/21**、交互 **13/13**、外壳 **55/55**、交换链 **30/30**、
+  合成器 **28/28**、编辑器 **12/12**、桌面 **19/19**、外观门禁 **0 像素**；Wayland 服务端 **28/28**、
+  协议 **29/29**、多客户端 **40/40**、**窗口摆放/输入语义 30/30**、wlshow **9/9**、wl 窗口 **11/11**、
+  wlprobe **14/14**、unix **18/18**、shm **18/18**、fdpass **21/21**。
+
 ### Wayland 进桌面窗口 + 协议补全 + 双缓冲交换链（v0.59.0 之后）
 
 - **Wayland surface 进入桌面窗口**：图片查看器现在直接绘制内核 Wayland 服务端最后一次 commit 的

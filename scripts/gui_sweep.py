@@ -46,6 +46,7 @@ SUITE = [
     ('wl_server_acceptance.py', 'wl_server'),
     ('wl_protocol_acceptance.py', 'wl_protocol'),
     ('wl_multi_acceptance.py', 'wl_multi'),
+    ('wl_win_semantics_acceptance.py', 'wl_semantics'),
     ('wl_show_acceptance.py', 'wl_show'),
     ('wl_desktop_window_acceptance.py', 'wl_window'),
     ('wlprobe_acceptance.py', 'wlprobe'),

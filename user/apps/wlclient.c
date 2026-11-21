@@ -608,6 +608,15 @@ int main(int argc, char **argv)
         for (x = DAMAGE_X; x < (unsigned)(DAMAGE_X + DAMAGE_W); x++)
             row[x] = DAMAGE_COLOR;
     }
+    /* Re-attach before the second commit: a release was received for the first
+     * one, so the buffer has to be handed back in before it can be committed
+     * again (one release per attach cycle). */
+    msg_begin(ID_SURFACE, 1u);           /* wl_surface.attach(buffer, 0, 0) */
+    msg_i32((int)ID_BUFFER);
+    msg_i32(0);
+    msg_i32(0);
+    check(msg_send(), "re-attach the buffer for frame 2");
+
     msg_begin(ID_SURFACE, 2u);           /* wl_surface.damage(x, y, w, h) */
     msg_i32(DAMAGE_X);
     msg_i32(DAMAGE_Y);
