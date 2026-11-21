@@ -10,6 +10,7 @@
 #include "userdb.h"
 #include "login.h"      /* login/su/identity switch (multiuser batch) */
 #include "time_source.h" /* timesrc: generic time-source registry (domain 11) */
+#include "vsync.h"      /* vsynctest: real vblank probe on VGA 0x3DA bit 3 */
 #include "virtio_gpu.h" /* vga2d: virtio-gpu 2D scanout backend (opt-in only) */
 #include "usb_hid.h"  /* usbinfo: EHCI boot keyboard/mouse + hot-plug rescan */
 #include "vmsvga.h"     /* vmsvga: VMware SVGA II 2D backend (opt-in only) */
@@ -71,6 +72,7 @@ int shell_cmd_shmtest(int argc, char **argv)
 int shell_cmd_unixtest(int argc, char **argv);   /* v0.53.0 */
 int shell_cmd_shmtest(int argc, char **argv);    /* v0.54.0 */
 int shell_cmd_fdpass(int argc, char **argv);    /* v0.55.0 */
+int shell_cmd_vsynctest(int argc, char **argv); /* vblank: 0x3DA bit 3 */
 struct shell_cmd {
     const char *name;
     int (*func)(int argc, char **argv);
@@ -200,6 +202,7 @@ static const struct shell_cmd g_commands[] = {
     {"usbinfo", shell_cmd_usbinfo, "USB HID keyboards/mice + hot-plug rescan: usbinfo [scan|watch [seconds]]"},
     {"vmsvga",  shell_cmd_vmsvga,  "VMware SVGA II 2D backend: vmsvga [on|off|status] (default boot never touches it)"},
     {"timesrc", shell_cmd_timesrc, "List the generic time sources (HPET / scheduler tick) and now_ns"},
+    {"vsynctest", shell_cmd_vsynctest, "Real vblank probe: VGA 0x3DA bit 3 edges, measured Hz, 30 present() waits"},
     {NULL, NULL, NULL}
 };
 
@@ -3511,5 +3514,83 @@ int shell_cmd_timesrc(int argc, char **argv) {
     shell_printf("[time] probe: t0_ns=%llu t1_ns=%llu delta_ns=%llu (expected ~10 ms)\n",
                  (unsigned long long)t0, (unsigned long long)t1,
                  (unsigned long long)(t1 - t0));
+    return 0;
+}
+
+/* Real vertical retrace (vblank) probe on the VGA-compatible status port.
+ *
+ * Everything printed here is measured at run time: the VGA 0x3DA bit 3 edge
+ * rate latched against the HPET nanosecond clock, the CRTC cross-check, 30
+ * bounded present() waits and the raw edge count over one second. When the
+ * port does not behave like a display refresh source the command says so and
+ * still prints the numbers it saw (source=none + reason), because silently
+ * claiming 60 Hz would be worse than reporting a rejected source. */
+int shell_cmd_vsynctest(int argc, char **argv) {
+    (void)argc; (void)argv;
+
+    const int rc = vsync_init();
+    const struct vsync_crtc_info *crtc = vsync_crtc_info();
+    char nominal[12];
+    char measured[12];
+
+    vsync_format_hz(nominal, (uint32_t)(vsync_nominal_hz100() > 0 ? vsync_nominal_hz100() : 0));
+    if (rc == 0) {
+        vsync_format_hz(measured, (uint32_t)vsync_hz100());
+        shell_printf("[vsync] init: source=vretrace nominal_hz=%s measured_hz=%s "
+                     "period_ns=%llu min_ns=%llu max_ns=%llu\n",
+                     nominal, measured,
+                     (unsigned long long)vsync_period_ns(),
+                     (unsigned long long)vsync_min_period_ns(),
+                     (unsigned long long)vsync_max_period_ns());
+    } else {
+        /* Print what was actually seen, not a polite zero. */
+        vsync_format_hz(measured, vsync_observed_hz100());
+        shell_printf("[vsync] init: source=none nominal_hz=%s measured_hz=%s "
+                     "period_ns=%llu min_ns=%llu max_ns=%llu (rejected: %s)\n",
+                     nominal, measured,
+                     (unsigned long long)vsync_period_ns(),
+                     (unsigned long long)vsync_min_period_ns(),
+                     (unsigned long long)vsync_max_period_ns(),
+                     vsync_status_text());
+    }
+
+    /* Cross-check evidence: the raw CRTC timing registers this mode is using. */
+    shell_printf("[vsync] crtc: htot=%x hend=%x vtot=%x ovf=%x vsync=%x vend=%x misc=%x clk=%x\n",
+                 (unsigned)crtc->h_total, (unsigned)crtc->h_display_end,
+                 (unsigned)crtc->v_total, (unsigned)crtc->overflow,
+                 (unsigned)crtc->v_sync_start, (unsigned)crtc->v_display_end,
+                 (unsigned)crtc->misc, (unsigned)crtc->clocking);
+
+    /* The hardware-independent half of the logic: this is the arithmetic a
+     * real 0x3DA vblank would go through, so prove it even when the port is
+     * not a usable source on this machine. */
+    (void)vsync_math_selftest();
+
+    uint32_t e0 = 0, t0 = 0, m0 = 0;
+    vsync_stats(&e0, &t0, &m0);
+    int got = 0, timed_out = 0, unavailable = 0;
+    for (int i = 0; i < 30; i++) {
+        const int r = vsync_present();
+        if (r == 1) got++;
+        else if (r == 0) timed_out++;
+        else unavailable++;
+    }
+    uint32_t e1 = 0, t1 = 0, m1 = 0;
+    vsync_stats(&e1, &t1, &m1);
+    shell_printf("[vsync] present x30: edges=%u timeouts=%u avg_wait_us=%u max_wait_us=%u\n",
+                 (unsigned)(e1 - e0), (unsigned)(t1 - t0),
+                 (unsigned)vsync_avg_wait_us(), (unsigned)vsync_max_wait_us());
+    if (unavailable) {
+        shell_printf("[vsync] present x30: %d call(s) returned -1 (%s)\n",
+                     unavailable, vsync_status_text());
+    }
+
+    /* One second of raw sampling: proves the bit toggles instead of guessing. */
+    uint32_t samples = 0, high = 0;
+    const uint32_t edges_1s = vsync_edges_in_window(1000, &samples, &high);
+    shell_printf("[vsync] edges_in_1s=%u samples=%u high=%u latch_edges=%u\n",
+                 edges_1s, samples, high, vsync_latch_edges());
+
+    (void)vsync_selftest();
     return 0;
 }

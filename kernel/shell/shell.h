@@ -139,6 +139,10 @@ int shell_cmd_hdatest(int argc, char **argv);
 int shell_cmd_hdavol(int argc, char **argv);
 /* Generic time-source registry (kernel/time/time_source.c). */
 int shell_cmd_timesrc(int argc, char **argv);
+/* Real vertical retrace (vblank) probe: VGA 0x3DA bit 3 edge rate measured
+ * against the HPET clock, CRTC cross-check, 30 bounded present() waits and the
+ * raw edge count over one second (kernel/gui/vsync.c). */
+int shell_cmd_vsynctest(int argc, char **argv);
 /* VirtIO-GPU 2D display backend (kernel/drivers/virtio_gpu.c): attach the
  * static backing store to scanout 0 and animate it, or stop again.  Nothing
  * runs unless the user asks, so the default boot presentation is untouched. */

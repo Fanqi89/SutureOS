@@ -32,6 +32,18 @@ extern uint32_t suture_gui_shell_step(uint32_t *fb, int32_t w, int32_t h,
                                       int32_t click_y, int32_t click_btn,
                                       uint32_t now_ms, int32_t key, int32_t ch,
                                       int32_t clock_hhmm);
+extern int32_t suture_gui_shell_exit(void);
+
+/* v0.64: present-side vertical retrace. kernel/gui/vsync.c provides the real
+ * driver; until it is linked these weak fallbacks report "no source" so the
+ * present path falls back to the 60 Hz HPET grid instead of failing to link. */
+__attribute__((weak)) int vsync_present(void) { return -1; }
+__attribute__((weak)) int vsync_hz100(void) { return 0; }
+__attribute__((weak)) int vsync_available(void) { return 0; }
+
+int suture_gui_vsync_wait(void) { return vsync_present(); }
+int suture_gui_vsync_hz100(void) { return vsync_hz100(); }
+
 extern uint32_t suture_gui_interactive_step(uint32_t *fb, int32_t w, int32_t h,
                                             int32_t pitch_px, int32_t mx,
                                             int32_t my, int32_t buttons,
@@ -390,6 +402,13 @@ int slint_gui_run_shell(void)
                                     mx, my, buttons, cx, cy, cb, now_ms, key, chr,
                                     clock_hhmm);
         frames++;
+        /* v0.64: the start menu's exit row asks the runner to leave the desktop
+         * (the same exit ESC performs, checked one frame later). */
+        if (suture_gui_shell_exit()) {
+            console_printf("[gui-shell] exit to terminal (start menu)\n");
+            quit = 1;
+            continue;
+        }
         if ((frames % 30) == 0) {
             console_printf("[gui-shell] frame %d ms=%u pointer=%d,%d\n",
                            frames, now_ms, mx, my);

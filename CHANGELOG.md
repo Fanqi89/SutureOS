@@ -10,6 +10,101 @@ in the repository.
 
 （下一批 GUI / 系统改动记在这里。）
 
+## [v0.64.0-alpha] — 2026-11-21
+
+发布正文见 `docs/release-notes-v0.64.0-alpha.md`。本版四件事：开始菜单能长到 7 行以上（可视 6 行 +
+滚动 + 第 7 行「退出到终端」）、计算器升级为定点小数/百分比/内存键且鼠标可点、把「焦点窗口拥有按键」
+收成一张注册表、给 present 路径加上垂直回扫探测与两套延迟直方图（**实测 QEMU 没有可用 vblank 源，
+如实降级，不冒充**）。
+
+### 键盘归属注册表（v0.64）
+
+- **一份表决定两件事**：`rust/suture-gui/src/shell.rs` 新增 `KEY_OWNERS`（目前 4 项：图片查看器
+  slot 2 / 文本编辑器 3 / Wayland 视图 4 / 计算器 5），条目带 `(slot, accent, name, sink)`。
+  帧循环不再走 `if editor … else if calc … else if image …` 的链，而是查表分派
+  （`key_owner_for()` + `dispatch_owned_key()`）；`draw_focus_line()` 也不再手写
+  `fi != 2 && fi != 3 && fi != 4 && fi != 5`，改为「在表里就不画输入行」。
+- 启动打一行 `[gui-shell] key owners=4 mask=60`（mask = 每个拥有者的窗口槽位 bit），门禁按它
+  断言 shell 真的在走这张表。**v0.63 的 bug（计算器键盘板被输入提示行压住）根因就是这两份清单
+  各自维护、改一处忘一处**，现在不可能再漂移。
+- 新门禁 `scripts/gui_keyowners_acceptance.py` **13/13**：普通窗口仍拿到一行输入带
+  （`input win=1 text=abc` + `input commit 1 3`）、编辑器 `editor key`、图片 `image shift 1`、
+  计算器 `calc key`、Wayland 视图既不画输入行也不吃键（无 `input win=4`），且四个拥有者的窗口
+  都不出现 `input win=N`。
+
+### 开始菜单滚动，7 行以上不再顶出屏幕（v0.64）
+
+- 面板高度原来 = `46 + 项数×44 + 14`，第 7 项会把面板顶到屏幕外。现在 **可视 6 行固定 324 px**
+  （既有验收的全部像素坐标一个都没动：面板上沿 y=398、行 0 从 y=444 起），超出部分滚动：
+  `MENU_VISIBLE = 6` + `menu_scroll` 状态 + `menu_visible_rows()/menu_scroll_max()`。
+- 第 7 行是**动作行**「退出到终端」而不是窗口：`MENU_ROWS` 变成 `{label, accent, target}` 表，
+  `MenuTarget::Window(slot)` / `MenuTarget::ExitToTerminal`；`menu_activate()` 负责分派。
+  选到动作行按 Enter → `menu: exit to terminal` → C 侧 runner 下一帧见到
+  `suture_gui_shell_exit()` 返回 1，打 `exit to terminal (start menu)` 退出桌面（与 ESC 同一条路）。
+- 滚动交互：↑/↓ 移动选择并自动把选择滚进可视区、Home/End 跳到首/末行、面板右缘的滚动条
+  （轨道 + 按比例的滑块）可点，点上半 = 上滚、下半 = 下滚；每次滚动打 `menu scroll <offset> <max>`。
+- damage 侧 `Snap` 新增 `menu_scroll`，滚动时只重合成菜单面板。
+- 新门禁 `scripts/gui_menu_scroll_acceptance.py` **13/13**：面板仍是 6 行（上沿 398）、滚动前
+  第 7 行不在屏上（灰 accent 像素 0）、↓×6 后第 7 行进入最后一个槽位且 slot 0 变成第 1 行
+  （青 317 px vs 蓝 104 px）、`menu scroll 1 1`、Home/End、滚动条上下半点击、Enter 退出后
+  终端提示符回来。
+
+### 计算器：定点小数 / 百分比 / 内存 / 鼠标可点（v0.64）
+
+- 数值模型：内部 `i64` 定点、单位 1/10000，显示最多 4 位小数（去尾随 0，整数不带小数点）；
+  乘除走 i128 中间值再折算，统一饱和到 i64（不 panic、全程无 f32）。除零进错误态。
+- `%` 语义（与手机计算器一致并写进文档）：待定运算符是 `+`/`-` **且已键入操作数** 时取
+  「累加器的 e%」（`a*e/1e6`）并立即结算；否则 `e = e/100` 保留待定符。
+- 内存 MC/MR/M+/M-（`C` 不清内存、`AC` 全清，有内存时显示条右侧画 accent 的 `M` 标记）、
+  `±`、`DEL`、`CE`、`00`、`√`(整数 isqrt)、`x²`、`1÷x`；键板 5×6=30 槽。
+- **鼠标可点**：按钮从 4×4 变成 5×6，窗口 300×260 → **320×330**；`apps.rs` 暴露
+  `calc_keypad_hit(relx,rely,w,h)` / `calc_tap(slot)` / `calc_slot_center(slot)` / `calc_layout()`
+  （返回 `(rows 6, cols 5, grid 16,92, cell 57,37)`），`shell.rs` 只在窗口体点击分支里加十行：
+  `hw == 5` 时把屏幕坐标换算成窗口内坐标查槽位 → `calc_tap()` → 失效窗口层 + 注入 damage。
+  键盘与鼠标走同一套状态机与同一套日志。
+- 日志：`calc value <scaled>`（负数先打符号）、`calc error (division by zero)`、`calc clear`、
+  `calc mem plus/recall/minus/clear <scaled>`、`calc tap <slot>`、首帧一次
+  `calc layout rows=6 cols=5 slots=30 grid=16,92 cell=57,37`。
+- 门禁 `scripts/gui_calc_acceptance.py` 重写为 **21/21**：`12.5+30.25=`→`calc value 427500`、
+  `9*9=`→810000、`7-10=`→-30000（负号单独打印）、`1/4=`→2500、`8/0=`→错误、`50+10%`→550000、
+  `200*10%`→200000、三次 `calc clear`、≥8 条 `calc tap`、鼠标点 7 + 8 = 得 `calc value 150000`、
+  `calc mem plus 150000` → `C` → `calc mem recall 150000` → `MC` → `calc mem recall 0`、
+  显示条亮像素 356 / 键板 363 种颜色（真画出来了）、无 `input win=5`、无 PANIC。
+
+### 垂直回扫探测 + present 延迟直方图（v0.64，含如实结论）
+
+- 新驱动 `kernel/gui/vsync.c/.h`（由并行队友实现，488+125 行）：读 VGA 兼容状态口 `0x3DA` bit3
+  的上升沿、用 HPET 纳秒时基锁存 60 个沿算实测周期、读 CRTC 时序寄存器做标称值交叉验证，
+  **速率不在 40–120 Hz 就拒绝**（不能把端口读速度当成刷新率）。`vsync_present()` 等待有界
+  （≈40 ms + 自旋上限），`vsync_selftest()`/`vsync_math_selftest()` 各自自检；`vsynctest`
+  shell 命令把「实测 vs 标称 vs 原始 1 秒采样」全部打出来。
+- present 路径（`rust/suture-gui/src/shell.rs` + `kernel/gui/slint_bridge.c`）每次上屏前调用一次
+  有界等待，并把结果记进 `SwapState`：新增 `vsync_edges/timeouts/unavail`、实测刷新率
+  `vsync_hz100`、**等待直方图**（<0.5/2/6/12/≥12 ms）与**产出→上屏延迟直方图**
+  （<17/34/50/100/≥100 ms），每 30 帧打一行 `[gui-shell] vsync: mode=… hz=… edges=… wait_hist=… lat_hist=…`，
+  `guishell swapstat` 末尾也带这些字段。`slint_bridge.c` 里用弱符号兜底，驱动没链接时也能编译。
+- **实测结论（关键，如实写）**：**QEMU 上没有可用的真 vblank**。`-display none` 与 `-display gtk`
+  两种配置下，`0x3DA` bit3 都是「每读一次就翻转」：7 轮复现里 `high` 恒等于 `samples/2`
+  （实测 111259–280426 Hz，随轮询速度变化），逐字证据见 `docs/vsync.md`；根因是 QEMU v11.1.0
+  `hw/display/vga.c:406-411` 的 `VGA_IS1_RC` 分支只做 toggle（`vga_dumb_retrace()`），真正按时钟
+  算的 `vga_precise_retrace()` 只在非默认的 `vga_retrace_method==PRECISE` 下启用。
+  所以驱动在 QEMU 上诚实判 `source=none`、`vsync_hz100()==0`、`vsync_present()` 返回 -1，
+  节拍继续用 HPET 16.67 ms 网格；`mode=off`、每次上屏记一次 `unavailable`。
+  **真机 0x3DA bit3 是文档化的垂直回扫标志，代码按此实现，但本机无法验证真机行为，不外推。**
+- 新门禁 `scripts/gui_vsync_present_acceptance.py` **17/17**：先跑 `vsynctest` 拿到探测结论
+  （`[vsync] math:` PASS + `source=none` + 实测 27 万 Hz + 1 秒原始采样 `high>0`），再进桌面；
+  断言 present 路径的 mode 与探测结论一致、`edges+timeouts+unavailable == presents`、
+  等待直方图求和 == edges、延迟直方图求和 == presents-1、等待最大值 ≤40 ms、
+  `guishell swapstat` 与逐帧行是同一批计数器。
+
+**最终验收（同一份 ISO，一次连续 `scripts/gui_sweep.py` 全量 31 门全绿）**：静态 21/21、交互 13/13、
+外壳 55/55、交换链 30/30、合成器 28/28、C 桌面任务栏 9/9、编辑器落盘 12/12、开始菜单 10/10、
+图片浏览 9/9、**计算器 21/21**、**vsync 探测 17/17**、**键盘归属 13/13**、**菜单滚动 13/13**、
+桌面 19/19、应用内容 23/23、两套外观门禁 0 像素、Logo 14/14、wl_server 28/28、wl_protocol 29/29、
+wl_multi 40/40、wl_semantics 38/38、wl_show 9/9、wl 窗口 11/11、wlprobe 14/14、GUI 中文 4/4、
+图片查看器 PASS、C 编辑器 5/5、unix 18/18、shm 18/18、fdpass 21/21；
+开机自检 16/16；符号扫描 1447 全局 / 0 冲突（145 对象）；产物 `kernel.elf` 6,607,000 B、
+`sutureos.iso` 23,824,384 B（sha256 `b89ede95c0443770db6b37de525efbf8d8277289ad9c2fe785e022edd7f4b7ab`）。
 ## [v0.63.0-alpha] — 2026-11-21
 
 发布正文见 `docs/release-notes-v0.63.0-alpha.md`；本版把 v0.60–v0.63 四个内部批次合并发布：

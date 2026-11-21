@@ -1,21 +1,31 @@
 #!/usr/bin/env python3
-"""SutureOS calculator acceptance (v0.63): a real app with real arithmetic.
+# -*- coding: utf-8 -*-
+"""SutureOS calculator acceptance (v0.64): decimals, percent, memory, mouse.
 
 The desktop's sixth application is a calculator (window 5, start-menu row 6). This
-gate proves it end to end:
+gate proves it end to end with real PS/2 keyboard and real mouse clicks:
 
-  * open it from the start menu (`menu launch 5`),
-  * type `12+30=` with the real PS/2 keyboard and require `calc result 42`,
-  * `9*9=` -> 81, `7-10=` -> -3 (negative results are part of the state machine),
-  * `8/0=` -> `calc error (division by zero)`,
-  * `c` -> `calc clear`,
-  * the display strip and the 4x4 keypad plates are on screen (pixels, not logs),
+  * open it from the start menu ("menu launch 5"),
+  * "[gui-shell] calc layout rows=6 cols=5 slots=30 grid=.. cell=.." is logged,
+  * keyboard / fixed point (4 decimals):
+        12.5+30.25=  -> calc value 427500
+        9*9=         -> calc value 810000
+        7-10=        -> calc value -30000        (negative path)
+        1/4=         -> calc value 2500
+        8/0=         -> calc error (division by zero)
+        50+10%=      -> calc value 550000        (percent of the accumulator)
+        200*10%=     -> calc value 200000        (percent of the operand)
+  * mouse: clicking 7 + 8 = on the pad emits "calc tap" lines and computes 15,
+  * memory: M+ / AC / MR / MC with "calc mem plus/recall/clear" lines,
+  * the display strip and the keypad really are painted (pixels, not just logs),
+  * the calculator owns the keyboard (no "input win=5" band),
   * no kernel PANIC.
 
 Exit code 0 only when every check passes.
 """
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -26,26 +36,44 @@ QEMU = r'C:\Program Files\qemu\qemu-system-x86_64.exe'
 QMP_PORT = int(os.environ.get('CALC_QMP_PORT', '45911'))
 SERIAL = 'build/serial_calc.log'
 SHOT = 'build/acc_calc.ppm'
-SHOT_42 = 'build/acc_calc_42.ppm'      # the state right after 12+30=
 DISK = 'build/fat32_ata.img'
 
 TASKBAR_Y = 730
 MENU_X = 12
-MENU_ITEMS_Y = 444            # 6-row menu: TASKBAR_Y - 324 - 8 + 46
-MENU_ROW_H = 44
-CALC_ROW = 5
+MENU_HEAD_H, MENU_ROW_H, MENU_FOOT_H = 46, 44, 14
+N_VISIBLE = 6
+MENU_H = MENU_HEAD_H + N_VISIBLE * MENU_ROW_H + MENU_FOOT_H        # 324
+MENU_Y = TASKBAR_Y - MENU_H - 8                                    # 398
+MENU_ITEMS_Y = MENU_Y + MENU_HEAD_H                                # 444
+CALC_ROW = 5                                                       # 计算器
 START_BTN = (25, 745)
 
-# window 5 geometry mirrored from shell.rs::win5 + apps.rs layout constants
-WIN5 = (600, 250, 300, 260)
-PAD, TITLE_H = 16, 30
+CALC_X, CALC_Y = 600, 210
+CAL_ROWS, CAL_COLS = 6, 5
+# window-relative pad geometry (apps.rs: PAD=16, TITLE_H=30, display 44, gap 10)
+CAL_GRID = (16, 92, 57, 37)
+CAL_DISP_Y = 38                                                    # TITLE_H + 8
+CAL_DISP_H = 44
 
-# QEMU's QKeyCode has physical keys only: shifted symbols are pressed as
-# "shift held + base key" (this also exercises the kernel's shift map).
-QCODE = {
-    ' ': 'spc', '-': 'minus', '.': 'dot', '/': 'slash', ',': 'comma',
-    '=': 'equal', '\n': 'ret', '+': ['shift', 'equal'], '*': ['shift', '8'],
-}
+# CAL_KEYS in apps.rs, row-major: slot = row * 5 + col
+LABELS = [['MC', 'MR', 'M+', 'M-', 'C'],
+          ['7', '8', '9', '/', 'DEL'],
+          ['4', '5', '6', '*', '±'],
+          ['1', '2', '3', '-', '%'],
+          ['0', '.', '=', '+', '00'],
+          ['CE', 'AC', '√', 'x2', '1/x']]
+
+LAYOUT_RE = re.compile(
+    r'\[gui-shell\] calc layout rows=(\d+) cols=(\d+) slots=(\d+) '
+    r'grid=(-?\d+),(-?\d+) cell=(\d+),(\d+)')
+
+
+def slot_of(label):
+    for r in range(CAL_ROWS):
+        for c in range(CAL_COLS):
+            if LABELS[r][c] == label:
+                return r * CAL_COLS + c
+    raise KeyError(label)
 
 
 class Qmp:
@@ -84,16 +112,20 @@ class Qmp:
         return self.cmd('human-monitor-command', **{'command-line': line})
 
 
+QCODE = {' ': 'spc', '-': 'minus', '.': 'dot', '/': 'slash',
+         ',': 'comma', '=': 'equal', '\n': 'ret'}
+SHIFTED = {'+': ['shift', 'equal'], '*': ['shift', '8'], '%': ['shift', '5']}
+
+
 def press(q, keys, delay=0.16):
+    """Press a sequence of characters; shifted symbols become a chord."""
     for k in keys:
-        seq = QCODE.get(k, k)
-        if isinstance(seq, str):
-            seq = [seq]
-        q.cmd('send-key', keys=[{'type': 'qcode', 'data': d} for d in seq])
+        data = SHIFTED.get(k, [QCODE.get(k, k)])
+        q.cmd('send-key', keys=[{'type': 'qcode', 'data': d} for d in data])
         time.sleep(delay)
 
 
-def move_to(q, pos, tx, ty, settle=0.35):
+def move_to(q, pos, tx, ty, settle=0.3):
     dx, dy = tx - pos[0], ty - pos[1]
     while dx or dy:
         sx = max(-90, min(90, dx))
@@ -106,19 +138,37 @@ def move_to(q, pos, tx, ty, settle=0.35):
     time.sleep(settle)
 
 
-def click(q, pos, tx, ty, settle=1.6):
+def click(q, pos, tx, ty, settle=1.2):
     move_to(q, pos, tx, ty)
     q.hmp('mouse_button 1')
-    time.sleep(0.20)
+    time.sleep(0.18)
     q.hmp('mouse_button 0')
     time.sleep(settle)
 
 
+def shot(q, path):
+    if os.path.exists(path):
+        os.remove(path)
+    q.cmd('screendump', filename=path)
+    for _ in range(80):
+        if os.path.exists(path) and os.path.getsize(path) > 1000:
+            time.sleep(0.4)
+            return
+        time.sleep(0.1)
+    raise RuntimeError('no screendump')
+
+
+def slot_screen(label):
+    slot = slot_of(label)
+    gx, gy, cw, ch = CAL_GRID
+    return (CALC_X + gx + (slot % CAL_COLS) * cw + cw // 2,
+            CALC_Y + gy + (slot // CAL_COLS) * ch + ch // 2)
+
+
 def boot():
-    for p in (SERIAL, SHOT, SHOT_42):
-        full = os.path.join(ROOT, p)
-        if os.path.exists(full):
-            os.remove(full)
+    for p in (SERIAL, SHOT):
+        if os.path.exists(os.path.join(ROOT, p)):
+            os.remove(os.path.join(ROOT, p))
     log = open(os.path.join(ROOT, 'build/qemu_calc.log'), 'wb')
     qemu = subprocess.Popen([
         QEMU, '-machine', 'pc', '-m', '512', '-display', 'none', '-vga', 'std',
@@ -129,15 +179,6 @@ def boot():
         '-smp', '2', '-no-reboot', '-no-shutdown',
     ], cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
     return qemu, log
-
-
-def count_where(px, x0, y0, x1, y1, pred):
-    n = 0
-    for y in range(y0, y1):
-        for x in range(x0, x1):
-            if pred(px[x, y]):
-                n += 1
-    return n
 
 
 def main():
@@ -160,25 +201,43 @@ def main():
         q = Qmp(QMP_PORT)
         print('waiting for the shell prompt ...', flush=True)
         time.sleep(75)
-        press(q, list('startgui') + ['\n'])
+        press(q, list('startgui') + ['ret'])
         time.sleep(16)
         click(q, pos, *START_BTN)
-        click(q, pos, MENU_X + 100, MENU_ITEMS_Y + CALC_ROW * MENU_ROW_H + 19)
-        time.sleep(1.5)
-        press(q, list('12+30='))
-        time.sleep(1.0)
-        q.cmd('screendump', filename=SHOT_42)   # display shows 42 here
-        time.sleep(1.0)
-        press(q, ['c'])
+        click(q, pos, MENU_X + 100, MENU_ITEMS_Y + CALC_ROW * MENU_ROW_H + 19, settle=2.2)
+
+        press(q, list('12.5+30.25='))
+        time.sleep(0.8)
         press(q, list('9*9='))
-        time.sleep(1.0)
-        press(q, ['c'])
+        time.sleep(0.8)
         press(q, list('7-10='))
-        time.sleep(1.0)
-        press(q, ['c'])
+        time.sleep(0.8)
+        press(q, list('1/4='))
+        time.sleep(0.8)
         press(q, list('8/0='))
-        time.sleep(1.5)
-        q.cmd('screendump', filename=SHOT)
+        time.sleep(0.8)
+        press(q, list('c'))
+        time.sleep(0.8)
+        press(q, list('50+10%='))
+        time.sleep(0.8)
+        press(q, list('c'))
+        time.sleep(0.8)
+        press(q, list('200*10%='))
+        time.sleep(0.8)
+        press(q, list('c'))
+        time.sleep(0.8)
+
+        # ---------------------------------------------------- mouse keypad path
+        for label in ('7', '+', '8', '='):
+            click(q, pos, *slot_screen(label), settle=1.0)
+        time.sleep(1.0)
+        shot(q, os.path.join(ROOT, SHOT))
+        # ------------------------------------------------------------- memory
+        click(q, pos, *slot_screen('M+'), settle=1.0)
+        click(q, pos, *slot_screen('C'), settle=1.0)
+        click(q, pos, *slot_screen('MR'), settle=1.0)
+        click(q, pos, *slot_screen('MC'), settle=1.0)
+        click(q, pos, *slot_screen('MR'), settle=1.0)
         time.sleep(1.0)
         q.cmd('quit')
     finally:
@@ -189,48 +248,65 @@ def main():
         log.close()
 
     text = open(os.path.join(ROOT, SERIAL), 'rb').read().decode('utf-8', 'replace')
-    check('the start menu launched the calculator', 'menu launch 5' in text,
-          'menu launch 5')
-    check('12+30= computes 42', 'calc result 42' in text, 'calc result 42')
-    check('9*9= computes 81', 'calc result 81' in text, 'calc result 81')
-    check('7-10= computes -3 (negative result)', 'calc result -3' in text,
-          'calc result -3')
-    check('8/0= reports a division-by-zero error',
-          'calc error (division by zero)' in text, 'calc error')
-    check('c clears the calculator', text.count('calc clear') >= 3,
-          '%d clear line(s)' % text.count('calc clear'))
-    check('every key reached the calculator window',
-          text.count('[gui-shell] calc key') >= len('12+30=') + len('9*9=')
-          + len('7-10=') + len('8/0='),
-          '%d key line(s)' % text.count('[gui-shell] calc key'))
+
+    m = LAYOUT_RE.search(text)
+    check('the calculator logged its keypad layout', m is not None,
+          m.group(0) if m else 'no calc layout line')
+    if m:
+        rows, cols, slots = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        grid = (int(m.group(4)), int(m.group(5)), int(m.group(6)), int(m.group(7)))
+        check('the pad is the 6x5 / 30-slot one this gate clicks',
+              (rows, cols, slots) == (CAL_ROWS, CAL_COLS, CAL_ROWS * CAL_COLS),
+              'rows=%d cols=%d slots=%d' % (rows, cols, slots))
+        check('the pad geometry matches the coordinates used for the clicks',
+              grid == CAL_GRID, 'grid=%d,%d cell=%d,%d' % grid)
+
+    check('the menu row opened the calculator window', 'menu launch 5' in text)
+    check('decimal arithmetic keeps 4 fixed-point digits (12.5+30.25)',
+          'calc value 427500' in text, 'calc value 427500')
+    check('multiplication (9*9)', 'calc value 810000' in text)
+    check('a negative result prints its sign (7-10)', 'calc value -30000' in text)
+    check('division keeps the fraction (1/4)', 'calc value 2500' in text)
+    check('division by zero is an error state',
+          'calc error (division by zero)' in text)
+    check('percent of the accumulator (50+10%)', 'calc value 550000' in text)
+    check('percent of the operand (200*10%)', 'calc value 200000' in text)
+    check('clear resets the display', text.count('calc clear') >= 3,
+          'calc clear x%d' % text.count('calc clear'))
+    check('mouse taps reach the keypad handlers',
+          text.count('calc tap') >= 8, 'calc tap x%d' % text.count('calc tap'))
+    check('mouse taps computed 7 + 8 = 15', 'calc value 150000' in text)
+    check('M+ stored the value', 'calc mem plus 150000' in text,
+          'calc mem plus 150000')
+    check('C keeps the memory (only AC clears it)',
+          'calc mem recall 150000' in text, 'calc mem recall 150000')
+    check('MC cleared the memory',
+          'calc mem clear' in text and 'calc mem recall 0' in text)
+    check('the calculator owns the keyboard (no input band)', 'input win=5' not in text)
+    check('no kernel PANIC', 'PANIC' not in text)
 
     from PIL import Image
     img = Image.open(os.path.join(ROOT, SHOT)).convert('RGB')
     px = img.load()
-    x0 = WIN5[0] + PAD
-    dy0 = WIN5[1] + TITLE_H + 8
-    dy1 = dy0 + 44
-    # the display strip is very dark; its text is warm white (0xffe6c8)
-    strip = count_where(px, x0, dy0, x0 + 260, dy1,
-                        lambda c: c[0] > 200 and c[1] > 170 and c[2] > 120)
-    check('the display strip draws the current value', strip > 60,
-          '%d text px in the display strip' % strip)
-    # keypad plates (0x2a3140) below the display
-    plate = count_where(px, x0, dy1 + 14, x0 + 268, dy1 + 170,
-                        lambda c: abs(c[0] - 0x2a) < 8 and abs(c[1] - 0x31) < 8
-                        and abs(c[2] - 0x40) < 8)
-    check('the 4x4 keypad plates are painted', plate > 3000,
-          '%d plate px' % plate)
-    check('no kernel PANIC', 'PANIC' not in text.upper().replace('NO PANIC', ''))
+    bright = 0
+    for y in range(CALC_Y + CAL_DISP_Y, CALC_Y + CAL_DISP_Y + CAL_DISP_H):
+        for x in range(CALC_X + 20, CALC_X + 300):
+            r, g, b = px[x, y]
+            if (r * 299 + g * 587 + b * 114) // 1000 > 150:
+                bright += 1
+    check('the display strip shows the computed digits (bright pixels)', bright > 60,
+          'bright px %d' % bright)
+    colors = set()
+    for y in range(CALC_Y + 100, CALC_Y + 320, 3):
+        for x in range(CALC_X + 20, CALC_X + 300, 3):
+            colors.add(px[x, y])
+    check('the keypad plates are painted (many distinct colours)',
+          len(colors) > 24, '%d colours' % len(colors))
 
-    ok = sum(1 for c in checks if c[1])
-    print('[calc] checks=%d ok=%d fail=%d' % (len(checks), ok, len(checks) - ok),
-          flush=True)
-    if ok == len(checks):
-        print('[calc] RESULT: PASS', flush=True)
-        return 0
-    print('[calc] RESULT: FAIL', flush=True)
-    return 1
+    ok = sum(1 for _, c, _ in checks if c)
+    print('\nchecks=%d ok=%d fail=%d' % (len(checks), ok, len(checks) - ok))
+    print('RESULT: %s' % ('PASS' if ok == len(checks) else 'FAIL'))
+    return 0 if ok == len(checks) else 1
 
 
 if __name__ == '__main__':

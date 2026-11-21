@@ -36,9 +36,25 @@ const MENU_HEAD_H: i32 = 46;
 const MENU_ROW_H: i32 = 44;
 const MENU_FOOT_H: i32 = 14;
 
+/* v0.64: the start menu scrolls instead of growing without bound. The panel is
+ * at most MENU_VISIBLE rows tall (324 px, i.e. exactly the height every existing
+ * acceptance has calibrated pixel coordinates against); anything past that is
+ * reachable with the keyboard, the scrollbar strip or Home/End. */
+const MENU_VISIBLE: usize = 6;
+
+#[inline]
+fn menu_visible_rows() -> usize {
+    if MENU_ROWS.len() > MENU_VISIBLE { MENU_VISIBLE } else { MENU_ROWS.len() }
+}
+
+#[inline]
+fn menu_scroll_max() -> usize {
+    if MENU_ROWS.len() > MENU_VISIBLE { MENU_ROWS.len() - MENU_VISIBLE } else { 0 }
+}
+
 #[inline]
 fn menu_h() -> i32 {
-    MENU_HEAD_H + (MENU_ITEMS.len() as i32) * MENU_ROW_H + MENU_FOOT_H
+    MENU_HEAD_H + menu_visible_rows() as i32 * MENU_ROW_H + MENU_FOOT_H
 }
 
 #[inline]
@@ -128,8 +144,10 @@ const fn win4() -> Win {
 /* v0.63: 计算器 (window 5). Placed bottom-left so it does not cover the two
  * default windows at the top; size is what a 4x4 keypad + display needs. */
 const fn win5() -> Win {
-    Win { x: 600, y: 250, w: 300, h: 260, nx: 600, ny: 250, nw: 300, nh: 260,
-          minimized: false, maximized: false, z: 6, title: "计算器", accent: crate::apps::ACC_CALC, open: false, sox: 0, soy: 0, ax: 600, ay: 250 }
+    /* v0.64: the calculator grew (fixed-point decimals + memory keys) so the
+     * keypad is 5x6 now and needs 320x330. */
+    Win { x: 600, y: 210, w: 320, h: 330, nx: 600, ny: 210, nw: 320, nh: 330,
+          minimized: false, maximized: false, z: 6, title: "计算器", accent: crate::apps::ACC_CALC, open: false, sox: 0, soy: 0, ax: 600, ay: 210 }
 }
 
 struct Shell {
@@ -149,6 +167,8 @@ struct Shell {
     hover_ctl: i32,    /* hovered title-bar control (0 min,1 max,2 close) */
     hover_win: i32,
     menu_sel: i32,
+    /* v0.64: first visible start-menu row (the panel is MENU_VISIBLE rows tall) */
+    menu_scroll: usize,
     /* v0.57.1: logo shutdown animation (S key): frame counter while playing */
     shutting: bool,
     shut_frame: u32,
@@ -213,6 +233,7 @@ static mut SHELL: Shell = Shell {
     hover_ctl: -1,
     hover_win: -1,
     menu_sel: 0,
+    menu_scroll: 0,
     shutting: false,
     shut_frame: 0,
     intro_frames: 0,
@@ -338,6 +359,10 @@ unsafe fn buf_is_front(i: i32) -> bool {
 /// best time source - HPET at 100 MHz when present, the 100 Hz tick otherwise.
 extern "C" {
     fn suture_gui_time_ns() -> u64;
+    /* v0.64: next vertical retrace, forwarded by kernel/gui/slint_bridge.c to
+     * kernel/gui/vsync.c. 1 = waited for an edge, 0 = timed out, -1 = no source. */
+    fn suture_gui_vsync_wait() -> i32;
+    fn suture_gui_vsync_hz100() -> i32;
 }
 
 #[inline]
@@ -406,6 +431,18 @@ pub struct SwapState {
     /// state-machine invariants checked at every present / violations found
     pub buf_checks: u32,
     pub buf_bad: u32,
+    /// v0.64: present-side vertical retrace accounting
+    pub vsync_edges: u32,
+    pub vsync_timeouts: u32,
+    pub vsync_unavail: u32,
+    /// refresh rate the driver measured (Hz * 100), 0 when it has none
+    pub vsync_hz100: i32,
+    /// retrace wait histogram (us): <500, <2000, <6000, <12000, >=12000
+    pub wait_hist: [u32; 5],
+    pub wait_sum_us: u32,
+    pub wait_max_us: u32,
+    /// production -> present latency histogram (ms): <17, <34, <50, <100, >=100
+    pub lat_hist: [u32; 5],
 }
 
 static mut SWAP: SwapState = SwapState {
@@ -440,6 +477,14 @@ static mut SWAP: SwapState = SwapState {
     carry_copies: 0,
     buf_checks: 0,
     buf_bad: 0,
+    vsync_edges: 0,
+    vsync_timeouts: 0,
+    vsync_unavail: 0,
+    vsync_hz100: 0,
+    wait_hist: [0; 5],
+    wait_sum_us: 0,
+    wait_max_us: 0,
+    lat_hist: [0; 5],
 };
 static mut SWAP_STARTED: bool = false;
 /// Time of the first present: grid slot k begins at VSYNC_BASE_NS + k*FRAME_NS.
@@ -479,6 +524,51 @@ unsafe fn vsync_jitter_us(now_ns: u64) -> u32 {
     let phase = now_ns.wrapping_sub(VSYNC_BASE_NS) % FRAME_NS;
     let d = if phase > FRAME_NS / 2 { FRAME_NS - phase } else { phase };
     (d / 1000) as u32
+}
+
+/// v0.64: one bounded wait for the next vertical retrace, recorded in the swap
+/// histograms. Returns the driver verdict (1 edge / 0 timeout / -1 no source).
+///
+/// The driver bounds the wait itself (~40 ms), so a machine without a readable
+/// vblank source cannot stall the desktop: the 60 Hz HPET grid above stays the
+/// only pacing and every attempt lands in `vsync_unavail`.
+unsafe fn vsync_present_wait() -> i32 {
+    let t0 = time_ns();
+    let verdict = suture_gui_vsync_wait();
+    let us = (time_ns().saturating_sub(t0) / 1000) as u32;
+    let st = &mut *core::ptr::addr_of_mut!(SWAP);
+    match verdict {
+        1 => {
+            st.vsync_edges = st.vsync_edges.wrapping_add(1);
+            let b = if us < 500 {
+                0
+            } else if us < 2000 {
+                1
+            } else if us < 6000 {
+                2
+            } else if us < 12000 {
+                3
+            } else {
+                4
+            };
+            st.wait_hist[b] = st.wait_hist[b].wrapping_add(1);
+            st.wait_sum_us = st.wait_sum_us.saturating_add(us);
+            if us > st.wait_max_us {
+                st.wait_max_us = us;
+            }
+        }
+        0 => {
+            st.vsync_timeouts = st.vsync_timeouts.wrapping_add(1);
+        }
+        _ => {
+            st.vsync_unavail = st.vsync_unavail.wrapping_add(1);
+        }
+    }
+    let hz = suture_gui_vsync_hz100();
+    if hz > 0 {
+        st.vsync_hz100 = hz;
+    }
+    verdict
 }
 
 /// Account for one framebuffer update: interval/jitter/dropped/histogram.
@@ -534,6 +624,20 @@ unsafe fn swap_commit(now_ns: u64, now_ms: u32, scene: bool, px: u64, latency_ns
         if lat_us > WLOG_LAT_MAX {
             WLOG_LAT_MAX = lat_us;
         }
+        /* v0.64: explicit production -> present latency histogram (ms buckets) */
+        let lat_ms = (latency_ns / 1_000_000) as u32;
+        let lb = if lat_ms < 17 {
+            0
+        } else if lat_ms < 34 {
+            1
+        } else if lat_ms < 50 {
+            2
+        } else if lat_ms < 100 {
+            3
+        } else {
+            4
+        };
+        st.lat_hist[lb] = st.lat_hist[lb].wrapping_add(1);
         let k = now_ns.saturating_sub(VSYNC_BASE_NS) / FRAME_NS + 1;
         NEXT_SLOT = k;
     }
@@ -559,7 +663,10 @@ interval_ms=%d skipped=%d rendered=%d scene=%d carry=%d full=%d dmg=%d \
 dmg_px=%llu framed_px=%llu oracle=%d mismatch=%d tear=%d tear_bad=%d \
 late=%d latency_us=%d latency_max_us=%d \
 hist=%d,%d,%d,%d,%d,%d deferred=%d pending=%d bufs=%c%c%c \
-buf_checks=%d buf_bad=%d\n\0"
+buf_checks=%d buf_bad=%d \
+vsync_edges=%d vsync_timeouts=%d vsync_unavail=%d vsync_hz=%d \
+wait_us=%d wait_max_us=%d wait_hist=%d,%d,%d,%d,%d \
+lat_hist=%d,%d,%d,%d,%d\n\0"
             .as_ptr(),
         st.presents as i32,
         st.generation as i32,
@@ -595,6 +702,22 @@ buf_checks=%d buf_bad=%d\n\0"
         buf_state_letter(2) as i32,
         st.buf_checks as i32,
         st.buf_bad as i32,
+        st.vsync_edges as i32,
+        st.vsync_timeouts as i32,
+        st.vsync_unavail as i32,
+        st.vsync_hz100,
+        if st.vsync_edges > 0 { (st.wait_sum_us / st.vsync_edges) as i32 } else { 0 },
+        st.wait_max_us as i32,
+        st.wait_hist[0] as i32,
+        st.wait_hist[1] as i32,
+        st.wait_hist[2] as i32,
+        st.wait_hist[3] as i32,
+        st.wait_hist[4] as i32,
+        st.lat_hist[0] as i32,
+        st.lat_hist[1] as i32,
+        st.lat_hist[2] as i32,
+        st.lat_hist[3] as i32,
+        st.lat_hist[4] as i32,
     );
     st.presents
 }
@@ -906,6 +1029,7 @@ struct Snap {
     hover_start: bool,
     menu_open: bool,
     menu_sel: i32,
+    menu_scroll: i32,
     menu_hover: i32,
     menu_alpha: u32,
     focus: i32,
@@ -931,6 +1055,7 @@ impl Snap {
             hover_start: false,
             menu_open: false,
             menu_sel: -1,
+            menu_scroll: 0,
             menu_hover: -1,
             menu_alpha: 0,
             focus: 0,
@@ -1261,13 +1386,275 @@ fn wb_rect(wins: &[Win; WINS], i: usize) -> Option<(i32, i32)> {
     Some((x, 96))
 }
 
-/* v0.59.0: one accent per app, shared by the start-menu row, the window title
- * bar icon and the pseudo-3D plate (matches Win::accent). */
-const APP_ACCENTS: [u32; 6] = [0x4f8dff, 0x22c1a8, 0xf5a524, 0xe05a8a, 0x7a5cff,
-                              crate::apps::ACC_CALC];
+/* v0.64: the start menu is a registry of rows. A row either opens a window slot
+ * or runs a shell action, so the menu can grow past the window count without
+ * inventing a new window for every command. One accent per row, shared by the
+ * row icon, the window title bar icon and the pseudo-3D plate (matches
+ * Win::accent). */
+pub enum MenuTarget {
+    Window(usize),
+    ExitToTerminal,
+}
 
-const MENU_ITEMS: [&str; 6] =
-    ["系统设置", "任务管理器", "图片查看器", "文本编辑器", "Wayland 客户端", "计算器"];
+pub struct MenuRow {
+    pub label: &'static str,
+    pub accent: u32,
+    pub target: MenuTarget,
+}
+
+pub const MENU_ROWS: [MenuRow; 7] = [
+    MenuRow { label: "系统设置", accent: 0x4f8dff, target: MenuTarget::Window(0) },
+    MenuRow { label: "任务管理器", accent: 0x22c1a8, target: MenuTarget::Window(1) },
+    MenuRow { label: "图片查看器", accent: 0xf5a524, target: MenuTarget::Window(2) },
+    MenuRow { label: "文本编辑器", accent: 0xe05a8a, target: MenuTarget::Window(3) },
+    MenuRow { label: "Wayland 客户端", accent: 0x7a5cff, target: MenuTarget::Window(4) },
+    MenuRow { label: "计算器", accent: crate::apps::ACC_CALC, target: MenuTarget::Window(5) },
+    /* the 7th row is an action, not a window: it leaves the desktop the same way
+     * ESC does - this is what makes the menu longer than the panel. */
+    MenuRow { label: "退出到终端", accent: 0x8b94a6, target: MenuTarget::ExitToTerminal },
+];
+
+/// Start menu row under (mx, my) for the given scroll offset, -1 when none.
+fn menu_row_at(mx: i32, my: i32, scroll: usize) -> i32 {
+    let count = menu_visible_rows();
+    let mut k = 0usize;
+    while k < count {
+        let idx = scroll + k;
+        if idx >= MENU_ROWS.len() {
+            break;
+        }
+        let y = menu_items_y() + k as i32 * MENU_ROW_H;
+        if mx >= MENU_X + 10 && mx < MENU_X + MENU_W - 10 && my >= y && my < y + 38 {
+            return idx as i32;
+        }
+        k += 1;
+    }
+    -1
+}
+
+/// v0.64: scroll the list by `dir` rows, bounded. Returns true when it moved.
+fn menu_scroll_by(sh: &mut Shell, dir: i32) -> bool {
+    let max = menu_scroll_max() as i32;
+    let cur = sh.menu_scroll as i32;
+    let next = (cur + dir).clamp(0, max);
+    if next != cur {
+        sh.menu_scroll = next as usize;
+        log2(c"menu scroll", next, max);
+        true
+    } else {
+        false
+    }
+}
+
+/// Keep the keyboard selection inside the visible window.
+fn menu_scroll_into_view(sh: &mut Shell) {
+    let sel = sh.menu_sel.max(0) as usize;
+    let vis = menu_visible_rows();
+    let cur = sh.menu_scroll;
+    let mut want = cur;
+    if sel < cur {
+        want = sel;
+    }
+    if sel >= cur + vis {
+        want = sel + 1 - vis;
+    }
+    if want != cur {
+        sh.menu_scroll = want.min(menu_scroll_max());
+        log2(c"menu scroll", sh.menu_scroll as i32, menu_scroll_max() as i32);
+    }
+}
+
+/// The scrollbar strip (right margin of the panel). Returns -1 (up) / +1 (down)
+/// when the click landed in its upper / lower half.
+fn menu_scroll_click(cx: i32, cy: i32) -> Option<i32> {
+    if MENU_ROWS.len() <= MENU_VISIBLE {
+        return None;
+    }
+    let x0 = MENU_X + MENU_W - 13;
+    let x1 = MENU_X + MENU_W - 4;
+    let y0 = menu_items_y();
+    let y1 = y0 + menu_visible_rows() as i32 * MENU_ROW_H;
+    if cx < x0 || cx >= x1 || cy < y0 || cy >= y1 {
+        return None;
+    }
+    Some(if cy < (y0 + y1) / 2 { -1 } else { 1 })
+}
+
+/// v0.64: run a menu row (window slot or shell action).
+fn menu_activate(sh: &mut Shell, idx: usize) {
+    if idx >= MENU_ROWS.len() {
+        return;
+    }
+    match MENU_ROWS[idx].target {
+        MenuTarget::Window(slot) => launch_window(sh, slot),
+        MenuTarget::ExitToTerminal => {
+            unsafe {
+                EXIT_REQ = true;
+            }
+            sh.menu_open = false;
+            log0(c"menu: exit to terminal");
+        }
+    }
+}
+
+/// Which built-in key handler a window owns (v0.64).
+#[derive(Clone, Copy, PartialEq)]
+pub enum KeySink {
+    /// the window consumes no keys but still has no one-line input band
+    None,
+    Editor,
+    Calc,
+    Image,
+}
+
+/// One row of the keyboard-ownership registry.
+pub struct KeyOwner {
+    pub slot: usize,
+    pub accent: u32,
+    pub name: &'static str,
+    pub sink: KeySink,
+}
+
+/* v0.64: per-window keyboard ownership registry.
+ *
+ * Before this, the frame step carried an if-chain (editor / calculator /
+ * picture viewer / generic input band) and `draw_focus_line` repeated the same
+ * knowledge as a hard-coded skip list of window indices.
+ * Every new application had to be added in two places and the two could
+ * disagree - a window that consumed keys but stayed off the skip list got the
+ * input band painted over its content (that is exactly what happened to the
+ * calculator in v0.63). The table below is now the only source of truth:
+ *   - the frame step walks it instead of the if-chain,
+ *   - `draw_focus_line` asks it whether the window hosts the input band,
+ *   - `keys` counts how many windows own the keyboard so an acceptance can
+ *     assert the table the shell really walks.
+ * A window that is NOT in this table is a plain text-input window. */
+pub const KEY_OWNERS: [KeyOwner; 4] = [
+    KeyOwner { slot: 2, accent: crate::apps::ACC_IMAGE, name: "image", sink: KeySink::Image },
+    KeyOwner { slot: 3, accent: crate::apps::ACC_EDITOR, name: "editor", sink: KeySink::Editor },
+    /* the Wayland compositor view paints client pixels edge to edge and has no
+     * text line of its own (its keys go to the client, not to a shell band) */
+    KeyOwner { slot: 4, accent: crate::apps::ACC_WAYLAND, name: "wayland", sink: KeySink::None },
+    KeyOwner { slot: 5, accent: crate::apps::ACC_CALC, name: "calc", sink: KeySink::Calc },
+];
+
+/// Registry lookup: (window slot, accent) -> owning row.
+pub fn key_owner_for(slot: usize, accent: u32) -> Option<&'static KeyOwner> {
+    let mut k = 0usize;
+    while k < KEY_OWNERS.len() {
+        if KEY_OWNERS[k].slot == slot && KEY_OWNERS[k].accent == accent {
+            return Some(&KEY_OWNERS[k]);
+        }
+        k += 1;
+    }
+    None
+}
+
+/// Bit per owning slot (used by the boot log and the acceptance).
+pub fn key_owner_mask() -> i32 {
+    let mut mask = 0i32;
+    let mut k = 0usize;
+    while k < KEY_OWNERS.len() {
+        mask |= 1 << KEY_OWNERS[k].slot;
+        k += 1;
+    }
+    mask
+}
+
+/// v0.64: editor keys (was an inline if-chain branch in `shell_step`).
+fn editor_keys(key: i32, ch: i32) -> bool {
+    let mut handled = true;
+    match key {
+        0x4b => crate::apps::editor_move(1),     /* left  */
+        0x4d => crate::apps::editor_move(2),     /* right */
+        0x48 => crate::apps::editor_move(3),     /* up    */
+        0x50 => crate::apps::editor_move(4),     /* down  */
+        0x47 => crate::apps::editor_move(5),     /* home  */
+        0x4f => crate::apps::editor_move(6),     /* end   */
+        0x3f => editor_save(),                   /* F5    */
+        _ => {
+            if ch == 0x08 || ch == 0x0a || ch == 0x0d || (ch >= 0x20 && ch < 0x7f) {
+                crate::apps::editor_key(ch as u8);
+            } else {
+                handled = false;
+            }
+        }
+    }
+    if handled {
+        unsafe {
+            WIN_KEY[3] = i32::MIN;
+        }
+        log2(c"editor key", key, ch);
+    }
+    handled
+}
+
+/// v0.64: calculator keys (digits, operators, '.', '%', '=', C, Backspace and
+/// the m/n/r/l memory shortcuts; anything else falls through).
+fn calc_keys(key: i32, ch: i32) -> bool {
+    if crate::apps::calc_key(key, ch) {
+        unsafe {
+            WIN_KEY[5] = i32::MIN;
+        }
+        log2(c"calc key", key, ch);
+        true
+    } else {
+        false
+    }
+}
+
+/// v0.64: picture viewer keys (Left/Right browse the supported files).
+fn image_keys(key: i32, ch: i32) -> bool {
+    let _ = ch;
+    if key == 0x4b || key == 0x4d {
+        let dir = if key == 0x4b { -1 } else { 1 };
+        if crate::apps::image_shift(dir) {
+            unsafe {
+                WIN_KEY[2] = i32::MIN;
+            }
+            /* 1 = next, 2 = previous (log args are read as unsigned) */
+            log2(c"image shift", if dir > 0 { 1 } else { 2 }, 0);
+            return true;
+        }
+    }
+    false
+}
+
+/// v0.64: run the focused window's handler and flag the layer/damage work it
+/// implies. Returns true when the window's pixels changed.
+fn dispatch_owned_key(sh: &mut Shell, owner: &KeyOwner, key: i32, ch: i32) -> bool {
+    let changed = match owner.sink {
+        KeySink::Editor => editor_keys(key, ch),
+        KeySink::Calc => calc_keys(key, ch),
+        KeySink::Image => image_keys(key, ch),
+        KeySink::None => false,
+    };
+    if changed {
+        match owner.sink {
+            KeySink::Editor => sh.dirty_editor = true,
+            KeySink::Calc => sh.dirty_calc = true,
+            KeySink::Image => sh.dirty_image = true,
+            KeySink::None => {}
+        }
+    }
+    let _ = owner.name;
+    changed
+}
+
+/// v0.64: set by the start menu's 退出到终端 row; the C runner polls it after
+/// every frame and leaves the desktop loop (the same exit ESC performs).
+static mut EXIT_REQ: bool = false;
+
+#[no_mangle]
+pub extern "C" fn suture_gui_shell_exit() -> i32 {
+    unsafe {
+        if EXIT_REQ {
+            1
+        } else {
+            0
+        }
+    }
+}
 
 /// Z above every window: the shell only has 4, so a counter is enough.
 static mut Z_COUNTER: i32 = 100;
@@ -1729,18 +2116,43 @@ fn draw_menu(s: &mut Surface<'_>, sh: &Shell, ctx: &FrameCtx) {
                      LOGO_MENU_SIZE as i32, LOGO_MENU_SIZE as i32,
                      MENU_X + 10, my + 2);
     s.text(MENU_X + 68, my + 16, "常用应用", 0xffffff, 0xf0, 1);
-    for (k, name) in MENU_ITEMS.iter().enumerate() {
+    /* v0.64: only the visible slice of the registry is drawn; MENU_ROWS can be
+     * longer than the panel. */
+    let first = sh.menu_scroll.min(menu_scroll_max());
+    let count = menu_visible_rows();
+    let mut k = 0usize;
+    while k < count {
+        let idx = first + k;
+        if idx >= MENU_ROWS.len() {
+            break;
+        }
+        let row = &MENU_ROWS[idx];
         let y = menu_items_y() + k as i32 * MENU_ROW_H;
-        let hovered = ctx.menu_hover == k as i32;
-        let selected = k as i32 == sh.menu_sel;
+        let hovered = ctx.menu_hover == idx as i32;
+        let selected = idx as i32 == sh.menu_sel;
         rrow(s, MENU_X + 10, y, MENU_X + MENU_W - 10, y + 38, 8, 0xffffff,
              if hovered { 0x2c } else if selected { 0x22 } else { 0x12 });
-        let accent = APP_ACCENTS[k];
+        let accent = row.accent;
         if hovered || selected {
             s.rect_fill(MENU_X + 10, y + 5, MENU_X + 13, y + 33, accent, 0xd8);
         }
-        draw_app_icon(s, MENU_X + 18, y + 8, 22, accent, k as i32);
-        s.text(MENU_X + 50, y + 11, name, 0xeef4ff, 0xe8, 1);
+        draw_app_icon(s, MENU_X + 18, y + 8, 22, accent, idx as i32);
+        s.text(MENU_X + 50, y + 11, row.label, 0xeef4ff, 0xe8, 1);
+        k += 1;
+    }
+    /* scrollbar: a track in the panel's right margin plus a proportional thumb
+     * (only when the registry is longer than the panel) */
+    if MENU_ROWS.len() > MENU_VISIBLE {
+        let tx0 = MENU_X + MENU_W - 12;
+        let tx1 = MENU_X + MENU_W - 6;
+        let ty0 = menu_items_y() + 2;
+        let ty1 = menu_items_y() + count as i32 * MENU_ROW_H - 2;
+        s.rect_fill(tx0, ty0, tx1, ty1, 0x000000, 0x38);
+        let track = ty1 - ty0;
+        let thumb_h = (track * count as i32 / MENU_ROWS.len() as i32).max(20);
+        let max = menu_scroll_max().max(1) as i32;
+        let ny = ty0 + (track - thumb_h) * first as i32 / max;
+        s.rect_fill(tx0, ny, tx1, ny + thumb_h, 0xa9c4ff, 0x88);
     }
     /* v0.52.0: 2-frame fade-in for the start menu (dim -> clear) */
     if ctx.menu_alpha > 0 {
@@ -1760,7 +2172,7 @@ fn draw_focus_line(s: &mut Surface<'_>, sh: &Shell, _ctx: &FrameCtx) {
     /* v0.63: windows that consume the keyboard themselves (picture viewer,
      * editor, Wayland surface, calculator) must not get the input band - on the
      * calculator it sat right on top of the 4x4 keypad. */
-    if w.open && !w.minimized && fi != 2 && fi != 3 && fi != 4 && fi != 5
+    if w.open && !w.minimized && key_owner_for(fi, w.accent).is_none()
         && y + 20 < w.y + w.h && w.y >= 0 {
         s.rect_fill(w.x + 16, y - 4, w.x + w.w - 16, y + 20, 0x000000, 0x24);
         s.text(w.x + 24, y, "输入:", 0x9fb2cc, 0xd0, 1);
@@ -1953,6 +2365,10 @@ unsafe fn present_pending(fb: *mut u32, pitch_px: usize, wu: usize, hu: usize,
         SWAP.deferred = SWAP.deferred.wrapping_add(1);
         return false;
     }
+    /* v0.64: real vertical retrace right before the framebuffer write. When the
+     * driver reports no readable vblank source this returns -1 immediately and
+     * the 60 Hz HPET grid above remains the only pacing (see swapstat). */
+    let _vr = vsync_present_wait();
     let idx = src as usize;
     let px = ACCUM.area() as u64;
     {
@@ -2070,7 +2486,8 @@ fn diff_damage(prev: &Snap, sh: &Shell, ctx: &FrameCtx) -> Damage {
     }
     let menu_changed = prev.menu_open != sh.menu_open
         || (sh.menu_open
-            && (prev.menu_sel != sh.menu_sel || prev.menu_hover != ctx.menu_hover))
+            && (prev.menu_sel != sh.menu_sel || prev.menu_hover != ctx.menu_hover
+                || prev.menu_scroll != sh.menu_scroll as i32))
         || prev.menu_alpha != ctx.menu_alpha;
     if menu_changed {
         d.add(menu_rect());
@@ -2225,6 +2642,7 @@ fn take_snap(sh: &Shell, ctx: &FrameCtx) -> Snap {
         hover_start: ctx.hover_start,
         menu_open: sh.menu_open,
         menu_sel: sh.menu_sel,
+        menu_scroll: sh.menu_scroll as i32,
         menu_hover: ctx.menu_hover,
         menu_alpha: ctx.menu_alpha,
         focus: sh.focus as i32,
@@ -2241,15 +2659,10 @@ fn take_snap(sh: &Shell, ctx: &FrameCtx) -> Snap {
     }
 }
 
-/// Index of the menu row under the pointer (-1 when none).
-fn menu_hover_index(mx: i32, my: i32) -> i32 {
-    for k in 0..MENU_ITEMS.len() {
-        let y = menu_items_y() + k as i32 * MENU_ROW_H;
-        if mx >= MENU_X + 10 && mx < MENU_X + MENU_W - 10 && my >= y && my < y + 38 {
-            return k as i32;
-        }
-    }
-    -1
+/// Index of the menu row under the pointer (-1 when none). v0.64: the panel
+/// scrolls, so the hover index is an absolute registry index.
+fn menu_hover_index(mx: i32, my: i32, scroll: usize) -> i32 {
+    menu_row_at(mx, my, scroll)
 }
 
 // ---------------------------------------------------------------- frame
@@ -2285,6 +2698,8 @@ pub unsafe fn shell_step(
     if !sh.started {
         sh.started = true;
         sh.frame_ms = now_ms;
+        console_printf(b"[gui-shell] key owners=%d mask=%d\n\0".as_ptr(),
+                       KEY_OWNERS.len() as i32, key_owner_mask());
         log0(c"shell: loop started");
     }
     /* v0.57.1: logo shutdown animation runs before (and instead of) the desktop
@@ -2332,13 +2747,13 @@ pub unsafe fn shell_step(
             if cx >= MENU_X && cx < MENU_X + MENU_W && cy >= menu_y() && cy < menu_y() + menu_h()
     {
                 clicked_in_menu = true;
-                /* menu rows launch / focus the matching window (v0.42.0) */
-                for k in 0..MENU_ITEMS.len() {
-                    let ry = menu_items_y() + k as i32 * MENU_ROW_H;
-                    if cx >= MENU_X + 10 && cx < MENU_X + MENU_W - 10 &&
-                       cy >= ry && cy < ry + 38 {
-                        launch_window(sh, k);
-                    }
+                /* v0.64: a row launches its window or runs its action; the
+                 * scrollbar strip pages the list. */
+                let row = menu_row_at(cx, cy, sh.menu_scroll);
+                if row >= 0 {
+                    menu_activate(sh, row as usize);
+                } else if let Some(dir) = menu_scroll_click(cx, cy) {
+                    menu_scroll_by(sh, dir);
                 }
             } else {
                 sh.menu_open = false;
@@ -2353,6 +2768,7 @@ pub unsafe fn shell_step(
                 log0(if sh.menu_open { c"menu open" } else { c"menu closed" });
                 if sh.menu_open {
                     sh.menu_intro = 2;
+                    menu_scroll_into_view(sh);
                 }
             } else {
                 /* taskbar window buttons */
@@ -2410,6 +2826,19 @@ pub unsafe fn shell_step(
                             sh.wins[hw as usize].z = next_z(sh);
                             sh.focus = hw as usize;
                             log2(c"focus", hw, 0);
+                            /* v0.64: the calculator keypad is clickable. The hit
+                             * test lives in apps.rs (it owns the layout), the
+                             * shell only maps screen pixels to window pixels. */
+                            if hw == 5 {
+                                let slot = crate::apps::calc_keypad_hit(
+                                    cx - wref.x, cy - wref.y, wref.w, wref.h);
+                                if slot >= 0 && crate::apps::calc_tap(slot) {
+                                    unsafe {
+                                        WIN_KEY[5] = i32::MIN;
+                                    }
+                                    sh.dirty_calc = true;
+                                }
+                            }
                         }
                     } else if cy < TASKBAR_Y {
                         /* click on empty desktop: keep the focus as it is */
@@ -2425,21 +2854,34 @@ pub unsafe fn shell_step(
             0x48 => {
                 sh.menu_sel -= 1;
                 if sh.menu_sel < 0 {
-                    sh.menu_sel = MENU_ITEMS.len() as i32 - 1;
+                    sh.menu_sel = MENU_ROWS.len() as i32 - 1;
                 }
                 log2(c"menu sel", sh.menu_sel, 0);
+                menu_scroll_into_view(sh);
             }
             0x50 => {
                 sh.menu_sel += 1;
-                if sh.menu_sel >= MENU_ITEMS.len() as i32 {
+                if sh.menu_sel >= MENU_ROWS.len() as i32 {
                     sh.menu_sel = 0;
                 }
                 log2(c"menu sel", sh.menu_sel, 0);
+                menu_scroll_into_view(sh);
+            }
+            /* v0.64: Home/End jump to the first/last registry row */
+            0x47 => {
+                sh.menu_sel = 0;
+                log2(c"menu sel", 0, 0);
+                menu_scroll_into_view(sh);
+            }
+            0x4f => {
+                sh.menu_sel = MENU_ROWS.len() as i32 - 1;
+                log2(c"menu sel", sh.menu_sel, 0);
+                menu_scroll_into_view(sh);
             }
             0x1C => {
                 let idx = sh.menu_sel.max(0) as usize;
-                if idx < MENU_ITEMS.len() {
-                    launch_window(sh, idx);
+                if idx < MENU_ROWS.len() {
+                    menu_activate(sh, idx);
                 }
                 log2(c"menu enter", idx as i32, 0);
             }
@@ -2472,9 +2914,9 @@ pub unsafe fn shell_step(
         // up/down with the menu closed is ignored (keeps the log honest)
     }
 
-    /* v0.58.0: per-window keyboard focus. Tab cycles the window focus, printable
-     * keys edit the focused window's line, Enter commits it to the log and
-     * Backspace deletes one character. */
+    /* v0.64: per-window keyboard focus. Tab cycles the window focus; after that
+     * the ownership registry (KEY_OWNERS) decides who sees the key - a window
+     * with a handler runs it, any other window edits its one-line input band. */
     if !sh.menu_open && !sh.shutting {
         let fi = sh.focus;
         if ch == 0x09 {
@@ -2490,88 +2932,36 @@ pub unsafe fn shell_step(
                 sh.focus = n;
                 log2(c"focus cycle", n as i32, 0);
             }
-        } else if sh.wins[fi].open && !sh.wins[fi].minimized
-            && sh.wins[fi].accent == crate::apps::ACC_EDITOR {
-            /* v0.61: the editor window owns a real buffer. Printable keys,
-             * Backspace and Enter edit it; the arrow/Home/End keys move the
-             * caret; F5 saves it to FAT32. The one-line input band stays for the
-             * other windows, so their acceptance (input win=N) is untouched. */
-            let mut handled = true;
-            match key {
-                0x4b => crate::apps::editor_move(1),     /* left  */
-                0x4d => crate::apps::editor_move(2),     /* right */
-                0x48 => crate::apps::editor_move(3),     /* up    */
-                0x50 => crate::apps::editor_move(4),     /* down  */
-                0x47 => crate::apps::editor_move(5),     /* home  */
-                0x4f => crate::apps::editor_move(6),     /* end   */
-                0x3f => editor_save(),                   /* F5    */
-                _ => {
-                    if ch == 0x08 || ch == 0x0a || ch == 0x0d
-                        || (ch >= 0x20 && ch < 0x7f) {
-                        crate::apps::editor_key(ch as u8);
-                    } else {
-                        handled = false;
-                    }
-                }
-            }
-            if handled {
-                unsafe {
-                    WIN_KEY[3] = i32::MIN;
-                }
-                sh.dirty_editor = true;
-                log2(c"editor key", key as i32, ch as i32);
-            }
-        } else if sh.wins[fi].open && !sh.wins[fi].minimized
-            && sh.wins[fi].accent == crate::apps::ACC_CALC {
-            /* v0.63: the calculator consumes digits, operators, '=', 'c' and
-             * Backspace; anything else falls through to the input band. */
-            if crate::apps::calc_key(key, ch) {
-                unsafe {
-                    WIN_KEY[5] = i32::MIN;
-                }
-                sh.dirty_calc = true;
-                log2(c"calc key", key as i32, ch as i32);
-            }
-        } else if sh.wins[fi].open && !sh.wins[fi].minimized
-            && sh.wins[fi].accent == crate::apps::ACC_IMAGE {
-            /* v0.62: the picture viewer owns Left/Right - it browses the supported
-             * files on the volume (BMP / QOI) and re-decodes the chosen one. Any
-             * other key falls through to the one-line input band below, so the
-             * existing "input win=N" behaviour is untouched. */
-            if key == 0x4b || key == 0x4d {
-                let dir = if key == 0x4b { -1 } else { 1 };
-                if crate::apps::image_shift(dir) {
-                    unsafe {
-                        WIN_KEY[2] = i32::MIN;
-                    }
-                    sh.dirty_image = true;
-                    /* 1 = next, 2 = previous (log args are read as unsigned) */
-                    log2(c"image shift", if dir > 0 { 1 } else { 2 }, 0);
-                }
-            }
         } else if sh.wins[fi].open && !sh.wins[fi].minimized {
-            let len = sh.ilen[fi] as usize;
-            if ch == 0x0a || ch == 0x0d {
-                if len > 0 {
-                    let buf = &sh.input[fi];
-                    console_printf(b"[gui-shell] input win=%d text=%s\n\0".as_ptr(),
-                                   fi as i32, buf.as_ptr());
-                    log2(c"input commit", fi as i32, len as i32);
-                    sh.ilen[fi] = 0;
-                    sh.input[fi][0] = 0;
-                }
-            } else if ch == 0x08 {
-                if len > 0 {
-                    sh.ilen[fi] -= 1;
-                    sh.input[fi][len - 1] = 0;
-                    log2(c"input backspace", fi as i32, (len - 1) as i32);
-                }
-            } else if ch >= 0x20 && ch < 0x7f && len < 32 {
-                sh.input[fi][len] = ch as u8;
-                sh.input[fi][len + 1] = 0;
-                sh.ilen[fi] = len as u32 + 1;
-                if len == 0 {
-                    log2(c"input start", fi as i32, 0);
+            /* v0.64: one table decides who eats the key. A registered window
+             * runs its handler; an unregistered one gets the one-line input
+             * band that its acceptance still exercises. */
+            if let Some(owner) = key_owner_for(fi, sh.wins[fi].accent) {
+                dispatch_owned_key(sh, owner, key, ch);
+            } else {
+                let len = sh.ilen[fi] as usize;
+                if ch == 0x0a || ch == 0x0d {
+                    if len > 0 {
+                        let buf = &sh.input[fi];
+                        console_printf(b"[gui-shell] input win=%d text=%s\n\0".as_ptr(),
+                                       fi as i32, buf.as_ptr());
+                        log2(c"input commit", fi as i32, len as i32);
+                        sh.ilen[fi] = 0;
+                        sh.input[fi][0] = 0;
+                    }
+                } else if ch == 0x08 {
+                    if len > 0 {
+                        sh.ilen[fi] -= 1;
+                        sh.input[fi][len - 1] = 0;
+                        log2(c"input backspace", fi as i32, (len - 1) as i32);
+                    }
+                } else if ch >= 0x20 && ch < 0x7f && len < 32 {
+                    sh.input[fi][len] = ch as u8;
+                    sh.input[fi][len + 1] = 0;
+                    sh.ilen[fi] = len as u32 + 1;
+                    if len == 0 {
+                        log2(c"input start", fi as i32, 0);
+                    }
                 }
             }
         }
@@ -2617,7 +3007,7 @@ pub unsafe fn shell_step(
         clock: clock_hhmm,
         hover_wb,
         hover_start,
-        menu_hover: if sh.menu_open { menu_hover_index(mx_c, my_c) } else { -1 },
+        menu_hover: if sh.menu_open { menu_hover_index(mx_c, my_c, sh.menu_scroll) } else { -1 },
         act_alpha: 0,
         act_idx: -1,
         intro_alpha: 0,
@@ -2975,6 +3365,43 @@ hist=%d,%d,%d,%d,%d,%d\n\0"
             st.hist[4] as i32,
             st.hist[5] as i32,
         );
+        /* v0.64: retrace source + wait/latency histograms */
+        {
+            let vmode: &core::ffi::CStr = if st.vsync_edges > 0 {
+                c"vblank"
+            } else if st.vsync_timeouts > 0 {
+                c"timeout"
+            } else {
+                c"off"
+            };
+            let wavg = if st.vsync_edges > 0 {
+                (st.wait_sum_us / st.vsync_edges) as i32
+            } else {
+                0
+            };
+            console_printf(
+                b"[gui-shell] vsync: mode=%s hz=%d edges=%d timeouts=%d unavailable=%d \
+wait_us=%d wait_max_us=%d wait_hist=%d,%d,%d,%d,%d lat_hist=%d,%d,%d,%d,%d\n\0"
+                    .as_ptr(),
+                vmode.as_ptr(),
+                st.vsync_hz100,
+                st.vsync_edges as i32,
+                st.vsync_timeouts as i32,
+                st.vsync_unavail as i32,
+                wavg,
+                st.wait_max_us as i32,
+                st.wait_hist[0] as i32,
+                st.wait_hist[1] as i32,
+                st.wait_hist[2] as i32,
+                st.wait_hist[3] as i32,
+                st.wait_hist[4] as i32,
+                st.lat_hist[0] as i32,
+                st.lat_hist[1] as i32,
+                st.lat_hist[2] as i32,
+                st.lat_hist[3] as i32,
+                st.lat_hist[4] as i32,
+            );
+        }
         if WLOG_ORACLE > 0 {
             console_printf(
                 b"[gui-shell] damage: identical oracle=%d frames=%d rects=%d tiles=%d permille=%d\n\0"
