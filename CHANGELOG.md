@@ -8,6 +8,17 @@ in the repository.
 
 ## [Unreleased]
 
+（下一批 GUI / 系统改动记在这里。）
+
+## [v0.63.0-alpha] — 2026-11-21
+
+发布正文见 `docs/release-notes-v0.63.0-alpha.md`；本版把 v0.60–v0.63 四个内部批次合并发布：
+桌面文本编辑器真编辑（缓冲区/光标/方向键/F5 落盘）、图片查看器 BMP+QOI 双解码与左右切换、
+计算器成为第 6 个应用、开始菜单 6 行动态几何、damage 32×32 tile 网格、
+Wayland 完整 US keymap / repeat_info / memfd 引用计数。
+验收：同一 ISO 一次连续 28 门 GUI 全绿、自检 16/16、符号 1435/0；
+产物 `sutureos.iso` 23,742,464 B sha256 `31ed2f53…390dcc`。
+
 ### GUI 第四轮（v0.63 未发布）：第 6 个应用「计算器」
 
 - **计算器（window 5，开始菜单第 6 行）**：整数四则运算（i64 饱和加减乘、除零进错误态），
