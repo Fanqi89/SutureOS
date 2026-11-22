@@ -193,6 +193,17 @@ struct Shell {
     drag_last_y: i32,
     /* v0.68: how many drag frames re-anchored the acrylic (live glass) */
     drag_glass_frames: u32,
+    /* v0.69: taskbar context menu + runtime pinned list (persisted to SHELL.CFG) */
+    ctx_open: bool,
+    ctx_kind: i32,      /* 1 = window button, 2 = pinned button */
+    ctx_idx: i32,       /* slot (kind 1) / pin index (kind 2) */
+    ctx_x: i32,
+    ctx_y: i32,
+    ctx_sel: i32,
+    ctx_prev: i32,      /* (open<<16)|(kind<<8)|sel - a change forces a full frame */
+    pinned: [i32; 8],
+    pinned_n: i32,
+    force_full: bool,
     prof_cache_miss: u32,
     prof_copy: u64,
     prof_win: u64,
@@ -255,6 +266,16 @@ static mut SHELL: Shell = Shell {
     drag_last_x: -1,
     drag_last_y: -1,
     drag_glass_frames: 0,
+    ctx_open: false,
+    ctx_kind: 0,
+    ctx_idx: -1,
+    ctx_x: 0,
+    ctx_y: 0,
+    ctx_sel: -1,
+    ctx_prev: -1,
+    pinned: [0, 1, 5, 3, -1, -1, -1, -1],
+    pinned_n: 4,
+    force_full: false,
     prof_cache_miss: 0,
     prof_copy: 0,
     prof_win: 0,
@@ -1155,6 +1176,9 @@ fn log0(msg: &core::ffi::CStr) {
 extern "C" {
     /* kernel/vfs: write a whole file (the editor's F5 save path) */
     fn vfs_write_file(path: *const u8, buf: *const u8, len: u32) -> i32;
+    /* v0.69: load the pinned taskbar apps from /mnt/fat/SHELL.CFG */
+    fn vfs_read_file(path: *const u8, len: *mut usize) -> *mut u8;
+    fn lemis_heap_free(p: *mut u8);
     /* kernel/ipc/wl_server.c (weak: no-op until the server defines it) */
     fn wl_server_desktop_pump();
 }
@@ -1380,29 +1404,318 @@ fn control_rect(w: &Win) -> (i32, i32, i32, i32) {
 }
 
 /* v0.68: complete taskbar layout.
- *   [start 8..42] [pinned app icons 50..242] [window buttons 250..] [clock]
+ *   [start 8..42] [pinned app icons 50..] [window buttons after them] [clock]
  * Pinned buttons are icon shortcuts for applications that are NOT open (once a
- * window is open its window button represents it, like the v0.34 C desktop). */
-const PINNED: [usize; 4] = [0, 1, 5, 3];
+ * window is open its window button represents it, like the v0.34 C desktop).
+ * v0.69: the pinned list is runtime state, so the window buttons start where the
+ * CURRENT pinned section ends (default 4 pins => x=250). */
+const PIN_DEFAULT: [i32; 4] = [0, 1, 5, 3];
+const PIN_MAX: i32 = 8;
 const PIN_X0: i32 = 50;
 const PIN_PITCH: i32 = 48;
 const PIN_W: i32 = 44;
-/// First window-button x: right of the pinned section (50 + 4*48 + 8).
-const WB_X0: i32 = PIN_X0 + 4 * PIN_PITCH + 8;
+/// First window-button x for a given pinned count (4 pins => 250).
+fn wb_x0(sh: &Shell) -> i32 {
+    PIN_X0 + sh.pinned_n.max(0) * PIN_PITCH + 8
+}
+
+/// Slot pinned in position `p` (-1 when empty).
+fn pin_slot(sh: &Shell, p: i32) -> i32 {
+    if p >= 0 && p < sh.pinned_n && p < PIN_MAX {
+        sh.pinned[p as usize]
+    } else {
+        -1
+    }
+}
+
+fn is_pinned(sh: &Shell, slot: i32) -> bool {
+    let mut p = 0;
+    while p < sh.pinned_n {
+        if sh.pinned[p as usize] == slot {
+            return true;
+        }
+        p += 1;
+    }
+    false
+}
 
 /// (x, w) of pinned button `p`.
-fn pin_rect(p: usize) -> (i32, i32) {
-    (PIN_X0 + p as i32 * PIN_PITCH, PIN_W)
+fn pin_rect(p: i32) -> (i32, i32) {
+    (PIN_X0 + p * PIN_PITCH, PIN_W)
 }
 
 /// (x, w) of the taskbar window button `i`, or None when hidden.
-fn wb_rect(wins: &[Win; WINS], i: usize) -> Option<(i32, i32)> {
-    let mut x = WB_X0;
+fn wb_rect(sh: &Shell, i: usize) -> Option<(i32, i32)> {
+    let mut x = wb_x0(sh);
     for k in 0..i {
-        if wins[k].open { x += 96 + 8; }
+        if sh.wins[k].open { x += 96 + 8; }
     }
-    if !wins[i].open { return None; }
+    if !sh.wins[i].open { return None; }
     Some((x, 96))
+}
+
+// ---------------------------------------------------- v0.69 context menu
+const CTX_W: i32 = 138;
+const CTX_ROW_H: i32 = 30;
+const CTX_PAD: i32 = 4;
+
+/// Number of rows in the open context menu.
+fn ctx_rows(sh: &Shell) -> i32 {
+    if sh.ctx_kind == 1 {
+        let slot = sh.ctx_idx;
+        let mut rows = 3;                       /* maximise/restore, minimise, close */
+        if slot >= 0 && slot < WINS as i32 && !is_pinned(sh, slot) && sh.pinned_n < PIN_MAX {
+            rows += 1;                          /* 固定到任务栏 */
+        }
+        rows
+    } else {
+        2                                       /* 打开, 取消固定 */
+    }
+}
+
+fn ctx_h(sh: &Shell) -> i32 {
+    ctx_rows(sh) * CTX_ROW_H + 2 * CTX_PAD
+}
+
+fn ctx_rect(sh: &Shell) -> (i32, i32, i32, i32) {
+    let w = CTX_W;
+    let h = ctx_h(sh);
+    let x = (sh.ctx_x - 40).clamp(4, SCREEN_W - w - 4);
+    let y = (sh.ctx_y - h - 6).clamp(4, TASKBAR_Y - h - 4);
+    (x, y, w, h)
+}
+
+fn ctx_row_rect(sh: &Shell, r: i32) -> (i32, i32, i32, i32) {
+    let (x, y, w, _h) = ctx_rect(sh);
+    (x, y + CTX_PAD + r * CTX_ROW_H, w, CTX_ROW_H)
+}
+
+/// Row index under a point, or -1.
+fn ctx_row_at(sh: &Shell, mx: i32, my: i32) -> i32 {
+    if !sh.ctx_open {
+        return -1;
+    }
+    let (x, y, w, h) = ctx_rect(sh);
+    if mx < x || mx >= x + w || my < y || my >= y + h {
+        return -1;
+    }
+    let r = (my - y - CTX_PAD) / CTX_ROW_H;
+    if r < 0 || r >= ctx_rows(sh) { -1 } else { r }
+}
+
+/// Label shown on row `r`.
+fn ctx_label(sh: &Shell, r: i32) -> &'static str {
+    if sh.ctx_kind == 1 {
+        let maxed = sh.ctx_idx >= 0 && sh.ctx_idx < WINS as i32
+            && sh.wins[sh.ctx_idx as usize].maximized;
+        match r {
+            0 => if maxed { "还原" } else { "最大化" },
+            1 => "最小化",
+            2 => "关闭",
+            _ => "固定到任务栏",
+        }
+    } else if r == 0 {
+        "打开"
+    } else {
+        "取消固定"
+    }
+}
+
+/// Persist the pinned list to the FAT32 test volume.
+fn taskbar_save(sh: &Shell) {
+    let mut buf = [0u8; 96];
+    let head = b"pinned=";
+    let mut n = 0usize;
+    let mut k = 0usize;
+    while k < head.len() {
+        buf[n] = head[k];
+        n += 1;
+        k += 1;
+    }
+    let mut p = 0i32;
+    while p < sh.pinned_n && p < PIN_MAX {
+        if p > 0 {
+            buf[n] = b',';
+            n += 1;
+        }
+        buf[n] = b'0' + (sh.pinned[p as usize].max(0) as u8 % 10);
+        n += 1;
+        p += 1;
+    }
+    buf[n] = 10u8;
+    n += 1;
+    let rc = unsafe {
+        vfs_write_file(b"/mnt/fat/SHELL.CFG\0".as_ptr(), buf.as_ptr(), n as u32)
+    };
+    unsafe {
+        console_printf(
+            b"[gui-shell] taskbar pinned saved %d item(s) rc=%d\n\0".as_ptr(),
+            sh.pinned_n as i64, rc as i64);
+    }
+}
+
+/// Load the pinned list (falls back to the defaults when the file is missing).
+fn taskbar_load(sh: &mut Shell) {
+    let mut len: usize = 0;
+    let p = unsafe { vfs_read_file(b"/mnt/fat/SHELL.CFG\0".as_ptr(), &mut len) };
+    if p.is_null() || len < 8 {
+        if !p.is_null() {
+            unsafe { lemis_heap_free(p) };
+        }
+        unsafe {
+            console_printf(b"[gui-shell] taskbar pinned defaults (no SHELL.CFG)\n\0".as_ptr());
+        }
+        return;
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(p, len) };
+    let mut slots = [0i32; 8];
+    let mut n = 0usize;
+    let mut after_eq = false;
+    let mut cur = 0i32;
+    let mut have_digit = false;
+    for k in 0..len {
+        let b = bytes[k];
+        if b == b'=' {
+            after_eq = true;
+            continue;
+        }
+        if !after_eq {
+            continue;
+        }
+        if b.is_ascii_digit() {
+            cur = (b - b'0') as i32;
+            have_digit = true;
+        } else if b == b',' || b == 10u8 || b == 13u8 {
+            if have_digit && n < slots.len() {
+                slots[n] = cur;
+                n += 1;
+            }
+            have_digit = false;
+            cur = 0;
+        }
+    }
+    if have_digit && n < slots.len() {
+        slots[n] = cur;
+        n += 1;
+    }
+    unsafe { lemis_heap_free(p) };
+    if n > 0 {
+        sh.pinned_n = n.min(PIN_MAX as usize) as i32;
+        let mut k = 0usize;
+        while k < slots.len() {
+            sh.pinned[k] = slots[k];
+            k += 1;
+        }
+        unsafe {
+            console_printf(b"[gui-shell] taskbar pinned loaded %d item(s) from SHELL.CFG\n\0".as_ptr(),
+                           sh.pinned_n as i64);
+        }
+    } else {
+        unsafe {
+            console_printf(b"[gui-shell] taskbar pinned defaults (empty SHELL.CFG)\n\0".as_ptr());
+        }
+    }
+}
+
+fn taskbar_pin(sh: &mut Shell, slot: usize) {
+    if sh.pinned_n >= PIN_MAX || is_pinned(sh, slot as i32) {
+        return;
+    }
+    sh.pinned[sh.pinned_n as usize] = slot as i32;
+    sh.pinned_n += 1;
+    log2(c"pin add", slot as i32, sh.pinned_n);
+    taskbar_save(sh);
+    sh.force_full = true;
+}
+
+fn taskbar_unpin(sh: &mut Shell, p: i32) {
+    if p < 0 || p >= sh.pinned_n {
+        return;
+    }
+    let slot = sh.pinned[p as usize];
+    let mut k = p;
+    while k + 1 < sh.pinned_n {
+        sh.pinned[k as usize] = sh.pinned[(k + 1) as usize];
+        k += 1;
+    }
+    sh.pinned_n -= 1;
+    sh.pinned[sh.pinned_n.max(0) as usize] = -1;
+    log2(c"pin unpin", slot, sh.pinned_n);
+    taskbar_save(sh);
+    sh.force_full = true;
+}
+
+/// Run row `r` of the open context menu.
+fn ctx_act(sh: &mut Shell, r: i32) {
+    if sh.ctx_kind == 1 {
+        let slot = sh.ctx_idx;
+        if slot < 0 || slot >= WINS as i32 {
+            sh.ctx_open = false;
+            return;
+        }
+        let i = slot as usize;
+        match r {
+            0 => {
+                let want = !sh.wins[i].maximized;
+                request_maximize(sh, i, want);
+                log2(c"ctx act maximize", slot, want as i32);
+            }
+            1 => {
+                begin_act(sh, 1, i);
+                log2(c"ctx act minimize", slot, 0);
+            }
+            2 => {
+                begin_act(sh, 2, i);
+                log2(c"ctx act close", slot, 0);
+            }
+            _ => {
+                taskbar_pin(sh, i);
+                log2(c"ctx act pin", slot, sh.pinned_n);
+            }
+        }
+    } else {
+        let p = sh.ctx_idx;
+        if p < 0 || p >= sh.pinned_n {
+            sh.ctx_open = false;
+            return;
+        }
+        if r == 0 {
+            let slot = sh.pinned[p as usize].max(0) as usize;
+            launch_window(sh, slot);
+            log2(c"ctx act open", slot as i32, p);
+        } else {
+            taskbar_unpin(sh, p);
+            log2(c"ctx act unpin", p, sh.pinned_n);
+        }
+    }
+    sh.ctx_open = false;
+    sh.force_full = true;
+}
+
+/// Draw the open context menu (after the taskbar, before the start menu).
+fn draw_ctx_menu(s: &mut Surface<'_>, sh: &Shell) {
+    if !sh.ctx_open {
+        return;
+    }
+    let (x, y, w, h) = ctx_rect(sh);
+    s.rect_fill(x + 3, y + 4, x + w + 3, y + h + 5, 0x000000, 0x52);
+    frosted(s, x, y, x + w, y + h, 10.0, 0x44);
+    s.rect_fill(x, y, x + w, y + 1, 0xffffff, 0x3a);
+    s.rect_fill(x, y + h - 1, x + w, y + h, 0x000000, 0x30);
+    let rows = ctx_rows(sh);
+    let mut r = 0;
+    while r < rows {
+        let (rx, ry, rw, rh) = ctx_row_rect(sh, r);
+        let selected = r == sh.ctx_sel;
+        if selected {
+            rrow(s, rx + 4, ry + 2, rx + rw - 4, ry + rh - 2, 6, 0xffffff, 0x24);
+        }
+        let danger = (sh.ctx_kind == 1 && r == 2) || (sh.ctx_kind != 1 && r == 1);
+        s.text(rx + 14, ry + 8, ctx_label(sh, r),
+               if danger { 0xffbdbd } else { 0xe8eefb },
+               if selected { 0xff } else { 0xe0 }, 1);
+        r += 1;
+    }
 }
 
 /* v0.64: the start menu is a registry of rows. A row either opens a window slot
@@ -2136,20 +2449,21 @@ fn draw_taskbar(s: &mut Surface<'_>, sh: &Shell, ctx: &FrameCtx) {
                      LOGO_SMALL_SIZE as i32, LOGO_SMALL_SIZE as i32,
                      start_btn.0 + 5, start_btn.1 + 2);
     /* v0.68: pinned application buttons (only while the app is closed) */
-    for p in 0..PINNED.len() {
-        let slot = PINNED[p];
-        if sh.wins[slot].open {
-            continue;
+    let mut p = 0i32;
+    while p < sh.pinned_n && p < PIN_MAX {
+        let slot = pin_slot(sh, p);
+        if slot >= 0 && slot < WINS as i32 && !sh.wins[slot as usize].open {
+            let (bx, bw) = pin_rect(p);
+            let hovered = ctx.hover_wb == -p - 2;
+            rrow(s, bx, TASKBAR_Y + 6, bx + bw, TASKBAR_Y + TASKBAR_H - 6, 8,
+                 0xffffff, if hovered { 0x2a } else { 0x10 });
+            draw_app_icon(s, bx + 11, TASKBAR_Y + 7, 24, sh.wins[slot as usize].accent,
+                          glyph_for_accent(sh.wins[slot as usize].accent));
         }
-        let (bx, bw) = pin_rect(p);
-        let hovered = ctx.hover_wb == -(p as i32) - 2;
-        rrow(s, bx, TASKBAR_Y + 6, bx + bw, TASKBAR_Y + TASKBAR_H - 6, 8,
-             0xffffff, if hovered { 0x2a } else { 0x10 });
-        draw_app_icon(s, bx + 11, TASKBAR_Y + 7, 24, sh.wins[slot].accent,
-                      glyph_for_accent(sh.wins[slot].accent));
+        p += 1;
     }
     for i in 0..WINS {
-        if let Some((bx, bw)) = wb_rect(&sh.wins, i) {
+        if let Some((bx, bw)) = wb_rect(sh, i) {
             let hovered = ctx.hover_wb == i as i32;
             let active = sh.focus == i && !sh.wins[i].minimized;
             rrow(s, bx, TASKBAR_Y + 6, bx + bw, TASKBAR_Y + TASKBAR_H - 6, 7,
@@ -2400,6 +2714,8 @@ fn compose_rect(scene: &mut [u32], wu: usize, sh: &mut Shell, r: Rect, ctx: &Fra
     if sh.menu_open {
         draw_menu(&mut s, sh, ctx);
     }
+    /* 10. v0.69: taskbar context menu (topmost) */
+    draw_ctx_menu(&mut s, sh);
 }
 
 /// Compose one list of rectangles into `buf`.
@@ -2915,7 +3231,7 @@ pub unsafe fn shell_step(
     buttons: i32,
     click_x: i32,
     click_y: i32,
-    _click_btn: i32,
+    click_btn: i32,
     now_ms: u32,
     clock_hhmm: i32,
     wheel: i32,
@@ -2939,9 +3255,10 @@ pub unsafe fn shell_step(
         console_printf(b"[gui-shell] key owners=%d mask=%d\n\0".as_ptr(),
                        KEY_OWNERS.len() as i32, key_owner_mask());
         log0(c"shell: loop started");
+        taskbar_load(sh);
         console_printf(
             b"[gui-shell] taskbar: %d pinned buttons from x=%d, window buttons from x=%d\n\0"
-                .as_ptr(), PINNED.len() as i64, PIN_X0 as i64, WB_X0 as i64);
+                .as_ptr(), sh.pinned_n as i64, PIN_X0 as i64, wb_x0(sh) as i64);
     }
     /* v0.57.1: logo shutdown animation runs before (and instead of) the desktop
      * render; it ends by powering the machine off. */
@@ -2962,7 +3279,7 @@ pub unsafe fn shell_step(
         && my_c >= start_btn.1 && my_c < start_btn.1 + start_btn.3;
     let mut hover_wb = -1;
     for i in 0..WINS {
-        if let Some((bx, bw)) = wb_rect(&sh.wins, i) {
+        if let Some((bx, bw)) = wb_rect(sh, i) {
             if mx_c >= bx && mx_c < bx + bw && my_c >= TASKBAR_Y + 5
                 && my_c < TASKBAR_Y + TASKBAR_H - 5
             {
@@ -2973,27 +3290,97 @@ pub unsafe fn shell_step(
     if hover_wb < 0 {
         /* v0.68: pinned buttons use negative hover ids (-2 == pin 0) so no new
          * damage-tracking state was needed */
-        for p in 0..PINNED.len() {
-            let slot = PINNED[p];
-            if sh.wins[slot].open {
-                continue;
+        let mut p = 0i32;
+        while p < sh.pinned_n && p < PIN_MAX {
+            let slot = pin_slot(sh, p);
+            if slot >= 0 && slot < WINS as i32 && !sh.wins[slot as usize].open {
+                let (bx, bw) = pin_rect(p);
+                if mx_c >= bx && mx_c < bx + bw && my_c >= TASKBAR_Y + 5
+                    && my_c < TASKBAR_Y + TASKBAR_H - 5
+                {
+                    hover_wb = -p - 2;
+                }
             }
-            let (bx, bw) = pin_rect(p);
-            if mx_c >= bx && mx_c < bx + bw && my_c >= TASKBAR_Y + 5
-                && my_c < TASKBAR_Y + TASKBAR_H - 5
-            {
-                hover_wb = -(p as i32) - 2;
-            }
+            p += 1;
         }
     }
     sh.hover_wb = hover_wb;
+
+    /* v0.69: context-menu hover (a change forces a full repaint, see below) */
+    if sh.ctx_open {
+        sh.ctx_sel = ctx_row_at(sh, mx_c, my_c);
+    } else {
+        sh.ctx_sel = -1;
+    }
+    let ctx_sig = (if sh.ctx_open { 1i32 } else { 0 }) * 65536
+        + ((sh.ctx_kind & 0xff) << 8) + (sh.ctx_sel & 0xff);
+    if ctx_sig != sh.ctx_prev {
+        sh.ctx_prev = ctx_sig;
+        sh.force_full = true;
+    }
 
     // 2. hit testing: taskbar first (it is on top), then windows
     let mut hw = hit_win(&sh.wins, mx_c, my_c, sh.focus as i32);
 
     // 3. clicks
     let mut clicked_in_menu = false;
+    /* v0.69: taskbar context menu. Right-click (input button 1) on a window or
+     * pinned button opens it; a left-click on a row runs that row; a click
+     * anywhere else dismisses it. */
+    let mut ctx_handled = false;
     if click_x >= 0 && click_y >= 0 {
+        let cx = click_x;
+        let cy = click_y;
+        let on_strip = cy >= TASKBAR_Y + 5 && cy < TASKBAR_Y + TASKBAR_H - 5;
+        if sh.ctx_open {
+            let row = ctx_row_at(sh, cx, cy);
+            if click_btn != 1 && row >= 0 {
+                ctx_act(sh, row);
+            } else {
+                sh.ctx_open = false;
+                sh.force_full = true;
+                log0(c"ctx menu closed");
+            }
+            ctx_handled = true;
+        } else if click_btn == 1 && on_strip {
+            let mut opened = false;
+            for i in 0..WINS {
+                if let Some((bx, bw)) = wb_rect(sh, i) {
+                    if cx >= bx && cx < bx + bw && !opened {
+                        sh.ctx_open = true;
+                        sh.ctx_kind = 1;
+                        sh.ctx_idx = i as i32;
+                        sh.ctx_x = cx;
+                        sh.ctx_y = cy;
+                        opened = true;
+                        log2(c"ctx menu open window", i as i32, 0);
+                    }
+                }
+            }
+            let mut p = 0i32;
+            while p < sh.pinned_n && p < PIN_MAX && !opened {
+                let slot = pin_slot(sh, p);
+                let (bx, bw) = pin_rect(p);
+                if slot >= 0 && slot < WINS as i32 && !sh.wins[slot as usize].open
+                    && cx >= bx && cx < bx + bw
+                {
+                    sh.ctx_open = true;
+                    sh.ctx_kind = 2;
+                    sh.ctx_idx = p;
+                    sh.ctx_x = cx;
+                    sh.ctx_y = cy;
+                    opened = true;
+                    log2(c"ctx menu open pin", slot, p);
+                }
+                p += 1;
+            }
+            if opened {
+                sh.force_full = true;
+            }
+            ctx_handled = true;
+        }
+    }
+    if click_x >= 0 && click_y >= 0 && !ctx_handled {
         /* v0.57.1: hit-test the click at the click coordinates, not at the current
          * pointer: a click can be consumed while PS/2 move packets are still in
          * flight, which sent close-button clicks to the stale pointer's window. */
@@ -3030,23 +3417,25 @@ pub unsafe fn shell_step(
             } else {
                 /* taskbar window buttons */
                 let mut handled = false;
-                /* v0.68: pinned app buttons launch (only shown while closed) */
-                for p in 0..PINNED.len() {
-                    let slot = PINNED[p];
-                    if sh.wins[slot].open {
-                        continue;
+                /* v0.68: pinned app buttons launch (only shown while closed).
+                 * v0.69: the pinned list is runtime state. */
+                let mut pp = 0i32;
+                while pp < sh.pinned_n && pp < PIN_MAX && !handled {
+                    let slot = pin_slot(sh, pp);
+                    if slot >= 0 && slot < WINS as i32 && !sh.wins[slot as usize].open {
+                        let (bx, bw) = pin_rect(pp);
+                        if cx >= bx && cx < bx + bw && cy >= TASKBAR_Y + 5
+                            && cy < TASKBAR_Y + TASKBAR_H - 5
+                        {
+                            handled = true;
+                            launch_window(sh, slot as usize);
+                            log2(c"pin launch", slot, pp);
+                        }
                     }
-                    let (bx, bw) = pin_rect(p);
-                    if cx >= bx && cx < bx + bw && cy >= TASKBAR_Y + 5
-                        && cy < TASKBAR_Y + TASKBAR_H - 5
-                    {
-                        handled = true;
-                        launch_window(sh, slot);
-                        log2(c"pin launch", slot as i32, p as i32);
-                    }
+                    pp += 1;
                 }
                 for i in 0..WINS {
-                    if let Some((bx, bw)) = wb_rect(&sh.wins, i) {
+                    if let Some((bx, bw)) = wb_rect(sh, i) {
                         if cx >= bx && cx < bx + bw && cy >= TASKBAR_Y + 5 &&
                            cy < TASKBAR_Y + TASKBAR_H - 5 {
                             handled = true;
@@ -3318,6 +3707,13 @@ pub unsafe fn shell_step(
         if tc > WLOG_TILES_MAX {
             WLOG_TILES_MAX = tc;
         }
+    }
+    if sh.force_full {
+        /* v0.69: the context menu / pinned layout can change any pixel of the
+         * strip and the popup sits over arbitrary windows - a full frame keeps
+         * the damage oracle exact (same decision as the drop frame below). */
+        dmg.full_screen();
+        sh.force_full = false;
     }
     if dropped_win >= 0 && dropped_win < WINS as i32 {
         dmg.add(WinSnap::of(&sh.wins[dropped_win as usize]).rect().expand(SHADOW_MARGIN));

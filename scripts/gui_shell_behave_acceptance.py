@@ -29,6 +29,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 QEMU = r'C:\Program Files\qemu\qemu-system-x86_64.exe'
 QMP_PORT = int(os.environ.get('SHELLB_QMP_PORT', '45971'))
 SERIAL = 'build/serial_shell_behave.log'
+SERIAL2 = 'build/serial_shell_behave2.log'
 DISK = 'build/fat32_ata.img'
 
 SCREEN_W, SCREEN_H = 1024, 768
@@ -41,6 +42,23 @@ WB_W, WB_PITCH = 96, 104
 # window 0 (System Settings) title bar centre, and its size
 W0_TITLE = (350, 135)
 W0_SIZE = (430, 300)
+# v0.69 context menu geometry: width 138, rows 30 px, 4 px pad, opened above the
+# clicked button (ctx_y - h - 6)
+CTX_W = 138
+CTX_ROW_H = 30
+CTX_PAD = 4
+
+
+def ctx_geometry(click_x, click_y, rows):
+    h = rows * CTX_ROW_H + 2 * CTX_PAD
+    x = max(4, min(click_x - 40, SCREEN_W - CTX_W - 4))
+    y = max(4, min(click_y - h - 6, TASKBAR_Y - h - 4))
+    return x, y, CTX_W, h
+
+
+def ctx_row_center(click_x, click_y, rows, row):
+    x, y, w, _h = ctx_geometry(click_x, click_y, rows)
+    return x + w // 2, y + CTX_PAD + row * CTX_ROW_H + CTX_ROW_H // 2
 
 
 class Qmp:
@@ -179,9 +197,9 @@ def main():
             pos[0], pos[1] = tx, ty
             time.sleep(0.3)
 
-        def click(tx, ty, settle=1.4):
+        def click(tx, ty, settle=1.4, button=1):
             move_to(tx, ty)
-            q.hmp('mouse_button 1')
+            q.hmp('mouse_button %d' % button)
             time.sleep(0.2)
             q.hmp('mouse_button 0')
             time.sleep(settle)
@@ -202,6 +220,29 @@ def main():
         calc_wb = (WB_X0 + 2 * WB_PITCH, WB_W)     # win0, win1 open, win5 open
         click(calc_wb[0] + WB_W // 2, TASKBAR_Y + 18, settle=1.8)
         click(calc_wb[0] + WB_W // 2, TASKBAR_Y + 18, settle=1.8)
+
+        # ---- 3b. v0.69: right-click the calculator's window button --------
+        calc_wb = (WB_X0 + 2 * WB_PITCH, WB_W)
+        wb_click = (calc_wb[0] + WB_W // 2, TASKBAR_Y + 18)
+        click(wb_click[0], wb_click[1], settle=1.2, button=2)
+        shot_ctx = Image.open(q.shot('sb_ctx.ppm', settle=0.3)).convert('RGB')
+        # the popup is painted above the taskbar (3 rows for a pinned window)
+        pop_at = (wb_click[0] - 40, wb_click[1] - (3 * CTX_ROW_H + 2 * CTX_PAD) - 6)
+        pop_now = strip_colours(shot_ctx, pop_at[0] + 6, pop_at[1] + 6,
+                                pop_at[0] + CTX_W - 6, pop_at[1] + 3 * CTX_ROW_H)
+        pop_before = strip_colours(start, pop_at[0] + 6, pop_at[1] + 6,
+                                   pop_at[0] + CTX_W - 6, pop_at[1] + 3 * CTX_ROW_H)
+        # row 1 = 最小化
+        r1 = ctx_row_center(wb_click[0], wb_click[1], 3, 1)
+        click(r1[0], r1[1], settle=1.8)
+        # restore it again so the rest of the gate sees the same layout
+        click(wb_click[0], wb_click[1], settle=1.8)
+
+        # ---- 3c. v0.69: right-click the editor pin and unpin it -----------
+        pin_editor = (PIN_X0 + 3 * PIN_PITCH + PIN_W // 2, TASKBAR_Y + 18)
+        click(pin_editor[0], pin_editor[1], settle=1.2, button=2)
+        r1 = ctx_row_center(pin_editor[0], pin_editor[1], 2, 1)
+        click(r1[0], r1[1], settle=1.6)
 
         # ---- 4. maximise/restore the calculator via its title-bar button --
         calc_min, calc_max, calc_close = title_controls(*W5)
@@ -301,7 +342,72 @@ def main():
                 changed += 1
     check('the glass pixels follow the wallpaper while dragging',
           changed >= 2, '%d/%d window-relative patches changed' % (changed, len(probes)))
+    # ---- v0.69: context menu + pin persistence ------------------------------
+    check('right-clicking a window button opens its context menu',
+          'ctx menu open window 5' in text, 'ctx menu open window 5')
+    check('the context menu is really painted above the taskbar',
+          len(pop_now) > 0 and pop_now != pop_before,
+          'popup colours %d vs wallpaper %d' % (len(pop_now), len(pop_before)))
+    check('a menu row performs its action (minimise)',
+          'ctx act minimize 5' in text and 'minimize 5' in text,
+          'ctx act minimize 5')
+    check('right-clicking a pinned button opens the pin menu',
+          'ctx menu open pin 3 3' in text, 'ctx menu open pin 3 3')
+    check('取消固定 removes the pin and saves the list',
+          'pin unpin 3 3' in text and 'taskbar pinned saved 3 item(s)' in text,
+          'pin unpin + saved')
+    check('the pinned section shrinks after unpinning',
+          'taskbar pinned saved 3 item(s)' in text,
+          'saved 3 items')
+
+    # host side: the FAT32 volume really carries SHELL.CFG
+    sys.path.insert(0, os.path.join(ROOT, 'scripts'))
+    import verify_fat32_write as vf
+    img = open(os.path.join(ROOT, DISK), 'rb').read()
+    fs = vf.parse(img)
+    ent = fs['entries'].get('SHELL.CFG')
+    cfg = b''
+    if ent:
+        cfg = fs['read_chain'](ent[0], ent[1])
+    check('SHELL.CFG exists on the volume the guest booted',
+          ent is not None, 'entries: %s' % ','.join(sorted(fs['entries'])))
+    check('SHELL.CFG lists the remaining pinned slots',
+          cfg == b'pinned=0,1,5\n', repr(cfg))
+
     check('no kernel PANIC', 'PANIC' not in text)
+
+    # ---- v0.69: second boot on the same volume reloads the pinned list -----
+    for p in (SERIAL2,):
+        if os.path.exists(os.path.join(ROOT, p)):
+            os.remove(os.path.join(ROOT, p))
+    log2f = open(os.path.join(ROOT, 'build', 'qemu_shell_behave2.log'), 'wb')
+    qemu2 = subprocess.Popen([
+        QEMU, '-machine', 'pc', '-m', '512', '-display', 'none', '-vga', 'std',
+        '-serial', 'file:' + SERIAL2,
+        '-qmp', 'tcp:127.0.0.1:%d,server,nowait' % (QMP_PORT + 1),
+        '-cdrom', os.path.join(ROOT, 'build', 'sutureos.iso'), '-boot', 'd',
+        '-drive', 'id=adisk,file=%s,format=raw,if=ide' % os.path.join(ROOT, DISK),
+        '-smp', '2', '-no-reboot', '-no-shutdown',
+    ], cwd=ROOT, stdout=log2f, stderr=subprocess.STDOUT)
+    try:
+        q2 = Qmp(QMP_PORT + 1)
+        time.sleep(75)
+        q2.keys('startgui')
+        time.sleep(16)
+        q2.cmd('quit')
+    finally:
+        try:
+            qemu2.wait(timeout=30)
+        except Exception:               # noqa: BLE001
+            qemu2.kill()
+        log2f.close()
+    text2 = open(os.path.join(ROOT, SERIAL2), 'rb').read().decode('utf-8', 'replace')
+    check('a second boot reloads the pinned list from SHELL.CFG',
+          'taskbar pinned loaded 3 item(s)' in text2,
+          'taskbar pinned loaded 3 item(s)')
+    check('the reloaded layout starts the window buttons at x=202',
+          'window buttons from x=202' in text2,
+          'window buttons from x=202')
 
     ok = sum(1 for _, c, _ in checks if c)
     print('\nchecks=%d ok=%d fail=%d' % (len(checks), ok, len(checks) - ok))

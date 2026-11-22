@@ -83,8 +83,37 @@ def fresh_test_volume():
         shutil.copyfile(src, dst)
 
 
+def qemu_pids():
+    """PIDs of running qemu-system-x86_64 processes (best effort)."""
+    try:
+        out = subprocess.run(
+            ['powershell', '-NoProfile', '-Command',
+             'Get-Process qemu-system-x86_64 -ErrorAction SilentlyContinue | '
+             'ForEach-Object { $_.Id }'],
+            capture_output=True, text=True, timeout=30).stdout
+        return set(int(x) for x in out.split())
+    except Exception:                       # noqa: BLE001 - best effort
+        return set()
+
+
+def kill_new_qemu(before):
+    """v0.69: a gate that times out can leave its VM running and starve the next
+    gates (seen twice: a stale QEMU made wl_protocol collapse to 2/29). Kill only
+    processes that appeared during this gate - never somebody else's VM."""
+    for pid in sorted(qemu_pids() - before):
+        try:
+            subprocess.run(
+                ['powershell', '-NoProfile', '-Command',
+                 '([System.Diagnostics.Process]::GetProcessById(%d)).Kill()' % pid],
+                capture_output=True, timeout=30)
+            print('  [sweep] killed orphan qemu pid=%d' % pid, flush=True)
+        except Exception:                   # noqa: BLE001
+            pass
+
+
 def run_one(script, timeout):
     fresh_test_volume()
+    before = qemu_pids()
     path = os.path.join(ROOT, 'scripts', script)
     if not os.path.exists(path):
         return ('missing', None, None, None, 0.0, 'script not found')
@@ -111,6 +140,7 @@ def run_one(script, timeout):
         res = m.group(1)
     if res is None:
         res = 'PASS' if rc == 0 else 'FAIL'
+    kill_new_qemu(before)
     return (res, checks, ok, fail, dt, '' if rc == 0 else 'rc=%s' % rc)
 
 
