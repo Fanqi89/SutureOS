@@ -191,6 +191,8 @@ struct Shell {
     /* v0.50.0: previous dragged-window position (for partial present) */
     drag_last_x: i32,
     drag_last_y: i32,
+    /* v0.68: how many drag frames re-anchored the acrylic (live glass) */
+    drag_glass_frames: u32,
     prof_cache_miss: u32,
     prof_copy: u64,
     prof_win: u64,
@@ -252,6 +254,7 @@ static mut SHELL: Shell = Shell {
     drag_frames_logged: 0,
     drag_last_x: -1,
     drag_last_y: -1,
+    drag_glass_frames: 0,
     prof_cache_miss: 0,
     prof_copy: 0,
     prof_win: 0,
@@ -1376,9 +1379,25 @@ fn control_rect(w: &Win) -> (i32, i32, i32, i32) {
     (w.x + w.w - 3 - 22 * 3 - 2 * 4, y, 22, 22)
 }
 
+/* v0.68: complete taskbar layout.
+ *   [start 8..42] [pinned app icons 50..242] [window buttons 250..] [clock]
+ * Pinned buttons are icon shortcuts for applications that are NOT open (once a
+ * window is open its window button represents it, like the v0.34 C desktop). */
+const PINNED: [usize; 4] = [0, 1, 5, 3];
+const PIN_X0: i32 = 50;
+const PIN_PITCH: i32 = 48;
+const PIN_W: i32 = 44;
+/// First window-button x: right of the pinned section (50 + 4*48 + 8).
+const WB_X0: i32 = PIN_X0 + 4 * PIN_PITCH + 8;
+
+/// (x, w) of pinned button `p`.
+fn pin_rect(p: usize) -> (i32, i32) {
+    (PIN_X0 + p as i32 * PIN_PITCH, PIN_W)
+}
+
 /// (x, w) of the taskbar window button `i`, or None when hidden.
 fn wb_rect(wins: &[Win; WINS], i: usize) -> Option<(i32, i32)> {
-    let mut x = 118;
+    let mut x = WB_X0;
     for k in 0..i {
         if wins[k].open { x += 96 + 8; }
     }
@@ -2116,6 +2135,19 @@ fn draw_taskbar(s: &mut Surface<'_>, sh: &Shell, ctx: &FrameCtx) {
     blit_logo_region(s, logo, LOGO_SMALL_SIZE, 0, 0,
                      LOGO_SMALL_SIZE as i32, LOGO_SMALL_SIZE as i32,
                      start_btn.0 + 5, start_btn.1 + 2);
+    /* v0.68: pinned application buttons (only while the app is closed) */
+    for p in 0..PINNED.len() {
+        let slot = PINNED[p];
+        if sh.wins[slot].open {
+            continue;
+        }
+        let (bx, bw) = pin_rect(p);
+        let hovered = ctx.hover_wb == -(p as i32) - 2;
+        rrow(s, bx, TASKBAR_Y + 6, bx + bw, TASKBAR_Y + TASKBAR_H - 6, 8,
+             0xffffff, if hovered { 0x2a } else { 0x10 });
+        draw_app_icon(s, bx + 11, TASKBAR_Y + 7, 24, sh.wins[slot].accent,
+                      glyph_for_accent(sh.wins[slot].accent));
+    }
     for i in 0..WINS {
         if let Some((bx, bw)) = wb_rect(&sh.wins, i) {
             let hovered = ctx.hover_wb == i as i32;
@@ -2255,11 +2287,15 @@ fn draw_scale_transition(s: &mut Surface<'_>, wu: usize, sh: &Shell, ctx: &Frame
     tmp.y = ctx.scale_rect[1];
     tmp.w = ctx.scale_rect[2].max(24);
     tmp.h = ctx.scale_rect[3].max(24);
-    draw_window_shadow(s, &tmp);
-    let clip = Rect::new(s.clip.0, s.clip.1, s.clip.2, s.clip.3);
-    if !composite_scaled(&mut s.px[..], wu, idx as usize, &tmp, clip) {
-        draw_window(s, &tmp, false);
+    /* v0.68: draw the window itself at the interpolated rectangle. The old path
+     * sampled the cached home-anchored layer, so windows whose layer had a
+     * different size/age (the ones opened at startup vs. the ones opened from the
+     * menu) animated visibly differently. One direct render = one animation. */
+    draw_window(s, &tmp, true);
+    unsafe {
+        WIN_KEY[idx as usize] = i32::MIN;
     }
+    let _ = (wu, s.clip);
 }
 
 /// Compose the rectangle `r` of the desktop from scratch: wallpaper, window
@@ -2903,6 +2939,9 @@ pub unsafe fn shell_step(
         console_printf(b"[gui-shell] key owners=%d mask=%d\n\0".as_ptr(),
                        KEY_OWNERS.len() as i32, key_owner_mask());
         log0(c"shell: loop started");
+        console_printf(
+            b"[gui-shell] taskbar: %d pinned buttons from x=%d, window buttons from x=%d\n\0"
+                .as_ptr(), PINNED.len() as i64, PIN_X0 as i64, WB_X0 as i64);
     }
     /* v0.57.1: logo shutdown animation runs before (and instead of) the desktop
      * render; it ends by powering the machine off. */
@@ -2928,6 +2967,22 @@ pub unsafe fn shell_step(
                 && my_c < TASKBAR_Y + TASKBAR_H - 5
             {
                 hover_wb = i as i32;
+            }
+        }
+    }
+    if hover_wb < 0 {
+        /* v0.68: pinned buttons use negative hover ids (-2 == pin 0) so no new
+         * damage-tracking state was needed */
+        for p in 0..PINNED.len() {
+            let slot = PINNED[p];
+            if sh.wins[slot].open {
+                continue;
+            }
+            let (bx, bw) = pin_rect(p);
+            if mx_c >= bx && mx_c < bx + bw && my_c >= TASKBAR_Y + 5
+                && my_c < TASKBAR_Y + TASKBAR_H - 5
+            {
+                hover_wb = -(p as i32) - 2;
             }
         }
     }
@@ -2975,6 +3030,21 @@ pub unsafe fn shell_step(
             } else {
                 /* taskbar window buttons */
                 let mut handled = false;
+                /* v0.68: pinned app buttons launch (only shown while closed) */
+                for p in 0..PINNED.len() {
+                    let slot = PINNED[p];
+                    if sh.wins[slot].open {
+                        continue;
+                    }
+                    let (bx, bw) = pin_rect(p);
+                    if cx >= bx && cx < bx + bw && cy >= TASKBAR_Y + 5
+                        && cy < TASKBAR_Y + TASKBAR_H - 5
+                    {
+                        handled = true;
+                        launch_window(sh, slot);
+                        log2(c"pin launch", slot as i32, p as i32);
+                    }
+                }
                 for i in 0..WINS {
                     if let Some((bx, bw)) = wb_rect(&sh.wins, i) {
                         if cx >= bx && cx < bx + bw && cy >= TASKBAR_Y + 5 &&
@@ -3021,6 +3091,7 @@ pub unsafe fn shell_step(
                             sh.focus = hw as usize;
                             sh.dragging = true;
                             sh.drag_idx = hw as usize;
+                            sh.drag_glass_frames = 0;
                             sh.drag_dx = cx - wref.x;
                             sh.drag_dy = cy - wref.y;
                             log2(c"drag begin", hw, cx);
@@ -3127,11 +3198,28 @@ pub unsafe fn shell_step(
         let bidx = sh.drag_idx;
         let nxp = (mx_c - sh.drag_dx).clamp(0, SCREEN_W - 200);
         let nyp = (my_c - sh.drag_dy).clamp(0, TASKBAR_Y - 80);
+        let moved = sh.wins[bidx].x != nxp || sh.wins[bidx].y != nyp;
         sh.wins[bidx].x = nxp;
         sh.wins[bidx].y = nyp;
         if !sh.wins[bidx].maximized {
             sh.wins[bidx].nx = nxp;
             sh.wins[bidx].ny = nyp;
+        }
+        if moved {
+            /* v0.68: LIVE ACRYLIC. The layer cache is anchored to `ax/ay`; keeping
+             * it at the home position froze the glass for the whole drag (the user
+             * saw it "refresh only after the drop"). Re-anchor to the current
+             * position and invalidate the layer so the frosted backdrop re-samples
+             * the wallpaper under the window every moved frame. */
+            sh.wins[bidx].ax = nxp;
+            sh.wins[bidx].ay = nyp;
+            unsafe {
+                WIN_KEY[bidx] = i32::MIN;
+            }
+            sh.drag_glass_frames = sh.drag_glass_frames.wrapping_add(1);
+            if sh.drag_glass_frames == 1 {
+                log0(c"drag: live acrylic (glass re-anchored every moved frame)");
+            }
         }
     }
 
@@ -3198,6 +3286,11 @@ pub unsafe fn shell_step(
             ctx.scale = true;
             ctx.scale_idx = sh.scale_idx;
             ctx.scale_rect = r;
+            /* v0.68: the gate asserts every window walks the SAME rect sequence */
+            console_printf(
+                b"[gui-shell] scale rect idx=%d %d,%d %d,%d\n\0".as_ptr(),
+                sh.scale_idx as i64, r[0] as i64, r[1] as i64, r[2] as i64,
+                r[3] as i64);
         }
     }
 
@@ -3228,6 +3321,12 @@ pub unsafe fn shell_step(
     }
     if dropped_win >= 0 && dropped_win < WINS as i32 {
         dmg.add(WinSnap::of(&sh.wins[dropped_win as usize]).rect().expand(SHADOW_MARGIN));
+        /* v0.68: with live acrylic the drop re-anchors the glass, so the WHOLE
+         * body changes without a geometry delta - a structural change. Repaint
+         * the frame in full (drops are rare) so a damage frame can never disagree
+         * with the oracle (this was a real 1-in-8 MISMATCH). */
+        dmg.full_screen();
+        log0(c"drop: full frame (glass re-anchor)");
     }
     let animating = ctx.act_alpha > 0 || ctx.intro_alpha > 0 || ctx.menu_alpha > 0
         || ctx.scale;
@@ -3413,7 +3512,10 @@ px=%llu present=%d accum=%d\n\0"
     if sh.act_frames > 0 {
         let idx = sh.act_idx;
         sh.act_frames -= 1;
-        if sh.act_frames == 0 && idx >= 0 && idx < 5 {
+        /* v0.68 BUGFIX: the bound was a leftover `5` from the 5-window era, so a
+         * deferred minimize/close of window 5 (calculator) never executed - it
+         * faded out, stayed open and kept focus. */
+        if sh.act_frames == 0 && idx >= 0 && idx < WINS as i32 {
             let ui = idx as usize;
             if sh.act_kind == 1 {
                 sh.wins[ui].minimized = true;

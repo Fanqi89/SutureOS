@@ -39,8 +39,8 @@ TASKBAR_Y = SCREEN_H - TASKBAR_H
 WIN0 = (150, 120, 430, 300)
 WIN1 = (470, 300, 400, 260)
 START_BTN = (8, TASKBAR_Y + 5, 34, 28)
-WB0 = (118, 96)                 # first taskbar window button (x, w)
-WB1 = (222, 96)                 # second one
+WB0 = (250, 96)                 # first window button (v0.68: pinned section is 50..242)
+WB1 = (354, 96)                 # second one
 MENU = (12, TASKBAR_Y - 324 - 8, 300, 324)
 MENU_ITEM0_Y = MENU[1] + 46
 MENU_ITEM_H = 44
@@ -468,7 +468,8 @@ def main():
         check('window 1 is minimised for the close check',
               log_text().count('[gui-shell] minimize 1') > _min_before,
               'minimize 1 lines: %d' % log_text().count('[gui-shell] minimize 1'))
-        move_to(326 + 48, TASKBAR_Y + 18)      # window 2 taskbar button (3rd)
+        # v0.68: window buttons start at WB0[0]; the 3rd one is window 2
+        move_to(WB0[0] + 2 * (WB0[1] + 8) + WB0[1] // 2, TASKBAR_Y + 18)
         click()
         time.sleep(0.8)
 

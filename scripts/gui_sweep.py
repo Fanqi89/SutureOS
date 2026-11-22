@@ -34,6 +34,7 @@ SUITE = [
     ('slint_gui_acceptance.py', 'static'),
     ('slint_gui_interactive_acceptance.py', 'interactive'),
     ('slint_gui_shell_acceptance.py', 'shell'),
+    ('gui_shell_behave_acceptance.py', 'shellbehave'),
     ('guishell_swap_acceptance.py', 'swap'),
     ('guishell_damage_acceptance.py', 'damage'),
     ('apps_taskbar_acceptance.py', 'apps_taskbar'),

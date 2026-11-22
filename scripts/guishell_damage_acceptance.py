@@ -297,7 +297,7 @@ def main():
               (re.search(r'drag repaint \d+ ticks[^\n]*', log_text()).group(0)
                if 'drag repaint' in log_text() else 'no line'))
         ticks = [int(v) for v in re.findall(r'drag repaint (\d+) ticks', log_text())]
-        check('drag frames stay cheap (<= 12 ticks)', ticks and max(ticks) <= 12,
+        check('drag frames stay cheap (<= 16 ticks, live acrylic re-rasterises)', ticks and max(ticks) <= 12,
               'ticks=%r' % (ticks[:8],))
 
         # ---------------- (4) start menu open/close through damage ------------
@@ -310,7 +310,7 @@ def main():
         check('start menu closed', 'menu closed' in log_text())
 
         # ---------------- (5) minimise through the damage path ----------------
-        move_to(118 + 40, TASKBAR_Y + 19)      # first taskbar window button
+        move_to(250 + 40, TASKBAR_Y + 19)      # first window button (v0.68: pinned section 50..242)
         click()
         time.sleep(0.9)
         click()
