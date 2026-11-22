@@ -52,13 +52,13 @@ def model_buffer():
     col = 0
     lines[line] = "abc"
     col = 3
-    # 3. Ctrl+Z twice (undo "abc", then the Enter) and Ctrl+Y once (redo the Enter):
+    # 3. Ctrl+Z twice (undo "abc", then the Enter) and one redo (Ctrl+Shift+Z),
     #    the buffer is back to "one extra empty line, caret at its start"
     lines[line] = ""
     col = 0
-    # 4. type zz on that empty line
-    lines[line] = "zz"
-    col = 2
+    # 4. type "quick brown" on that empty line as a fast burst (11 characters)
+    lines[line] = "quick brown"
+    col = len("quick brown")
     # 5. eleven Enters: each inserts an empty line and moves the caret down, so
     #    the caret leaves the ten visible rows and the viewport has to scroll
     for _ in range(11):
@@ -118,13 +118,13 @@ QCODE = {' ': 'spc', '-': 'minus', '.': 'dot', '/': 'slash',
          ',': 'comma', '=': 'equal', '\n': 'ret'}
 
 
-def press(q, keys, delay=0.45):
+def press(q, keys, delay=0.03):
     for k in keys:
         q.cmd('send-key', keys=[{'type': 'qcode', 'data': QCODE.get(k, k)}])
         time.sleep(delay)
 
 
-def chord(q, keys, settle=1.4):
+def chord(q, keys, settle=0.8):
     """Press several keys together (Ctrl+Z ...)."""
     q.cmd('send-key', keys=[{'type': 'qcode', 'data': k} for k in keys])
     time.sleep(settle)
@@ -212,16 +212,16 @@ def main():
         press(q, ['ret'])
         press(q, list('abc'))
         time.sleep(1)
-        # 2. undo x2 (abc, then the Enter) and redo once (the Enter)
+        # 2. undo x2 (abc, then the Enter) and one redo via Ctrl+Shift+Z
         chord(q, ['ctrl', 'z'])
         chord(q, ['ctrl', 'z'])
-        chord(q, ['ctrl', 'y'])
+        chord(q, ['ctrl', 'shift', 'z'])   # redo through the 0x80|control code
         time.sleep(0.8)
         # 3. type zz, then 14 Enters to push the caret past the visible rows
-        press(q, list('zz'))
-        time.sleep(0.5)
+        press(q, list('quick brown'))
+        time.sleep(0.8)
         for _ in range(11):
-            press(q, ['ret'], delay=0.42)
+            press(q, ['ret'], delay=0.03)
         time.sleep(1.0)
         # 4. PageUp (a page is the visible row count)
         press(q, ['pgup'])
@@ -248,14 +248,17 @@ def main():
     check('the buffer reports the new 48x64 geometry',
           'editor init lines=48 cols=64' in text, 'editor init lines=48 cols=64')
     key_lines = text.count('[gui-shell] editor key')
-    check('typed keys reached the editor buffer', key_lines >= 10,
+    check('the shell never had to drop a queued key',
+          'key queue overflow' not in text,
+          'overflow line present' if 'key queue overflow' in text else 'no overflow')
+    check('typed keys reached the editor buffer', key_lines >= 20,
           '%d key line(s)' % key_lines)
 
     undone = re.findall(r'editor undo (\d+)', text)
     redone = re.findall(r'editor redo (\d+)', text)
     check('Ctrl+Z reached editor_undo (twice)', len(undone) >= 2,
           'undo depths %s' % ','.join(undone))
-    check('Ctrl+Y reached editor_redo', len(redone) >= 1,
+    check('Ctrl+Shift+Z reached editor_redo', len(redone) >= 1,
           'redo depths %s' % ','.join(redone))
     check('the Ctrl chord reached the shell as a modifier, not a letter',
           'editor ctrl' in text)

@@ -667,14 +667,19 @@ pub unsafe extern "C" fn suture_gui_shell_step(
     click_y: i32,
     click_btn: i32,
     now_ms: u32,
-    key: i32,
-    ch: i32,
     clock_hhmm: i32,
     wheel: i32,
-    mods: i32,
 ) -> u32 {
     shell::shell_step(fb, w, h, pitch_px, mx, my, buttons, click_x, click_y,
-                      click_btn, now_ms, key, ch, clock_hhmm, wheel, mods)
+                      click_btn, now_ms, clock_hhmm, wheel)
+}
+
+/// v0.67: queue one decoded key event for the next frame (drained by
+/// `shell_step`). The bridge calls this once per event it read, so a burst no
+/// longer has to fit into a single frame's key slot.
+#[no_mangle]
+pub unsafe extern "C" fn suture_gui_shell_push_key(key: i32, ch: i32, mods: i32) {
+    shell::push_key(key, ch, mods);
 }
 
 /// Log the swap-chain counters once (`guishell swapstat`). Returns presents.

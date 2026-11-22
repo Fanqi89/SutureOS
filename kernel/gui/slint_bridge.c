@@ -30,9 +30,9 @@ extern uint32_t suture_gui_shell_step(uint32_t *fb, int32_t w, int32_t h,
                                       int32_t pitch_px, int32_t mx, int32_t my,
                                       int32_t buttons, int32_t click_x,
                                       int32_t click_y, int32_t click_btn,
-                                      uint32_t now_ms, int32_t key, int32_t ch,
-                                      int32_t clock_hhmm, int32_t wheel,
-                                      int32_t mods);
+                                      uint32_t now_ms, int32_t clock_hhmm,
+                                      int32_t wheel);
+extern void suture_gui_shell_push_key(int32_t key, int32_t ch, int32_t mods);
 extern int32_t suture_gui_shell_exit(void);
 
 /* v0.64: present-side vertical retrace. kernel/gui/vsync.c provides the real
@@ -386,11 +386,10 @@ int slint_gui_run_shell(void)
                 }
             }
         }
-        int key = -1;                      /* key/char served this frame */
-        int chr = -1;
-        if (kq_head != kq_tail) {
-            key = kq[kq_head].sc;
-            chr = kq[kq_head].ch;
+        /* v0.67: hand the shell EVERY event read this frame (it drains a 64-entry
+         * queue before rendering), instead of one key per frame. */
+        while (kq_head != kq_tail) {
+            suture_gui_shell_push_key(kq[kq_head].sc, kq[kq_head].ch, mods);
             kq_head = (kq_head + 1) % 32;
         }
 
@@ -406,8 +405,8 @@ int slint_gui_run_shell(void)
 
         const uint32_t now_ms = (uint32_t)((g_tick_count - start) * 10u);
         (void)suture_gui_shell_step(fb, (int32_t)w, (int32_t)h, (int32_t)pitch_px,
-                                    mx, my, buttons, cx, cy, cb, now_ms, key, chr,
-                                    clock_hhmm, wheel, mods);
+                                    mx, my, buttons, cx, cy, cb, now_ms,
+                                    clock_hhmm, wheel);
         frames++;
         /* v0.64: the start menu's exit row asks the runner to leave the desktop
          * (the same exit ESC performs, checked one frame later). */

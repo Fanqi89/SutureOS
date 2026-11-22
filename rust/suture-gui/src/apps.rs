@@ -413,14 +413,38 @@ unsafe fn ed_ensure_visible() {
 
 /// Snapshot the state before a mutation. Consecutive operations of the same kind
 /// (a typing run, a backspace run) collapse into one undo step.
+///
+/// v0.67 BUGFIX: when the four slots were full the old code clamped the index to
+/// `ED_UNDO_DEPTH` *after* writing, so the next mutation indexed `ED_UNDO[4]` on a
+/// four-element array and panicked the Rust GUI. Fast batch delivery (11 Enters in
+/// one frame) runs into it immediately; now the oldest step is shifted out first.
 unsafe fn ed_maybe_snapshot(kind: u8) {
     if ED_LAST_KIND == kind {
         return;
     }
     ED_LAST_KIND = kind;
+    if ED_UNDO_N >= ED_UNDO_DEPTH {
+        /* drop the oldest snapshot: slot i+1 -> i, then keep one free slot */
+        let mut i = 0usize;
+        while i + 1 < ED_UNDO_DEPTH {
+            let mut k = 0usize;
+            while k < ED_LINES * ED_COLS {
+                ED_UNDO[i][k] = ED_UNDO[i + 1][k];
+                k += 1;
+            }
+            let mut r = 0usize;
+            while r < ED_LINES {
+                ED_UNDO_LEN[i][r] = ED_UNDO_LEN[i + 1][r];
+                r += 1;
+            }
+            ED_UNDO_META[i] = ED_UNDO_META[i + 1];
+            i += 1;
+        }
+        ED_UNDO_N = ED_UNDO_DEPTH - 1;
+    }
     ed_store(ED_UNDO[ED_UNDO_N].as_mut_ptr(), ED_UNDO_LEN[ED_UNDO_N].as_mut_ptr(),
              ED_UNDO_META[ED_UNDO_N].as_mut_ptr());
-    ED_UNDO_N = (ED_UNDO_N + 1).min(ED_UNDO_DEPTH);
+    ED_UNDO_N += 1;
     ED_REDO_N = 0;                       /* a new edit invalidates the redo path */
 }
 
@@ -829,7 +853,7 @@ fn settings_body(s: &mut Surface<'_>, accent: u32, wx: i32, wy: i32, w: i32, h: 
     let rows: [(&str, &str); 3] = [
         ("账户与登录", "alice"),
         ("显示与外观", "1024x768 ・ 32bpp"),
-        ("关于本机", "SutureOS 0.66.0-alpha"),
+        ("关于本机", "SutureOS 0.67.0-alpha"),
     ];
     let pill = lighten(accent, 10);
     let mut y = wy + TITLE_H + 20;

@@ -10,6 +10,49 @@ in the repository.
 
 （下一批 GUI / 系统改动记在这里。）
 
+## [v0.67.0-alpha] — 2026-11-22
+
+发布正文见 `docs/release-notes-v0.67.0-alpha.md`。本版把输入层从「每帧一个按键」改成
+「按事件推、每帧排空」，于是快速打字不再丢键——而这一改同时把一个潜伏的 Rust 越界 panic 打了出来。
+
+### 输入层：批量按键投递（v0.67）
+
+- **问题**：桥每帧只从 32 项事件队列里取一个事件交给 `suture_gui_shell_step(..., key, ch)`，
+  其余等下一帧；TCG 下每帧 100–300 ms，30 ms/键的输入远快于消费速度 → 队列满丢最旧（v0.66 门禁
+  被迫 0.45 s/键 才稳定）。
+- **修法**：新增 push ABI `suture_gui_shell_push_key(key, ch, mods)`，事件进外壳内 64 项队列；
+  `shell_step` 渲染前**排空整条队列**（原来的 per-key 逻辑抽成 `handle_key()`）；桥把本帧读到的
+  事件全部推入，一帧只渲染一次。`shell_step` 参数从 16 个减回 14 个。
+- **实测**：30 ms/键（约 33 键/秒）连续输入**零丢失**；门禁断言日志里没有 `key queue overflow`。
+
+### 撤销栈越界 panic（v0.67，真 bug）
+
+- **现象**：快速投递一上来就 `[gui-slint] PANIC in Rust GUI`（撤销/回车连发后立刻死）。
+- **根因**：`ed_maybe_snapshot()` 在 4 个撤销槽满后把索引 `min` 到 `ED_UNDO_DEPTH`（=4），下一次
+  编辑却写 `ED_UNDO[4]`——4 元素数组越界 → panic。v0.66 每次只处理一个键、快照很少连续填满，
+  所以从未触发。
+- **修法**：满时把最老的快照整体前移一格（i+1 → i）再写最后一个槽，变成真正的 4 级环形语义。
+
+### Ctrl+Shift+Z = 重做（v0.67）
+
+- `mb_kbd.c`：`Ctrl+Shift+<字母>` → `0x80 | (base & 0x1f)`（Ctrl+Shift+Z = 0x9A）；`editor_keys`
+  把 0x9A 接到 `editor_redo()`，与 Ctrl+Y 并存；日志 `editor ctrl <sc> <ch>` 可证（ch=154）。
+
+### 门禁：`gui_editor_live_acceptance.py` **19/19**
+
+- 按键间隔 0.45 s → **0.03 s**，新增 11 字符快速 burst（`quick brown`）；
+- 新增「shell 从未丢过队列按键」（断言无 overflow 行）与「Ctrl+Shift+Z 到达 editor_redo」；
+- 仍逐字节比对宿主解析的 FAT32 镜像（19 行 / 71 字节）、视口滚动/滚轮回滚/PageUp 落点。
+
+**最终验收（同一份 ISO，一次连续 `scripts/gui_sweep.py` 全量 32 门全绿）**：静态 21/21、交互 13/13、
+外壳 55/55、交换链 30/30、合成器 28/28、C 桌面任务栏 9/9、**编辑器落盘 19/19**、开始菜单 10/10、
+图片浏览 9/9、计算器 28/28、滚轮 9/9、vsync 探测 17/17、键盘归属 13/13、菜单滚动 13/13、桌面 19/19、
+应用内容 23/23、两套外观门禁 0 像素、Logo 14/14、wl_server 28/28、wl_protocol 29/29、wl_multi 40/40、
+wl_semantics 38/38、wl_show 9/9、wl 窗口 11/11、wlprobe 14/14、GUI 中文 4/4、图片查看器 PASS、
+C 编辑器 5/5、unix 18/18、shm 18/18、fdpass 21/21；开机自检 16/16；
+符号扫描 1453 全局 / 0 冲突（145 对象）；产物 `kernel.elf` 6,622,944 B、
+`sutureos.iso` 23,853,056 B（sha256 `49a56f323a209da2dc9a176bc9b8ab9e0ac8e1d0b04afb7a1692e2684b069d51`）。
+
 ## [v0.66.0-alpha] — 2026-11-22
 
 发布正文见 `docs/release-notes-v0.66.0-alpha.md`。本版把桌面编辑器做实（48×64 缓冲、滚动视口、

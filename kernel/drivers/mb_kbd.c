@@ -249,8 +249,15 @@ int mbos_kbd_decode(uint8_t scancode)
          * 0x1A, Ctrl+Y = 0x19, Ctrl+S = 0x13). Decoding it here is race-free: a
          * consumer that only sampled the modifier mask a frame later would see
          * Ctrl already released (both edges arrive in the same burst). */
-        if ((kb_mode & MBOS_KBD_CTRL) != 0 && base >= 'a' && base <= 'z')
-            return (int)(unsigned char)(base & 0x1f);
+        if ((kb_mode & MBOS_KBD_CTRL) != 0 && base >= 'a' && base <= 'z') {
+            int code = (int)(unsigned char)(base & 0x1f);
+
+            /* v0.67: Ctrl+Shift+<letter> keeps its own code (0x80 | control) so
+             * Ctrl+Shift+Z can mean "redo" next to Ctrl+Z. */
+            if ((kb_mode & MBOS_KBD_SHIFT) != 0)
+                code |= 0x80;
+            return code;
+        }
         if (base >= 'a' && base <= 'z')
             shift_on = shift_on != kb_caps;
         return (int)(unsigned char)(shift_on ? shifted : base);

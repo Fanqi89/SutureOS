@@ -1576,7 +1576,7 @@ fn editor_keys(mods: i32, key: i32, ch: i32) -> bool {
             log2(c"editor ctrl", key, ch);
             return true;
         }
-        0x19 => {                                    /* Ctrl+Y */
+        0x19 | 0x9a => {                             /* Ctrl+Y / Ctrl+Shift+Z */
             crate::apps::editor_redo();
             unsafe {
                 WIN_KEY[3] = i32::MIN;
@@ -2710,6 +2710,164 @@ fn menu_hover_index(mx: i32, my: i32, scroll: usize) -> i32 {
     menu_row_at(mx, my, scroll)
 }
 
+// ---------------------------------------------------------------- key queue
+/* v0.67: the kernel pushes one event at a time and the next frame drains them
+ * all, instead of transporting exactly one event per frame (a burst larger than
+ * the bridge queue used to lose keys). */
+const KEYQ_LEN: usize = 64;
+static mut KEYQ: [(i32, i32, i32); KEYQ_LEN] = [(0, 0, 0); KEYQ_LEN];
+static mut KEYQ_HEAD: usize = 0;
+static mut KEYQ_TAIL: usize = 0;
+static mut KEYQ_DROPPED: u32 = 0;
+static mut KEYQ_LOGGED_DROP: bool = false;
+
+/// v0.67: append one decoded key event (key = PS/2 make code or -1, ch = the
+/// character the decoder produced or -1, mods = SHIFT/CTRL/ALT bits).
+pub unsafe fn push_key(key: i32, ch: i32, mods: i32) {
+    let next = (KEYQ_TAIL + 1) % KEYQ_LEN;
+    if next == KEYQ_HEAD {
+        KEYQ_HEAD = (KEYQ_HEAD + 1) % KEYQ_LEN;
+        KEYQ_DROPPED = KEYQ_DROPPED.wrapping_add(1);
+        if !KEYQ_LOGGED_DROP {
+            KEYQ_LOGGED_DROP = true;
+            console_printf(b"[gui-shell] key queue overflow (%d dropped)\n\0".as_ptr(),
+                           KEYQ_DROPPED as i64);
+        }
+    }
+    KEYQ[KEYQ_TAIL] = (key, ch, mods);
+    KEYQ_TAIL = next;
+}
+
+/// v0.67: one key event, factored out of `shell_step` so a frame can apply many.
+unsafe fn handle_key(sh: &mut Shell, key: i32, ch: i32, mods: i32) {
+    // keyboard: menu navigation (v0.43.0). Scancodes are PS/2 set-1 make codes.
+    if sh.menu_open {
+        match key {
+            0x48 => {
+                sh.menu_sel -= 1;
+                if sh.menu_sel < 0 {
+                    sh.menu_sel = MENU_ROWS.len() as i32 - 1;
+                }
+                log2(c"menu sel", sh.menu_sel, 0);
+                menu_scroll_into_view(sh);
+            }
+            0x50 => {
+                sh.menu_sel += 1;
+                if sh.menu_sel >= MENU_ROWS.len() as i32 {
+                    sh.menu_sel = 0;
+                }
+                log2(c"menu sel", sh.menu_sel, 0);
+                menu_scroll_into_view(sh);
+            }
+            /* v0.65: PageUp/PageDown scroll a whole page without moving the
+             * selection, so the list can be paged while keeping the cursor. */
+            0x49 | 0x51 => {
+                let page = menu_visible_rows() as i32;
+                let dir = if key == 0x49 { -page } else { page };
+                let _ = menu_scroll_by(sh, dir);
+            }
+            /* v0.64: Home/End jump to the first/last registry row */
+            0x47 => {
+                sh.menu_sel = 0;
+                log2(c"menu sel", 0, 0);
+                menu_scroll_into_view(sh);
+            }
+            0x4f => {
+                sh.menu_sel = MENU_ROWS.len() as i32 - 1;
+                log2(c"menu sel", sh.menu_sel, 0);
+                menu_scroll_into_view(sh);
+            }
+            0x1C => {
+                let idx = sh.menu_sel.max(0) as usize;
+                if idx < MENU_ROWS.len() {
+                    menu_activate(sh, idx);
+                }
+                log2(c"menu enter", idx as i32, 0);
+            }
+            _ => {}
+        }
+    } else if key == 0x3C && !sh.shutting {
+        /* v0.60: F2 toggles the dedicated Wayland compositor window (window #4).
+         * v0.62: the window is also a start-menu row now (the menu grows with the
+         * registry); F2 stays as the keyboard shortcut and means
+         * open -> minimize -> restore. */
+        if sh.wins[4].open && !sh.wins[4].minimized && sh.focus == 4 {
+            sh.wins[4].minimized = true;
+            if let Some(n) = next_visible(sh, 4) {
+                sh.wins[n].z = next_z(sh);
+                sh.focus = n;
+            }
+            log0(c"wayland window minimized");
+        } else {
+            launch_window(sh, 4);
+            log0(c"wayland window opened");
+        }
+    } else if key == 0x44 && !sh.shutting {
+        /* F10 = shutdown: play the reverse logo animation, then power off.
+         * (v0.58.0 moved this off 'S': the shell now accepts typed text, so
+         * every printable key has to reach the focused window.) */
+        sh.shutting = true;
+        sh.shut_frame = 0;
+        log0(c"logo shutdown start");
+    } else if key == 0x50 || key == 0x48 {
+        // up/down with the menu closed is ignored (keeps the log honest)
+    }
+
+    /* v0.64: per-window keyboard focus. Tab cycles the window focus; after that
+     * the ownership registry (KEY_OWNERS) decides who sees the key - a window
+     * with a handler runs it, any other window edits its one-line input band. */
+    if !sh.menu_open && !sh.shutting {
+        let fi = sh.focus;
+        if ch == 0x09 {
+            let mut n = fi;
+            for _ in 0..WINS {
+                n = (n + 1) % WINS;
+                if sh.wins[n].open && !sh.wins[n].minimized {
+                    break;
+                }
+            }
+            if n != fi {
+                sh.wins[n].z = next_z(sh);
+                sh.focus = n;
+                log2(c"focus cycle", n as i32, 0);
+            }
+        } else if sh.wins[fi].open && !sh.wins[fi].minimized {
+            /* v0.64: one table decides who eats the key. A registered window
+             * runs its handler; an unregistered one gets the one-line input
+             * band that its acceptance still exercises. */
+            if let Some(owner) = key_owner_for(fi, sh.wins[fi].accent) {
+                dispatch_owned_key(sh, owner, mods, key, ch);
+            } else {
+                let len = sh.ilen[fi] as usize;
+                if ch == 0x0a || ch == 0x0d {
+                    if len > 0 {
+                        let buf = &sh.input[fi];
+                        console_printf(b"[gui-shell] input win=%d text=%s\n\0".as_ptr(),
+                                       fi as i32, buf.as_ptr());
+                        log2(c"input commit", fi as i32, len as i32);
+                        sh.ilen[fi] = 0;
+                        sh.input[fi][0] = 0;
+                    }
+                } else if ch == 0x08 {
+                    if len > 0 {
+                        sh.ilen[fi] -= 1;
+                        sh.input[fi][len - 1] = 0;
+                        log2(c"input backspace", fi as i32, (len - 1) as i32);
+                    }
+                } else if ch >= 0x20 && ch < 0x7f && len < 32 {
+                    sh.input[fi][len] = ch as u8;
+                    sh.input[fi][len + 1] = 0;
+                    sh.ilen[fi] = len as u32 + 1;
+                    if len == 0 {
+                        log2(c"input start", fi as i32, 0);
+                    }
+                }
+            }
+        }
+    }
+
+}
+
 // ---------------------------------------------------------------- frame
 pub unsafe fn shell_step(
     fb: *mut u32,
@@ -2723,11 +2881,8 @@ pub unsafe fn shell_step(
     click_y: i32,
     _click_btn: i32,
     now_ms: u32,
-    key: i32,
-    ch: i32,
     clock_hhmm: i32,
     wheel: i32,
-    mods: i32,
 ) -> u32 {
     if fb.is_null() || w <= 0 || h <= 0 || pitch_px < w {
         return 0;
@@ -2940,130 +3095,13 @@ pub unsafe fn shell_step(
         }
     }
 
-    // keyboard: menu navigation (v0.43.0). Scancodes are PS/2 set-1 make codes.
-    if sh.menu_open {
-        match key {
-            0x48 => {
-                sh.menu_sel -= 1;
-                if sh.menu_sel < 0 {
-                    sh.menu_sel = MENU_ROWS.len() as i32 - 1;
-                }
-                log2(c"menu sel", sh.menu_sel, 0);
-                menu_scroll_into_view(sh);
-            }
-            0x50 => {
-                sh.menu_sel += 1;
-                if sh.menu_sel >= MENU_ROWS.len() as i32 {
-                    sh.menu_sel = 0;
-                }
-                log2(c"menu sel", sh.menu_sel, 0);
-                menu_scroll_into_view(sh);
-            }
-            /* v0.65: PageUp/PageDown scroll a whole page without moving the
-             * selection, so the list can be paged while keeping the cursor. */
-            0x49 | 0x51 => {
-                let page = menu_visible_rows() as i32;
-                let dir = if key == 0x49 { -page } else { page };
-                let _ = menu_scroll_by(sh, dir);
-            }
-            /* v0.64: Home/End jump to the first/last registry row */
-            0x47 => {
-                sh.menu_sel = 0;
-                log2(c"menu sel", 0, 0);
-                menu_scroll_into_view(sh);
-            }
-            0x4f => {
-                sh.menu_sel = MENU_ROWS.len() as i32 - 1;
-                log2(c"menu sel", sh.menu_sel, 0);
-                menu_scroll_into_view(sh);
-            }
-            0x1C => {
-                let idx = sh.menu_sel.max(0) as usize;
-                if idx < MENU_ROWS.len() {
-                    menu_activate(sh, idx);
-                }
-                log2(c"menu enter", idx as i32, 0);
-            }
-            _ => {}
-        }
-    } else if key == 0x3C && !sh.shutting {
-        /* v0.60: F2 toggles the dedicated Wayland compositor window (window #4).
-         * v0.62: the window is also a start-menu row now (the menu grows with the
-         * registry); F2 stays as the keyboard shortcut and means
-         * open -> minimize -> restore. */
-        if sh.wins[4].open && !sh.wins[4].minimized && sh.focus == 4 {
-            sh.wins[4].minimized = true;
-            if let Some(n) = next_visible(sh, 4) {
-                sh.wins[n].z = next_z(sh);
-                sh.focus = n;
-            }
-            log0(c"wayland window minimized");
-        } else {
-            launch_window(sh, 4);
-            log0(c"wayland window opened");
-        }
-    } else if key == 0x44 && !sh.shutting {
-        /* F10 = shutdown: play the reverse logo animation, then power off.
-         * (v0.58.0 moved this off 'S': the shell now accepts typed text, so
-         * every printable key has to reach the focused window.) */
-        sh.shutting = true;
-        sh.shut_frame = 0;
-        log0(c"logo shutdown start");
-    } else if key == 0x50 || key == 0x48 {
-        // up/down with the menu closed is ignored (keeps the log honest)
-    }
-
-    /* v0.64: per-window keyboard focus. Tab cycles the window focus; after that
-     * the ownership registry (KEY_OWNERS) decides who sees the key - a window
-     * with a handler runs it, any other window edits its one-line input band. */
-    if !sh.menu_open && !sh.shutting {
-        let fi = sh.focus;
-        if ch == 0x09 {
-            let mut n = fi;
-            for _ in 0..WINS {
-                n = (n + 1) % WINS;
-                if sh.wins[n].open && !sh.wins[n].minimized {
-                    break;
-                }
-            }
-            if n != fi {
-                sh.wins[n].z = next_z(sh);
-                sh.focus = n;
-                log2(c"focus cycle", n as i32, 0);
-            }
-        } else if sh.wins[fi].open && !sh.wins[fi].minimized {
-            /* v0.64: one table decides who eats the key. A registered window
-             * runs its handler; an unregistered one gets the one-line input
-             * band that its acceptance still exercises. */
-            if let Some(owner) = key_owner_for(fi, sh.wins[fi].accent) {
-                dispatch_owned_key(sh, owner, mods, key, ch);
-            } else {
-                let len = sh.ilen[fi] as usize;
-                if ch == 0x0a || ch == 0x0d {
-                    if len > 0 {
-                        let buf = &sh.input[fi];
-                        console_printf(b"[gui-shell] input win=%d text=%s\n\0".as_ptr(),
-                                       fi as i32, buf.as_ptr());
-                        log2(c"input commit", fi as i32, len as i32);
-                        sh.ilen[fi] = 0;
-                        sh.input[fi][0] = 0;
-                    }
-                } else if ch == 0x08 {
-                    if len > 0 {
-                        sh.ilen[fi] -= 1;
-                        sh.input[fi][len - 1] = 0;
-                        log2(c"input backspace", fi as i32, (len - 1) as i32);
-                    }
-                } else if ch >= 0x20 && ch < 0x7f && len < 32 {
-                    sh.input[fi][len] = ch as u8;
-                    sh.input[fi][len + 1] = 0;
-                    sh.ilen[fi] = len as u32 + 1;
-                    if len == 0 {
-                        log2(c"input start", fi as i32, 0);
-                    }
-                }
-            }
-        }
+    /* v0.67: keys arrive in batches. The bridge pushes every event it read this
+     * frame and the shell handles them all before rendering, so a typing burst
+     * no longer overflows a one-key ABI. */
+    while KEYQ_HEAD != KEYQ_TAIL {
+        let (k, cc, mm) = KEYQ[KEYQ_HEAD];
+        KEYQ_HEAD = (KEYQ_HEAD + 1) % KEYQ_LEN;
+        handle_key(sh, k, cc, mm);
     }
 
     let mut dropped_win: i32 = -1;
