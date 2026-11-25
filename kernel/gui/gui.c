@@ -1401,6 +1401,15 @@ static void gui_render(void) {
     gui_draw_pointer();
 
     gui_clip_full();
+
+    /* Commit the frame to a virtio-gpu scanout when that is the system display
+     * (`-vga none`). Only the dirty union rect is transferred, which is exactly
+     * the region this composer just repainted. A no-op otherwise. */
+    {
+        extern void virtio_gpu_fb_present_rect(uint32_t, uint32_t, uint32_t, uint32_t);
+        virtio_gpu_fb_present_rect((uint32_t)x0, (uint32_t)y0,
+                                   (uint32_t)(x1 - x0), (uint32_t)(y1 - y0));
+    }
     g_dirty_any = false;              /* clear AFTER commit (gui64.cpp lesson) */
 }
 

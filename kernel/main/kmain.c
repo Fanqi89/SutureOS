@@ -212,7 +212,32 @@ void kernel_main(uint32_t magic, uint32_t mbi) {
          * with a heap that gets reset underneath it (observed as a fault loop
          * flooding the serial line). fbcon carries the early log meanwhile. */
     } else {
-        console_puts("[init] no framebuffer - serial console only\n");
+        /* No firmware framebuffer (`-vga none`). A virtio-gpu scanout can take
+         * its place: the driver's backing store is identity-mapped .bss, so it
+         * can be published as the linear framebuffer and every existing renderer
+         * (fbcon, flanterm, C desktop, Rust shell) keeps working untouched.
+         * This is the only boot-time entry into the virtio-gpu driver, and it
+         * only happens when there is nothing else to draw on. */
+        extern int virtio_gpu_fb_init(void);
+        extern uint64_t virtio_gpu_fb_addr(void);
+        extern uint32_t virtio_gpu_fb_width(void);
+        extern uint32_t virtio_gpu_fb_height(void);
+        extern uint32_t virtio_gpu_fb_pitch(void);
+
+        if (virtio_gpu_fb_init() == 0) {
+            limine_fb_addr   = virtio_gpu_fb_addr();
+            limine_fb_width  = virtio_gpu_fb_width();
+            limine_fb_height = virtio_gpu_fb_height();
+            limine_fb_pitch  = virtio_gpu_fb_pitch();
+            limine_fb_bpp    = 32;
+            console_printf("[init] virtio-gpu framebuffer %ux%u pitch=%u bpp=32\n",
+                           limine_fb_width, limine_fb_height, limine_fb_pitch);
+            fbcon_init(limine_fb_addr, limine_fb_width, limine_fb_height,
+                       limine_fb_pitch, limine_fb_bpp);
+            console_puts("[init] fbcon initialized (virtio-gpu scanout)\n");
+        } else {
+            console_puts("[init] no framebuffer - serial console only\n");
+        }
     }
 
     /* Banner */

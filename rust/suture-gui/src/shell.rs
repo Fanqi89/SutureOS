@@ -4230,79 +4230,113 @@ fn glyph_for_accent(accent: u32) -> i32 {
     }
 }
 
-/// v0.59.0: pseudo-3D Fluent app icon: rounded plate with a vertical gradient,
-/// a specular top highlight, a dark bottom rim and a soft drop shadow. The
-/// rounded silhouette is drawn with per-row insets (integer rect fills only) so
-/// a 22 px icon costs no soft-float sqrt.
+/// v0.70 flat icon set (redrawn by the ConlyesOS author, merged on
+/// request; the rest of this desktop keeps the glass/Fluent chrome):
+/// a solid accent plate with an anti-aliased silhouette
+/// and one flat white pictogram per application. Nothing is lit - no gradient
+/// body, no specular band, no rim light, no drop shadow. Every glyph uses a
+/// different construction (sliders / bars / frame / lines / window / keypad)
+/// so the six apps stay distinguishable at 16 px without relying on colour.
 fn draw_app_icon(s: &mut Surface<'_>, x: i32, y: i32, size: i32, accent: u32,
                  glyph: i32) {
     if size < 8 {
         return;
     }
-    let r = if size >= 20 { 3 } else { 2 };
-    let light = shade_px(accent, 150, 100);
-    let dark = shade_px(accent, 58, 100);
-    /* drop shadow (pseudo-3D: the plate floats above the surface) */
-    s.rect_fill(x + 2, y + 2, x + size + 2, y + size + 2, 0x000000, 0x34);
-    for i in 0..size {
-        /* inset profile: r, r-1, 0, 0, ... 0, r-1, r */
-        let ins = if i < r {
-            r - i
-        } else if i >= size - r {
-            r - (size - 1 - i)
-        } else {
-            0
-        };
-        let c = lerp_px(light, dark, i, (size - 1).max(1));
-        s.rect_fill(x + ins, y + i, x + size - ins, y + i + 1, c, 0xff);
-    }
-    /* specular highlight + bottom rim (the actual 3D cue) */
-    s.rect_fill(x + r, y + 1, x + size - r, y + 2, 0xffffff, 0x8c);
-    s.rect_fill(x + r, y + size - 3, x + size - r, y + size - 2, 0x000000, 0x38);
-    /* v0.60: side rim light + bottom reflection band, so the plate keeps an edge
-     * on the brighter menu rows and title strips instead of melting into them. */
-    s.rect_fill(x + 1, y + 3, x + 2, y + size - 3, 0xffffff, 0x2a);
-    s.rect_fill(x + size - 2, y + 3, x + size - 1, y + size - 3, 0xffffff, 0x18);
-    if size >= 20 {
-        s.rect_fill(x + r + 1, y + size - 5, x + size - r - 1, y + size - 4,
-                    0xffffff, 0x1e);
-    }
-    /* glyph */
+    let sf = size as f32;
+    s.round_rect(x as f32, y as f32, (x + size) as f32, (y + size) as f32,
+                 sf * 0.20, accent, 255);
     let gx = x + size / 2;
     let gy = y + size / 2;
+    /* v0.70: at title-bar size (16 px) the detailed glyphs collapse into
+     * mush, so swap in compact marks that keep a legible silhouette. */
+    if size < 18 {
+        let g = 4i32;
+        let ink = 0xffffffu32;
+        match glyph {
+            0 => {
+                s.rect_fill(gx - g, gy - 3, gx + g, gy - 2, ink, 255);
+                s.rect_fill(gx - g, gy + 2, gx + g, gy + 3, ink, 255);
+                s.rect_fill(gx - 1, gy - 5, gx + 1, gy - 1, ink, 255);
+                s.rect_fill(gx + 1, gy + 1, gx + 3, gy + 5, ink, 255);
+            }
+            1 => {
+                s.rect_fill(gx - g, gy + 3, gx + g, gy + 4, ink, 255);
+                s.rect_fill(gx - g, gy, gx - g + 2, gy + 2, ink, 255);
+                s.rect_fill(gx - 1, gy - 3, gx + 1, gy + 2, ink, 255);
+                s.rect_fill(gx + g - 2, gy - 4, gx + g, gy + 2, ink, 255);
+            }
+            3 => {
+                s.rect_fill(gx - g, gy - 4, gx + g, gy - 3, ink, 255);
+                s.rect_fill(gx - g, gy - 1, gx + g - 1, gy, ink, 255);
+                s.rect_fill(gx - g, gy + 2, gx + g, gy + 3, ink, 255);
+            }
+            5 => {
+                s.rect_fill(gx - g, gy - 3, gx + g, gy - 2, ink, 255);
+                s.rect_fill(gx - g, gy - 1, gx + g, gy, ink, 255);
+                s.rect_fill(gx - 3, gy + 2, gx - 1, gy + 4, ink, 235);
+                s.rect_fill(gx + 1, gy + 2, gx + 3, gy + 4, ink, 235);
+            }
+            _ => {
+                s.round_rect_stroke((gx - g) as f32, (gy - g) as f32,
+                                    (gx + g) as f32, (gy + g) as f32, 1.0, ink, 235);
+                s.rect_fill(gx - 2, gy - 2, gx + 1, gy + 1, ink, 255);
+            }
+        }
+        return;
+    }
+
     let g = if size >= 20 { 4 } else { 3 };
+    let ink = 0xffffffu32;
     match glyph {
-        0 => {                       /* settings: ring */
-            s.rect_fill(gx - g, gy - 1, gx + g, gy + 1, 0xffffff, 0xd8);
-            s.rect_fill(gx - 1, gy - g, gx + 1, gy + g, 0xffffff, 0xd8);
+        0 => {                       /* system settings: two flat sliders */
+            s.rect_fill(gx - g, gy - 4, gx + g, gy - 3, ink, 255);
+            s.rect_fill(gx - g, gy + 3, gx + g, gy + 4, ink, 255);
+            s.round_rect((gx - g + 1) as f32, (gy - 6) as f32,
+                         (gx - g + 4) as f32, (gy - 1) as f32, 2.0, ink, 255);
+            s.round_rect((gx + g - 4) as f32, (gy + 1) as f32,
+                         (gx + g - 1) as f32, (gy + 6) as f32, 2.0, ink, 255);
         }
-        1 => {                       /* task manager: bars */
-            s.rect_fill(gx - g, gy + 1, gx - g + 2, gy + g, 0xffffff, 0xd0);
-            s.rect_fill(gx - 1, gy - 2, gx + 1, gy + g, 0xffffff, 0xd0);
-            s.rect_fill(gx + g - 2, gy - g, gx + g, gy + g, 0xffffff, 0xd0);
+        1 => {                       /* task manager: ascending bars */
+            s.rect_fill(gx - g, gy + g - 1, gx + g, gy + g, ink, 255);
+            s.rect_fill(gx - g, gy + 1, gx - g + 2, gy + g - 1, ink, 255);
+            s.rect_fill(gx - 1, gy - 2, gx + 1, gy + g - 1, ink, 255);
+            s.rect_fill(gx + g - 2, gy - g, gx + g, gy + g - 1, ink, 255);
         }
-        2 => {                       /* image viewer: frame */
-            s.rect_fill(gx - g, gy - g, gx + g, gy - g + 1, 0xffffff, 0xd0);
-            s.rect_fill(gx - g, gy + g - 1, gx + g, gy + g, 0xffffff, 0xd0);
-            s.rect_fill(gx - g, gy - g + 1, gx - g + 1, gy + g - 1, 0xffffff, 0xd0);
-            s.rect_fill(gx + g - 1, gy - g + 1, gx + g, gy + g - 1, 0xffffff, 0xd0);
-            s.rect_fill(gx - 2, gy, gx + 2, gy + 2, 0xffffff, 0xc0);
+        2 => {                       /* image viewer: frame, sun, horizon */
+            s.round_rect_stroke((gx - g) as f32, (gy - g) as f32,
+                                (gx + g) as f32, (gy + g) as f32, 1.0, ink, 255);
+            s.round_rect((gx - g + 2) as f32, (gy - g + 2) as f32,
+                         (gx - g + 4) as f32, (gy - g + 4) as f32, 1.0, ink, 255);
+            s.rect_fill(gx - g + 1, gy + 1, gx + g - 1, gy + 2, ink, 255);
+            s.rect_fill(gx - 1, gy - 1, gx + 1, gy + 1, ink, 255);
         }
-        5 => {                       /* calculator: two "=" bars */
-            s.rect_fill(gx - g, gy - 3, gx + g, gy - 1, 0xffffff, 0xd8);
-            s.rect_fill(gx - g, gy + 2, gx + g, gy + 4, 0xffffff, 0xd8);
+        3 => {                       /* text editor: four document lines */
+            s.rect_fill(gx - g, gy - g, gx + g, gy - g + 1, ink, 255);
+            s.rect_fill(gx - g, gy - 1, gx + g - 1, gy, ink, 255);
+            s.rect_fill(gx - g, gy + 2, gx + g, gy + 3, ink, 255);
+            s.rect_fill(gx - g, gy + 5, gx + g - 3, gy + 6, ink, 255);
         }
-        4 => {                       /* wayland client: a surface + a pointer dot */
-            s.rect_fill(gx - g, gy - g, gx + g, gy - g + 1, 0xffffff, 0xd0);
-            s.rect_fill(gx - g, gy + g - 1, gx + g, gy + g, 0xffffff, 0xd0);
-            s.rect_fill(gx - g, gy - g + 1, gx - g + 1, gy + g - 1, 0xffffff, 0xd0);
-            s.rect_fill(gx + g - 1, gy - g + 1, gx + g, gy + g - 1, 0xffffff, 0xd0);
-            s.rect_fill(gx - 1, gy - 1, gx + 2, gy + 2, 0xffffff, 0xe0);
+        4 => {                       /* wayland client: surface + pointer */
+            s.round_rect_stroke((gx - g) as f32, (gy - g) as f32,
+                                (gx + g) as f32, (gy + g) as f32, 1.0, ink, 200);
+            s.rect_fill(gx + 1, gy, gx + 5, gy + 5, ink, 235);
+            s.rect_fill(gx + 1, gy + 5, gx + 3, gy + 6, ink, 235);
         }
-        _ => {                       /* text editor: text lines */
-            s.rect_fill(gx - g, gy - g, gx + g, gy - g + 1, 0xffffff, 0xd0);
-            s.rect_fill(gx - g, gy, gx + 1, gy + 1, 0xffffff, 0xd0);
-            s.rect_fill(gx - g, gy + g - 1, gx + g, gy + g, 0xffffff, 0xd0);
+        5 => {                       /* calculator: equals + keypad dots */
+            s.rect_fill(gx - g, gy - g, gx + g, gy - g + 1, ink, 255);
+            s.rect_fill(gx - g, gy - g + 2, gx + g, gy - g + 3, ink, 255);
+            for dy in [0i32, 4] {
+                for dx in [0i32, 4] {
+                    s.round_rect((gx - g + dx) as f32, (gy + dy) as f32,
+                                 (gx - g + dx + 2) as f32, (gy + dy + 2) as f32,
+                                 1.0, ink, 235);
+                }
+            }
+        }
+        _ => {                       /* default: three menu lines */
+            s.rect_fill(gx - g, gy - g, gx + g, gy - g + 1, ink, 255);
+            s.rect_fill(gx - g, gy, gx + 1, gy + 1, ink, 255);
+            s.rect_fill(gx - g, gy + g - 1, gx + g, gy + g, ink, 255);
         }
     }
 }

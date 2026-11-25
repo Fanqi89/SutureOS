@@ -162,6 +162,17 @@ add copies from that repository.
 
 ---
 
+## v0.70 外部贡献：ConlyesOS（virtio-gpu 帧缓冲模式 + 图标重绘）
+
+| 项 | 内容 |
+|---|---|
+| 贡献者 | **ConlyesOS 作者**（GitHub 账号待补录） |
+| 交付 | 2026-11-25 提供了改好的整棵工作树（`SutureOS-0.70.0-alpha/`），不是 git patch |
+| 许可 | 交付物内未声明许可；作者以提供文件的方式同意使用，条款待书面确认 —— 本项目按 GPL-3.0 收录并如实标注，不假装已有书面许可 |
+| 合入范围 | `kernel/drivers/virtio_gpu.c/.h`（`virtio_gpu_fb_*` 一族：帧缓冲模式、8 MiB backing、`vgpu_attach_resource`/`vgpu_cmd_flush_rect`、ISR 只标 dirty）、`kernel/main/kmain.c`（无 GOP 时的 boot 入口）、`kernel/drivers/fbcon.c`、`kernel/term/term.c`、`arch/x86_64/serial.c`、`kernel/gui/gui.c`、`kernel/gui/slint_bridge.c`、`kernel/gui/wl_view.c`（present 钩子）、`rust/suture-gui/src/shell.rs::draw_app_icon`（六个应用图标重绘） |
+| 未合入 | 同一棵树里的扁平化桌面（`FLAT_*` 色板、纯色壁纸、不透明窗面、去亚克力/阴影、任务栏与菜单重绘）—— 本项目保留圆角 + 轻亚克力 + Fluent 外观 |
+| 核对方式 | 87 个差异文件逐字节比对：除行尾/空白归一化外无实质改动；未入库 `sutureos.img`（作者测试镜像） |
+
 ## Symbol Prefix Legend
 
 | Prefix | Module |

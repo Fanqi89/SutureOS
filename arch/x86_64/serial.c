@@ -83,6 +83,21 @@ void console_putc(char c)
     } else {
         fbcon_putc(c);
     }
+
+    /* virtio-gpu system framebuffer (only when the firmware had none): a line
+     * end is pushed to the scanout immediately, because boot has no idle loop
+     * yet; single characters (typing echo, backspace) only mark the frame
+     * dirty and the shell idle loop presents them. That keeps the per-character
+     * console path free of device commands while still making typed input
+     * visible within one idle spin. Both calls are no-ops on a normal boot. */
+    {
+        extern void virtio_gpu_fb_present(void);
+        extern void virtio_gpu_fb_mark_dirty(void);
+        if (c == '\n')
+            virtio_gpu_fb_present();
+        else
+            virtio_gpu_fb_mark_dirty();
+    }
 }
 
 void console_puts(const char *s)

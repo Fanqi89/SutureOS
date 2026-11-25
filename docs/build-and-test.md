@@ -84,3 +84,31 @@ QEMU `-kernel` 直通是主验证路径。若需 VMware 实测，需把内核做
 用 `x86_64-elf-objcopy -O binary` 取平坦镜像 + 自写 512 字节 multiboot/加载扇区
 （路线图 Phase-2 的磁盘镜像任务），VMware 挂载该磁盘启动。当前阶段验证以
 QEMU 为准（任务允许 QEMU **或** VMware）。
+
+## 8. 没有 GOP 帧缓冲时用 virtio-gpu 当系统屏幕（v0.70）
+
+`-vga std` 走 BIOS 提供的线性帧缓冲。要看 virtio-gpu 的帧缓冲路径，就必须把 VGA 关掉，
+让 virtio-gpu 自己持有 scanout 0：
+
+```bash
+qemu-system-x86_64 -machine pc -m 256 -display none \
+  -vga none -device virtio-gpu-pci -nic none \
+  -cdrom build/sutureos.iso -boot d \
+  -serial file:build/serial_vgpu.log \
+  -qmp tcp:127.0.0.1:48205,server,nowait -no-reboot -no-shutdown
+```
+
+串口应出现：
+
+```
+[vgpu] display 1024x768 -> framebuffer 1024x768 (cap 1920x1080)
+[vga2d] scanout 0 <- resource 1
+[vgpu] framebuffer ready: addr=0x... 1024x768 pitch=4096 bpp=32
+[init] virtio-gpu framebuffer 1024x768 pitch=4096 bpp=32
+[init] fbcon initialized (virtio-gpu scanout)
+```
+
+`-vga std` 这条路**一行 `[vgpu]` 都不该出现**（冻结启动呈现不受影响）。截图用 QMP
+`screendump <file.ppm>`：终端 banner 与 `startgui` 之后的桌面都应直接落在 virtio 输出上。
+细节与 present 模型见 `docs/virtio-gpu.md`，自动化验收见
+`scripts/gui_virtio_gpu_fb_acceptance.py`。

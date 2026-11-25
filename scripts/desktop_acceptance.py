@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """SutureOS desktop acceptance (v0.59.0): `startgui` must start the Rust desktop
-shell, its start menu must show the pseudo-3D app icons, ESC must return to the
+shell, its start menu must show the flat v0.70 app icons, ESC must return to the
 terminal, and `startgui-classic` must still start the original C desktop.
 
   py -3 scripts/desktop_acceptance.py
@@ -223,11 +223,26 @@ def main():
         for k in range(4):
             y = MENU[1] + 46 + k * MENU_ITEM_H
             stats.append(icon_stats(mpx, ICON_X, y + 8))
-        check('start-menu icons are pseudo-3D (specular top + shaded bottom)',
-              all(top > bot + 4 for (_c, top, bot) in stats),
+        # v0.70: the icon set is flat on purpose (ConlyesOS redraw) - a plate has
+        # no specular top and no shaded bottom, so the old top>bottom+4 assertion
+        # is inverted into "the plate really is flat".
+        check('start-menu icons are flat accent plates (no fake lighting)',
+              all(abs(top - bot) <= 8 for (_c, top, bot) in stats),
               'top/bottom brightness: ' +
               ', '.join('%.0f/%.0f' % (t, b) for (_c, t, b) in stats))
-        check('start-menu icons have gradients (not flat squares)',
+        white = []
+        for k in range(4):
+            y = MENU[1] + 46 + k * MENU_ITEM_H
+            cnt = 0
+            for yy in range(22):
+                for xx in range(22):
+                    p = mpx[ICON_X + xx, y + 8 + yy]
+                    if p[0] > 200 and p[1] > 200 and p[2] > 200:
+                        cnt += 1
+            white.append(cnt)
+        check('each flat plate still carries a white glyph', all(n >= 12 for n in white),
+              'white glyph pixels: %s' % white)
+        check('start-menu icons are anti-aliased plates (many shades, not 1 colour)',
               all(len(c) >= 4 for (c, _t, _b) in stats),
               'distinct colours per icon: %s' % [len(c) for (c, _t, _b) in stats])
         means = []

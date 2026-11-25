@@ -89,6 +89,12 @@ int wl_view_show(void) {
     console_printf("[wl] show %dx%d scale=%d at %d,%d (stride %d)\n",
                    sw, sh, scale, ox, oy, stride);
 
+    /* Push the blit to a virtio-gpu scanout (no-op on a firmware framebuffer). */
+    {
+        extern void virtio_gpu_fb_present(void);
+        virtio_gpu_fb_present();
+    }
+
     /* ESC (make code 0x01) dismisses; bounded so a headless run cannot hang */
     const uint64_t t0 = g_tick_count;
     for (;;) {

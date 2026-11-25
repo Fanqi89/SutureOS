@@ -62,6 +62,13 @@ void fbcon_init(uint64_t phys, uint32_t w, uint32_t h, uint32_t pitch, uint32_t 
     fb = (uint32_t *)(uintptr_t)phys;
 
     fbcon_clear();
+
+    /* If this framebuffer is a virtio-gpu scanout, push the clear so the
+     * screen really goes black instead of showing the host's stale frame. */
+    {
+        extern void virtio_gpu_fb_present(void);
+        virtio_gpu_fb_present();
+    }
 }
 
 void fbcon_clear(void)
@@ -207,5 +214,11 @@ void fbcon_timer_tick(void)
         cursor_blink_ticks = 0;
         cursor_visible = !cursor_visible;
         fbcon_draw_cursor();
+        /* Runs in the timer ISR: only mark the frame dirty, never issue device
+         * commands here (the present path takes the driver lock). */
+        {
+            extern void virtio_gpu_fb_mark_dirty(void);
+            virtio_gpu_fb_mark_dirty();
+        }
     }
 }

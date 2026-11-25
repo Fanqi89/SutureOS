@@ -853,7 +853,7 @@ fn settings_body(s: &mut Surface<'_>, accent: u32, wx: i32, wy: i32, w: i32, h: 
     let rows: [(&str, &str); 3] = [
         ("账户与登录", "alice"),
         ("显示与外观", "1024x768 ・ 32bpp"),
-        ("关于本机", "SutureOS 0.69.0-alpha"),
+        ("关于本机", "SutureOS 0.70.0-alpha"),
     ];
     let pill = lighten(accent, 10);
     let mut y = wy + TITLE_H + 20;

@@ -491,6 +491,13 @@ void term_clear(void)
     term_wipe_framebuffer();
     flanterm_full_refresh(term_ctx);
     flanterm_flush(term_ctx);
+
+    /* A full clear + repaint is a commit point: push it to a virtio-gpu
+     * scanout (no-op when the framebuffer is firmware-provided). */
+    {
+        extern void virtio_gpu_fb_present(void);
+        virtio_gpu_fb_present();
+    }
 }
 
 /* Clear the screen AND repaint every cell.

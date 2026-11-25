@@ -132,9 +132,13 @@ int slint_gui_render_frame(void) {
                        (uint64_t)bpp);
         return -3;
     }
-    const uint32_t w = (uint32_t)limine_fb_width;
-    const uint32_t h = (uint32_t)limine_fb_height;
+    uint32_t w = (uint32_t)limine_fb_width;
+    uint32_t h = (uint32_t)limine_fb_height;
     const uint32_t pitch_px = (uint32_t)(limine_fb_pitch / 4u);
+    /* v0.70.1: the Rust scene buffers are 1024x768; never hand it a bigger
+     * viewport (a larger scanout then renders in the top-left corner). */
+    if (w > 1024u) w = 1024u;
+    if (h > 768u) h = 768u;
     if (pitch_px < w) {
         console_printf("[gui-slint] bad pitch (%llu bytes for %llu px)\n",
                        (uint64_t)limine_fb_pitch, (uint64_t)w);
@@ -155,6 +159,10 @@ int slint_gui_render_frame(void) {
     console_printf("[gui-slint] frame rendered %llux%llu checksum=%llx frames=%llu %s\n",
                    (uint64_t)w, (uint64_t)h, (uint64_t)sum,
                    (uint64_t)suture_gui_frames(), sum ? "OK" : "EMPTY");
+    {
+        extern void virtio_gpu_fb_present(void);
+        virtio_gpu_fb_present();
+    }
     if (!sum) return -4;
     return 0;
 }
@@ -183,9 +191,13 @@ int slint_gui_run_interactive(void)
     if (!slint_gui_linked()) return -1;
     if (!limine_fb_addr || !limine_fb_width || !limine_fb_height) return -2;
     if (limine_fb_bpp != 32) return -3;
-    const uint32_t w = (uint32_t)limine_fb_width;
-    const uint32_t h = (uint32_t)limine_fb_height;
+    uint32_t w = (uint32_t)limine_fb_width;
+    uint32_t h = (uint32_t)limine_fb_height;
     const uint32_t pitch_px = (uint32_t)(limine_fb_pitch / 4u);
+    /* v0.70.1: the Rust scene buffers are 1024x768; never hand it a bigger
+     * viewport (a larger scanout then renders in the top-left corner). */
+    if (w > 1024u) w = 1024u;
+    if (h > 768u) h = 768u;
     if (pitch_px < w) return -3;
     uint32_t *fb = (uint32_t *)(uintptr_t)limine_fb_addr;
 
@@ -228,6 +240,12 @@ int slint_gui_run_interactive(void)
         (void)suture_gui_interactive_step(fb, (int32_t)w, (int32_t)h,
                                           (int32_t)pitch_px, mx, my, buttons,
                                           cx, cy, cb, now_ms);
+        /* The Rust step blits into the framebuffer; push it to a virtio-gpu
+         * scanout when that is the system display (no-op otherwise). */
+        {
+            extern void virtio_gpu_fb_present(void);
+            virtio_gpu_fb_present();
+        }
         frames++;
         if ((frames % 120) == 0) {
             console_printf("[gui-slint] frame %d ms=%u pointer=%d,%d\n",
@@ -297,9 +315,13 @@ int slint_gui_run_shell(void)
     if (!slint_gui_linked()) return -1;
     if (!limine_fb_addr || !limine_fb_width || !limine_fb_height) return -2;
     if (limine_fb_bpp != 32) return -3;
-    const uint32_t w = (uint32_t)limine_fb_width;
-    const uint32_t h = (uint32_t)limine_fb_height;
+    uint32_t w = (uint32_t)limine_fb_width;
+    uint32_t h = (uint32_t)limine_fb_height;
     const uint32_t pitch_px = (uint32_t)(limine_fb_pitch / 4u);
+    /* v0.70.1: the Rust scene buffers are 1024x768; never hand it a bigger
+     * viewport (a larger scanout then renders in the top-left corner). */
+    if (w > 1024u) w = 1024u;
+    if (h > 768u) h = 768u;
     if (pitch_px < w) return -3;
     uint32_t *fb = (uint32_t *)(uintptr_t)limine_fb_addr;
 
@@ -407,6 +429,12 @@ int slint_gui_run_shell(void)
         (void)suture_gui_shell_step(fb, (int32_t)w, (int32_t)h, (int32_t)pitch_px,
                                     mx, my, buttons, cx, cy, cb, now_ms,
                                     clock_hhmm, wheel);
+        /* One present per shell frame: the Rust compositor may coalesce frames
+         * internally, but the scanout has to be told explicitly. */
+        {
+            extern void virtio_gpu_fb_present(void);
+            virtio_gpu_fb_present();
+        }
         frames++;
         /* v0.64: the start menu's exit row asks the runner to leave the desktop
          * (the same exit ESC performs, checked one frame later). */

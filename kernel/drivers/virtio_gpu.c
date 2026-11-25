@@ -11,6 +11,15 @@
  * polling, strict completion status checking) follow the in-tree legacy
  * reference kernel/drivers/virtio_blk.c.  SutureOS is GPL-3.0.
  *
+ * v0.70 (external contribution): the system-framebuffer mode below
+ * (virtio_gpu_fb_init/present/present_rect/mark_dirty/service, the 8 MiB
+ * 1920x1080 backing, vgpu_attach_resource and vgpu_cmd_flush_rect) plus its
+ * boot hook and present hooks were contributed by the **ConlyesOS author**,
+ * who delivered the changed tree on 2026-11-25.  The contribution shipped
+ * without a licence statement; recorded as author-permitted use with terms
+ * pending written confirmation - see docs/provenance.md.  Everything else in
+ * this file (demo output mode, modern-PCI bring-up) is SutureOS original.
+ *
  * Why "modern" and not the legacy (0.9.5) I/O-port transport of virtio_blk:
  * `-device virtio-gpu-pci` in QEMU is a **non-transitional virtio 1.0**
  * device: there is no legacy I/O BAR.  It exposes the modern PCI capability
@@ -23,14 +32,18 @@
  *
  * Hard constraints from the porting brief
  * --------------------------------------
- *  - Boot presentation / terminal / GUI must not change.  Therefore nothing
- *    in this file runs at boot: kmain does not call it.  The first use is the
- *    shell command `vga2d on`, and on a plain `-vga std` boot not one
- *    `[vga2d]` line is printed.
+ *  - Boot presentation / terminal / GUI must not change on a normal boot.
+ *    Nothing in this file runs at boot unless the firmware gave the kernel no
+ *    framebuffer at all; the demo first use is the shell command `vga2d on`,
+ *    and on a plain `-vga std` boot not one `[vga2d]` line is printed.
  *  - The scanout buffer is a static .bss array (so it does not depend on the
- *    kernel heap or the PMM), capped at 1024x768x4 = 3 MiB.
- *  - fbcon / kernel/term / kernel/gui are never touched: this is an extra
- *    display output, not a replacement for the framebuffer console.
+ *    kernel heap or the PMM), capped at 1920x1080x4 = 8 MiB.
+ *  - Two exclusive modes over one control queue:
+ *      demo         `vga2d on` - animated bands on a private scanout;
+ *      framebuffer  claimed by kmain when limine_parse_fb() found nothing
+ *                   (`-vga none -device virtio-gpu-pci`). fbcon / term /
+ *                   gui draw into it and call present() at their commit
+ *                   points. The demo refuses to run while this mode is on.
  *
  * Pipeline (control queue 0, one command in flight, polled):
  *   GET_DISPLAY_INFO(0x0100) -> RESOURCE_CREATE_2D(0x0101) ->
@@ -137,7 +150,7 @@ extern volatile uint64_t g_tick_count;
 
 /* Frame pacing: one TRANSFER+FLUSH every 5 system ticks (100 Hz) = 50 ms =
  * 20 fps.  Each frame only transfers the strip the moving square occupies, so
- * the DMA cost is at most 2 x 64 x 64 x 4 bytes, not the whole 3 MiB frame. */
+ * the DMA cost is at most 2 x 64 x 64 x 4 bytes, not the whole 3 MiB demo frame. */
 #define VGPU_FRAME_TICKS   5u
 
 /* Animation geometry: a 64x64 white square sliding horizontally over eight
@@ -310,7 +323,9 @@ static uint8_t  g_vq[VGPU_VQ_BYTES] __attribute__((aligned(4096)));
 static union vgpu_cmd_buf  g_cmd  __attribute__((aligned(64)));
 static uint8_t  g_resp[VGPU_RESP_BYTES] __attribute__((aligned(64)));
 
-/* The scanout backing store: 1024x768x4 = 3 MiB, the brief's hard cap. */
+/* The scanout backing store: 1920x1080x4 = 8 MiB, the hard cap.  In
+ * framebuffer mode this *is* the system framebuffer (fbcon/term/gui draw
+ * straight into it); in demo mode only the top-left 1024x768 is used. */
 static uint32_t g_fb[VIRTIO_GPU_MAX_WIDTH * VIRTIO_GPU_MAX_HEIGHT]
     __attribute__((aligned(4096)));
 
@@ -318,7 +333,9 @@ static uint32_t g_fb[VIRTIO_GPU_MAX_WIDTH * VIRTIO_GPU_MAX_HEIGHT]
 static struct {
     int      found;          /* a virtio-gpu PCI function was seen         */
     int      up;             /* modern bring-up finished (queue usable)    */
-    int      enabled;        /* `vga2d on` in effect -> service runs       */
+    int      enabled;        /* `vga2d on` in effect -> demo service runs  */
+    int      fb_mode;        /* scanout 0 is the system framebuffer        */
+    volatile int fb_dirty;   /* a present was deferred (lock held / ISR)   */
 
     uint8_t  bus, dev, fn;
     uint16_t did;
@@ -350,9 +367,11 @@ static struct {
     uint32_t disp_scanout;
     uint32_t res_id;
     uint32_t w, h;                             /* active scanout geometry    */
+    uint32_t pitch;                            /* framebuffer bytes per row  */
     uint32_t sq_x;                             /* current square x           */
     uint32_t frame;                            /* animation frames applied   */
     uint64_t flushes;                          /* RESOURCE_FLUSH issued      */
+    uint64_t presents;                         /* framebuffer-mode presents  */
     uint64_t errors;
     uint64_t last_tick;
 } g;
@@ -369,6 +388,15 @@ static inline void vgpu_lock(void)
 static inline void vgpu_unlock(void)
 {
     __atomic_clear(&g_lock, __ATOMIC_RELEASE);
+}
+
+/* Non-blocking variant for the framebuffer present path: an interrupt (or a
+ * second CPU) that finds the command queue busy must never spin - on a single
+ * CPU that would deadlock against the thread it interrupted.  It just leaves
+ * the frame dirty and the next service pass pushes it. */
+static inline int vgpu_trylock(void)
+{
+    return __atomic_test_and_set(&g_lock, __ATOMIC_ACQUIRE) ? 0 : 1;
 }
 
 /* Cache maintenance around DMA.  QEMU's device model is coherent with the CPU
@@ -724,7 +752,10 @@ static int vgpu_cmd_attach_backing(void)
     g_cmd.attach.resource_id = VGPU_RESOURCE_ID;
     g_cmd.attach.nr_entries = 1u;
     g_cmd.attach.entries[0].addr = (uint64_t)(uintptr_t)g_fb;
-    g_cmd.attach.entries[0].length = (uint32_t)sizeof(g_fb);
+    /* Exactly w*h*4: the resource is created at the scanout geometry, so the
+     * backing store QEMU reads must be at least that long. The static array is
+     * the 1920x1080 cap, which is always the larger of the two. */
+    g_cmd.attach.entries[0].length = g.w * g.h * 4u;
     g_cmd.attach.entries[0].padding = 0u;
     /* 48 bytes for one entry: 24 (hdr) + 4 (res) + 4 (nr) + 16 (entry).  The
      * static_assert above pins it; a struct 8 bytes longer would make QEMU read
@@ -760,13 +791,13 @@ static int vgpu_cmd_transfer(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
                        VGPU_RESP_OK_NODATA, NULL, "transfer_to_host_2d");
 }
 
-static int vgpu_cmd_flush_full(void)
+static int vgpu_cmd_flush_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 {
     vgpu_cmd_begin(VGPU_CMD_RESOURCE_FLUSH);
-    g_cmd.flush.r.x = 0;
-    g_cmd.flush.r.y = 0;
-    g_cmd.flush.r.width = g.w;
-    g_cmd.flush.r.height = g.h;
+    g_cmd.flush.r.x = x;
+    g_cmd.flush.r.y = y;
+    g_cmd.flush.r.width = w;
+    g_cmd.flush.r.height = h;
     g_cmd.flush.resource_id = VGPU_RESOURCE_ID;
     return vgpu_submit((uint32_t)sizeof(struct vgpu_cmd_resource_flush),
                        VGPU_RESP_OK_NODATA, NULL, "resource_flush");
@@ -1138,27 +1169,13 @@ int virtio_gpu_init(void)
 }
 
 /* ===================== scanout + presentation ===================== */
-/* Draw frame 0 and push the whole frame, then point the scanout at the
- * resource.  Called once per `vga2d on`. */
-static int vgpu_attach_scanout(void)
+/* Attach the static backing store as resource 1 and point scanout 0 at it.
+ * Nothing is painted here: whichever mode owns the buffer fills it. */
+static int vgpu_attach_resource(uint32_t w, uint32_t h)
 {
-    uint32_t w = g.disp_w, h = g.disp_h;
-
-    if (w > VIRTIO_GPU_MAX_WIDTH)
-        w = VIRTIO_GPU_MAX_WIDTH;
-    if (h > VIRTIO_GPU_MAX_HEIGHT)
-        h = VIRTIO_GPU_MAX_HEIGHT;
-    if (w == 0u || h == 0u) {
-        w = VIRTIO_GPU_MAX_WIDTH;
-        h = VIRTIO_GPU_MAX_HEIGHT;
-    }
-    if (w != g.disp_w || h != g.disp_h)
-        console_printf("[vga2d] clamp %ux%u -> %ux%u (static backing store limit)\n",
-                       (uint64_t)g.disp_w, (uint64_t)g.disp_h,
-                       (uint64_t)w, (uint64_t)h);
-
     g.w = w;
     g.h = h;
+    g.pitch = w * 4u;
 
     if (vgpu_cmd_resource_create_2d(w, h) != 0)
         return -1;
@@ -1168,14 +1185,39 @@ static int vgpu_attach_scanout(void)
 
     if (vgpu_cmd_attach_backing() != 0)
         return -1;
-    console_printf("[vga2d] backing attached addr=0x%x bytes=%u\n",
-                   (uint64_t)(uintptr_t)g_fb, (uint64_t)sizeof(g_fb));
+    console_printf("[vga2d] backing attached addr=0x%x bytes=%u pitch=%u\n",
+                   (uint64_t)(uintptr_t)g_fb, (uint64_t)(w * h * 4u),
+                   (uint64_t)g.pitch);
 
     if (vgpu_cmd_set_scanout(w, h) != 0)
         return -1;
     console_printf("[vga2d] scanout %u <- resource %u (%ux%u)\n",
                    (uint64_t)VGPU_SCANOUT_ID, (uint64_t)g.res_id,
                    (uint64_t)w, (uint64_t)h);
+    return 0;
+}
+
+/* Demo mode (`vga2d on`): draw frame 0, push the whole frame, then point the
+ * scanout at it. */
+static int vgpu_attach_scanout(void)
+{
+    uint32_t w = g.disp_w, h = g.disp_h;
+
+    if (w > VIRTIO_GPU_MAX_WIDTH)
+        w = VIRTIO_GPU_MAX_WIDTH;
+    if (h > VIRTIO_GPU_MAX_HEIGHT)
+        h = VIRTIO_GPU_MAX_HEIGHT;
+    if (w == 0u || h == 0u) {
+        w = 1024u;
+        h = 768u;
+    }
+    if (w != g.disp_w || h != g.disp_h)
+        console_printf("[vga2d] clamp %ux%u -> %ux%u (static backing store limit)\n",
+                       (uint64_t)g.disp_w, (uint64_t)g.disp_h,
+                       (uint64_t)w, (uint64_t)h);
+
+    if (vgpu_attach_resource(w, h) != 0)
+        return -1;
 
     /* First frame: full-screen band fill plus the square at frame 0. */
     vgpu_paint_static();
@@ -1185,7 +1227,7 @@ static int vgpu_attach_scanout(void)
 
     if (vgpu_cmd_transfer(0u, 0u, g.w, g.h) != 0)
         return -1;
-    if (vgpu_cmd_flush_full() != 0)
+    if (vgpu_cmd_flush_rect(0u, 0u, g.w, g.h) != 0)
         return -1;
     g.flushes++;
     console_printf("[vga2d] flush #%u (full frame %ux%u)\n",
@@ -1195,6 +1237,12 @@ static int vgpu_attach_scanout(void)
 
 int virtio_gpu_on(void)
 {
+    if (g.fb_mode) {
+        /* The scanout belongs to the desktop: repainting it with the demo
+         * animation would destroy the system framebuffer. Refuse honestly. */
+        console_puts("[vga2d] framebuffer mode owns scanout 0; demo disabled\n");
+        return -1;
+    }
     if (!g.up) {
         if (virtio_gpu_init() != 0)
             return -1;
@@ -1219,7 +1267,7 @@ int virtio_gpu_on(void)
         g.sq_x = vgpu_square_x(0u);
         vgpu_fill_solid(g.sq_x, vgpu_square_y(), VGPU_SQ, VGPU_SQ, VGPU_SQ_COLOR);
         if (vgpu_cmd_transfer(0u, 0u, g.w, g.h) != 0 ||
-            vgpu_cmd_flush_full() != 0) {
+            vgpu_cmd_flush_rect(0u, 0u, g.w, g.h) != 0) {
             vgpu_unlock();
             console_puts("[vga2d] on failed (re-attach)\n");
             return -1;
@@ -1255,11 +1303,171 @@ int virtio_gpu_off(void)
     return 0;
 }
 
+/* ===================== system framebuffer mode =====================
+ * `-vga none -device virtio-gpu-pci`: no GOP/VBE framebuffer exists, so this
+ * scanout becomes the system display.  The buffer is static .bss (identity
+ * mapped, physically contiguous, DMA-visible) and is published to the rest of
+ * the kernel as limine_fb_* by kmain; fbcon / term / gui then draw into it
+ * exactly as they would into a linear framebuffer.
+ *
+ * Presentation is explicit: TRANSFER_TO_HOST_2D + RESOURCE_FLUSH for the rect
+ * that changed.  There is no automatic "display scanout from guest memory",
+ * which is why every renderer calls present()/mark_dirty() at its commit point.
+ */
+
+/* One present of `w x h` at `(x,y)`; caller holds the command lock and the
+ * rectangle is already clamped. */
+static int vgpu_present_locked(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    if (w == 0u || h == 0u)
+        return 0;
+    if (vgpu_cmd_transfer(x, y, w, h) != 0)
+        return -1;
+    if (vgpu_cmd_flush_rect(x, y, w, h) != 0)
+        return -1;
+    g.flushes++;
+    g.presents++;
+    return 0;
+}
+
+int virtio_gpu_fb_init(void)
+{
+    uint32_t w, h;
+
+    if (g.fb_mode)
+        return 0;
+    if (!g.up && virtio_gpu_init() != 0) {
+        console_puts("[vgpu] framebuffer: no usable virtio-gpu device\n");
+        return -1;
+    }
+
+    vgpu_lock();
+
+    /* The device's enabled scanout decides the geometry; a device that answers
+     * with nothing gets the historical 1024x768 boot size. */
+    w = (g.disp_w != 0u) ? g.disp_w : 1024u;
+    h = (g.disp_h != 0u) ? g.disp_h : 768u;
+    if (w > VIRTIO_GPU_MAX_WIDTH)
+        w = VIRTIO_GPU_MAX_WIDTH;
+    if (h > VIRTIO_GPU_MAX_HEIGHT)
+        h = VIRTIO_GPU_MAX_HEIGHT;
+    /* v0.70.1: the whole desktop stack (fbcon layout, C desktop, Rust shell) is
+     * designed for 1024x768 and the Rust shell indexes fixed 1024x768 buffers.
+     * QEMU 11.1's virtio-gpu-pci reports 1280x800, and adopting that size made
+     * `startgui` panic ([gui-slint] PANIC in Rust GUI). Cap the scanout at the
+     * design size: the host shows the guest frame in the top-left of its window,
+     * and no renderer can write past the end of its own buffers. */
+    if (w > 1024u)
+        w = 1024u;
+    if (h > 768u)
+        h = 768u;
+
+    console_printf("[vgpu] display %ux%u -> framebuffer %ux%u (cap %ux%u)\n",
+                   (uint64_t)g.disp_w, (uint64_t)g.disp_h,
+                   (uint64_t)w, (uint64_t)h,
+                   (uint64_t)VIRTIO_GPU_MAX_WIDTH,
+                   (uint64_t)VIRTIO_GPU_MAX_HEIGHT);
+
+    if (vgpu_attach_resource(w, h) != 0) {
+        vgpu_unlock();
+        console_puts("[vgpu] framebuffer attach failed\n");
+        return -1;
+    }
+
+    /* Black start: the host may still show the previous guest's frame until
+     * the first transfer, so push an empty frame before anyone draws. */
+    memset(g_fb, 0, (size_t)w * (size_t)h * 4u);
+    g.enabled = 0;
+    g.fb_dirty = 0;
+    g.presents = 0;
+    g.fb_mode = 1;
+    if (vgpu_present_locked(0u, 0u, w, h) != 0) {
+        g.fb_mode = 0;
+        vgpu_unlock();
+        console_puts("[vgpu] first flush failed; staying on the serial console\n");
+        return -1;
+    }
+    vgpu_unlock();
+
+    console_printf("[vgpu] framebuffer ready: addr=0x%x %ux%u pitch=%u bpp=32\n",
+                   (uint64_t)(uintptr_t)g_fb, (uint64_t)g.w, (uint64_t)g.h,
+                   (uint64_t)g.pitch);
+    return 0;
+}
+
+int virtio_gpu_fb_active(void)
+{
+    return g.fb_mode;
+}
+
+uint64_t virtio_gpu_fb_addr(void)
+{
+    return g.fb_mode ? (uint64_t)(uintptr_t)g_fb : 0u;
+}
+
+uint32_t virtio_gpu_fb_width(void)  { return g.fb_mode ? g.w : 0u; }
+uint32_t virtio_gpu_fb_height(void) { return g.fb_mode ? g.h : 0u; }
+uint32_t virtio_gpu_fb_pitch(void)  { return g.fb_mode ? g.pitch : 0u; }
+uint32_t virtio_gpu_fb_bpp(void)    { return g.fb_mode ? 32u : 0u; }
+
+void virtio_gpu_fb_present_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    int failed;
+
+    if (!g.fb_mode || !g.up || w == 0u || h == 0u)
+        return;
+    if (x >= g.w || y >= g.h)
+        return;
+    if (x + w > g.w)
+        w = g.w - x;
+    if (y + h > g.h)
+        h = g.h - y;
+
+    if (!vgpu_trylock()) {
+        /* IRQ or another CPU is already talking to the device: defer. The next
+         * service pass (shell idle loop / desktop loop) pushes the frame. */
+        g.fb_dirty = 1;
+        return;
+    }
+    failed = vgpu_present_locked(x, y, w, h) != 0;
+    if (failed) {
+        g.errors++;
+        g.fb_mode = 0;
+    }
+    vgpu_unlock();
+    if (failed)
+        console_puts("[vgpu] present failed; framebuffer mode stopped\n");
+    else
+        g.fb_dirty = 0;
+}
+
+void virtio_gpu_fb_present(void)
+{
+    if (g.fb_mode)
+        virtio_gpu_fb_present_rect(0u, 0u, g.w, g.h);
+}
+
+void virtio_gpu_fb_mark_dirty(void)
+{
+    if (g.fb_mode)
+        g.fb_dirty = 1;
+}
+
+void virtio_gpu_fb_service(void)
+{
+    if (g.fb_mode && g.fb_dirty)
+        virtio_gpu_fb_present();
+}
+
 void virtio_gpu_service(void)
 {
     uint32_t oldx, nx, y, lo, hi;
     uint64_t now;
 
+    if (g.fb_mode) {
+        virtio_gpu_fb_service();
+        return;
+    }
     if (!g.enabled || !g.up)
         return;
 
@@ -1279,7 +1487,7 @@ void virtio_gpu_service(void)
 
     /* Erase the old square back to its band colours, draw the new one, then
      * transfer only the strip that changed (2 x 64 x 64 x 4 bytes instead of
-     * the full 3 MiB frame). */
+     * the full demo frame). */
     vgpu_fill_bands(oldx, y, VGPU_SQ, VGPU_SQ);
     vgpu_fill_solid(nx, y, VGPU_SQ, VGPU_SQ, VGPU_SQ_COLOR);
     g.sq_x = nx;
@@ -1288,7 +1496,7 @@ void virtio_gpu_service(void)
     hi = ((oldx > nx) ? oldx : nx) + VGPU_SQ;
 
     if (vgpu_cmd_transfer(lo, y, hi - lo, VGPU_SQ) == 0 &&
-        vgpu_cmd_flush_full() == 0) {
+        vgpu_cmd_flush_rect(0u, 0u, g.w, g.h) == 0) {
         g.flushes++;
         console_printf("[vga2d] flush #%u x=%u\n",
                        (uint64_t)g.flushes, (uint64_t)nx);
@@ -1322,4 +1530,10 @@ void virtio_gpu_status(void)
     console_printf("[vga2d] queue0 size=%u flushes=%u frames=%u errors=%u\n",
                    (uint64_t)g.qsize, (uint64_t)g.flushes,
                    (uint64_t)g.frame, (uint64_t)g.errors);
+    if (g.fb_mode)
+        console_printf("[vgpu] system framebuffer: %ux%u pitch=%u addr=0x%x "
+                       "presents=%u dirty=%u\n",
+                       (uint64_t)g.w, (uint64_t)g.h, (uint64_t)g.pitch,
+                       (uint64_t)(uintptr_t)g_fb,
+                       (uint64_t)g.presents, (uint64_t)g.fb_dirty);
 }

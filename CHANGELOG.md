@@ -10,6 +10,60 @@ in the repository.
 
 （下一批 GUI / 系统改动记在这里。）
 
+## [v0.70.0-alpha] — 2026-11-25
+
+发布正文见 `docs/release-notes-v0.70.0-alpha.md`。**外部贡献合并版**：ConlyesOS 作者把
+virtio-gpu 的帧缓冲模式移植过来并重绘了六个应用图标；桌面外壳风格按用户选择保持
+圆角 + 轻亚克力 + Fluent 不变。
+
+### virtio-gpu 帧缓冲模式（v0.70，外部贡献）
+
+- 固件没给线性帧缓冲时（`-vga none -device virtio-gpu-pci`），驱动用 virtio-gpu 2D
+  resource 当系统 framebuffer：8 MiB 静态 `.bss` backing（恒等映射）、
+  `GET_DISPLAY_INFO → RESOURCE_CREATE_2D → ATTACH_BACKING → SET_SCANOUT(0) →
+  TRANSFER_TO_HOST_2D + RESOURCE_FLUSH`；fbcon / flanterm / C 桌面 / Rust 外壳照旧绘制。
+- present 模型：`virtio_gpu_fb_present/present_rect/mark_dirty/service`，ISR 只标 dirty
+  （命令队列永不从中断里发），`vgpu_trylock()` 忙时跳过一帧而不是死等。
+- 钩子：`kmain`（无 GOP 时 boot 入口）、`fbcon_init/fbcon_timer_tick`、`term_clear`、
+  `console_putc`、`gui_render`（按 dirty 面积 present）、`slint_bridge` 三个 runner、
+  `wl_view` show。
+- **v0.70.1 修正（我们自己发现的真 bug）**：QEMU 11.1 的 `virtio-gpu-pci` 上报
+  **1280x800**，而整套渲染器按 **1024x768** 设计（Rust 外壳直接索引固定 1024x768 缓冲）
+  → 直接采用上报尺寸会让 `startgui` 崩溃（`[gui-slint] PANIC in Rust GUI`）。现在驱动把
+  扫描输出夹到 1024x768（日志 `[vgpu] display 1280x800 -> framebuffer 1024x768`），三个
+  Rust runner 也把 viewport 夹到 1024x768。
+- 新门禁 `scripts/gui_virtio_gpu_fb_acceptance.py` **15/15**：无 GOP 启动 → `[vgpu]
+  framebuffer ready … bpp=32` → `[init] fbcon initialized (virtio-gpu scanout)` → 截图尺寸
+  与上报一致 + banner 像素 → `startgui` 桌面落在同一 scanout（非黑屏、多色）→ ESC 回终端；
+  再加一个 `-vga std` 对照启动，断言**一行 `[vgpu]`/`[vga2d]` 都没有**（冻结启动呈现不变）。
+
+### 图标重绘（v0.70，外部贡献）
+
+- `rust/suture-gui/src/shell.rs::draw_app_icon` 换成作者的扁平图标：纯色 accent 圆角底板
+  + 白色几何字形（设置=双滑杆、任务管理器=递增柱、图片=框+太阳+地平线、编辑器=四行文档、
+  Wayland=表面+指针、计算器==号+键盘点）；16 px 标题栏另有一套紧凑字形。
+- 开始菜单 / 任务栏固定按钮 / 窗口标题栏三处同时生效；`apps.rs` 的版本串同步到 0.70。
+- 外观基线重生（动态矩形外 0 像素）；`desktop_acceptance.py` 里「伪 3D 图标（顶部高光、
+  底部压暗）」的两条断言按新规格重写为「平板不假打光（|top-bottom| ≤ 8）」+「白字形仍存在」
+  （20/20），而不是删掉检查。
+
+### 未合入：作者同棵树里的扁平化桌面
+
+作者还顺手把桌面改成扁平设计（纯色壁纸、不透明窗面、去亚克力/阴影/渐变/伪 3D、任务栏与
+菜单重绘，并写了 `docs/gui-visual-spec.md` 的 v0.70 规范）。**按用户选择不并入**：`FLAT_*`
+色板与扁平 chrome 没有进入本项目，`draw_app_icon` 只借字形。
+
+### 来源与作者（第三方组件出处规范）
+
+- `docs/provenance.md`（v0.70 条目，列出合入/未合入范围）、`THIRD_PARTY_LICENSES.md` §21、
+  `docs/licensing-audit.md` §6、`docs/virtio-gpu.md` 末尾「来源与作者」表、
+  `kernel/drivers/virtio_gpu.c` 文件头注释 —— 五处登记。
+- 交付物**没有许可声明**：按「作者授权使用、条款待书面确认」记录，不得声称已获得宽松许可。
+- 比对方式：87 个差异文件逐字节 + 去行尾/空白的语义比对，除 virtio-gpu / present 钩子 /
+  图标 / 文档外没有其它实质改动；交付树的 `sutureos.img`（作者测试镜像）未入库。
+
+[//]: # (v070-sweep-line)
+
 ## [v0.69.0-alpha] — 2026-11-22
 
 发布正文见 `docs/release-notes-v0.69.0-alpha.md`。任务栏从"能点"变成"能管"：右键菜单、

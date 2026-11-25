@@ -58,6 +58,7 @@ SUITE = [
     ('wl_show_acceptance.py', 'wl_show'),
     ('wl_desktop_window_acceptance.py', 'wl_window'),
     ('wlprobe_acceptance.py', 'wlprobe'),
+    ('gui_virtio_gpu_fb_acceptance.py', 'vgpufb'),
     ('gui_cjk_acceptance.py', 'gui_cjk'),
     ('imgview_acceptance.py', 'imgview'),
     ('editor_acceptance.py', 'editor'),

@@ -285,3 +285,10 @@ GPL-3.0 **聚合兼容**（aggregate compatible），即本项目整体可按 GP
 - 二进制文件: `tools/limine/limine-binary/limine-bios.sys`, `limine-bios-cd.bin`, `limine-uefi-cd.bin`, `BOOTX64.EFI`
 - 协议: BSD-2-Clause（见 `tools/limine/limine-binary/LICENSE`）
 - 说明: 作为独立引导加载程序聚合在 ISO 上，与 GPL-3.0 内核分离分发。
+
+## 21. ConlyesOS 作者贡献 — 许可待确认（v0.70）
+
+- 内容：virtio-gpu 帧缓冲模式（`virtio_gpu_fb_*`）、无 GOP 时的 boot 入口与 present 钩子、六个应用图标的重绘。
+- 交付：2026-11-25 由 ConlyesOS 作者直接提供整棵工作树，**文件内没有许可声明**。
+- 现状：本项目按 GPL-3.0 收录并在 `docs/provenance.md` 与 `docs/release-notes-v0.70.0-alpha.md` 中署名标注；
+  正式许可条款待作者书面确认后补录。**不得据此声称已获得 MIT/Apache 等宽松许可。**
