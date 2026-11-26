@@ -62,7 +62,23 @@ class Qmp:
         return (r.get('return') or '').strip()
 
 
+def fresh_volume():
+    """v0.71: rebuild the FAT32 test volume before shooting.
+
+    The shot is the appearance baseline, so it must always be the pristine
+    default desktop. Leftover state (e.g. the style gate persisted
+    `style=flat` in SHELL.CFG) would otherwise be captured as the baseline -
+    that actually happened once and made every later compare fail by 759k px.
+    """
+    import shutil
+    subprocess.run([sys.executable, os.path.join(ROOT, 'scripts', 'mkfat32_testimg.py')],
+                   cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    shutil.copyfile(os.path.join(ROOT, 'build', 'fat32.img'),
+                    os.path.join(ROOT, 'build', 'fat32_ata.img'))
+
+
 def main():
+    fresh_volume()
     log_abs = os.path.join(ROOT, LOG)
     for p in [log_abs, os.path.join(ROOT, SHOT_A), os.path.join(ROOT, SHOT_B)]:
         if os.path.exists(p):

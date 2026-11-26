@@ -845,15 +845,52 @@ pub fn draw_body(s: &mut Surface<'_>, accent: u32, wx: i32, wy: i32, w: i32, h: 
     }
 }
 
+/* v0.71: 系统设置 is interactive. The shell owns the desktop style (it is the
+ * one that draws both looks), so it pushes the current value here for the value
+ * text and asks `settings_row_at()` which row a click landed on. The row layout
+ * constants below mirror `settings_body` - keep them in sync if you move rows. */
+static mut SETTINGS_STYLE: u8 = 0;
+pub const SETTINGS_ROW_STYLE: i32 = 1;
+const SETTINGS_ROW_TOP: i32 = TITLE_H + 20;
+const SETTINGS_ROW_H: i32 = 52;
+const SETTINGS_ROW_PITCH: i32 = 62;
+
+pub fn settings_set_style(v: u8) {
+    unsafe { SETTINGS_STYLE = v; }
+}
+
+/// Window-relative y (plus the window height) -> settings row index, or -1.
+pub fn settings_row_at(y: i32, h: i32) -> i32 {
+    let mut ry = SETTINGS_ROW_TOP;
+    let mut row = 0i32;
+    while row < 3 {
+        if ry + SETTINGS_ROW_H > h - 14 {
+            break;
+        }
+        if y >= ry && y < ry + SETTINGS_ROW_H {
+            return row;
+        }
+        ry += SETTINGS_ROW_PITCH;
+        row += 1;
+    }
+    -1
+}
+
 /// 系统设置: three rounded setting rows, each with a label on the left, the
-/// value right-aligned, and an accent pill on the left edge.
+/// value right-aligned, and an accent pill on the left edge. v0.71: the
+/// 外观风格 row is clickable (it toggles the desktop style).
 fn settings_body(s: &mut Surface<'_>, accent: u32, wx: i32, wy: i32, w: i32, h: i32) {
     let x0 = wx + PAD;
     let x1 = wx + w - PAD;
+    let style_val: &str = if unsafe { SETTINGS_STYLE } == 1 {
+        "扁平 ・ Flat  (点击切换)"
+    } else {
+        "玻璃 ・ Fluent  (点击切换)"
+    };
     let rows: [(&str, &str); 3] = [
         ("账户与登录", "alice"),
-        ("显示与外观", "1024x768 ・ 32bpp"),
-        ("关于本机", "SutureOS 0.70.0-alpha"),
+        ("外观风格", style_val),
+        ("关于本机", "SutureOS 0.71.0-alpha"),
     ];
     let pill = lighten(accent, 10);
     let mut y = wy + TITLE_H + 20;

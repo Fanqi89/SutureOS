@@ -84,6 +84,39 @@ fn menu_rect() -> Rect {
  * layer used to leave behind. */
 const SHADOW_RING: [u32; 8] = [0x22, 0x1c, 0x16, 0x10, 0x0b, 0x07, 0x04, 0x02];
 
+/* ---- v0.71: two desktop styles ------------------------------------------
+ * STYLE_GLASS (0, default) is the look built from v0.37 to v0.70: gradient
+ * wallpaper, acrylic (blurred) window bodies, soft shadow rings, translucent
+ * taskbar / start menu / context menu.
+ * STYLE_FLAT (1) is the flat language the ConlyesOS author drew for his v0.70
+ * tree: one opaque wallpaper colour, opaque panels, 1 px hairlines, no shadow
+ * and no blur. His palette is reproduced verbatim below (credited in
+ * docs/virtio-gpu.md and docs/provenance.md).
+ * The switch lives in 系统设置 -> 外观风格 and is persisted in SHELL.CFG, so both
+ * styles survive a reboot; the default is glass, which is what the appearance
+ * baseline is pinned to. */
+pub const STYLE_GLASS: u8 = 0;
+pub const STYLE_FLAT: u8 = 1;
+const FLAT_WALL: u32 = 0x0e1726;   /* desktop backdrop        */
+const FLAT_PANEL: u32 = 0x161d29;  /* window body             */
+const FLAT_TITLE: u32 = 0x1f2734;  /* title strip             */
+const FLAT_BAR: u32 = 0x0b1018;    /* taskbar strip           */
+const FLAT_MENU: u32 = 0x131a24;   /* start / context menu    */
+const FLAT_LINE: u32 = 0x2b3547;   /* hairlines               */
+const FLAT_HOVER: u32 = 0x223046;  /* hover fill              */
+const FLAT_PRESS: u32 = 0x2b3d5c;  /* active fill             */
+const FLAT_TEXT: u32 = 0xe9effb;
+/* The active style, mirrored in a module static so the pure draw helpers
+ * (draw_window and friends only take a Surface + Win) can branch without a new
+ * parameter on every call site. shell_step refreshes it from the Shell at entry
+ * and the cache key includes it, so a switch can never blit a stale layer. */
+static mut STYLE: u8 = STYLE_GLASS;
+
+#[inline]
+fn flat_ui() -> bool {
+    unsafe { STYLE == STYLE_FLAT }
+}
+
 /* v0.59.0: the shared placeholder body text is gone - every window paints its
  * own application content through crate::apps::draw_body. */
 
@@ -193,6 +226,8 @@ struct Shell {
     drag_last_y: i32,
     /* v0.68: how many drag frames re-anchored the acrylic (live glass) */
     drag_glass_frames: u32,
+    /* v0.71: desktop style (STYLE_GLASS / STYLE_FLAT), persisted in SHELL.CFG */
+    style: u8,
     /* v0.69: taskbar context menu + runtime pinned list (persisted to SHELL.CFG) */
     ctx_open: bool,
     ctx_kind: i32,      /* 1 = window button, 2 = pinned button */
@@ -266,6 +301,7 @@ static mut SHELL: Shell = Shell {
     drag_last_x: -1,
     drag_last_y: -1,
     drag_glass_frames: 0,
+    style: STYLE_GLASS,
     ctx_open: false,
     ctx_kind: 0,
     ctx_idx: -1,
@@ -1222,50 +1258,62 @@ unsafe fn build_caches() {
     let wall = &mut *core::ptr::addr_of_mut!(WALL);
     let mut s = Surface { px: &mut wall[..], w: SCREEN_W as usize, h: SCREEN_H as usize,
                           stride: SCREEN_W as usize, clip: (0, 0, 1024, 768) };
-    // wallpaper: 3-stop gradient + two soft colour blobs (the acrylic source)
-    s.vgrad3(0, 0, SCREEN_W, SCREEN_H, 0x1b2440, 0x121a2b, 0x090d16, 0.45);
-    s.hgrad_round(60.0, 90.0, 500.0, 560.0, 96.0, 0x3f7bff, 0x9a5cff, 0xd0);
-    s.hgrad_round(600.0, 60.0, 1000.0, 400.0, 96.0, 0x12b8a6, 0x2f6bff, 0xc0);
-    /* v0.60 polish: a faint cool glow hugging the top edge, then an integer
-     * vignette - six 8 px bands per edge whose alpha falls off with distance.
-     * Both run once, when the cache is built; nothing here is per frame. */
-    s.hgrad_round(300.0, 24.0, 780.0, 320.0, 120.0, 0x8fb4ff, 0x1d2a4d, 0x1c);
-    for i in 0..6 {
-        let a = (26 - i * 4) as u32;
-        let d = i * 8;
-        s.rect_fill(0, d, SCREEN_W, d + 8, 0x000000, a);
-        s.rect_fill(0, SCREEN_H - d - 8, SCREEN_W, SCREEN_H - d, 0x000000, a);
-        s.rect_fill(d, 0, d + 8, SCREEN_H, 0x000000, a);
-        s.rect_fill(SCREEN_W - d - 8, 0, SCREEN_W - d, SCREEN_H, 0x000000, a);
+    if flat_ui() {
+        /* v0.71 flat style: one opaque colour, no gradient, no blobs, no vignette
+         * (the flat language never pretends the backdrop is lit). */
+        s.rect_fill(0, 0, SCREEN_W, SCREEN_H, FLAT_WALL, 255);
+    } else {
+        // wallpaper: 3-stop gradient + two soft colour blobs (the acrylic source)
+        s.vgrad3(0, 0, SCREEN_W, SCREEN_H, 0x1b2440, 0x121a2b, 0x090d16, 0.45);
+        s.hgrad_round(60.0, 90.0, 500.0, 560.0, 96.0, 0x3f7bff, 0x9a5cff, 0xd0);
+        s.hgrad_round(600.0, 60.0, 1000.0, 400.0, 96.0, 0x12b8a6, 0x2f6bff, 0xc0);
+        /* v0.60 polish: a faint cool glow hugging the top edge, then an integer
+         * vignette - six 8 px bands per edge whose alpha falls off with distance.
+         * Both run once, when the cache is built; nothing here is per frame. */
+        s.hgrad_round(300.0, 24.0, 780.0, 320.0, 120.0, 0x8fb4ff, 0x1d2a4d, 0x1c);
+        for i in 0..6 {
+            let a = (26 - i * 4) as u32;
+            let d = i * 8;
+            s.rect_fill(0, d, SCREEN_W, d + 8, 0x000000, a);
+            s.rect_fill(0, SCREEN_H - d - 8, SCREEN_W, SCREEN_H - d, 0x000000, a);
+            s.rect_fill(d, 0, d + 8, SCREEN_H, 0x000000, a);
+            s.rect_fill(SCREEN_W - d - 8, 0, SCREEN_W - d, SCREEN_H, 0x000000, a);
+        }
     }
-
     // small mirror of the wallpaper, blurred -> cheap "frosted" source for
     // windows/taskbar/menu (sampled with nearest neighbour, looks right for
     // translucent surfaces)
     let small = &mut *core::ptr::addr_of_mut!(SMALL);
     let mut ss = Surface { px: &mut small[..], w: SMALL_W, h: SMALL_H, stride: SMALL_W, clip: (0, 0, 1024, 768) };
-    ss.vgrad3(0, 0, SMALL_W as i32, SMALL_H as i32, 0x1b2440, 0x121a2b, 0x090d16, 0.45);
-    let sx = SMALL_W as f32 / SCREEN_W as f32;
-    let sy = SMALL_H as f32 / SCREEN_H as f32;
-    ss.hgrad_round(60.0 * sx, 90.0 * sy, 500.0 * sx, 560.0 * sy, 24.0,
-                   0x3f7bff, 0x9a5cff, 0xd0);
-    ss.hgrad_round(600.0 * sx, 60.0 * sy, 1000.0 * sx, 400.0 * sy, 24.0,
-                   0x12b8a6, 0x2f6bff, 0xc0);
-    /* v0.60: the frosted source mirrors the new wallpaper depth, otherwise a
-     * window parked near an edge would be lit differently from the desktop. */
-    ss.hgrad_round(300.0 * sx, 24.0 * sy, 780.0 * sx, 320.0 * sy, 30.0,
-                   0x8fb4ff, 0x1d2a4d, 0x1c);
-    for i in 0..6 {
-        let a = (26 - i * 4) as u32;
-        let d = i * 2;
-        ss.rect_fill(0, d, SMALL_W as i32, d + 2, 0x000000, a);
-        ss.rect_fill(0, SMALL_H as i32 - d - 2, SMALL_W as i32,
-                     SMALL_H as i32 - d, 0x000000, a);
-        ss.rect_fill(d, 0, d + 2, SMALL_H as i32, 0x000000, a);
-        ss.rect_fill(SMALL_W as i32 - d - 2, 0, SMALL_W as i32 - d,
-                     SMALL_H as i32, 0x000000, a);
+    if flat_ui() {
+        /* v0.71: the flat style has no frosted source, but the taskbar/menu code
+         * still asks for the cache geometry - keep it the flat backdrop colour. */
+        ss.rect_fill(0, 0, SMALL_W as i32, SMALL_H as i32, FLAT_WALL, 255);
+    } else {
+        ss.vgrad3(0, 0, SMALL_W as i32, SMALL_H as i32, 0x1b2440, 0x121a2b, 0x090d16, 0.45);
+        let sx = SMALL_W as f32 / SCREEN_W as f32;
+        let sy = SMALL_H as f32 / SCREEN_H as f32;
+        ss.hgrad_round(60.0 * sx, 90.0 * sy, 500.0 * sx, 560.0 * sy, 24.0,
+                       0x3f7bff, 0x9a5cff, 0xd0);
+        ss.hgrad_round(600.0 * sx, 60.0 * sy, 1000.0 * sx, 400.0 * sy, 24.0,
+                       0x12b8a6, 0x2f6bff, 0xc0);
+        /* v0.60: the frosted source mirrors the new wallpaper depth, otherwise a
+         * window parked near an edge would be lit differently from the desktop. */
+        ss.hgrad_round(300.0 * sx, 24.0 * sy, 780.0 * sx, 320.0 * sy, 30.0,
+                       0x8fb4ff, 0x1d2a4d, 0x1c);
+        for i in 0..6 {
+            let a = (26 - i * 4) as u32;
+            let d = i * 2;
+            ss.rect_fill(0, d, SMALL_W as i32, d + 2, 0x000000, a);
+            ss.rect_fill(0, SMALL_H as i32 - d - 2, SMALL_W as i32,
+                         SMALL_H as i32 - d, 0x000000, a);
+            ss.rect_fill(d, 0, d + 2, SMALL_H as i32, 0x000000, a);
+            ss.rect_fill(SMALL_W as i32 - d - 2, 0, SMALL_W as i32 - d,
+                         SMALL_H as i32, 0x000000, a);
+        }
+        swrast::acrylic_blur(&mut ss, 0, 0, SMALL_W as i32, SMALL_H as i32, 6);
     }
-    swrast::acrylic_blur(&mut ss, 0, 0, SMALL_W as i32, SMALL_H as i32, 6);
+
 
     // screen -> small-buffer coordinate maps (built once, 2 KiB total)
     let xm = &mut *core::ptr::addr_of_mut!(XMAP);
@@ -1521,6 +1569,26 @@ fn ctx_label(sh: &Shell, r: i32) -> &'static str {
     }
 }
 
+/// v0.71: switch the desktop style. Saves the config, forces a full frame and
+/// (because `layer_key` includes the style) makes every cached window body stale,
+/// so the new look is never mixed with the old one.
+fn set_style(sh: &mut Shell, v: u8) {
+    if v == sh.style || v > STYLE_FLAT {
+        return;
+    }
+    sh.style = v;
+    unsafe { STYLE = v; }
+    crate::apps::settings_set_style(v);
+    /* The wallpaper and the frosted mirror are built once into static caches, so
+     * a runtime switch has to rebuild them - otherwise the flat desktop would
+     * keep showing the glass gradient behind its opaque panels. */
+    unsafe { build_caches(); }
+    sh.force_full = true;
+    sh.menu_intro = 2;
+    log0(if v == STYLE_FLAT { c"style: flat" } else { c"style: glass (fluent)" });
+    taskbar_save(sh);
+}
+
 /// Persist the pinned list to the FAT32 test volume.
 fn taskbar_save(sh: &Shell) {
     let mut buf = [0u8; 96];
@@ -1544,13 +1612,24 @@ fn taskbar_save(sh: &Shell) {
     }
     buf[n] = 10u8;
     n += 1;
+    /* v0.71: the desktop style lives in the same config file, so both styles
+     * survive a reboot. */
+    let style_line: &[u8] = if sh.style == STYLE_FLAT {
+        b"style=flat\n"
+    } else {
+        b"style=glass\n"
+    };
+    for b in style_line.iter() {
+        buf[n] = *b;
+        n += 1;
+    }
     let rc = unsafe {
         vfs_write_file(b"/mnt/fat/SHELL.CFG\0".as_ptr(), buf.as_ptr(), n as u32)
     };
     unsafe {
         console_printf(
-            b"[gui-shell] taskbar pinned saved %d item(s) rc=%d\n\0".as_ptr(),
-            sh.pinned_n as i64, rc as i64);
+            b"[gui-shell] shell cfg saved: pinned=%d style=%d rc=%d\n\0".as_ptr(),
+            sh.pinned_n as i64, sh.style as i64, rc as i64);
     }
 }
 
@@ -1598,6 +1677,23 @@ fn taskbar_load(sh: &mut Shell) {
         slots[n] = cur;
         n += 1;
     }
+    /* v0.71: a second line `style=flat|glass` selects the desktop style. */
+    let mut style = STYLE_GLASS;
+    let mut q = 0usize;
+    while q + 6 < len {
+        if bytes[q] == b's' && &bytes[q..q + 6] == b"style=" {
+            let mut e = q + 6;
+            while e < len && bytes[e] != b'\n' && bytes[e] != b'\r' {
+                e += 1;
+            }
+            if &bytes[q + 6..e] == b"flat" {
+                style = STYLE_FLAT;
+            }
+            break;
+        }
+        q += 1;
+    }
+    sh.style = style;
     unsafe { lemis_heap_free(p) };
     if n > 0 {
         sh.pinned_n = n.min(PIN_MAX as usize) as i32;
@@ -1607,12 +1703,14 @@ fn taskbar_load(sh: &mut Shell) {
             k += 1;
         }
         unsafe {
-            console_printf(b"[gui-shell] taskbar pinned loaded %d item(s) from SHELL.CFG\n\0".as_ptr(),
-                           sh.pinned_n as i64);
+            console_printf(b"[gui-shell] shell cfg loaded: pinned=%d style=%d from SHELL.CFG
+ ".as_ptr(),
+                       sh.pinned_n as i64, sh.style as i64);
         }
     } else {
         unsafe {
-            console_printf(b"[gui-shell] taskbar pinned defaults (empty SHELL.CFG)\n\0".as_ptr());
+            console_printf(b"[gui-shell] shell cfg defaults (empty SHELL.CFG)
+ ".as_ptr());
         }
     }
 }
@@ -1698,10 +1796,19 @@ fn draw_ctx_menu(s: &mut Surface<'_>, sh: &Shell) {
         return;
     }
     let (x, y, w, h) = ctx_rect(sh);
+    if flat_ui() {
+        /* v0.71 flat popup: opaque panel + hairline, no shadow, no acrylic */
+        s.round_rect(x as f32, y as f32, (x + w) as f32, (y + h) as f32,
+                     8.0, FLAT_MENU, 255);
+        s.round_rect_stroke(x as f32 + 0.5, y as f32 + 0.5,
+                            (x + w) as f32 - 0.5, (y + h) as f32 - 0.5,
+                            8.0, FLAT_LINE, 255);
+    } else {
     s.rect_fill(x + 3, y + 4, x + w + 3, y + h + 5, 0x000000, 0x52);
     frosted(s, x, y, x + w, y + h, 10.0, 0x44);
     s.rect_fill(x, y, x + w, y + 1, 0xffffff, 0x3a);
     s.rect_fill(x, y + h - 1, x + w, y + h, 0x000000, 0x30);
+    }
     let rows = ctx_rows(sh);
     let mut r = 0;
     while r < rows {
@@ -2323,7 +2430,15 @@ fn input_line_rect(w: &Win) -> Rect {
     if !w.open || w.minimized {
         return Rect::EMPTY;
     }
-    let y = w.y + TITLE_H + 104;
+    /* v0.71: 系统设置 draws its hint at the bottom of the body (the default
+     * position sat on the clickable 外观风格 row), so the damage rect has to
+     * follow it - otherwise typing never repaints that band and the damage
+     * oracle catches a mismatch. Keep this rule identical to draw_focus_line. */
+    let y = if w.accent == crate::apps::ACC_SETTINGS {
+        (w.y + w.h - 30).max(w.y + TITLE_H + 8)
+    } else {
+        w.y + TITLE_H + 104
+    };
     if !(y + 20 < w.y + w.h) || w.y < 0 || w.w < 80 {
         return Rect::EMPTY;
     }
@@ -2433,12 +2548,18 @@ fn copy_wall(s: &mut Surface<'_>, r: Rect) {
 
 /// Taskbar strip: acrylic sample, start button, logo, window buttons, clock.
 fn draw_taskbar(s: &mut Surface<'_>, sh: &Shell, ctx: &FrameCtx) {
+    if flat_ui() {
+        /* v0.71 flat strip: one opaque band + one hairline, no acrylic */
+        s.rect_fill(0, TASKBAR_Y, SCREEN_W, SCREEN_H, FLAT_BAR, 255);
+        s.rect_fill(0, TASKBAR_Y, SCREEN_W, TASKBAR_Y + 1, FLAT_LINE, 255);
+    } else {
     frosted(s, 0, TASKBAR_Y, SCREEN_W, SCREEN_H, 0.0, 0x30);
     s.rect_fill(0, TASKBAR_Y, SCREEN_W, SCREEN_H, 0xffffff, 0x08);
     /* v0.60 polish: 1 px top hairline and a darker bottom edge give the strip a
      * glass thickness instead of a flat band */
     s.rect_fill(0, TASKBAR_Y, SCREEN_W, TASKBAR_Y + 1, 0xffffff, 0x26);
     s.rect_fill(0, SCREEN_H - 1, SCREEN_W, SCREEN_H, 0x000000, 0x2c);
+    }
     let start_btn = (8, TASKBAR_Y + 5, 34, 28);
     rrow(s, start_btn.0, start_btn.1, start_btn.0 + start_btn.2,
          start_btn.1 + start_btn.3, 7, 0xffffff,
@@ -2492,6 +2613,16 @@ fn draw_taskbar(s: &mut Surface<'_>, sh: &Shell, ctx: &FrameCtx) {
 /// Start menu block (drawn only while the menu is open).
 fn draw_menu(s: &mut Surface<'_>, sh: &Shell, ctx: &FrameCtx) {
     let (my, mh) = (menu_y(), menu_h());
+    if flat_ui() {
+        /* v0.71 flat panel: opaque fill + 1 px outline, no shadow, no blur */
+        s.round_rect(MENU_X as f32, my as f32, (MENU_X + MENU_W) as f32,
+                     (my + mh) as f32, 10.0, FLAT_MENU, 255);
+        s.round_rect_stroke(MENU_X as f32 + 0.5, my as f32 + 0.5,
+                            (MENU_X + MENU_W) as f32 - 0.5,
+                            (my + mh) as f32 - 0.5, 10.0, FLAT_LINE, 255);
+        s.rect_fill(MENU_X + 1, my + 46, MENU_X + MENU_W - 1, my + 47,
+                    FLAT_LINE, 255);
+    } else {
     s.rect_fill(MENU_X + 3, my + 10, MENU_X + MENU_W + 3, my + mh + 12,
                 0x000000, 0x44);
     frosted(s, MENU_X, my, MENU_X + MENU_W, my + mh, 14.0, 0x34);
@@ -2501,6 +2632,7 @@ fn draw_menu(s: &mut Surface<'_>, sh: &Shell, ctx: &FrameCtx) {
     s.rect_fill(MENU_X, my + 10, MENU_X + 1, my + mh - 10, 0xffffff, 0x3c);
     s.rect_fill(MENU_X + MENU_W - 1, my + 10, MENU_X + MENU_W, my + mh - 10,
                 0xffffff, 0x3c);
+    }
     /* v0.57.1: start-menu icon = 48px step of the logo ladder */
     let logo = unsafe { &*core::ptr::addr_of!(g_logo48) };
     blit_logo_region(s, logo, LOGO_MENU_SIZE, 0, 0,
@@ -2556,13 +2688,22 @@ fn draw_menu(s: &mut Surface<'_>, sh: &Shell, ctx: &FrameCtx) {
 fn draw_focus_line(s: &mut Surface<'_>, sh: &Shell, _ctx: &FrameCtx) {
     let fi = sh.focus;
     let w = sh.wins[fi];
-    let y = w.y + TITLE_H + 104;
+    /* v0.71: 系统设置 draws its hint at the bottom of the body - the default
+     * position (TITLE_H + 104) sits right on top of the clickable 外观风格 row. */
+    let y = if w.accent == crate::apps::ACC_SETTINGS {
+        (w.y + w.h - 30).max(w.y + TITLE_H + 8)
+    } else {
+        w.y + TITLE_H + 104
+    };
     /* v0.59.x: the image viewer has no text content, and when it shows a
      * committed Wayland surface the focus hint would sit on top of the client's
      * pixels - skip the editable line for that window. */
     /* v0.63: windows that consume the keyboard themselves (picture viewer,
      * editor, Wayland surface, calculator) must not get the input band - on the
      * calculator it sat right on top of the 4x4 keypad. */
+    /* v0.71: 系统设置 is a click-driven window (the 外观风格 row toggles the
+     * desktop style), so the free-text input band no longer belongs there - it
+     * was drawn straight across that row. */
     if w.open && !w.minimized && key_owner_for(fi, w.accent).is_none()
         && y + 20 < w.y + w.h && w.y >= 0 {
         s.rect_fill(w.x + 16, y - 4, w.x + w.w - 16, y + 20, 0x000000, 0x24);
@@ -3249,6 +3390,9 @@ pub unsafe fn shell_step(
     wl_server_desktop_pump();
     let (wu, hu) = (w as usize, h as usize);
     let sh = &mut *core::ptr::addr_of_mut!(SHELL);
+    unsafe { STYLE = sh.style; }
+    /* the Settings window prints the current style as a row value */
+    crate::apps::settings_set_style(sh.style);
     if !sh.started {
         sh.started = true;
         sh.frame_ms = now_ms;
@@ -3256,6 +3400,17 @@ pub unsafe fn shell_step(
                        KEY_OWNERS.len() as i32, key_owner_mask());
         log0(c"shell: loop started");
         taskbar_load(sh);
+        unsafe { STYLE = sh.style; }
+        crate::apps::settings_set_style(sh.style);
+        unsafe { WIN_KEY[0] = i32::MIN; }
+        if sh.style != STYLE_GLASS {
+            /* the caches were built before the config was read, so rebuild the
+             * wallpaper/frosted source for the persisted style */
+            build_caches();
+            console_printf(
+                b"[gui-shell] caches rebuilt for the persisted style %d\n\0".as_ptr(),
+                sh.style as i64);
+        }
         console_printf(
             b"[gui-shell] taskbar: %d pinned buttons from x=%d, window buttons from x=%d\n\0"
                 .as_ptr(), sh.pinned_n as i64, PIN_X0 as i64, wb_x0(sh) as i64);
@@ -3499,6 +3654,24 @@ pub unsafe fn shell_step(
                                         WIN_KEY[5] = i32::MIN;
                                     }
                                     sh.dirty_calc = true;
+                                }
+                            }
+                            /* v0.71: 系统设置 rows are clickable - 外观风格
+                             * toggles between the glass and the flat style. The
+                             * row layout lives in apps.rs (it draws the window). */
+                            if hw == 0 && cy >= wref.y + TITLE_H {
+                                let row = crate::apps::settings_row_at(
+                                    cy - wref.y, wref.h);
+                                if row == crate::apps::SETTINGS_ROW_STYLE {
+                                    let next = if sh.style == STYLE_FLAT {
+                                        STYLE_GLASS
+                                    } else {
+                                        STYLE_FLAT
+                                    };
+                                    set_style(sh, next);
+                                    unsafe {
+                                        WIN_KEY[0] = i32::MIN;
+                                    }
                                 }
                             }
                         }
@@ -4119,6 +4292,9 @@ fn layer_key(w: &Win, slot: usize) -> i32 {
     if slot == 2 || slot == 4 {
         k = k.wrapping_mul(31).wrapping_add(crate::apps::wl_epoch());
     }
+    /* v0.71: a window body is drawn differently per style, so the style is part
+     * of the key - otherwise switching style would keep blitting the old look. */
+    k = k.wrapping_mul(31).wrapping_add(unsafe { STYLE as i32 });
     k
 }
 
@@ -4380,7 +4556,53 @@ fn ctl_tile(s: &mut Surface<'_>, x: i32, y: i32, w: i32, h: i32, a: u32) {
     s.rect_fill(x + 1, y + 1, x + w - 1, y + h - 1, 0xffffff, a);
 }
 
+/// v0.71: the flat window - opaque body, 1 px outline, flat title strip and
+/// glyph-only controls. No shadow, no frosted sample, no gradient, no highlight.
+fn draw_window_flat(s: &mut Surface<'_>, w: &Win) {
+    s.round_rect(w.x as f32, w.y as f32, (w.x + w.w) as f32, (w.y + w.h) as f32,
+                 10.0, FLAT_PANEL, 255);
+    s.round_rect_stroke(w.x as f32 + 0.5, w.y as f32 + 0.5,
+                        (w.x + w.w) as f32 - 0.5, (w.y + w.h) as f32 - 0.5,
+                        10.0, FLAT_LINE, 255);
+    /* title strip: inside the rounded top, separated by one hairline */
+    s.rect_fill(w.x + 2, w.y + 2, w.x + w.w - 2, w.y + TITLE_H, FLAT_TITLE, 255);
+    s.rect_fill(w.x + 2, w.y + TITLE_H - 1, w.x + w.w - 2, w.y + TITLE_H,
+                FLAT_LINE, 255);
+    /* the author kept one accent cue per app: a 2 px identity bar */
+    s.rect_fill(w.x + 6, w.y + 7, w.x + 8, w.y + TITLE_H - 6, w.accent, 255);
+    draw_app_icon(s, w.x + 14, w.y + 8, TITLE_H - 16, w.accent,
+                  glyph_for_accent(w.accent));
+    s.text(w.x + 36, w.y + 7, w.title, FLAT_TEXT, 0xff, 1);
+    /* glyph-only controls: minimise bar, maximise frame, close cross */
+    let (bx, by, bw, bh) = control_rect(w);
+    for k in 0..3 {
+        let x = bx + k * (bw + 4);
+        let ink = 0xd7dfeeu32;
+        if k == 0 {
+            s.rect_fill(x + 7, by + 14, x + 15, by + 15, ink, 255);
+        } else if k == 1 {
+            s.rect_fill(x + 7, by + 7, x + 15, by + 8, ink, 255);
+            s.rect_fill(x + 7, by + 14, x + 15, by + 15, ink, 255);
+            s.rect_fill(x + 7, by + 7, x + 8, by + 15, ink, 255);
+            s.rect_fill(x + 14, by + 7, x + 15, by + 15, ink, 255);
+        } else {
+            for d in 0..8 {
+                s.rect_fill(x + 7 + d, by + 7 + d, x + 8 + d, by + 8 + d, ink, 255);
+                s.rect_fill(x + 14 - d, by + 7 + d, x + 15 - d, by + 8 + d, ink, 255);
+            }
+        }
+    }
+    /* v0.71 BUGFIX: the application content (settings rows, task-manager bars,
+     * image, editor, keypad) is painted at the end of the glass path; the flat
+     * early-return skipped it, so flat windows came up empty. Same call here. */
+    crate::apps::draw_body(s, w.accent, w.x, w.y, w.w, w.h);
+}
+
 fn draw_window(s: &mut Surface<'_>, w: &Win, with_shadow: bool) {
+    if flat_ui() {
+        draw_window_flat(s, w);
+        return;
+    }
     let t_all = ticks();
     if with_shadow {
         draw_window_shadow(s, w);

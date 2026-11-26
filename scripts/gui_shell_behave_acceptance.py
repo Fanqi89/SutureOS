@@ -354,10 +354,10 @@ def main():
     check('right-clicking a pinned button opens the pin menu',
           'ctx menu open pin 3 3' in text, 'ctx menu open pin 3 3')
     check('取消固定 removes the pin and saves the list',
-          'pin unpin 3 3' in text and 'taskbar pinned saved 3 item(s)' in text,
+          'pin unpin 3 3' in text and 'shell cfg saved: pinned=3 style=' in text,
           'pin unpin + saved')
     check('the pinned section shrinks after unpinning',
-          'taskbar pinned saved 3 item(s)' in text,
+          'shell cfg saved: pinned=3 style=' in text,
           'saved 3 items')
 
     # host side: the FAT32 volume really carries SHELL.CFG
@@ -371,8 +371,8 @@ def main():
         cfg = fs['read_chain'](ent[0], ent[1])
     check('SHELL.CFG exists on the volume the guest booted',
           ent is not None, 'entries: %s' % ','.join(sorted(fs['entries'])))
-    check('SHELL.CFG lists the remaining pinned slots',
-          cfg == b'pinned=0,1,5\n', repr(cfg))
+    check('SHELL.CFG lists the remaining pinned slots (and the style line)',
+          cfg == b'pinned=0,1,5\nstyle=glass\n', repr(cfg))
 
     check('no kernel PANIC', 'PANIC' not in text)
 
@@ -403,8 +403,8 @@ def main():
         log2f.close()
     text2 = open(os.path.join(ROOT, SERIAL2), 'rb').read().decode('utf-8', 'replace')
     check('a second boot reloads the pinned list from SHELL.CFG',
-          'taskbar pinned loaded 3 item(s)' in text2,
-          'taskbar pinned loaded 3 item(s)')
+          'shell cfg loaded: pinned=3 style=0' in text2,
+          'shell cfg loaded: pinned=3 style=0')
     check('the reloaded layout starts the window buttons at x=202',
           'window buttons from x=202' in text2,
           'window buttons from x=202')

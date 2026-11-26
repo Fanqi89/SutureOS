@@ -10,6 +10,55 @@ in the repository.
 
 （下一批 GUI / 系统改动记在这里。）
 
+## [v0.71.0-alpha] — 2026-11-26
+
+发布正文见 `docs/release-notes-v0.71.0-alpha.md`。**外观风格可切换**：系统设置 → 外观风格，
+点一下在「玻璃 · Fluent」（默认）与「扁平 · Flat」（ConlyesOS 作者的扁平语言）之间来回切，
+选择写进 `/mnt/fat/SHELL.CFG`，重启后保留。
+
+### 两种风格 + 可交互的设置面板（v0.71）
+
+- `shell.rs` 新增 `STYLE_GLASS`（0，默认）与 `STYLE_FLAT`（1）+ 作者色板
+  （`FLAT_WALL/PANEL/TITLE/BAR/MENU/LINE/HOVER/PRESS/TEXT`）；壁纸、窗口本体、标题条、
+  任务栏、开始菜单、右键菜单各有一条扁平绘制分支，玻璃路径一行未动。
+- 设置窗口第二行改为 `外观风格`，值显示当前风格；`apps::settings_row_at()` 用与
+  `settings_body` 同一套布局常量（`TITLE_H+20` / 52 / 62）把点击映射成行号，shell 收到后
+  `set_style()` 切换。
+- 持久化：`SHELL.CFG` 变成两行（`pinned=…` + `style=flat|glass`），启动时读入并重建壁纸缓存；
+  日志 `shell cfg loaded: pinned=4 style=1` / `shell cfg saved: pinned=4 style=1`。
+- 一致性：风格进入窗口层缓存键，切换时 `build_caches()` 重建壁纸/磨砂源并强制整屏帧。
+
+### 三个真实 bug（本批自己写出来又修掉的）
+
+1. 扁平窗口只剩标题栏：`draw_window` 的内容绘制在玻璃路径末尾，扁平分支 `return` 太早 →
+   `apps::draw_body` 没被调用。修法：扁平分支末尾补同一调用，门禁加"扁平窗体仍有正文内容"
+   的亮像素计数断言。
+2. 设置行被"输入: 键入文本"横条压住：`draw_focus_line` 画在 `w.y+TITLE_H+104`，正好落在新的
+   外观风格行上。修法：系统设置不再画输入条（点击驱动，不是文本框）。
+3. 切换后行值仍是旧文案 / 壁纸仍是旧缓存：`settings_set_style()` 只在帧首调用，而配置在同帧稍后
+   才读进 Shell；壁纸缓存是开机建一次。修法：读配置后与切换时都同步文案并失效该窗口层；
+   `set_style()` 里重建缓存。
+
+### 门禁
+
+- 新增 `scripts/gui_style_switch_acceptance.py` **14/14**：默认玻璃（壁纸渐变通道差 >12）→
+  点击切扁平（`style: flat` + `pinned=4 style=1` + 壁纸纯色差 ≤3 + 标题条/任务栏取到扁平色板
+  精确色值 + 正文仍绘制）→ 再点回玻璃（渐变回来）→ 同一块盘重启断言 `style=1` 且桌面直接扁平。
+  取样用"连续两次 screendump 逐字节相同"的稳定帧，避免切换重建帧被拍成半成品。
+
+**最终验收（同一份 ISO、一次连续 `scripts/gui_sweep.py` 全量 35 门全绿）**：静态 21/21、交互 13/13、
+外壳 55/55、外壳行为 26/26、交换链 30/30、合成器 28/28、C 桌面任务栏 9/9、编辑器 19/19、开始菜单 10/10、
+图片浏览 9/9、计算器 28/28、滚轮 9/9、vsync 17/17、键盘归属 13/13、菜单滚动 13/13、桌面 20/20、
+应用内容 23/23、两套外观 0 像素、Logo 14/14、wl_server 28/28、wl_protocol 29/29、wl_multi 40/40、
+wl_semantics 38/38、wl_show 9/9、wl 窗口 11/11、wlprobe 14/14、virtio-gpu 帧缓冲 15/15、
+**外观风格切换 14/14（新）**、GUI 中文 4/4、图片查看器 PASS、C 编辑器 5/5、unix 18/18、shm 18/18、
+fdpass 21/21；开机自检 16/16；符号扫描 1464 全局 / 0 冲突（145 对象）；
+`kernel.elf` 6,638,032 B、`sutureos.iso` 23,885,824 B（sha256 `0b5bafe7cb4913f238ad10af9c39886e980fbf8e25e770795e362ea5f1062f20`）。
+
+**两个门禁的真问题（本轮抓到的）**：①`gui_baseline_shot.py` 用上一轮残留的测试卷截图，风格门禁把
+`style=flat` 持久化后又重生成基线 → 基线变成扁平桌面，之后所有外观比较差 759k 像素；现在截图前先重建
+夹具。②独立跑门禁（不经 sweep）也会继承残留测试卷，`build/run_gate.py` 现在每次尝试前重建夹具。
+
 ## [v0.70.0-alpha] — 2026-11-25
 
 发布正文见 `docs/release-notes-v0.70.0-alpha.md`。**外部贡献合并版**：ConlyesOS 作者把

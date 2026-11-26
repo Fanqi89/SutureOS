@@ -520,10 +520,16 @@ def main():
             key(_ch, 0.16)               # back-to-back keys can be dropped
         time.sleep(1.2)
 
+        # v0.71: 系统设置 draws its input hint at the *bottom* of the body (the
+        # default TITLE_H+104 position sat on top of the clickable 外观风格 row),
+        # so the band this check samples has to follow it.
+        band_y0 = wy + WIN0[3] - 46
+        band_y1 = wy + WIN0[3] - 6
+
         def diff_band(im1, im2):
             p1, p2 = im1.load(), im2.load()
             n = 0
-            for yy in range(wy + 128, min(wy + 168, SCREEN_H)):
+            for yy in range(band_y0, min(band_y1, SCREEN_H)):
                 for xx in range(wx + 60, min(wx + 300, SCREEN_W)):
                     a, b = p1[xx, yy], p2[xx, yy]
                     if abs(a[0] - b[0]) + abs(a[1] - b[1]) + abs(a[2] - b[2]) > 20:
